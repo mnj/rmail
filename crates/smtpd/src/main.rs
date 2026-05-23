@@ -1,21 +1,18 @@
-use anyhow::Result;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
 
 use rmail_common::{config::Config, maildir};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+mod tls;
+use tls::load_tls_acceptor;
+use tokio_rustls::TlsAcceptor;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // load config (example path)
-    let cfg = match Config::from_file("config/example.toml") {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load config/example.toml: {}", e);
-            return Err(e);
-        }
-    };
+    let cfg = Config::from_file("config/example.toml").context("loading config/example.toml")?;
 
     let mut allowed: HashSet<String> = HashSet::new();
     if let Some(mboxes) = &cfg.mailboxes {
@@ -26,78 +23,199 @@ async fn main() -> Result<()> {
     let catchalls: HashMap<String, String> = cfg.catchalls.clone().unwrap_or_default();
     let mail_root = cfg.global.mail_root.clone();
 
-    let listen_addr = "127.0.0.1:2525";
-    let listener = TcpListener::bind(listen_addr).await?;
-    println!("rMail SMTPD listening on {}", listen_addr);
+    // build TLS acceptor if certificate paths present
+    let tls_acceptor = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
+        match load_tls_acceptor(cert, key) {
+            Ok(a) => Some(Arc::new(a)),
+            Err(e) => {
+                eprintln!("Failed to load TLS config: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
+    let listen_addrs = if let Some(addrs) = &cfg.global.listen_addrs {
+        addrs.clone()
+    } else {
+        vec!["127.0.0.1:2525".to_string(), "[::1]:2525".to_string()]
+    };
+
+    // spawn plain SMTP listeners
+    for addr in listen_addrs.iter() {
+        let addr = addr.clone();
+        let allowed = allowed.clone();
+        let catchalls = catchalls.clone();
+        let mail_root = mail_root.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_plain_listener(&addr, allowed, catchalls, mail_root).await {
+                eprintln!("Listener {} failed: {}", addr, e);
+            }
+        });
+    }
+
+    // spawn SMTPS listener (implicit TLS) if configured
+    if let Some(s_acceptor) = tls_acceptor.clone() {
+        if let Some(port) = cfg.global.smtps_port {
+            let addr_v4 = format!("0.0.0.0:{}", port);
+            let addr_v6 = format!("[::]:{}", port);
+            let allowed = allowed.clone();
+            let catchalls = catchalls.clone();
+            let mail_root = mail_root.clone();
+            let acceptor = s_acceptor.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_smtps_listener(&addr_v4, acceptor, allowed, catchalls, mail_root.clone()).await {
+                    eprintln!("SMTPS {} failed: {}", addr_v4, e);
+                }
+            });
+            tokio::spawn(async move {
+                if let Err(e) = run_smtps_listener(&addr_v6, s_acceptor.clone(), allowed, catchalls, mail_root).await {
+                    eprintln!("SMTPS {} failed: {}", addr_v6, e);
+                }
+            });
+        }
+    } else {
+        println!("TLS not configured; SMTPS disabled (implicit TLS)");
+    }
+
+    // keep running
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
+async fn run_plain_listener(addr: &str, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    println!("rMail SMTPD listening on {}", addr);
     loop {
         let (stream, _peer) = listener.accept().await?;
         let allowed = allowed.clone();
         let catchalls = catchalls.clone();
         let mail_root = mail_root.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, allowed, catchalls, mail_root).await {
+            if let Err(e) = process_stream(stream, allowed, catchalls, mail_root).await {
                 eprintln!("client error: {}", e);
             }
         });
     }
 }
 
-async fn handle_client(
-    stream: TcpStream,
-    allowed: HashSet<String>,
-    catchalls: HashMap<String, String>,
-    mail_root: String,
-) -> Result<()> {
-    let peer = stream.peer_addr()?;
-    let (r, mut w) = stream.into_split();
-    let mut reader = BufReader::new(r).lines();
-    w.write_all(b"220 rMail SMTPD ready\r\n").await?;
+async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    println!("rMail SMTPS listening on {}", addr);
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let allowed = allowed.clone();
+        let catchalls = catchalls.clone();
+        let mail_root = mail_root.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    if let Err(e) = process_stream(tls_stream, allowed, catchalls, mail_root).await {
+                        eprintln!("tls client error: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("TLS accept error: {}", e),
+            }
+        });
+    }
+}
+
+// function to extract address
+fn extract_addr(s: &str) -> Option<String> {
+    let s = s.trim();
+    let s = s.trim_matches(|c| c == '<' || c == '>' || c == ' ');
+    if s.contains('@') {
+        Some(s.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+async fn process_stream<S>(stream: S, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let writer = reader.get_mut();
+    writer.write_all(b"220 rMail SMTPD ready\r\n").await?;
+    writer.flush().await?;
     let mut rcpts: Vec<String> = Vec::new();
-    while let Some(line) = reader.next_line().await? {
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 { break; }
         let cmd = line.trim_end().to_string();
         let up = cmd.to_ascii_uppercase();
         if up.starts_with("HELO") || up.starts_with("EHLO") {
-            w.write_all(b"250 Hello\r\n").await?;
+            writer.write_all(b"250 Hello\r\n").await?;
+            writer.flush().await?;
         } else if up.starts_with("MAIL FROM:") {
-            w.write_all(b"250 OK\r\n").await?;
+            writer.write_all(b"250 OK\r\n").await?;
+            writer.flush().await?;
+            rcpts.clear();
         } else if up.starts_with("RCPT TO:") {
-            let addr_raw = cmd[8..].trim();
-            let addr = addr_raw.trim_matches(|c| c == '<' || c == '>' || c == ' ');
-            let addr_l = addr.to_ascii_lowercase();
-            if allowed.contains(&addr_l) {
-                rcpts.push(addr.to_string());
-                w.write_all(b"250 OK\r\n").await?;
-            } else if let Some(at) = addr_l.find('@') {
-                let domain = &addr_l[at + 1..];
-                if let Some(target) = catchalls.get(domain) {
-                    // redirect to the configured catchall target
-                    rcpts.push(target.clone());
-                    w.write_all(b"250 OK\r\n").await?;
+            if let Some(raw) = cmd.get(8..) {
+                if let Some(addr) = extract_addr(raw) {
+                    if allowed.contains(&addr) {
+                        rcpts.push(addr.clone());
+                        writer.write_all(b"250 OK\r\n").await?;
+                        writer.flush().await?;
+                    } else if let Some(at) = addr.find('@') {
+                        let domain = &addr[at+1..];
+                        if let Some(target) = catchalls.get(domain) {
+                            rcpts.push(target.clone());
+                            writer.write_all(b"250 OK\r\n").await?;
+                            writer.flush().await?;
+                        } else {
+                            writer.write_all(b"550 No such user\r\n").await?;
+                            writer.flush().await?;
+                        }
+                    } else {
+                        writer.write_all(b"550 Bad address\r\n").await?;
+                        writer.flush().await?;
+                    }
                 } else {
-                    w.write_all(b"550 No such user\r\n").await?;
+                    writer.write_all(b"550 Bad address\r\n").await?;
+                    writer.flush().await?;
                 }
             } else {
-                w.write_all(b"550 Bad address\r\n").await?;
+                writer.write_all(b"550 Bad address\r\n").await?;
+                writer.flush().await?;
             }
         } else if up.starts_with("DATA") {
             if rcpts.is_empty() {
-                w.write_all(b"554 No recipients\r\n").await?;
+                writer.write_all(b"554 No recipients\r\n").await?;
+                writer.flush().await?;
                 continue;
             }
-            w.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
+            writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
+            writer.flush().await?;
+            // read data lines with dot-stuffing unescape
             let mut data: Vec<u8> = Vec::new();
-            while let Some(dline) = reader.next_line().await? {
-                if dline == "." {
+            loop {
+                let mut dline = String::new();
+                let n = reader.read_line(&mut dline).await?;
+                if n == 0 { break; }
+                let d = if dline.ends_with('\n') { dline.trim_end_matches('\n').to_string() } else { dline.clone() };
+                let d = d.trim_end_matches('\r');
+                if d == "." {
                     break;
                 }
-                data.extend_from_slice(dline.as_bytes());
+                let mut out = d.to_string();
+                if out.starts_with("..") {
+                    out.remove(0); // un-escape leading dot
+                }
+                data.extend_from_slice(out.as_bytes());
                 data.extend_from_slice(b"\r\n");
             }
             for rcpt in &rcpts {
                 if let Some(at) = rcpt.find('@') {
                     let local = &rcpt[..at];
-                    let domain = &rcpt[at + 1..];
+                    let domain = &rcpt[at+1..];
                     let mr = PathBuf::from(&mail_root);
                     match maildir::deliver(&mr, domain, local, &data) {
                         Ok(path) => println!("Delivered to {} -> {:?}", rcpt, path),
@@ -106,14 +224,20 @@ async fn handle_client(
                 }
             }
             rcpts.clear();
-            w.write_all(b"250 OK\r\n").await?;
+            writer.write_all(b"250 OK\r\n").await?;
+            writer.flush().await?;
         } else if up.starts_with("QUIT") {
-            w.write_all(b"221 Bye\r\n").await?;
+            writer.write_all(b"221 Bye\r\n").await?;
+            writer.flush().await?;
             break;
+        } else if up.starts_with("STARTTLS") {
+            writer.write_all(b"454 TLS not available\r\n").await?;
+            writer.flush().await?;
+            // For now STARTTLS is not implemented; implicit SMTPS supported
         } else {
-            w.write_all(b"502 Command not implemented\r\n").await?;
+            writer.write_all(b"502 Command not implemented\r\n").await?;
+            writer.flush().await?;
         }
     }
-    println!("Connection from {} closed", peer);
     Ok(())
 }
