@@ -30,6 +30,8 @@ pub struct Mailbox {
     pub address: String,
     pub password_hash: Option<String>,
     pub maildir: Option<String>,
+    /// Optional SCRAM verifier JSON (base64 salt, iterations, stored_key, server_key)
+    pub scram: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

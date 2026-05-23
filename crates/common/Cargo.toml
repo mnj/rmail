@@ -12,3 +12,9 @@ password-hash = "0.4"
 rand = "0.8"
 serde_json = "1.0"
 rusqlite = { version = "0.29", features = ["bundled"] }
+
+# SCRAM helpers
+pbkdf2 = "0.11"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.21"

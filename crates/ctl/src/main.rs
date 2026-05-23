@@ -79,14 +79,18 @@ fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
             let cfg = Config::from_file(&cfg_path)?;
             // determine password_hash: either provided precomputed, or hash the plaintext password
-            let ph = if let Some(h) = password_hash {
-                h
+            // Also generate a SCRAM verifier if a plaintext password was provided so SCRAM-SHA-256 can be used.
+            let (ph, scram_json) = if let Some(h) = password_hash {
+                (h, None)
             } else if let Some(p) = password {
                 let mut rng = OsRng;
                 let salt = SaltString::generate(&mut rng);
-                Argon2::default().hash_password(p.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string()
+                let phs = Argon2::default().hash_password(p.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string();
+                // create SCRAM verifier JSON with a reasonable iteration count
+                let scram = rmail_common::auth::create_scram_verifier(&p, 4096)?;
+                (phs, Some(scram))
             } else {
-                String::new()
+                (String::new(), None)
             };
 
             if let Some(at) = address.find('@') {
@@ -105,7 +109,7 @@ fn main() -> Result<()> {
                 if let Some(dbp) = cfg.global.db_path.as_ref() {
                     // ensure DB initialized
                     rmail_common::db::init_db(dbp)?;
-                    rmail_common::db::add_mailbox(dbp, &address.to_ascii_lowercase(), if ph.is_empty() { None } else { Some(&ph) }, Some(&maildir_path))?;
+                    rmail_common::db::add_mailbox(dbp, &address.to_ascii_lowercase(), if ph.is_empty() { None } else { Some(&ph) }, Some(&maildir_path), scram_json.as_deref())?;
                     println!("Added mailbox {} into DB at {}", address, dbp);
                 } else {
                     eprintln!("No db_path configured; SQLite DB is required");

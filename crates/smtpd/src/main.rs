@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
 use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
+use std::sync::Mutex;
+use std::net::{SocketAddr, IpAddr};
+use std::time::{Instant, Duration};
+use once_cell::sync::Lazy;
 
 use rmail_common::{config::Config, maildir, metrics, auth, db};
 use base64;
@@ -9,11 +13,25 @@ use tokio::net::{TcpListener, TcpStream};
 mod tls;
 use tls::load_tls_acceptor;
 use tokio_rustls::TlsAcceptor;
+use rand::RngCore;
 
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
 // so that boxed trait objects can be used with tokio::io::BufReader.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
+
+// Simple in-memory rate-limiter for authentication failures keyed by remote IP. This is a
+// best-effort defensive measure against brute-force attacks. It is intentionally lightweight
+// and uses an in-process Mutex-protected HashMap. For multi-process deployments a shared
+// store (Redis, etc.) should be used instead.
+#[derive(Clone)]
+struct AuthFailInfo {
+    count: u32,
+    first: Instant,
+    locked_until: Option<Instant>,
+}
+
+static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Increment an on-disk counter for delivered messages. Uses an atomic write via a temporary file
 /// so that concurrent processes won't corrupt the counter file. This is intentionally simple and
@@ -31,6 +49,40 @@ async fn increment_delivery_counter() -> Result<()> {
     Ok(())
 }
 
+
+/// Check whether the remote IP is currently blocked from authenticating. Returns remaining block Duration if blocked.
+fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
+    let m = AUTH_FAILS.lock().unwrap();
+    if let Some(info) = m.get(&ip) {
+        if let Some(until) = info.locked_until {
+            let now = Instant::now();
+            if until > now {
+                return Some(until - now);
+            }
+        }
+    }
+    None
+}
+
+/// Record a failed auth attempt for the IP and apply a temporary lockout if threshold exceeded.
+fn record_auth_failure(ip: IpAddr) {
+    let mut m = AUTH_FAILS.lock().unwrap();
+    let now = Instant::now();
+    let entry = m.entry(ip).or_insert(AuthFailInfo { count: 0, first: now, locked_until: None });
+    entry.count = entry.count.saturating_add(1);
+    // if 5 failures within short window, lock for 30 minutes
+    if entry.count >= 5 {
+        entry.locked_until = Some(now + Duration::from_secs(30 * 60));
+        entry.count = 0;
+        entry.first = now;
+    }
+}
+
+/// Reset any recorded failures for this IP (on successful authentication)
+fn reset_auth_failures(ip: IpAddr) {
+    let mut m = AUTH_FAILS.lock().unwrap();
+    m.remove(&ip);
+}
 
 #[tokio::main]
 async fn main() -> Result<()> { 
@@ -125,12 +177,12 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPD listening on {}", addr);
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer)).await {
                 eprintln!("client error: {}", e);
             }
         });
@@ -141,14 +193,14 @@ async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: S
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPS listening on {}", addr);
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, None, db_clone).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, None, db_clone, Some(peer)).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -169,7 +221,7 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<SocketAddr>) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
     // - MAX_MESSAGE_BYTES: overall DATA size cap to avoid OOM
@@ -217,9 +269,9 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             if tls_acceptor.is_some() {
                 resp.push_str("250-STARTTLS\r\n");
             }
-            // advertise AUTH mechanisms if DB is configured (we support AUTH PLAIN and LOGIN)
+            // advertise AUTH mechanisms if DB is configured (we support AUTH PLAIN, LOGIN and SCRAM-SHA-256)
             if db_path.is_some() {
-                resp.push_str("250-AUTH PLAIN LOGIN\r\n");
+                resp.push_str("250-AUTH PLAIN LOGIN SCRAM-SHA-256\r\n");
             }
             resp.push_str("250 OK\r\n");
             let w = reader.get_mut();
@@ -233,6 +285,15 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
             let mech = parts.get(1).map(|s| s.to_ascii_uppercase()).unwrap_or_default();
             let initial = parts.get(2).map(|s| *s);
+            // Rate-limiting: block repeated failures per remote IP
+            if let Some(peer_addr) = peer {
+                if let Some(rem) = auth_block_remaining(peer_addr.ip()) {
+                    let w = reader.get_mut();
+                    w.write_all(format!("454 4.7.1 Too many failed auth attempts; try again in {}s\r\n", rem.as_secs()).as_bytes()).await?;
+                    w.flush().await?;
+                    continue;
+                }
+            }
             // Require encryption (implicit SMTPS or STARTTLS) for authentication in production
             if tls_acceptor.is_some() {
                 let w = reader.get_mut();
@@ -265,17 +326,19 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                                     let w = reader.get_mut();
                                                     w.write_all(b"235 Authentication succeeded\r\n").await?;
                                                     w.flush().await?;
+                                                    if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
                                                 }
-                                                Ok(false) => { let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
-                                                Err(e) => { eprintln!("auth verify error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                                                Ok(false) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
+                                                Err(e) => { eprintln!("auth verify error: {}", e); if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                             }
                                         } else {
+                                            if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
                                             let w = reader.get_mut();
                                             w.write_all(b"535 No password set\r\n").await?;
                                             w.flush().await?;
                                         }
                                     }
-                                    Ok(Ok(None)) => { let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
+                                    Ok(Ok(None)) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
                                     Ok(Err(e)) => { eprintln!("db error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                     Err(e) => { eprintln!("db task join error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                 }
@@ -317,13 +380,14 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                                     let w = reader.get_mut();
                                                     w.write_all(b"235 Authentication succeeded\r\n").await?;
                                                     w.flush().await?;
+                                                    if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
                                                 }
-                                                Ok(false) => { let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
-                                                Err(e) => { eprintln!("auth verify error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                                                Ok(false) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
+                                                Err(e) => { eprintln!("auth verify error: {}", e); if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                             }
-                                        } else { let w = reader.get_mut(); w.write_all(b"535 No password set\r\n").await?; w.flush().await?; }
+                                        } else { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No password set\r\n").await?; w.flush().await?; }
                                     }
-                                    Ok(Ok(None)) => { let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
+                                    Ok(Ok(None)) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
                                     Ok(Err(e)) => { eprintln!("db error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                     Err(e) => { eprintln!("db task join error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                 }
@@ -332,6 +396,110 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; }
                     }
                 }
+            } else if mech == "SCRAM-SHA-256" {
+                // SCRAM-SHA-256 server-side (RFC 5802 minimal implementation)
+                // Workflow: client-first-message [base64] -> server-first-message (r=nonce,s=salt,i=iter) -> client-final-message (with proof)
+                let client_first_msg = if let Some(b64) = initial {
+                    match base64::decode(b64) {
+                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                        Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; continue; }
+                    }
+                } else {
+                    let w = reader.get_mut();
+                    w.write_all(b"334 \r\n").await?;
+                    w.flush().await?;
+                    let mut resp_line = String::new();
+                    reader.read_line(&mut resp_line).await?;
+                    let b64 = resp_line.trim();
+                    match base64::decode(b64) {
+                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                        Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; continue; }
+                    }
+                };
+
+                // client-first-bare is the part after the GS2 header "n,,"
+                let client_first_bare = if let Some(idx) = client_first_msg.find(",,") { client_first_msg[idx+2..].to_string() } else { client_first_msg.clone() };
+
+                // parse username (n=) and client nonce (r=) from client-first-bare
+                let mut username = String::new();
+                let mut client_nonce = String::new();
+                for part in client_first_bare.split(',') {
+                    if part.starts_with("n=") { username = part[2..].to_string(); }
+                    else if part.starts_with("r=") { client_nonce = part[2..].to_string(); }
+                }
+                if username.is_empty() || client_nonce.is_empty() {
+                    let w = reader.get_mut();
+                    w.write_all(b"501 Invalid SCRAM client-first message\r\n").await?;
+                    w.flush().await?;
+                    continue;
+                }
+
+                if let Some(dbp) = db_path.as_ref() {
+                    let dbp2 = dbp.clone();
+                    let user_lower = username.to_ascii_lowercase();
+                    match tokio::task::spawn_blocking(move || rmail_common::db::get_mailbox(&dbp2, &user_lower)).await {
+                        Ok(Ok(Some(mb))) => {
+                            if let Some(scram_json) = mb.scram {
+                                match rmail_common::auth::parse_scram_verifier(&scram_json) {
+                                    Ok((salt_b64, iter)) => {
+                                        // generate server nonce and compose server-first-message
+                                        let mut rn = [0u8; 18];
+                                        let mut rng = rand::rngs::OsRng;
+                                        rng.fill_bytes(&mut rn);
+                                        let server_nonce = base64::encode(&rn);
+                                        let combined_nonce = format!("{}{}", client_nonce, server_nonce);
+                                        let server_first_msg = format!("r={},s={},i={}", combined_nonce, salt_b64, iter);
+
+                                        // send server-first-message (base64)
+                                        let sf_b64 = base64::encode(server_first_msg.as_bytes());
+                                        let w = reader.get_mut();
+                                        w.write_all(format!("334 {}\r\n", sf_b64).as_bytes()).await?;
+                                        w.flush().await?;
+
+                                        // read client-final-message (base64)
+                                        let mut resp_line = String::new();
+                                        reader.read_line(&mut resp_line).await?;
+                                        let b64_cf = resp_line.trim();
+                                        let cf_bytes = match base64::decode(b64_cf) {
+                                            Ok(b) => b,
+                                            Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; continue; }
+                                        };
+                                        let client_final_msg = String::from_utf8_lossy(&cf_bytes).to_string();
+
+                                        // split out the proof (p=) and client-final-without-proof
+                                        if let Some(pos) = client_final_msg.find(",p=") {
+                                            let client_final_wo_proof = client_final_msg[..pos].to_string();
+                                            let client_proof_b64 = &client_final_msg[pos+3..];
+                                            let auth_message = format!("{},{},{}", client_first_bare, server_first_msg, client_final_wo_proof);
+
+                                            match rmail_common::auth::verify_scram_proof(&scram_json, &auth_message, client_proof_b64) {
+                                                Ok(server_sig) => {
+                                                    // send server-final-message (v=base64) in a 235 success response
+                                                    let server_final = format!("v={}", base64::encode(&server_sig));
+                                                    let sf_b64 = base64::encode(server_final.as_bytes());
+                                                    let w = reader.get_mut();
+                                                    w.write_all(format!("235 {}\r\n", sf_b64).as_bytes()).await?;
+                                                    w.flush().await?;
+                                                    authenticated_user = Some(mb.address.to_ascii_lowercase());
+                                                    if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
+                                                }
+                                                Err(_) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
+                                            }
+                                        } else {
+                                            let w = reader.get_mut();
+                                            w.write_all(b"501 Invalid SCRAM client-final message\r\n").await?;
+                                            w.flush().await?;
+                                        }
+                                    }
+                                    Err(_) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                                }
+                            } else { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"504 SCRAM not configured for user\r\n").await?; w.flush().await?; }
+                        }
+                        Ok(Ok(None)) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
+                        Ok(Err(e)) => { eprintln!("db error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                        Err(e) => { eprintln!("db task join error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                    }
+                } else { let w = reader.get_mut(); w.write_all(b"454 TLS not available\r\n").await?; w.flush().await?; }
             } else if mech == "LOGIN" {
                 // LOGIN: two step username/password base64 prompts
                 if let Some(b64u) = initial {
@@ -359,13 +527,14 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                                             let w = reader.get_mut();
                                                             w.write_all(b"235 Authentication succeeded\r\n").await?;
                                                             w.flush().await?;
+                                                            if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
                                                         }
-                                                        Ok(false) => { let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
-                                                        Err(e) => { eprintln!("auth verify error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                                                        Ok(false) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
+                                                        Err(e) => { eprintln!("auth verify error: {}", e); if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                                     }
-                                                } else { let w = reader.get_mut(); w.write_all(b"535 No password set\r\n").await?; w.flush().await?; }
+                                                } else { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No password set\r\n").await?; w.flush().await?; }
                                             }
-                                            Ok(Ok(None)) => { let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
+                                            Ok(Ok(None)) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
                                             Ok(Err(e)) => { eprintln!("db error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                             Err(e) => { eprintln!("db task join error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                         }
@@ -407,13 +576,14 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                                             let w = reader.get_mut();
                                                             w.write_all(b"235 Authentication succeeded\r\n").await?;
                                                             w.flush().await?;
+                                                            if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
                                                         }
-                                                        Ok(false) => { let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
-                                                        Err(e) => { eprintln!("auth verify error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
+                                                        Ok(false) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 Authentication failed\r\n").await?; w.flush().await?; }
+                                                        Err(e) => { eprintln!("auth verify error: {}", e); if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                                     }
-                                                } else { let w = reader.get_mut(); w.write_all(b"535 No password set\r\n").await?; w.flush().await?; }
+                                                } else { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No password set\r\n").await?; w.flush().await?; }
                                             }
-                                            Ok(Ok(None)) => { let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
+                                            Ok(Ok(None)) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(b"535 No such user\r\n").await?; w.flush().await?; }
                                             Ok(Err(e)) => { eprintln!("db error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                             Err(e) => { eprintln!("db task join error: {}", e); let w = reader.get_mut(); w.write_all(b"451 Temporary error\r\n").await?; w.flush().await?; }
                                         }
@@ -430,6 +600,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 w.write_all(b"504 Unrecognized authentication mechanism\r\n").await?;
                 w.flush().await?;
             }
+        } else if up.starts_with("MAIL FROM:") {
         } else if up.starts_with("MAIL FROM:") {
             // Parse MAIL FROM and set sender; on syntax error return 501
             mail_from = extract_addr(cmd).or_else(|| {
@@ -717,7 +888,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 match acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, None, db_path.clone()));
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, None, db_path.clone(), peer));
                         return fut.await;
                     }
                     Err(e) => {

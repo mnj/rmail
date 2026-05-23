@@ -16,7 +16,8 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             password_hash TEXT,
             maildir TEXT,
             created_at INTEGER,
-            uidvalidity INTEGER
+            uidvalidity INTEGER,
+            scram TEXT
         );
         CREATE TABLE IF NOT EXISTS catchalls (
             domain TEXT PRIMARY KEY,
@@ -48,11 +49,11 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
 }
 
 /// Add or replace mailbox
-pub fn add_mailbox<P: AsRef<Path>>(path: P, address: &str, password_hash: Option<&str>, maildir: Option<&str>) -> Result<()> {
+pub fn add_mailbox<P: AsRef<Path>>(path: P, address: &str, password_hash: Option<&str>, maildir: Option<&str>, scram: Option<&str>) -> Result<()> {
     let conn = Connection::open(path)?;
     conn.execute(
-        "INSERT OR REPLACE INTO mailboxes (address, password_hash, maildir, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))",
-        params![address, password_hash, maildir],
+        "INSERT OR REPLACE INTO mailboxes (address, password_hash, maildir, created_at, scram) VALUES (?1, ?2, ?3, strftime('%s','now'), ?4)",
+        params![address, password_hash, maildir, scram],
     )?;
     Ok(())
 }
@@ -60,13 +61,14 @@ pub fn add_mailbox<P: AsRef<Path>>(path: P, address: &str, password_hash: Option
 /// Get mailbox by exact address
 pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mailbox>> {
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare("SELECT address, password_hash, maildir FROM mailboxes WHERE address = ?1")?;
+    let mut stmt = conn.prepare("SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address = ?1")?;
     let mut rows = stmt.query(params![address])?;
     if let Some(row) = rows.next()? {
         let address: String = row.get(0)?;
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
-        Ok(Some(Mailbox { address, password_hash, maildir }))
+        let scram: Option<String> = row.get(3)?;
+        Ok(Some(Mailbox { address, password_hash, maildir, scram }))
     } else {
         Ok(None)
     }
@@ -75,7 +77,7 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
 /// Find unique mailbox by localpart (address like local@*) — returns None if ambiguous
 pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result<Option<Mailbox>> {
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare("SELECT address, password_hash, maildir FROM mailboxes WHERE address LIKE ?1")?;
+    let mut stmt = conn.prepare("SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address LIKE ?1")?;
     let like = format!("{}@%", local);
     let mut rows = stmt.query(params![like])?;
     let mut found: Option<Mailbox> = None;
@@ -84,7 +86,8 @@ pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result
         let address: String = row.get(0)?;
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
-        found = Some(Mailbox { address, password_hash, maildir });
+        let scram: Option<String> = row.get(3)?;
+        found = Some(Mailbox { address, password_hash, maildir, scram });
     }
     Ok(found)
 }
@@ -97,14 +100,15 @@ pub fn mailbox_exists<P: AsRef<Path>>(path: P, address: &str) -> Result<bool> {
 /// List all mailboxes
 pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare("SELECT address, password_hash, maildir FROM mailboxes ORDER BY address")?;
+    let mut stmt = conn.prepare("SELECT address, password_hash, maildir, scram FROM mailboxes ORDER BY address")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let address: String = row.get(0)?;
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
-        out.push(Mailbox { address, password_hash, maildir });
+        let scram: Option<String> = row.get(3)?;
+        out.push(Mailbox { address, password_hash, maildir, scram });
     }
     Ok(out)
 }
