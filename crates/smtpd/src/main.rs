@@ -901,56 +901,112 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
 
                             // measure per-recipient delivery latency
                             let start = std::time::Instant::now();
-                            match maildir::deliver(&mr, &domain, &local, &data) {
-                                Ok(path) => {
-                                    any_accepted = true;
-                                    let elapsed_us = start.elapsed().as_micros() as u64;
-                                    // update metrics
-                                    rmail_common::metrics::inc_deliveries();
-                                    rmail_common::metrics::add_delivered_bytes(data.len() as u64);
-                                    rmail_common::metrics::observe_delivery_latency_us(elapsed_us);
+                            // If DMARC recommends quarantine, deliver to quarantine Maildir
+                            if dmarc_res.as_deref() == Some("quarantine") {
+                                match maildir::deliver_quarantine(&mr, &domain, &local, &data) {
+                                    Ok(path) => {
+                                        any_accepted = true;
+                                        let elapsed_us = start.elapsed().as_micros() as u64;
+                                        // update metrics
+                                        rmail_common::metrics::inc_deliveries();
+                                        rmail_common::metrics::add_delivered_bytes(data.len() as u64);
+                                        rmail_common::metrics::observe_delivery_latency_us(elapsed_us);
 
-                                    println!("Delivered to {} -> {:?}", rcpt, path);
-                                    // persist metadata to DB if configured
-                                    if let Some(dbp) = db_path.as_ref() {
-                                        let dbp2 = dbp.clone();
-                                        let db_domain = domain.clone();
-                                        let db_local = local.clone();
-                                        let print_domain = db_domain.clone();
-                                        let print_local = db_local.clone();
-                                        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                                        let size = data.len() as i64;
-                                        // clone analysis results into spawn
-                                        let dkim_clone = dkim_res.clone();
-                                        let spf_clone = spf_res.clone();
-                                        let dmarc_clone = dmarc_res.clone();
-                                        tokio::spawn(async move {
-                                            match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &db_domain, &db_local, &fname, size, dkim_clone.as_deref(), spf_clone.as_deref(), dmarc_clone.as_deref())).await {
-                                                Ok(Ok(uid)) => {
-                                                    println!("Recorded message UID {} for {}@{}", uid, print_local, print_domain);
+                                        println!("Quarantined to {} -> {:?}", rcpt, path);
+                                        // persist metadata to DB if configured
+                                        if let Some(dbp) = db_path.as_ref() {
+                                            let dbp2 = dbp.clone();
+                                            let db_domain = domain.clone();
+                                            let db_local = local.clone();
+                                            let print_domain = db_domain.clone();
+                                            let print_local = db_local.clone();
+                                            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                                            let size = data.len() as i64;
+                                            // clone analysis results into spawn
+                                            let dkim_clone = dkim_res.clone();
+                                            let spf_clone = spf_res.clone();
+                                            let dmarc_clone = dmarc_res.clone();
+                                            tokio::spawn(async move {
+                                                match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &db_domain, &db_local, &fname, size, dkim_clone.as_deref(), spf_clone.as_deref(), dmarc_clone.as_deref())).await {
+                                                    Ok(Ok(uid)) => {
+                                                        println!("Recorded quarantined message UID {} for {}@{}", uid, print_local, print_domain);
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        eprintln!("db add_message error: {}", e);
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("db task join error: {}", e);
+                                                    }
                                                 }
-                                                Ok(Err(e)) => {
-                                                    eprintln!("db add_message error: {}", e);
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("db task join error: {}", e);
-                                                }
-                                            }
-                                        });
+                                            });
+                                        }
+
+                                        // update simple on-disk metric; failures are non-fatal
+                                        if let Err(e) = increment_delivery_counter().await {
+                                            eprintln!("metrics update failed: {}", e);
+                                        }
                                     }
-
-                                    // update simple on-disk metric; failures are non-fatal
-                                    if let Err(e) = increment_delivery_counter().await {
-                                        eprintln!("metrics update failed: {}", e);
+                                    Err(e) => {
+                                        any_rejected = true;
+                                        rmail_common::metrics::inc_failed_deliveries();
+                                        eprintln!("quarantine deliver error for {}: {}", rcpt, e);
+                                        let w = reader.get_mut();
+                                        w.write_all(b"451 Requested action aborted: local error in processing\r\n").await?;
+                                        w.flush().await?;
                                     }
                                 }
-                                Err(e) => {
-                                    any_rejected = true;
-                                    rmail_common::metrics::inc_failed_deliveries();
-                                    eprintln!("deliver error for {}: {}", rcpt, e);
-                                    let w = reader.get_mut();
-                                    w.write_all(b"451 Requested action aborted: local error in processing\r\n").await?;
-                                    w.flush().await?;
+                            } else {
+                                match maildir::deliver(&mr, &domain, &local, &data) {
+                                    Ok(path) => {
+                                        any_accepted = true;
+                                        let elapsed_us = start.elapsed().as_micros() as u64;
+                                        // update metrics
+                                        rmail_common::metrics::inc_deliveries();
+                                        rmail_common::metrics::add_delivered_bytes(data.len() as u64);
+                                        rmail_common::metrics::observe_delivery_latency_us(elapsed_us);
+
+                                        println!("Delivered to {} -> {:?}", rcpt, path);
+                                        // persist metadata to DB if configured
+                                        if let Some(dbp) = db_path.as_ref() {
+                                            let dbp2 = dbp.clone();
+                                            let db_domain = domain.clone();
+                                            let db_local = local.clone();
+                                            let print_domain = db_domain.clone();
+                                            let print_local = db_local.clone();
+                                            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                                            let size = data.len() as i64;
+                                            // clone analysis results into spawn
+                                            let dkim_clone = dkim_res.clone();
+                                            let spf_clone = spf_res.clone();
+                                            let dmarc_clone = dmarc_res.clone();
+                                            tokio::spawn(async move {
+                                                match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &db_domain, &db_local, &fname, size, dkim_clone.as_deref(), spf_clone.as_deref(), dmarc_clone.as_deref())).await {
+                                                    Ok(Ok(uid)) => {
+                                                        println!("Recorded message UID {} for {}@{}", uid, print_local, print_domain);
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        eprintln!("db add_message error: {}", e);
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("db task join error: {}", e);
+                                                    }
+                                                }
+                                            });
+                                        }
+
+                                        // update simple on-disk metric; failures are non-fatal
+                                        if let Err(e) = increment_delivery_counter().await {
+                                            eprintln!("metrics update failed: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        any_rejected = true;
+                                        rmail_common::metrics::inc_failed_deliveries();
+                                        eprintln!("deliver error for {}: {}", rcpt, e);
+                                        let w = reader.get_mut();
+                                        w.write_all(b"451 Requested action aborted: local error in processing\r\n").await?;
+                                        w.flush().await?;
+                                    }
                                 }
                             }
                         } else {
