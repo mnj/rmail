@@ -7,6 +7,12 @@ use trust_dns_resolver::TokioAsyncResolver;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use native_tls::TlsConnector as NativeTlsConnector;
 use rmail_common::db;
+use trust_dns_resolver::proto::rr::RecordType;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use openssl::x509::X509;
+use openssl::pkey::PKey;
+use openssl::sha::{sha256, sha512};
+use hex;
 
 // Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
@@ -214,17 +220,87 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
         let (code, _resp) = read_response(&mut reader).await?;
         if code != 220 { return Err(anyhow::anyhow!("STARTTLS rejected: {}", code)); }
 
-        // perform TLS handshake using system certificates
-        let inner = reader.into_inner();
-        // Respect env var to enable DANE/TLSA verification. Default disabled.
+        // perform optional DANE/TLSA verification if requested
         let enable_dane = std::env::var("RMAIL_ENABLE_DANE").map(|v| {
             let v = v.to_ascii_lowercase();
             !(v == "0" || v == "false")
         }).unwrap_or(false);
+
         if enable_dane {
-            eprintln!("DANE/TLSA requested but full TLSA verification not yet implemented; proceeding with standard PKI for {}", selected_host);
-            // TODO: implement TLSA lookup and certificate matching here using trust-dns-resolver and the negotiated certificate
+            // Lookup TLSA records for _port._tcp.hostname
+            let port: u16 = 25;
+            let tlsa_name = format!("_{}._tcp.{}", port, selected_host);
+            let mut tlsa_records: Vec<(u8,u8,u8,Vec<u8>)> = Vec::new();
+            match resolver.lookup(tlsa_name.as_str(), RecordType::TLSA).await {
+                Ok(lookup) => {
+                    for rec in lookup.iter() {
+                        let s = rec.to_string();
+                        let mut parts = s.split_whitespace();
+                        if let (Some(us), Some(sel), Some(mt), Some(data)) = (parts.next(), parts.next(), parts.next(), parts.next()) {
+                            if let (Ok(usage), Ok(selector), Ok(mtype)) = (us.parse::<u8>(), sel.parse::<u8>(), mt.parse::<u8>()) {
+                                if let Ok(bytes) = hex::decode(data) {
+                                    tlsa_records.push((usage, selector, mtype, bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("TLSA lookup failed for {}: {}", tlsa_name, e);
+                }
+            }
+
+            if !tlsa_records.is_empty() {
+                // perform a blocking TLS handshake (no cert verification) to obtain peer cert/SPKI
+                let host_clone = selected_host.clone();
+                let addr = format!("{}:{}", host_clone, port);
+                let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+                    let tcp = std::net::TcpStream::connect(addr)?;
+                    tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                    tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+                    let mut b = SslConnector::builder(SslMethod::tls())?;
+                    b.set_verify(SslVerifyMode::NONE);
+                    let conn = b.build();
+                    let ssl_stream = conn.connect(host_clone.as_str(), tcp)?;
+                    let cert = ssl_stream.ssl().peer_certificate().ok_or_else(|| anyhow::anyhow!("no peer certificate"))?;
+                    let cert_der = cert.to_der()?;
+                    let pubkey = cert.public_key()?;
+                    let spki_der = pubkey.public_key_to_der()?;
+                    Ok((cert_der, spki_der))
+                }).await;
+
+                let (cert_der, spki_der) = match res {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => { eprintln!("DANE TLS handshake failed: {}", e); return Err(e); }
+                    Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
+                };
+
+                // match TLSA records
+                let mut matched = false;
+                for (usage, sel, mtype, assoc) in tlsa_records.iter() {
+                    let target = if *sel == 0 { cert_der.as_slice() } else { spki_der.as_slice() };
+                    let ok = match *mtype {
+                        0 => target == assoc.as_slice(),
+                        1 => {
+                            let dg = sha256(target);
+                            dg.as_slice() == assoc.as_slice()
+                        }
+                        2 => {
+                            let dg = sha512(target);
+                            dg.as_slice() == assoc.as_slice()
+                        }
+                        _ => false,
+                    };
+                    if ok { matched = true; break; }
+                }
+                if !matched {
+                    return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", selected_host));
+                }
+            }
         }
+
+        // proceed with normal TLS handshake using system cert store
+        let inner = reader.into_inner();
         let native = NativeTlsConnector::builder().build().context("building native tls connector")?;
         let connector = TokioTlsConnector::from(native);
         let server_name = selected_host.trim_end_matches('.');
