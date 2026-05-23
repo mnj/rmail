@@ -4,6 +4,7 @@ use rmail_common::outbound::QueueControl;
 use serde_json::json;
 use std::path::PathBuf;
 use std::fs;
+use std::io::{self, Write};
 
 /// rmail_queuectl: inspect and manage the on-disk outbound queue (queue/inflight/sent/failed)
 #[derive(Parser)]
@@ -33,12 +34,44 @@ enum Commands {
         #[arg(long)]
         lines: Option<usize>,
     },
-    /// Requeue a message from failed/inflight/sent back into queue (reset attempts)
-    Requeue { name: String },
+    /// Requeue a message by name or pattern
+    Requeue {
+        /// message filename or name (without .eml)
+        #[arg(short, long)]
+        name: Option<String>,
+        /// pattern (supports '*' wildcard)
+        #[arg(short, long)]
+        pattern: Option<String>,
+        /// Assume yes to all prompts
+        #[arg(short = 'y', long, default_value_t = false)]
+        yes: bool,
+    },
     /// Promote a message by setting a higher priority (moves to queue)
-    Promote { name: String, #[arg(long)] priority: i32 },
+    Promote {
+        /// message filename or name (without .eml)
+        #[arg(short, long)]
+        name: Option<String>,
+        /// pattern (supports '*' wildcard)
+        #[arg(short, long)]
+        pattern: Option<String>,
+        /// priority value
+        #[arg(long)]
+        priority: i32,
+        /// Assume yes to all prompts
+        #[arg(short = 'y', long, default_value_t = false)]
+        yes: bool,
+    },
     /// Delete a message (move to failed and mark as administratively deleted)
-    Delete { name: String },
+    Delete {
+        #[arg(short, long)]
+        name: Option<String>,
+        /// pattern (supports '*' wildcard)
+        #[arg(short, long)]
+        pattern: Option<String>,
+        /// Assume yes to all prompts
+        #[arg(short = 'y', long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -52,9 +85,9 @@ fn main() -> Result<()> {
         None => cmd_list(&root, false)?,
         Some(Commands::List { json }) => cmd_list(&root, json)?,
         Some(Commands::Show { name, lines }) => cmd_show(&root, &name, lines.unwrap_or(20))?,
-        Some(Commands::Requeue { name }) => cmd_requeue(&root, &name)?,
-        Some(Commands::Promote { name, priority }) => cmd_promote(&root, &name, priority)?,
-        Some(Commands::Delete { name }) => cmd_delete(&root, &name)?,
+        Some(Commands::Requeue { name, pattern, yes }) => cmd_requeue(&root, name.as_deref(), pattern.as_deref(), yes)?,
+        Some(Commands::Promote { name, pattern, priority, yes }) => cmd_promote(&root, name.as_deref(), pattern.as_deref(), priority, yes)?,
+        Some(Commands::Delete { name, pattern, yes }) => cmd_delete(&root, name.as_deref(), pattern.as_deref(), yes)?,
     }
     Ok(())
 }
@@ -83,6 +116,113 @@ fn read_entries(dir: &PathBuf) -> Result<Vec<(String, Option<QueueControl>)>> {
     }
     out.sort_by(|a,b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+fn ensure_ext(name: &str) -> String {
+    if name.ends_with(".eml") { name.to_string() } else { format!("{}.eml", name) }
+}
+
+fn find_message(root: &PathBuf, name: &str) -> Result<Option<(String, PathBuf, Option<PathBuf>)>> {
+    let fname = ensure_ext(name);
+    let (queue, inflight, sent, failed) = spool_dirs(root);
+    let candidates = vec![("queue", queue), ("inflight", inflight), ("sent", sent), ("failed", failed)];
+    for (spool, dir) in candidates {
+        let eml = dir.join(&fname);
+        if eml.exists() && eml.is_file() {
+            let jsonp = dir.join(format!("{}.json", &fname));
+            let j = if jsonp.exists() { Some(jsonp) } else { None };
+            return Ok(Some((spool.to_string(), eml, j)));
+        }
+    }
+    Ok(None)
+}
+
+fn read_control_opt(jsonp: &Option<PathBuf>) -> Option<QueueControl> {
+    if let Some(p) = jsonp {
+        match fs::read_to_string(p) {
+            Ok(s) => serde_json::from_str::<QueueControl>(&s).ok(),
+            Err(_) => None,
+        }
+    } else { None }
+}
+
+fn write_control(path: &PathBuf, ctrl: &QueueControl) -> Result<()> {
+    let j = serde_json::to_string_pretty(ctrl)?;
+    fs::write(path, j)?;
+    Ok(())
+}
+
+fn move_with_json(src_eml: &PathBuf, dst_dir: &PathBuf, json_opt: &Option<PathBuf>) -> Result<(PathBuf, Option<PathBuf>)> {
+    fs::create_dir_all(dst_dir)?;
+    let fname = src_eml.file_name().and_then(|n| n.to_str()).ok_or_else(|| anyhow::anyhow!("invalid filename"))?.to_string();
+    let dst_eml = dst_dir.join(&fname);
+    fs::rename(src_eml, &dst_eml)?;
+    let dst_json = if let Some(jp) = json_opt {
+        let dstj = dst_dir.join(jp.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        fs::rename(jp, &dstj).ok();
+        Some(dstj)
+    } else { None };
+    Ok((dst_eml, dst_json))
+}
+
+fn matches_pattern(name: &str, pattern: &str) -> bool {
+    if pattern.contains('*') {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut rem = name;
+        for (i, p) in parts.iter().enumerate() {
+            if p.is_empty() { continue; }
+            if let Some(pos) = rem.find(p) {
+                if i == 0 && !pattern.starts_with('*') && pos != 0 { return false; }
+                rem = &rem[pos + p.len()..];
+            } else {
+                return false;
+            }
+        }
+        if !pattern.ends_with('*') {
+            if let Some(last) = parts.iter().rev().find(|s| !s.is_empty()) {
+                if !name.ends_with(last) { return false; }
+            }
+        }
+        true
+    } else {
+        name == pattern || name == format!("{}.eml", pattern) || name.contains(pattern)
+    }
+}
+
+fn find_messages_matching(root: &PathBuf, pattern: &str) -> Result<Vec<(String, PathBuf, Option<PathBuf>, String)>> {
+    let (queue, inflight, sent, failed) = spool_dirs(root);
+    let mut out = Vec::new();
+    let dirs = vec![("queue", queue), ("inflight", inflight), ("sent", sent), ("failed", failed)];
+    for (spool, dir) in dirs {
+        if !dir.exists() { continue; }
+        for e in fs::read_dir(&dir)? {
+            let ent = e?;
+            if !ent.file_type()?.is_file() { continue; }
+            let fname = ent.file_name().into_string().unwrap_or_default();
+            if !fname.ends_with(".eml") { continue; }
+            if matches_pattern(&fname, pattern) || matches_pattern(&fname, &format!("{}.eml", pattern)) || matches_pattern(&fname, pattern.trim_matches('*')) {
+                let eml = dir.join(&fname);
+                let jsonp = dir.join(format!("{}.json", &fname));
+                let j = if jsonp.exists() { Some(jsonp) } else { None };
+                out.push((spool.to_string(), eml, j, fname));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn confirm(prompt: &str, auto_yes: bool) -> bool {
+    if auto_yes { return true; }
+    print!("{} [y/N]: ", prompt);
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(_) => {
+            let t = line.trim().to_lowercase();
+            t == "y" || t == "yes"
+        }
+        Err(_) => false,
+    }
 }
 
 fn cmd_list(root: &PathBuf, as_json: bool) -> Result<()> {
@@ -120,40 +260,6 @@ fn cmd_list(root: &PathBuf, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_ext(name: &str) -> String {
-    if name.ends_with(".eml") { name.to_string() } else { format!("{}.eml", name) }
-}
-
-fn find_message(root: &PathBuf, name: &str) -> Result<Option<(String, PathBuf, Option<PathBuf>)>> {
-    let fname = ensure_ext(name);
-    let (queue, inflight, sent, failed) = spool_dirs(root);
-    let candidates = vec![("queue", queue), ("inflight", inflight), ("sent", sent), ("failed", failed)];
-    for (spool, dir) in candidates {
-        let eml = dir.join(&fname);
-        if eml.exists() && eml.is_file() {
-            let jsonp = dir.join(format!("{}.json", &fname));
-            let j = if jsonp.exists() { Some(jsonp) } else { None };
-            return Ok(Some((spool.to_string(), eml, j)));
-        }
-    }
-    Ok(None)
-}
-
-fn read_control_opt(jsonp: &Option<PathBuf>) -> Option<QueueControl> {
-    if let Some(p) = jsonp {
-        match fs::read_to_string(p) {
-            Ok(s) => serde_json::from_str::<QueueControl>(&s).ok(),
-            Err(_) => None,
-        }
-    } else { None }
-}
-
-fn write_control(path: &PathBuf, ctrl: &QueueControl) -> Result<()> {
-    let j = serde_json::to_string_pretty(ctrl)?;
-    fs::write(path, j)?;
-    Ok(())
-}
-
 fn cmd_show(root: &PathBuf, name: &str, body_lines: usize) -> Result<()> {
     if let Some((_spool, eml, jsonp)) = find_message(root, name)? {
         let data = fs::read(&eml)?;
@@ -180,88 +286,120 @@ fn cmd_show(root: &PathBuf, name: &str, body_lines: usize) -> Result<()> {
     }
 }
 
-fn move_with_json(src_eml: &PathBuf, dst_dir: &PathBuf, json_opt: &Option<PathBuf>) -> Result<(PathBuf, Option<PathBuf>)> {
-    fs::create_dir_all(dst_dir)?;
-    let fname = src_eml.file_name().and_then(|n| n.to_str()).ok_or_else(|| anyhow::anyhow!("invalid filename"))?.to_string();
-    let dst_eml = dst_dir.join(&fname);
-    fs::rename(src_eml, &dst_eml)?;
-    let dst_json = if let Some(jp) = json_opt {
-        let dstj = dst_dir.join(jp.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        fs::rename(jp, &dstj).ok();
-        Some(dstj)
-    } else { None };
-    Ok((dst_eml, dst_json))
+fn requeue_single(spool: &str, eml: &PathBuf, jsonp: &Option<PathBuf>, root: &PathBuf) -> Result<()> {
+    let (queue, _inflight, _sent, _failed) = spool_dirs(root);
+    if spool == "queue" {
+        let fname = eml.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let ctrl = read_control_opt(jsonp).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
+        let mut c = ctrl;
+        c.attempts = 0;
+        c.next_try = None;
+        let jpath = queue.join(format!("{}.json", fname));
+        write_control(&jpath, &c)?;
+        println!("Reset attempts for {} in queue", fname);
+        return Ok(());
+    }
+    let (dst_eml, dst_json) = move_with_json(eml, &queue, jsonp)?;
+    let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
+    ctrl.attempts = 0;
+    ctrl.next_try = None;
+    ctrl.last_error = None;
+    let fname = dst_eml.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let jpath = queue.join(format!("{}.json", fname));
+    write_control(&jpath, &ctrl)?;
+    println!("Requeued {} (from {})", fname, spool);
+    Ok(())
 }
 
-fn cmd_requeue(root: &PathBuf, name: &str) -> Result<()> {
-    let fname = ensure_ext(name);
-    if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
-        let (queue, _inflight, _sent, _failed) = spool_dirs(root);
-        if spool == "queue" {
-            // reset attempts and next_try
-            let ctrl = read_control_opt(&jsonp).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
-            let mut c = ctrl;
-            c.attempts = 0;
-            c.next_try = None;
-            let jpath = queue.join(format!("{}.json", fname));
-            write_control(&jpath, &c)?;
-            println!("Reset attempts for {} in queue", fname);
-            return Ok(());
+fn cmd_requeue(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: bool) -> Result<()> {
+    if let Some(n) = name {
+        let fname = ensure_ext(n.as_ref());
+        if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
+            if !confirm(&format!("Requeue {} from {}?", fname, spool), yes) { println!("aborted"); return Ok(()); }
+            return requeue_single(&spool, &eml, &jsonp, root);
+        } else { return Err(anyhow::anyhow!("message not found")); }
+    }
+    if let Some(pat) = pattern {
+        let matches = find_messages_matching(root, pat)?;
+        if matches.is_empty() { println!("No matches for pattern {}"); return Ok(()); }
+        println!("Found {} matches for pattern {}", matches.len(), pat);
+        for (spool, eml, jsonp, fname) in matches {
+            if !confirm(&format!("Requeue {} from {}?", fname, spool), yes) { println!("skipping {}"); continue; }
+            requeue_single(&spool, &eml, &jsonp, root)?;
         }
-        let (dst_eml, dst_json) = move_with_json(&eml, &queue, &jsonp)?;
-        // reset control
-        let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
-        ctrl.attempts = 0;
-        ctrl.next_try = None;
-        ctrl.last_error = None;
-        let jpath = queue.join(format!("{}.json", fname));
-        write_control(&jpath, &ctrl)?;
-        println!("Requeued {} (from {})", fname, spool);
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("message not found"))
+        return Ok(());
     }
+    Err(anyhow::anyhow!("Provide --name or --pattern"))
 }
 
-fn cmd_promote(root: &PathBuf, name: &str, priority: i32) -> Result<()> {
-    let fname = ensure_ext(name);
-    if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
-        let (queue, _inflight, _sent, _failed) = spool_dirs(root);
-        // move to queue if not already
-        let (dst_eml, dst_json) = if spool == "queue" {
-            (eml.clone(), jsonp.clone())
-        } else {
-            move_with_json(&eml, &queue, &jsonp)?
-        };
-        let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
-        ctrl.priority = priority;
-        let jpath = queue.join(format!("{}.json", fname));
-        write_control(&jpath, &ctrl)?;
-        println!("Promoted {} to priority {}", fname, priority);
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("message not found"))
+fn cmd_promote(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, priority: i32, yes: bool) -> Result<()> {
+    if let Some(n) = name {
+        let fname = ensure_ext(n.as_ref());
+        if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
+            if !confirm(&format!("Promote {} from {} to priority {}?", fname, spool, priority), yes) { println!("aborted"); return Ok(()); }
+            let (queue, _i, _s, _f) = spool_dirs(root);
+            let (dst_eml, dst_json) = if spool == "queue" { (eml.clone(), jsonp.clone()) } else { move_with_json(&eml, &queue, &jsonp)? };
+            let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
+            ctrl.priority = priority;
+            let jpath = queue.join(format!("{}.json", ensure_ext(&fname)));
+            write_control(&jpath, &ctrl)?;
+            println!("Promoted {} to priority {}", fname, priority);
+            return Ok(());
+        } else { return Err(anyhow::anyhow!("message not found")); }
     }
+    if let Some(pat) = pattern {
+        let matches = find_messages_matching(root, pat)?;
+        if matches.is_empty() { println!("No matches for pattern {}"); return Ok(()); }
+        println!("Found {} matches for pattern {}", matches.len(), pat);
+        for (spool, eml, jsonp, fname) in matches {
+            if !confirm(&format!("Promote {} from {} to priority {}?", fname, spool, priority), yes) { println!("skipping {}"); continue; }
+            let (queue, _i, _s, _f) = spool_dirs(root);
+            let (_dst_eml, dst_json) = if spool == "queue" { (eml.clone(), jsonp.clone()) } else { move_with_json(&eml, &queue, &jsonp)? };
+            let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
+            ctrl.priority = priority;
+            let jpath = queue.join(format!("{}.json", fname));
+            write_control(&jpath, &ctrl)?;
+            println!("Promoted {} to priority {}", fname, priority);
+        }
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("Provide --name or --pattern"))
 }
 
-fn cmd_delete(root: &PathBuf, name: &str) -> Result<()> {
-    let fname = ensure_ext(name);
-    if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
-        let (_queue, _inflight, _sent, failed) = spool_dirs(root);
-        let (dst_eml, dst_json) = if spool == "failed" {
-            (eml.clone(), jsonp.clone())
-        } else {
-            move_with_json(&eml, &failed, &jsonp)?
-        };
-        // mark admin delete
-        let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
-        ctrl.attempts = ctrl.max_attempts;
-        ctrl.last_error = Some("deleted by admin".to_string());
-        let jpath = failed.join(format!("{}.json", fname));
-        write_control(&jpath, &ctrl)?;
-        println!("Deleted (moved to failed) {}", fname);
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("message not found"))
+fn cmd_delete(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: bool) -> Result<()> {
+    if let Some(n) = name {
+        let fname = ensure_ext(n.as_ref());
+        if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
+            if !confirm(&format!("Delete {} from {}? (move to failed)", fname, spool), yes) { println!("aborted"); return Ok(()); }
+            let (_q, _i, _s, failed) = spool_dirs(root);
+            let (_dst_eml, dst_json) = if spool == "failed" { (eml.clone(), jsonp.clone()) } else { move_with_json(&eml, &failed, &jsonp)? };
+            let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
+            ctrl.attempts = ctrl.max_attempts;
+            ctrl.last_error = Some("deleted by admin".to_string());
+            let jpath = failed.join(format!("{}.json", fname));
+            write_control(&jpath, &ctrl)?;
+            println!("Deleted (moved to failed) {}", fname);
+            return Ok(());
+        } else { return Err(anyhow::anyhow!("message not found")); }
     }
+    if let Some(pat) = pattern {
+        let matches = find_messages_matching(root, pat)?;
+        if matches.is_empty() { println!("No matches for pattern {}"); return Ok(()); }
+        println!("Found {} matches for pattern {}", matches.len(), pat);
+        for (spool, eml, jsonp, fname) in matches {
+            if !confirm(&format!("Delete {} from {}? (move to failed)", fname, spool), yes) { println!("skipping {}"); continue; }
+            let (_dst_eml, dst_json) = move_with_json(&eml, &spool.iter().map(|s| PathBuf::from(s)).collect::<Vec<_>>()[0], &jsonp).ok().unwrap_or((eml.clone(), jsonp.clone()));
+            // move_with_json above is a bit awkward for batch; simpler: move to failed directly
+            let (_q, _i, _s, failed) = spool_dirs(root);
+            let (_dst_eml2, dst_json2) = move_with_json(&eml, &failed, &jsonp)?;
+            let mut ctrl = read_control_opt(&dst_json2).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
+            ctrl.attempts = ctrl.max_attempts;
+            ctrl.last_error = Some("deleted by admin".to_string());
+            let jpath = failed.join(format!("{}.json", fname));
+            write_control(&jpath, &ctrl)?;
+            println!("Deleted (moved to failed) {}", fname);
+        }
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("Provide --name or --pattern"))
 }
