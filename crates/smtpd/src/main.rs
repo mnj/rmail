@@ -70,6 +70,8 @@ fn record_auth_failure(ip: IpAddr) {
     let now = Instant::now();
     let entry = m.entry(ip).or_insert(AuthFailInfo { count: 0, first: now, locked_until: None });
     entry.count = entry.count.saturating_add(1);
+    // Increment global metric for monitoring
+    rmail_common::metrics::inc_auth_failures();
     // if 5 failures within short window, lock for 30 minutes
     if entry.count >= 5 {
         entry.locked_until = Some(now + Duration::from_secs(30 * 60));

@@ -8,6 +8,8 @@ pub static DELIVERY_LATENCY_US_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static CONNECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static TLS_HANDSHAKES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static BYTES_RECEIVED_TOTAL: AtomicU64 = AtomicU64::new(0);
+// Authentication failures recorded by servers (incremented on each failed auth attempt)
+pub static AUTH_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc_deliveries() { DELIVERIES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_failed_deliveries() { DELIVERIES_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed); }
@@ -19,6 +21,9 @@ pub fn observe_delivery_latency_us(us: u64) {
 pub fn inc_connections() { CONNECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_tls_handshakes() { TLS_HANDSHAKES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn add_bytes_received(n: u64) { BYTES_RECEIVED_TOTAL.fetch_add(n, Ordering::Relaxed); }
+/// Increment the total count of recorded authentication failures. This is a best-effort
+/// metric to track brute-force attempts and can be monitored via the web UI.
+pub fn inc_auth_failures() { AUTH_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 
 pub fn gather_prometheus() -> String {
     let mut out = String::new();
@@ -46,5 +51,8 @@ pub fn gather_prometheus() -> String {
     out.push_str("# HELP rmail_bytes_received_total Total bytes received\n");
     out.push_str("# TYPE rmail_bytes_received_total counter\n");
     out.push_str(&format!("rmail_bytes_received_total {}\n", BYTES_RECEIVED_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_auth_failures_total Total authentication failures recorded\n");
+    out.push_str("# TYPE rmail_auth_failures_total counter\n");
+    out.push_str(&format!("rmail_auth_failures_total {}\n", AUTH_FAILURES_TOTAL.load(Ordering::Relaxed)));
     out
 }
