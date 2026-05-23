@@ -216,6 +216,15 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
 
         // perform TLS handshake using system certificates
         let inner = reader.into_inner();
+        // Respect env var to enable DANE/TLSA verification. Default disabled.
+        let enable_dane = std::env::var("RMAIL_ENABLE_DANE").map(|v| {
+            let v = v.to_ascii_lowercase();
+            !(v == "0" || v == "false")
+        }).unwrap_or(false);
+        if enable_dane {
+            eprintln!("DANE/TLSA requested but full TLSA verification not yet implemented; proceeding with standard PKI for {}", selected_host);
+            // TODO: implement TLSA lookup and certificate matching here using trust-dns-resolver and the negotiated certificate
+        }
         let native = NativeTlsConnector::builder().build().context("building native tls connector")?;
         let connector = TokioTlsConnector::from(native);
         let server_name = selected_host.trim_end_matches('.');
