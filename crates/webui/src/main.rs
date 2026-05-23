@@ -110,6 +110,8 @@ async fn main() -> Result<()> {
         .route("/logs", get(logs_handler));
 
     println!("rMail web UI listening on {}", addr);
-    hyper::Server::bind(&addr).serve(app.into_make_service()).await?;
+    // Use AddrIncoming + Server::builder to avoid feature gating issues with bind
+    let incoming = hyper::server::conn::AddrIncoming::bind(&addr)?;
+    hyper::Server::builder(incoming).serve(app.into_make_service()).await?;
     Ok(())
 }
