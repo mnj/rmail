@@ -1,0 +1,19 @@
+# Example rMail configuration (TOML)
+[global]
+mail_root = "mail"
+listen_addrs = ["0.0.0.0:25", "[::]:25"]
+smtps_port = 465
+submission_port = 587
+imaps_port = 993
+imap_port = 143
+tls_cert = "config/certs/localhost.crt"
+tls_key = "config/certs/localhost.key"
+log_level = "info"
+
+[[mailboxes]]
+address = "user@example.local"
+password_hash = "argon2$PLACEHOLDER"
+maildir = "mail/example.local/user/Maildir"
+
+[catchalls]
+"example.local" = "postmaster@example.local"

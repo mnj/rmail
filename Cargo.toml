@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "crates/common",
+  "crates/smtpd",
+  "crates/imapd",
+  "crates/ctl",
+]

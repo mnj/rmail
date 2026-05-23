@@ -1,0 +1,8 @@
+/target
+**/target
+config/certs/
+Cargo.lock
+*.log
+.idea
+.vscode
+.DS_Store
