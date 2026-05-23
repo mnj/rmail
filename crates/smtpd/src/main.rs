@@ -37,16 +37,20 @@ async fn main() -> Result<()> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    if let Some(mboxes) = &cfg.mailboxes {
-        for m in mboxes {
-            allowed.insert(m.address.to_ascii_lowercase());
+    let mail_root = cfg.global.mail_root.clone();
+    // SQLite DB is the authoritative source for mailboxes and catchalls
+    let db_path = cfg.global.db_path.clone();
+    if db_path.is_none() {
+        eprintln!("No db_path configured in global; SQLite DB is required");
+        std::process::exit(1);
+    }
+    // initialize DB schema if missing
+    if let Some(ref dbp) = db_path {
+        if let Err(e) = rmail_common::db::init_db(dbp) {
+            eprintln!("Failed to initialize database {}: {}", dbp, e);
+            std::process::exit(1);
         }
     }
-    let catchalls: HashMap<String, String> = cfg.catchalls.clone().unwrap_or_default();
-    let mail_root = cfg.global.mail_root.clone();
-    // Optional SQLite DB path for mailboxes/catchall overrides
-    let db_path = cfg.global.db_path.clone();
 
     // build TLS acceptor if certificate paths present
     let tls_acceptor = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
@@ -70,13 +74,11 @@ async fn main() -> Result<()> {
     // spawn plain SMTP listeners
     for addr in listen_addrs.iter() {
         let addr = addr.clone();
-        let allowed_clone = allowed.clone();
-        let catchalls_clone = catchalls.clone();
         let mail_root_clone = mail_root.clone();
         let acceptor_clone = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_plain_listener(&addr, allowed_clone, catchalls_clone, mail_root_clone, acceptor_clone, db_clone).await {
+            if let Err(e) = run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone).await {
                 eprintln!("Listener {} failed: {}", addr, e);
             }
         });
@@ -89,25 +91,21 @@ async fn main() -> Result<()> {
             let addr_v6 = format!("[::]:{}", port);
 
             // v4 listener
-            let allowed_v4 = allowed.clone();
-            let catchalls_v4 = catchalls.clone();
             let mail_root_v4 = mail_root.clone();
             let acceptor_v4 = s_acceptor.clone();
             let db_v4 = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v4, acceptor_v4, allowed_v4, catchalls_v4, mail_root_v4, db_v4).await {
+                if let Err(e) = run_smtps_listener(&addr_v4, acceptor_v4, mail_root_v4, db_v4).await {
                     eprintln!("SMTPS {} failed: {}", addr_v4, e);
                 }
             });
 
             // v6 listener
-            let allowed_v6 = allowed.clone();
-            let catchalls_v6 = catchalls.clone();
             let mail_root_v6 = mail_root.clone();
             let acceptor_v6 = s_acceptor.clone();
             let db_v6 = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v6, acceptor_v6, allowed_v6, catchalls_v6, mail_root_v6, db_v6).await {
+                if let Err(e) = run_smtps_listener(&addr_v6, acceptor_v6, mail_root_v6, db_v6).await {
                     eprintln!("SMTPS {} failed: {}", addr_v6, e);
                 }
             });
@@ -122,38 +120,34 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPD listening on {}", addr);
     loop {
         let (stream, _peer) = listener.accept().await?;
-        let allowed = allowed.clone();
-        let catchalls = catchalls.clone();
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), allowed, catchalls, mail_root, acceptor, db_clone).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone).await {
                 eprintln!("client error: {}", e);
             }
         });
     }
 }
 
-async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, db_path: Option<String>) -> Result<()> {
+async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: String, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPS listening on {}", addr);
     loop {
         let (stream, _peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
-        let allowed = allowed.clone();
-        let catchalls = catchalls.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), allowed, catchalls, mail_root, None, db_clone).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, None, db_clone).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -174,7 +168,7 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
     // - MAX_MESSAGE_BYTES: overall DATA size cap to avoid OOM
@@ -252,90 +246,12 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
             }
             let raw = cmd.get(8..).unwrap_or("");
             if let Some(addr) = extract_addr(raw) {
-            // Prefer DB lookup when configured
-            if let Some(dbp) = db_path.as_ref() {
-                let dbp2 = dbp.clone();
-                let addr2 = addr.clone();
-                match tokio::task::spawn_blocking(move || rmail_common::db::mailbox_exists(dbp2, &addr2)).await {
-                    Ok(Ok(true)) => {
-                        if rcpts.len() >= MAX_RCPT {
-                            let w = reader.get_mut();
-                            w.write_all(b"452 Too many recipients\r\n").await?;
-                            w.flush().await?;
-                        } else {
-                            rcpts.push(addr.clone());
-                            let w = reader.get_mut();
-                            w.write_all(b"250 OK\r\n").await?;
-                            w.flush().await?;
-                        }
-                    }
-                    Ok(Ok(false)) => {
-                        // mailbox not found in DB; check DB catchall
-                        if let Some(at) = addr.find('@') {
-                            let domain = addr[at+1..].to_string();
-                            let dbp3 = dbp.clone();
-                            match tokio::task::spawn_blocking(move || rmail_common::db::get_catchall(dbp3, &domain)).await {
-                                Ok(Ok(Some(target))) => {
-                                    if rcpts.len() >= MAX_RCPT {
-                                        let w = reader.get_mut();
-                                        w.write_all(b"452 Too many recipients\r\n").await?;
-                                        w.flush().await?;
-                                    } else {
-                                        rcpts.push(target.clone());
-                                        let w = reader.get_mut();
-                                        w.write_all(b"250 OK\r\n").await?;
-                                        w.flush().await?;
-                                    }
-                                }
-                                Ok(Ok(None)) => {
-                                    // fallback to config-based catchalls
-                                    if let Some(at2) = addr.find('@') {
-                                        let domain2 = &addr[at2+1..];
-                                        if let Some(target) = catchalls.get(domain2) {
-                                            if rcpts.len() >= MAX_RCPT {
-                                                let w = reader.get_mut();
-                                                w.write_all(b"452 Too many recipients\r\n").await?;
-                                                w.flush().await?;
-                                            } else {
-                                                rcpts.push(target.clone());
-                                                let w = reader.get_mut();
-                                                w.write_all(b"250 OK\r\n").await?;
-                                                w.flush().await?;
-                                            }
-                                        } else {
-                                            let w = reader.get_mut();
-                                            w.write_all(b"550 No such user\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    } else {
-                                        let w = reader.get_mut();
-                                        w.write_all(b"550 Bad address\r\n").await?;
-                                        w.flush().await?;
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    eprintln!("db get_catchall error: {}", e);
-                                    let w = reader.get_mut();
-                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                    w.flush().await?;
-                                }
-                                Err(e) => {
-                                    eprintln!("db task join error: {}", e);
-                                    let w = reader.get_mut();
-                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                    w.flush().await?;
-                                }
-                            }
-                        } else {
-                            let w = reader.get_mut();
-                            w.write_all(b"550 Bad address\r\n").await?;
-                            w.flush().await?;
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        eprintln!("db mailbox_exists error: {}", e);
-                        // fallback to config-based checks
-                        if allowed.contains(&addr) {
+                // DB is authoritative — must be configured at startup
+                if let Some(dbp) = db_path.as_ref() {
+                    let dbp2 = dbp.clone();
+                    let addr2 = addr.clone();
+                    match tokio::task::spawn_blocking(move || rmail_common::db::mailbox_exists(dbp2, &addr2)).await {
+                        Ok(Ok(true)) => {
                             if rcpts.len() >= MAX_RCPT {
                                 let w = reader.get_mut();
                                 w.write_all(b"452 Too many recipients\r\n").await?;
@@ -346,74 +262,70 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
                                 w.write_all(b"250 OK\r\n").await?;
                                 w.flush().await?;
                             }
-                        } else if let Some(at) = addr.find('@') {
-                            let domain = &addr[at+1..];
-                            if let Some(target) = catchalls.get(domain) {
-                                if rcpts.len() >= MAX_RCPT {
-                                    let w = reader.get_mut();
-                                    w.write_all(b"452 Too many recipients\r\n").await?;
-                                    w.flush().await?;
-                                } else {
-                                    rcpts.push(target.clone());
-                                    let w = reader.get_mut();
-                                    w.write_all(b"250 OK\r\n").await?;
-                                    w.flush().await?;
+                        }
+                        Ok(Ok(false)) => {
+                            if let Some(at) = addr.find('@') {
+                                let domain = addr[at+1..].to_string();
+                                let dbp3 = dbp.clone();
+                                match tokio::task::spawn_blocking(move || rmail_common::db::get_catchall(dbp3, &domain)).await {
+                                    Ok(Ok(Some(target))) => {
+                                        if rcpts.len() >= MAX_RCPT {
+                                            let w = reader.get_mut();
+                                            w.write_all(b"452 Too many recipients\r\n").await?;
+                                            w.flush().await?;
+                                        } else {
+                                            rcpts.push(target.clone());
+                                            let w = reader.get_mut();
+                                            w.write_all(b"250 OK\r\n").await?;
+                                            w.flush().await?;
+                                        }
+                                    }
+                                    Ok(Ok(None)) => {
+                                        let w = reader.get_mut();
+                                        w.write_all(b"550 No such user\r\n").await?;
+                                        w.flush().await?;
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("db get_catchall error: {}", e);
+                                        let w = reader.get_mut();
+                                        w.write_all(b"451 Temporary error\r\n").await?;
+                                        w.flush().await?;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("db task join error: {}", e);
+                                        let w = reader.get_mut();
+                                        w.write_all(b"451 Temporary error\r\n").await?;
+                                        w.flush().await?;
+                                    }
                                 }
                             } else {
                                 let w = reader.get_mut();
-                                w.write_all(b"550 No such user\r\n").await?;
+                                w.write_all(b"550 Bad address\r\n").await?;
                                 w.flush().await?;
                             }
-                        } else {
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("db mailbox_exists error: {}", e);
                             let w = reader.get_mut();
-                            w.write_all(b"550 Bad address\r\n").await?;
+                            w.write_all(b"451 Temporary error\r\n").await?;
                             w.flush().await?;
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("db task join error: {}", e);
-                        let w = reader.get_mut();
-                        w.write_all(b"451 Temporary error\r\n").await?;
-                        w.flush().await?;
-                    }
-                }
-            } else {
-                // DB not configured; fallback to config lists
-                if allowed.contains(&addr) {
-                    if rcpts.len() >= MAX_RCPT {
-                        let w = reader.get_mut();
-                        w.write_all(b"452 Too many recipients\r\n").await?;
-                        w.flush().await?;
-                    } else {
-                        rcpts.push(addr.clone());
-                        let w = reader.get_mut();
-                        w.write_all(b"250 OK\r\n").await?;
-                        w.flush().await?;
-                    }
-                } else if let Some(at) = addr.find('@') {
-                    let domain = &addr[at+1..];
-                    if let Some(target) = catchalls.get(domain) {
-                        // Deliver to catchall target, respect recipient limit
-                        if rcpts.len() >= MAX_RCPT {
+                        Err(e) => {
+                            eprintln!("db task join error: {}", e);
                             let w = reader.get_mut();
-                            w.write_all(b"452 Too many recipients\r\n").await?;
-                            w.flush().await?;
-                        } else {
-                            rcpts.push(target.clone());
-                            let w = reader.get_mut();
-                            w.write_all(b"250 OK\r\n").await?;
+                            w.write_all(b"451 Temporary error\r\n").await?;
                             w.flush().await?;
                         }
-                    } else {
-                        let w = reader.get_mut();
-                        w.write_all(b"550 No such user\r\n").await?;
-                        w.flush().await?;
                     }
                 } else {
                     let w = reader.get_mut();
-                    w.write_all(b"550 Bad address\r\n").await?;
+                    w.write_all(b"451 No DB configured\r\n").await?;
                     w.flush().await?;
                 }
+            } else {
+                let w = reader.get_mut();
+                w.write_all(b"501 Syntax: RCPT TO:<address>\r\n").await?;
+                w.flush().await?;
             }
         } else {
             let w = reader.get_mut();

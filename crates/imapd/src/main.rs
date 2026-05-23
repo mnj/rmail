@@ -33,14 +33,12 @@ async fn main() -> Result<()> {
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
     let mail_root = cfg.global.mail_root.clone();
 
-    // Build mailbox map: address -> Mailbox (lowercased)
-    let mut mailbox_map: HashMap<String, Mailbox> = HashMap::new();
-    if let Some(mboxes) = &cfg.mailboxes {
-        for m in mboxes {
-            mailbox_map.insert(m.address.to_ascii_lowercase(), m.clone());
-        }
+    // SQLite DB is the authoritative source for mailboxes/catchalls
+    let db_path = cfg.global.db_path.clone();
+    if db_path.is_none() {
+        eprintln!("No db_path configured; SQLite DB is required");
+        std::process::exit(1);
     }
-    let mailbox_map = Arc::new(mailbox_map);
 
     // TLS acceptor if certs present
     let tls_acceptor = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
@@ -56,12 +54,11 @@ async fn main() -> Result<()> {
     let imap_port = cfg.global.imap_port.unwrap_or(143);
     let imap_addr = format!("0.0.0.0:{}", imap_port);
     let db_path = cfg.global.db_path.clone();
-    let mailbox_map_clone = mailbox_map.clone();
     let mail_root_clone = mail_root.clone();
     let acceptor_clone = tls_acceptor.clone();
     let db_clone = db_path.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_plain_listener(&imap_addr, mailbox_map_clone, mail_root_clone, acceptor_clone, db_clone).await {
+        if let Err(e) = run_plain_listener(&imap_addr, mail_root_clone, acceptor_clone, db_clone).await {
             eprintln!("IMAP plain listener failed: {}", e);
         }
     });
@@ -70,12 +67,11 @@ async fn main() -> Result<()> {
     if let Some(acceptor) = tls_acceptor.clone() {
         if let Some(imaps_port) = cfg.global.imaps_port {
             let imaps_addr = format!("0.0.0.0:{}", imaps_port);
-            let mailbox_map = mailbox_map.clone();
             let mail_root = mail_root.clone();
             let acceptor = acceptor.clone();
             let db_clone = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_imaps_listener(&imaps_addr, acceptor, mailbox_map, mail_root, db_clone).await {
+                if let Err(e) = run_imaps_listener(&imaps_addr, acceptor, mail_root, db_clone).await {
                     eprintln!("IMAPS listener failed: {}", e);
                 }
             });
@@ -88,36 +84,34 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD listening on {}", addr);
     loop {
         let (stream, _peer) = listener.accept().await?;
-        let mailbox_map = mailbox_map.clone();
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mailbox_map, mail_root, acceptor, db_clone).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone).await {
                 eprintln!("IMAP client error: {}", e);
             }
         });
     }
 }
 
-async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, db_path: Option<String>) -> Result<()> {
+async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: String, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
         let (stream, _peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
-        let mailbox_map = mailbox_map.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mailbox_map, mail_root, None, db_clone).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, None, db_clone).await {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -189,27 +183,12 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                         }
                     }
                 }
-                // fallback to config file list
+                // If DB lookup didn't find a mailbox, report not found (DB is authoritative)
                 if mb.is_none() {
-                    if user.contains('@') {
-                        mb = mailbox_map.get(&user.to_ascii_lowercase()).cloned();
-                    } else {
-                        // try unique localpart match
-                        let mut found = None;
-                        for (addr, m) in mailbox_map.iter() {
-                            if let Some(at) = addr.find('@') {
-                                if &addr[..at] == user {
-                                    if found.is_some() {
-                                        found = None; // ambiguous
-                                        break;
-                                    } else {
-                                        found = Some(m.clone());
-                                    }
-                                }
-                            }
-                        }
-                        mb = found;
-                    }
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                    continue;
                 }
                 if let Some(mailbox) = mb {
                     if let Some(ref hash) = mailbox.password_hash {

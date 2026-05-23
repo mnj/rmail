@@ -19,10 +19,3 @@ db_path = "config/rmail.db"
 # directory used to serve ACME http-01 challenges (used by automated cert managers)
 acme_challenge_dir = "config/acme-challenges"
 
-[[mailboxes]]
-address = "user@example.local"
-password_hash = "argon2$PLACEHOLDER"
-maildir = "mail/example.local/user/Maildir"
-
-[catchalls]
-"example.local" = "postmaster@example.local"

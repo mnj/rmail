@@ -18,10 +18,3 @@ db_path = "config/rmail_test.db"
 # ACME challenge dir for local testing (empty by default)
 acme_challenge_dir = "config/acme-challenges"
 
-[[mailboxes]]
-address = "user@example.local"
-password_hash = "plain:password"
-maildir = "mail_test/example.local/user/Maildir"
-
-[catchalls]
-"example.local" = "postmaster@example.local"

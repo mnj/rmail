@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| {
         // fallback default settings
-        Config { global: rmail_common::config::Global { mail_root: "mail".into(), listen_addrs: None, smtps_port: None, submission_port: None, imaps_port: None, imap_port: None, web_port: None, tls_cert: None, tls_key: None, log_level: None, web_admin_user: None, web_admin_password_hash: None }, mailboxes: None, catchalls: None }
+        Config { global: rmail_common::config::Global { mail_root: "mail".into(), listen_addrs: None, smtps_port: None, submission_port: None, imaps_port: None, imap_port: None, web_port: None, tls_cert: None, tls_key: None, log_level: None, web_admin_user: None, web_admin_password_hash: None, acme_challenge_dir: None, db_path: None } }
     });
     let port = cfg.global.web_port.unwrap_or(8080);
     let addr = format!("0.0.0.0:{}", port);

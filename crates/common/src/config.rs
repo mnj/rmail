@@ -35,8 +35,6 @@ pub struct Mailbox {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub global: Global,
-    pub mailboxes: Option<Vec<Mailbox>>,
-    pub catchalls: Option<HashMap<String, String>>,
 }
 
 impl Config {

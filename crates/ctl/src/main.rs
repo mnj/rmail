@@ -108,11 +108,8 @@ fn main() -> Result<()> {
                     rmail_common::db::add_mailbox(dbp, &address.to_ascii_lowercase(), if ph.is_empty() { None } else { Some(&ph) }, Some(&maildir_path))?;
                     println!("Added mailbox {} into DB at {}", address, dbp);
                 } else {
-                    // append mailbox to config file (simple append — robust editing can be added later)
-                    let snippet = format!("\n[[mailboxes]]\naddress = \"{}\"\npassword_hash = \"{}\"\nmaildir = \"{}\"\n", address.to_ascii_lowercase(), ph, maildir_path);
-                    let mut f = OpenOptions::new().append(true).create(true).open(&cfg_path)?;
-                    f.write_all(snippet.as_bytes())?;
-                    println!("Added mailbox {} (config file)", address);
+                    eprintln!("No db_path configured; SQLite DB is required");
+                    std::process::exit(1);
                 }
             } else {
                 eprintln!("Invalid address '{}'", address);
@@ -127,13 +124,8 @@ fn main() -> Result<()> {
                     println!("{}", m.address);
                 }
             } else {
-                if let Some(mboxes) = cfg.mailboxes {
-                    for m in mboxes {
-                        println!("{}", m.address);
-                    }
-                } else {
-                    println!("No mailboxes configured");
-                }
+                eprintln!("No db_path configured; SQLite DB is required");
+                std::process::exit(1);
             }
         }
     }
