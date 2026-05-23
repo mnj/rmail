@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs;
 use std::path::Path;
+use std::process::Command;
 use rmail_common::{config::Config, maildir};
 use argon2::{Argon2, password_hash::{SaltString, PasswordHasher}};
 use rand::rngs::OsRng;
@@ -51,6 +51,20 @@ enum Commands {
     /// List configured mailboxes (DB or TOML)
     List {
         /// optional config path
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Obtain TLS certificates via ACME (Let's Encrypt certbot) using webroot challenge
+    ObtainCert {
+        /// Domains, comma-separated (e.g. example.com,www.example.com)
+        domains: String,
+        /// Email address for registration with ACME server
+        #[arg(long)]
+        email: Option<String>,
+        /// Use LetsEncrypt staging endpoint for testing
+        #[arg(long)]
+        staging: bool,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
         #[arg(long)]
         config: Option<String>,
     },
@@ -131,6 +145,37 @@ fn main() -> Result<()> {
                 eprintln!("No db_path configured; SQLite DB is required");
                 std::process::exit(1);
             }
+        }
+        Commands::ObtainCert { domains, email, staging, config } => {
+            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let cfg = Config::from_file(&cfg_path)?;
+            let acme_dir = cfg.global.acme_challenge_dir.clone().ok_or_else(|| anyhow::anyhow!("No acme_challenge_dir configured in global config"))?;
+            // ensure webroot exists
+            if !Path::new(&acme_dir).exists() {
+                fs::create_dir_all(&acme_dir)?;
+            }
+            // Build certbot command
+            let mut cmd = Command::new("certbot");
+            cmd.arg("certonly").arg("--non-interactive").arg("--agree-tos").arg("--webroot").arg("-w").arg(&acme_dir).arg("--rsa-key-size").arg("2048");
+            if staging { cmd.arg("--staging"); }
+            if let Some(e) = email.as_ref() { cmd.arg("--email").arg(e); } else { cmd.arg("--register-unsafely-without-email"); }
+            for d in domains.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) { cmd.arg("-d").arg(d); }
+            println!("Running certbot to obtain certificate for {}", domains);
+            let status = cmd.status().map_err(|e| anyhow::anyhow!(format!("failed to run certbot: {}", e)))?;
+            if !status.success() { return Err(anyhow::anyhow!(format!("certbot exited with status {}", status))); }
+            // Copy certs for primary domain
+            let primary_domain = domains.split(',').next().unwrap().trim();
+            let live_dir = Path::new("/etc/letsencrypt/live").join(primary_domain);
+            let fullchain = live_dir.join("fullchain.pem");
+            let privkey = live_dir.join("privkey.pem");
+            if !fullchain.exists() || !privkey.exists() { return Err(anyhow::anyhow!(format!("expected cert files not found in {}", live_dir.display()))); }
+            let out_cert = cfg.global.tls_cert.clone().unwrap_or(format!("config/certs/{}.crt", primary_domain));
+            let out_key = cfg.global.tls_key.clone().unwrap_or(format!("config/certs/{}.key", primary_domain));
+            if let Some(parent) = Path::new(&out_cert).parent() { fs::create_dir_all(parent)?; }
+            if let Some(parent) = Path::new(&out_key).parent() { fs::create_dir_all(parent)?; }
+            fs::copy(&fullchain, &out_cert)?;
+            fs::copy(&privkey, &out_key)?;
+            println!("Obtained cert for {} -> {} / {}", primary_domain, out_cert, out_key);
         }
     }
     Ok(())
