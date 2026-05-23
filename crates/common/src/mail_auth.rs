@@ -708,4 +708,14 @@ mod tests {
         let res = expand_spf_macros("%{i}.spf.%{d}", peer, "local@example.com", "example.com");
         assert_eq!(res, "1.2.3.4.spf.example.com");
     }
+
+    #[test]
+    fn test_remove_b_from_dkim_header() {
+        let hdr = "DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=brisbane; h=from:to:subject; bh=xyz; b=AbCdEfGhIjKlMnOpQrStUvWxY1234567890+/==\r\n";
+        let out = remove_b_from_dkim_header(hdr.as_bytes());
+        let out_s = String::from_utf8_lossy(&out).to_string();
+        // should contain an empty b= tag and should not contain the original long b= value
+        assert!(out_s.contains("b=") );
+        assert!(!out_s.contains("b=AbCdEfGhIjKlMnOpQrStUvWxY1234567890+/=="));
+    }
 }
