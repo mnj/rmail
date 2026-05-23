@@ -75,7 +75,7 @@ async fn run_plain_listener(addr: &str, mailbox_map: Arc<HashMap<String, Mailbox
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, mailbox_map, mail_root, acceptor).await {
+            if let Err(e) = process_stream(Box::new(stream), mailbox_map, mail_root, acceptor).await {
                 eprintln!("IMAP client error: {}", e);
             }
         });
@@ -93,7 +93,7 @@ async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mailbox_map:
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(tls_stream, mailbox_map, mail_root, None).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mailbox_map, mail_root, None).await {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -112,10 +112,7 @@ fn unquote(s: &str) -> &str {
     }
 }
 
-async fn process_stream<S>(stream: S, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+async fn process_stream(stream: Box<dyn tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();

@@ -104,7 +104,7 @@ async fn run_plain_listener(addr: &str, allowed: HashSet<String>, catchalls: Has
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, allowed, catchalls, mail_root, acceptor).await {
+            if let Err(e) = process_stream(Box::new(stream), allowed, catchalls, mail_root, acceptor).await {
                 eprintln!("client error: {}", e);
             }
         });
@@ -123,7 +123,7 @@ async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, allowed: Has
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(tls_stream, allowed, catchalls, mail_root, None).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), allowed, catchalls, mail_root, None).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -144,10 +144,7 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
-async fn process_stream<S>(stream: S, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+async fn process_stream(stream: Box<dyn tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     {
@@ -265,7 +262,7 @@ where
                 match acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // enter TLS-protected processing loop (no STARTTLS inside)
-                        return process_stream(tls_stream, allowed, catchalls, mail_root, None).await;
+                        return process_stream(Box::new(tls_stream), allowed, catchalls, mail_root, None).await;
                     }
                     Err(e) => {
                         eprintln!("TLS accept error: {}", e);
