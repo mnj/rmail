@@ -37,76 +37,124 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&sent_dir).await?;
     tokio::fs::create_dir_all(&failed_dir).await?;
 
-    // If RMAIL_DB_PATH is set, use SQLite-backed outbound queue. Otherwise fall back to
-    // the on-disk queue in <mail_root>/outbound/queue.
-    if let Ok(db_path) = std::env::var("RMAIL_DB_PATH") {
-        println!("Using DB-backed outbound queue: {}", db_path);
-        loop {
-            // Claim one outbound item atomically in a blocking SQLite transaction
-            match tokio::task::spawn_blocking({ let db_path = db_path.clone(); move || db::claim_outbound(&db_path) }).await {
-                Ok(Ok(Some((id, recipient, envelope_from, data, _attempts)))) => {
-                    // Attempt delivery
-                    match deliver_to_remote(envelope_from.as_deref(), &recipient, &data).await {
-                        Ok(_) => {
-                            if let Err(e) = tokio::task::spawn_blocking({ let db_path = db_path.clone(); move || db::mark_outbound_sent(&db_path, id) }).await {
-                                eprintln!("failed to mark outbound id {} as sent: {:?}", id, e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("delivery failed for id {} recipient {}: {}", id, recipient, e);
-                            // schedule a retry after a fixed backoff (could be exponential)
-                            let _ = tokio::task::spawn_blocking({ let db_path = db_path.clone(); let err = e.to_string(); move || db::mark_outbound_failed(&db_path, id, Some(&err), Some(300)) }).await;
-                        }
-                    }
+    println!("Using on-disk outbound queue: {}", queue_dir.display());
+    loop {
+        // Collect candidate .eml files with optional control JSON
+        let mut candidates: Vec<(PathBuf, Option<PathBuf>, i64, i32, u32, u32, Option<i64>)> = Vec::new();
+        let mut entries = tokio::fs::read_dir(&queue_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let p = entry.path();
+            if !p.is_file() { continue; }
+            // only consider .eml files
+            if p.extension().and_then(|e| e.to_str()).unwrap_or("") != "eml" { continue; }
+            let jsonp = p.with_extension("json");
+            // read control if present
+            let control = if tokio::fs::metadata(&jsonp).await.is_ok() {
+                match tokio::fs::read_to_string(&jsonp).await {
+                    Ok(s) => match serde_json::from_str::<rmail_common::outbound::QueueControl>(&s) {
+                        Ok(c) => c,
+                        Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
+                    },
+                    Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
                 }
-                Ok(Ok(None)) => {
-                    // nothing to do
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+            } else {
+                rmail_common::outbound::QueueControl::default_with_timestamp(0)
+            };
+            let created_at = if control.created_at != 0 { control.created_at } else {
+                match tokio::fs::metadata(&p).await.and_then(|m| m.modified()) {
+                    Ok(t) => t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                    Err(_) => 0,
                 }
-                Ok(Err(e)) => {
-                    eprintln!("db claim error: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                Err(e) => {
-                    eprintln!("spawn_blocking join error: {:?}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
+            };
+            candidates.push((p, if tokio::fs::metadata(&jsonp).await.is_ok() { Some(jsonp) } else { None }, created_at, control.priority, control.attempts, control.max_attempts, control.next_try));
         }
-    } else {
-        loop {
-            // Read queue directory
-            let mut entries = tokio::fs::read_dir(&queue_dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let p = entry.path();
-                if !p.is_file() { continue; }
-                let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-                let inflight = inflight_dir.join(&fname);
-                // Atomically move into inflight to claim work
-                match tokio::fs::rename(&p, &inflight).await {
-                    Ok(_) => {}
-                    Err(e) => { eprintln!("rename to inflight failed {}: {}", fname, e); continue; }
-                }
 
-                // Process the file
-                let res = process_file(&inflight).await;
-                if res.is_ok() {
-                    let sentp = sent_dir.join(&fname);
-                    if let Err(e) = tokio::fs::rename(&inflight, &sentp).await {
-                        eprintln!("failed to move to sent {}: {}", fname, e);
-                    }
-                } else {
-                    eprintln!("delivery failed for {}: {:?}", fname, res.err());
-                    let failedp = failed_dir.join(&fname);
-                    if let Err(e) = tokio::fs::rename(&inflight, &failedp).await {
-                        eprintln!("failed to move to failed {}: {}", fname, e);
-                    }
-                }
-            }
+        // filter and sort by priority desc, next_try asc, created_at asc
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+        candidates.retain(|c| if let Some(nt) = c.6 { nt <= now } else { true });
+        candidates.sort_by(|a, b| {
+            let pa = a.3;
+            let pb = b.3;
+            pb.cmp(&pa)
+                .then_with(|| a.6.unwrap_or(0).cmp(&b.6.unwrap_or(0)))
+                .then_with(|| a.2.cmp(&b.2))
+        });
 
-            // Sleep between polls
+        if candidates.is_empty() {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
         }
+
+        // Claim the first candidate
+        let (eml_path, json_path_opt, _created_at, _priority, _attempts, _max_attempts, _next_try) = candidates.remove(0);
+        let fname = eml_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let inflight_eml = inflight_dir.join(&fname);
+        if let Err(e) = tokio::fs::rename(&eml_path, &inflight_eml).await {
+            eprintln!("claim rename failed for {}: {}", fname, e);
+            continue;
+        }
+        let inflight_json = inflight_eml.with_extension("json");
+        if let Some(jp) = &json_path_opt {
+            if let Err(e) = tokio::fs::rename(jp, &inflight_json).await {
+                eprintln!("failed to move control json to inflight for {}: {}", fname, e);
+            }
+        } else {
+            let control = rmail_common::outbound::QueueControl::new(5, 0);
+            let _ = tokio::fs::write(&inflight_json, serde_json::to_string(&control)?).await;
+        }
+
+        // increment attempts in inflight control
+        let mut control: rmail_common::outbound::QueueControl = match tokio::fs::read_to_string(&inflight_json).await {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| rmail_common::outbound::QueueControl::default_with_timestamp(0)),
+            Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
+        };
+        control.attempts = control.attempts.saturating_add(1);
+        tokio::fs::write(&inflight_json, serde_json::to_string(&control)?).await?;
+
+        // Process
+        let res = process_file(&inflight_eml).await;
+
+        if res.is_ok() {
+            let sent_eml = sent_dir.join(&fname);
+            let sent_json = sent_eml.with_extension("json");
+            if let Err(e) = tokio::fs::rename(&inflight_eml, &sent_eml).await {
+                eprintln!("failed to move to sent {}: {}", fname, e);
+            } else {
+                let _ = tokio::fs::rename(&inflight_json, &sent_json).await;
+            }
+        } else {
+            let err = res.err().map(|e| e.to_string()).unwrap_or_else(|| "unknown".to_string());
+            eprintln!("delivery failed for {}: {}", fname, err);
+            if control.attempts >= control.max_attempts {
+                let failed_eml = failed_dir.join(&fname);
+                let failed_json = failed_eml.with_extension("json");
+                if let Err(e) = tokio::fs::rename(&inflight_eml, &failed_eml).await {
+                    eprintln!("failed to move to failed {}: {}", fname, e);
+                } else {
+                    let mut c = control.clone();
+                    c.last_error = Some(err.clone());
+                    let _ = tokio::fs::write(&failed_json, serde_json::to_string(&c)?).await;
+                }
+            } else {
+                // exponential backoff
+                let base: u64 = 60;
+                let backoff = base.saturating_mul(2u64.pow((control.attempts.saturating_sub(1)) as u32));
+                let next_try = now + backoff as i64;
+                control.next_try = Some(next_try);
+                control.last_error = Some(err.clone());
+                let queue_eml = queue_dir.join(&fname);
+                let queue_json = queue_eml.with_extension("json");
+                if let Err(e) = tokio::fs::write(&queue_json, serde_json::to_string(&control)?).await {
+                    eprintln!("failed to write control json for retry {}: {}", fname, e);
+                }
+                if let Err(e) = tokio::fs::rename(&inflight_eml, &queue_eml).await {
+                    eprintln!("failed to move back to queue {}: {}", fname, e);
+                }
+            }
+        }
+
+        // small delay to avoid tight-loop
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

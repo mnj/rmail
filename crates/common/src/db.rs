@@ -281,8 +281,8 @@ pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Op
     let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    // Select one queued row eligible for delivery
-    let mut stmt = tx.prepare("SELECT id, recipient, envelope_from, data, attempts FROM outbound_queue WHERE status = 'queued' AND (next_try IS NULL OR next_try <= ?1) ORDER BY created_at LIMIT 1")?;
+    // Select one queued row eligible for delivery ordered by priority then next_try then created_at
+    let mut stmt = tx.prepare("SELECT id, recipient, envelope_from, data, attempts FROM outbound_queue WHERE status = 'queued' AND (next_try IS NULL OR next_try <= ?1) ORDER BY priority DESC, next_try ASC, created_at ASC LIMIT 1")?;
     let mut rows = stmt.query(params![now])?;
     if let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
@@ -310,8 +310,24 @@ pub fn mark_outbound_sent<P: AsRef<Path>>(path: P, id: i64) -> Result<()> {
 /// Mark an outbound item as failed and schedule a retry after `retry_after_seconds` if provided.
 pub fn mark_outbound_failed<P: AsRef<Path>>(path: P, id: i64, last_error: Option<&str>, retry_after_seconds: Option<i64>) -> Result<()> {
     let conn = Connection::open(path)?;
-    let next_try = if let Some(s) = retry_after_seconds { (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64) + s } else { 0 };
-    conn.execute("UPDATE outbound_queue SET status = 'queued', last_error = ?1, next_try = ?2 WHERE id = ?3", params![last_error, next_try, id])?;
+    // Fetch current attempts and configured max_attempts (default 5)
+    let mut stmt = conn.prepare("SELECT attempts, max_attempts FROM outbound_queue WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    let (attempts, max_attempts) = if let Some(row) = rows.next()? {
+        let a: i64 = row.get(0)?;
+        let m: Option<i64> = row.get(1)?;
+        (a, m.unwrap_or(5))
+    } else {
+        (0, 5)
+    };
+
+    if attempts >= max_attempts {
+        // Move to dead-letter state
+        conn.execute("UPDATE outbound_queue SET status = 'dead', last_error = ?1 WHERE id = ?2", params![last_error, id])?;
+    } else {
+        let next_try = if let Some(s) = retry_after_seconds { (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64) + s } else { 0 };
+        conn.execute("UPDATE outbound_queue SET status = 'queued', last_error = ?1, next_try = ?2 WHERE id = ?3", params![last_error, next_try, id])?;
+    }
     Ok(())
 }
 
@@ -376,5 +392,26 @@ pub fn mark_dmarc_events_reported<P: AsRef<Path>>(path: P, ids: &[i64]) -> Resul
         tx.execute("UPDATE dmarc_events SET reported = 1 WHERE id = ?1", params![id])?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Ensure outbound_queue has the columns required by the queue manager (priority, max_attempts).
+pub fn ensure_outbound_columns<P: AsRef<Path>>(path: P) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("PRAGMA table_info(outbound_queue)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_priority = false;
+    let mut has_max_attempts = false;
+    while let Some(r) = rows.next()? {
+        let col: String = r.get(1)?;
+        if col == "priority" { has_priority = true; }
+        if col == "max_attempts" { has_max_attempts = true; }
+    }
+    if !has_priority {
+        let _ = conn.execute("ALTER TABLE outbound_queue ADD COLUMN priority INTEGER DEFAULT 0", []);
+    }
+    if !has_max_attempts {
+        let _ = conn.execute("ALTER TABLE outbound_queue ADD COLUMN max_attempts INTEGER DEFAULT 5", []);
+    }
     Ok(())
 }

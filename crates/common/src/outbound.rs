@@ -2,6 +2,25 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct QueueControl {
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub priority: i32,
+    pub next_try: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+}
+
+impl QueueControl {
+    pub fn new(max_attempts: u32, priority: i32) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        QueueControl { attempts: 0, max_attempts, priority, next_try: None, last_error: None, created_at: now }
+    }
+    pub fn default_with_timestamp(ts: i64) -> Self { QueueControl { attempts: 0, max_attempts: 5, priority: 0, next_try: None, last_error: None, created_at: ts } }
+}
 
 /// Simple outbound queue: writes email files into <mail_root>/outbound/queue with an atomic tmp->final move.
 /// This is intentionally minimal — a more complete MTA would implement retry/backoff, SMTP delivery workers, and per-domain queuing.

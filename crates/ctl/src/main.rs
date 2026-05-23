@@ -239,7 +239,9 @@ fn main() -> Result<()> {
                     for rua in ruas.iter() {
                         // Build a simple email with XML body
                         let email = format!("From: {}\r\nTo: {}\r\nSubject: DMARC aggregate report for {}\r\nMIME-Version: 1.0\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n{}", org_email, rua, domain, xml);
-                        let _ = rmail_common::db::enqueue_outbound(&dbp, rua, Some(org_email), email.as_bytes())?;
+                        // enqueue via on-disk queue (avoid SQLite for queues)
+                        let mail_root = cfg.global.mail_root.clone();
+                        let _ = rmail_common::outbound::queue_outbound(std::path::Path::new(&mail_root), rua, email.as_bytes(), Some(org_email))?;
                     }
 
                     // mark events reported

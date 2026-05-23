@@ -1029,41 +1029,27 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                             }
                         } else {
                             // queue outbound for remote recipients (requires authentication in RCPT stage)
-                            if let Some(dbp) = db_path.as_ref() {
-                                // Enqueue in SQLite so multiple outbound workers can coordinate retries.
-                                let dbp2 = dbp.clone();
+                            {
+                                // Always use on-disk queueing to avoid SQLite for queues. Use spawn_blocking since filesystem ops are blocking.
+                                let mr2 = mr.clone();
                                 let rcpt_c = rcpt.clone();
                                 let envelope = mail_from.clone();
                                 let data_c = data.clone();
-                                match tokio::task::spawn_blocking(move || rmail_common::db::enqueue_outbound(&dbp2, &rcpt_c, envelope.as_deref(), &data_c)).await {
-                                    Ok(Ok(id)) => {
-                                        any_accepted = true;
-                                        println!("Queued outbound to {} id={}", rcpt, id);
-                                    }
-                                    Ok(Err(e)) => {
-                                        any_rejected = true;
-                                        eprintln!("failed to enqueue outbound {}: {}", rcpt, e);
-                                        let w = reader.get_mut();
-                                        w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
-                                        w.flush().await?;
-                                    }
-                                    Err(e) => {
-                                        any_rejected = true;
-                                        eprintln!("db task join error: {}", e);
-                                        let w = reader.get_mut();
-                                        w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
-                                        w.flush().await?;
-                                    }
-                                }
-                            } else {
-                                match rmail_common::outbound::queue_outbound(&mr, rcpt, &data, mail_from.as_deref()) {
-                                    Ok(path) => {
+                                match tokio::task::spawn_blocking(move || rmail_common::outbound::queue_outbound(&mr2, &rcpt_c, &data_c, envelope.as_deref())).await {
+                                    Ok(Ok(path)) => {
                                         any_accepted = true;
                                         println!("Queued outbound to {} -> {:?}", rcpt, path);
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         any_rejected = true;
                                         eprintln!("failed to queue outbound {}: {}", rcpt, e);
+                                        let w = reader.get_mut();
+                                        w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
+                                        w.flush().await?;
+                                    }
+                                    Err(e) => {
+                                        any_rejected = true;
+                                        eprintln!("queue spawn_blocking join error: {}", e);
                                         let w = reader.get_mut();
                                         w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
                                         w.flush().await?;
