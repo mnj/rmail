@@ -53,6 +53,17 @@ pub fn queue_outbound(maildir_root: &Path, recipient: &str, data: &[u8], envelop
 
     // write the original message bytes unchanged
     f.write_all(data)?;
+    // ensure data is flushed to disk before moving
+    f.sync_all()?;
+
+    // write control JSON to tmp and then move to queue dir
+    let control = QueueControl::new(5, 0);
+    let control_json = serde_json::to_string(&control)?;
+    let tmp_json = tmp_dir.join(format!("{}.json", &filename));
+    fs::write(&tmp_json, control_json.as_bytes())?;
+
     fs::rename(&tmp_path, &final_path)?;
+    let final_json = queue_dir.join(format!("{}.json", &filename));
+    fs::rename(&tmp_json, &final_json)?;
     Ok(final_path)
 }
