@@ -167,6 +167,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
     }
 
     // SMTP transaction state
+    const MAX_RCPT: usize = 100; // limit recipients per transaction to mitigate abuse
     let mut rcpts: Vec<String> = Vec::new();
     let mut mail_from: Option<String> = None;
 
@@ -229,18 +230,30 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
             let raw = cmd.get(8..).unwrap_or("");
             if let Some(addr) = extract_addr(raw) {
                 if allowed.contains(&addr) {
-                    rcpts.push(addr.clone());
-                    let w = reader.get_mut();
-                    w.write_all(b"250 OK\r\n").await?;
-                    w.flush().await?;
-                } else if let Some(at) = addr.find('@') {
-                    let domain = &addr[at+1..];
-                    if let Some(target) = catchalls.get(domain) {
-                        // Deliver to catchall target
-                        rcpts.push(target.clone());
+                    if rcpts.len() >= MAX_RCPT {
+                        let w = reader.get_mut();
+                        w.write_all(b"452 Too many recipients\r\n").await?;
+                        w.flush().await?;
+                    } else {
+                        rcpts.push(addr.clone());
                         let w = reader.get_mut();
                         w.write_all(b"250 OK\r\n").await?;
                         w.flush().await?;
+                    }
+                } else if let Some(at) = addr.find('@') {
+                    let domain = &addr[at+1..];
+                    if let Some(target) = catchalls.get(domain) {
+                        // Deliver to catchall target, respect recipient limit
+                        if rcpts.len() >= MAX_RCPT {
+                            let w = reader.get_mut();
+                            w.write_all(b"452 Too many recipients\r\n").await?;
+                            w.flush().await?;
+                        } else {
+                            rcpts.push(target.clone());
+                            let w = reader.get_mut();
+                            w.write_all(b"250 OK\r\n").await?;
+                            w.flush().await?;
+                        }
                     } else {
                         let w = reader.get_mut();
                         w.write_all(b"550 No such user\r\n").await?;
