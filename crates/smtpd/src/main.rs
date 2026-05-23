@@ -6,7 +6,8 @@ use std::time::{Instant, Duration};
 use once_cell::sync::Lazy;
 
 use rmail_common::{config::Config, maildir, metrics, auth, db};
-use base64;
+use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
+use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -315,7 +316,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             }
             if mech == "PLAIN" {
                 if let Some(b64) = initial {
-                    match base64::decode(b64) {
+                    match BASE64_ENGINE.decode(b64) {
                         Ok(bytes) => {
                             // PLAIN: [authz] NUL authcid NUL password
                             let splits: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
@@ -370,7 +371,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     let mut resp_line = String::new();
                     reader.read_line(&mut resp_line).await?;
                     let b64 = resp_line.trim();
-                    match base64::decode(b64) {
+                    match base64::engine::general_purpose::STANDARD.decode(b64) {
                         Ok(bytes) => {
                             let splits: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
                             let (authcid, password) = if splits.len() >= 3 {
@@ -412,7 +413,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 // SCRAM-SHA-256 server-side (RFC 5802 minimal implementation)
                 // Workflow: client-first-message [base64] -> server-first-message (r=nonce,s=salt,i=iter) -> client-final-message (with proof)
                 let client_first_msg = if let Some(b64) = initial {
-                    match base64::decode(b64) {
+                    match base64::engine::general_purpose::STANDARD.decode(b64) {
                         Ok(b) => String::from_utf8_lossy(&b).to_string(),
                         Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; continue; }
                     }
@@ -423,7 +424,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     let mut resp_line = String::new();
                     reader.read_line(&mut resp_line).await?;
                     let b64 = resp_line.trim();
-                    match base64::decode(b64) {
+                    match base64::engine::general_purpose::STANDARD.decode(b64) {
                         Ok(b) => String::from_utf8_lossy(&b).to_string(),
                         Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; continue; }
                     }
@@ -474,12 +475,12 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                         let mut rn = [0u8; 18];
                                         let mut rng = rand::rngs::OsRng;
                                         rng.fill_bytes(&mut rn);
-                                        let server_nonce = base64::encode(&rn);
+                                        let server_nonce = base64::engine::general_purpose::STANDARD.encode(&rn);
                                         let combined_nonce = format!("{}{}", client_nonce, server_nonce);
                                         let server_first_msg = format!("r={},s={},i={}", combined_nonce, salt_b64, iter);
 
                                         // send server-first-message (base64)
-                                        let sf_b64 = base64::encode(server_first_msg.as_bytes());
+                                        let sf_b64 = base64::engine::general_purpose::STANDARD.encode(server_first_msg.as_bytes());
                                         let w = reader.get_mut();
                                         w.write_all(format!("334 {}\r\n", sf_b64).as_bytes()).await?;
                                         w.flush().await?;
@@ -488,7 +489,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                         let mut resp_line = String::new();
                                         reader.read_line(&mut resp_line).await?;
                                         let b64_cf = resp_line.trim();
-                                        let cf_bytes = match base64::decode(b64_cf) {
+                                        let cf_bytes = match base64::engine::general_purpose::STANDARD.decode(b64_cf) {
                                             Ok(b) => b,
                                             Err(_) => { let w = reader.get_mut(); w.write_all(b"501 Invalid base64\r\n").await?; w.flush().await?; continue; }
                                         };
@@ -540,8 +541,8 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                             match rmail_common::auth::verify_scram_proof(&scram_json, &auth_message, client_proof_b64) {
                                                 Ok(server_sig) => {
                                                     // send server-final-message (v=base64) in a 235 success response
-                                                    let server_final = format!("v={}", base64::encode(&server_sig));
-                                                    let sf_b64 = base64::encode(server_final.as_bytes());
+                                                    let server_final = format!("v={}", base64::engine::general_purpose::STANDARD.encode(&server_sig));
+                                                    let sf_b64 = base64::engine::general_purpose::STANDARD.encode(server_final.as_bytes());
                                                     let w = reader.get_mut();
                                                     w.write_all(format!("235 {}\r\n", sf_b64).as_bytes()).await?;
                                                     w.flush().await?;
@@ -568,7 +569,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             } else if mech == "LOGIN" {
                 // LOGIN: two step username/password base64 prompts
                 if let Some(b64u) = initial {
-                    match base64::decode(b64u) {
+                    match base64::engine::general_purpose::STANDARD.decode(b64u) {
                         Ok(u_bytes) => {
                             let username = String::from_utf8_lossy(&u_bytes).to_string();
                             let w = reader.get_mut();
@@ -577,7 +578,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                             let mut pass_line = String::new();
                             reader.read_line(&mut pass_line).await?;
                             let b64p = pass_line.trim();
-                            match base64::decode(b64p) {
+                            match base64::engine::general_purpose::STANDARD.decode(b64p) {
                                 Ok(p_bytes) => {
                                     let password = String::from_utf8_lossy(&p_bytes).to_string();
                                     if let Some(dbp) = db_path.as_ref() {
@@ -617,7 +618,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     let mut uline = String::new();
                     reader.read_line(&mut uline).await?;
                     let b64u = uline.trim();
-                    match base64::decode(b64u) {
+                    match base64::engine::general_purpose::STANDARD.decode(b64u) {
                         Ok(u_bytes) => {
                             let username = String::from_utf8_lossy(&u_bytes).to_string();
                             let w = reader.get_mut();
@@ -626,7 +627,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                             let mut pass_line = String::new();
                             reader.read_line(&mut pass_line).await?;
                             let b64p = pass_line.trim();
-                            match base64::decode(b64p) {
+                            match base64::engine::general_purpose::STANDARD.decode(b64p) {
                                 Ok(p_bytes) => {
                                     let password = String::from_utf8_lossy(&p_bytes).to_string();
                                     if let Some(dbp) = db_path.as_ref() {

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use rmail_common::config::Config;
 use std::path::PathBuf;
 use anyhow::Result;
-use base64;
+use base64::Engine;
 use rmail_common::auth;
 use std::collections::HashMap;
 use tokio::net::TcpListener;
@@ -111,7 +111,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
         if let Some(authz) = headers.get("authorization") {
             if authz.len() > 6 && authz[..6].eq_ignore_ascii_case("Basic ") {
                 let b64 = authz[6..].trim();
-                if let Ok(bytes) = base64::decode(b64) {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
                     if let Ok(creds) = String::from_utf8(bytes) {
                         if let Some(colon) = creds.find(':') {
                             let u = &creds[..colon];
