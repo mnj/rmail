@@ -28,7 +28,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path) -> Result<Stats> {
     let mut mailbox_count = 0usize;
     let mut total_messages = 0usize;
     if !mail_root.exists() || !mail_root.is_dir() {
-        return Ok(Stats { mailboxes: 0, total_messages: 0 });
+    return Ok(Stats { mailboxes: 0, total_messages: 0, delivered_count: 0 });
     }
     for domain_entry in std::fs::read_dir(mail_root)? {
         let domain_entry = domain_entry?;
@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| {
         // fallback default settings
-        Config { global: rmail_common::config::Global { mail_root: "mail".into(), listen_addrs: None, smtps_port: None, submission_port: None, imaps_port: None, imap_port: None, web_port: None, tls_cert: None, tls_key: None, log_level: None }, mailboxes: None, catchalls: None }
+        Config { global: rmail_common::config::Global { mail_root: "mail".into(), listen_addrs: None, smtps_port: None, submission_port: None, imaps_port: None, imap_port: None, web_port: None, tls_cert: None, tls_key: None, log_level: None, web_admin_user: None, web_admin_password_hash: None }, mailboxes: None, catchalls: None }
     });
     let port = cfg.global.web_port.unwrap_or(8080);
     let addr = format!("0.0.0.0:{}", port);

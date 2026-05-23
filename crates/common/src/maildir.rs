@@ -86,3 +86,82 @@ pub fn read_message(maildir_root: &Path, domain: &str, localpart: &str, index: u
         Err(anyhow::anyhow!("no message at index"))
     }
 }
+
+use std::collections::HashMap;
+
+/// Load or create a persistent UID mapping for a Maildir.
+///
+/// This function ensures a mailbox-specific UIDVALIDITY is present (stored in Maildir/uidvalidity)
+/// and a filename -> UID map persisted in Maildir/uidmap.json. It returns the UIDVALIDITY and an
+/// ordered Vec of (UID, PathBuf) matching the stable ordering used for IMAP sequence numbers.
+///
+/// Implementation notes:
+/// - Filenames are used as stable identifiers; if a filename has an existing UID it is reused.
+/// - New files receive monotonically increasing UIDs written back to the uidmap.json atomically.
+/// - UIDVALIDITY is generated from time XOR randomness when first created.
+pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyhow::Result<(u64, Vec<(u64, PathBuf)>)> {
+    let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
+    ensure_maildir(&mailbox_dir)?;
+    let uidvalidity_path = mailbox_dir.join("uidvalidity");
+    let uidmap_path = mailbox_dir.join("uidmap.json");
+
+    // Load or initialize UIDVALIDITY
+    let uidvalidity: u64 = if uidvalidity_path.exists() {
+        let s = fs::read_to_string(&uidvalidity_path)?;
+        s.trim().parse::<u64>().unwrap_or_else(|_| {
+            let v = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64) ^ rand::random::<u64>();
+            // attempt to persist repaired value
+            let tmp = uidvalidity_path.with_extension("tmp");
+            let _ = fs::write(&tmp, v.to_string());
+            let _ = fs::rename(&tmp, &uidvalidity_path);
+            v
+        })
+    } else {
+        let v = (SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64) ^ rand::random::<u64>();
+        let tmp = uidvalidity_path.with_extension("tmp");
+        fs::write(&tmp, v.to_string())?;
+        fs::rename(&tmp, &uidvalidity_path)?;
+        v
+    };
+
+    // Load existing UID map (filename -> uid)
+    let mut map: HashMap<String, u64> = if uidmap_path.exists() {
+        let s = fs::read_to_string(&uidmap_path)?;
+        match serde_json::from_str(&s) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("warning: failed to parse uidmap.json: {} — rebuilding", e);
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // Build ordered list of messages and assign UIDs to new files
+    let msgs_paths = list_messages(maildir_root, domain, localpart)?;
+    let mut max_uid = map.values().cloned().max().unwrap_or(0);
+    let mut out: Vec<(u64, PathBuf)> = Vec::new();
+    for p in msgs_paths.into_iter() {
+        if let Some(fname_os) = p.file_name() {
+            if let Some(fname) = fname_os.to_str() {
+                let uid = if let Some(&u) = map.get(fname) {
+                    u
+                } else {
+                    max_uid = max_uid.saturating_add(1);
+                    map.insert(fname.to_string(), max_uid);
+                    max_uid
+                };
+                out.push((uid, p));
+            }
+        }
+    }
+
+    // Persist updated map atomically
+    let tmp = uidmap_path.with_extension("tmp");
+    let json = serde_json::to_string(&map)?;
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &uidmap_path)?;
+
+    Ok((uidvalidity, out))
+}

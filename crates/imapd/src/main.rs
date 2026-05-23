@@ -14,6 +14,18 @@ use tokio_rustls::TlsAcceptor;
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
 
+/// SelectedMailbox holds state for the currently selected mailbox in an IMAP session.
+/// It maintains the mailbox domain/localpart, the persistent UIDVALIDITY value, and an
+/// ordered Vec of (UID, PathBuf) where the order corresponds to IMAP sequence numbers.
+/// This lightweight structure is recomputed on SELECT and reused for subsequent FETCH/UID commands
+/// during the session to provide stable UIDs and predictable sequence numbers.
+struct SelectedMailbox {
+    pub domain: String,
+    pub local: String,
+    pub uidvalidity: u64,
+    pub msgs: Vec<(u64, std::path::PathBuf)>,
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -128,6 +140,8 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
     }
     let mut line = String::new();
     let mut authed_mailbox: Option<String> = None; // store address lowercase
+    // current mailbox selection state (set by SELECT)
+    let mut selected: Option<SelectedMailbox> = None;
 
     loop {
         line.clear();
@@ -235,16 +249,32 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 if let Some(at) = addr.find('@') {
                     let local = &addr[..at];
                     let domain = &addr[at+1..];
-                    let count = maildir::count_messages(&std::path::Path::new(&mail_root), domain, local)?;
-                    let w = reader.get_mut();
-                    w.write_all(format!("* {} EXISTS\r\n", count).as_bytes()).await?;
-                    w.flush().await?;
-                    let w = reader.get_mut();
-                    w.write_all(b"* 0 RECENT\r\n").await?;
-                    w.flush().await?;
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} OK [READ-WRITE] SELECT completed\r\n", tag).as_bytes()).await?;
-                    w.flush().await?;
+
+                    // Load or build UID mapping for this Maildir. This maintains a persistent UIDVALIDITY
+                    // and a filename -> UID map stored under Maildir/uidmap.json to provide stable UIDs
+                    // across server restarts. list_messages provides stable ordering for sequence numbers.
+                    match maildir::load_uid_map(std::path::Path::new(&mail_root), domain, local) {
+                        Ok((uidvalidity, msgs)) => {
+                            let count = msgs.len();
+                            // store selection in session state
+                            selected = Some(SelectedMailbox { domain: domain.to_string(), local: local.to_string(), uidvalidity, msgs });
+                            let w = reader.get_mut();
+                            w.write_all(format!("* {} EXISTS\r\n", count).as_bytes()).await?;
+                            w.flush().await?;
+                            let w = reader.get_mut();
+                            w.write_all(b"* 0 RECENT\r\n").await?;
+                            w.flush().await?;
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} OK [UIDVALIDITY {}] [READ-WRITE] SELECT completed\r\n", tag, uidvalidity).as_bytes()).await?;
+                            w.flush().await?;
+                        }
+                        Err(e) => {
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} NO Error opening mailbox\r\n", tag).as_bytes()).await?;
+                            w.flush().await?;
+                            eprintln!("load_uid_map error: {}", e);
+                        }
+                    }
                 } else {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
@@ -282,95 +312,105 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                     w.flush().await?;
                     continue;
                 }
+                // Ensure a mailbox has been selected with SELECT first
+                if selected.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                    continue;
+                }
                 let args = args.trim();
                 let mut a = args.splitn(2, ' ');
                 let seq_set = a.next().unwrap_or("");
                 let _what = a.next().unwrap_or("");
-                let addr = authed_mailbox.as_ref().unwrap();
-                if let Some(at) = addr.find('@') {
-                    let local = &addr[..at];
-                    let domain = &addr[at+1..];
-                    let msgs = maildir::list_messages(&std::path::Path::new(&mail_root), domain, local)?;
-                    let total = msgs.len();
-                    let seqs: Vec<usize> = if seq_set == "1:*" {
-                        (1..=total).collect()
-                    } else if seq_set.contains(':') {
-                        let mut parts = seq_set.split(':');
-                        let start = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-                        let end = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(total);
-                        (start..=end).collect()
-                    } else {
-                        if let Ok(v) = seq_set.parse::<usize>() { vec![v] } else { vec![] }
-                    };
-                    for seq in seqs {
-                        if seq == 0 || seq > total { continue; }
-                        let idx = seq - 1;
-                        let data = maildir::read_message(&std::path::Path::new(&mail_root), domain, local, idx)?;
-                        let w = reader.get_mut();
-                        w.write_all(format!("* {} FETCH (RFC822 {{{}}}\r\n", seq, data.len()).as_bytes()).await?;
-                        w.write_all(&data).await?;
-                        w.write_all(b"\r\n)\r\n").await?;
-                        w.flush().await?;
-                    }
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes()).await?;
-                    w.flush().await?;
+                let sel = selected.as_ref().unwrap();
+                let total = sel.msgs.len();
+                let seqs: Vec<usize> = if seq_set == "1:*" {
+                    (1..=total).collect()
+                } else if seq_set.contains(':') {
+                    let mut parts = seq_set.split(':');
+                    let start = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                    let end = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(total);
+                    (start..=end).collect()
                 } else {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
-                    w.flush().await?;
-                }
-            },
-            "UID" => {
-                // minimal UID support: treat UID numbers as sequence numbers for now
-                let mut a = args.trim().splitn(2, ' ');
-                let subcmd = a.next().unwrap_or("").to_uppercase();
-                let subargs = a.next().unwrap_or("");
-                if subcmd.as_str() == "FETCH" {
-                    let mut b = subargs.splitn(2, ' ');
-                    let uid_set = b.next().unwrap_or("");
-                    let _what = b.next().unwrap_or("");
-                    // reuse FETCH logic but treat uid_set as sequence set
-                    if authed_mailbox.is_none() {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let addr = authed_mailbox.as_ref().unwrap();
-                    if let Some(at) = addr.find('@') {
-                        let local = &addr[..at];
-                        let domain = &addr[at+1..];
-                        let msgs = maildir::list_messages(&std::path::Path::new(&mail_root), domain, local)?;
-                        let total = msgs.len();
-                        let seqs: Vec<usize> = if uid_set == "1:*" {
-                            (1..=total).collect()
-                        } else if uid_set.contains(':') {
-                            let mut parts = uid_set.split(':');
-                            let start = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-                            let end = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(total);
-                            (start..=end).collect()
-                        } else {
-                            if let Ok(v) = uid_set.parse::<usize>() { vec![v] } else { vec![] }
-                        };
-                        for seq in seqs {
-                            if seq == 0 || seq > total { continue; }
-                            let idx = seq - 1;
-                            let data = maildir::read_message(&std::path::Path::new(&mail_root), domain, local, idx)?;
+                    if let Ok(v) = seq_set.parse::<usize>() { vec![v] } else { vec![] }
+                };
+                for seq in seqs {
+                    if seq == 0 || seq > total { continue; }
+                    let idx = seq - 1;
+                    let path = &sel.msgs[idx].1;
+                    match std::fs::read(path) {
+                        Ok(data) => {
                             let w = reader.get_mut();
-                            w.write_all(format!("* {} FETCH (UID {} RFC822 {{{}}}\r\n", seq, seq, data.len()).as_bytes()).await?;
+                            w.write_all(format!("* {} FETCH (RFC822 {{{}}}\r\n", seq, data.len()).as_bytes()).await?;
                             w.write_all(&data).await?;
                             w.write_all(b"\r\n)\r\n").await?;
                             w.flush().await?;
                         }
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes()).await?;
-                        w.flush().await?;
-                    } else {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
-                        w.flush().await?;
+                        Err(e) => {
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes()).await?;
+                            w.flush().await?;
+                            eprintln!("read message error: {}", e);
+                        }
                     }
+                }
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes()).await?;
+                w.flush().await?;
+            },
+            "UID" => {
+                let mut a = args.trim().splitn(2, ' ');
+                let subcmd = a.next().unwrap_or("").to_uppercase();
+                let subargs = a.next().unwrap_or("");
+                if subcmd.as_str() == "FETCH" {
+                    if selected.is_none() {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes()).await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                    let mut b = subargs.splitn(2, ' ');
+                    let uid_set = b.next().unwrap_or("");
+                    let _what = b.next().unwrap_or("");
+                    let sel = selected.as_ref().unwrap();
+                    // Build list of UIDs to return, handling ranges
+                    let uids: Vec<u64> = if uid_set == "1:*" {
+                        sel.msgs.iter().map(|(u,_)| *u).collect()
+                    } else if uid_set.contains(':') {
+                        let mut parts = uid_set.split(':');
+                        let start = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+                        let end = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| sel.msgs.last().map(|(u,_)| *u).unwrap_or(start));
+                        sel.msgs.iter().filter_map(|(u,_)| {
+                            if *u >= start && *u <= end { Some(*u) } else { None }
+                        }).collect()
+                    } else {
+                        if let Ok(v) = uid_set.parse::<u64>() { vec![v] } else { vec![] }
+                    };
+                    for uid in uids {
+                        if let Some(pos) = sel.msgs.iter().position(|(u,_)| *u == uid) {
+                            let seq = pos + 1;
+                            let path = &sel.msgs[pos].1;
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let w = reader.get_mut();
+                                    w.write_all(format!("* {} FETCH (UID {} RFC822 {{{}}}\r\n", seq, uid, data.len()).as_bytes()).await?;
+                                    w.write_all(&data).await?;
+                                    w.write_all(b"\r\n)\r\n").await?;
+                                    w.flush().await?;
+                                }
+                                Err(e) => {
+                                    let w = reader.get_mut();
+                                    w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes()).await?;
+                                    w.flush().await?;
+                                    eprintln!("read message error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                 } else {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes()).await?;
