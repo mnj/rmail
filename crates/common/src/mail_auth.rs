@@ -266,50 +266,89 @@ fn resolver() -> Result<Resolver> {
 }
 
 fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option<String>> {
-    // Minimal SPF: lookup TXT records for the envelope-from domain and evaluate ip4/ip6 mechanisms only.
+    // Improved SPF: support ip4/ip6, a, mx, and include mechanisms (best-effort).
+    use std::collections::HashSet;
+
     let mf = match mail_from { Some(s) => s, None => return Ok(None) };
     let at = mf.rfind('@');
     let domain = if let Some(i) = at { &mf[i+1..] } else { mf };
-    let resolver = match resolver() { Ok(r) => r, Err(_) => return Ok(None) };
-    let lookup = match resolver.txt_lookup(domain) {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
+    if peer_ip.is_none() { return Ok(None); }
+    let peer = peer_ip.unwrap();
 
-    // iterate TXT records and find an spf record
-    use trust_dns_resolver::proto::rr::rdata::TXT;
-    for txt in lookup.iter() {
-        // try to obtain a string from TXT record
-        let txt_str = txt.to_string();
-        if txt_str.to_ascii_lowercase().starts_with("v=spf1") {
-            // split tokens
-            let tokens = txt_str.split_whitespace().skip(1);
-            let mut matched = false;
-            let mut seen_all: Option<&str> = None;
-            for tok in tokens {
-                if tok.starts_with("ip4:") || tok.starts_with("ip6:") {
-                    let net = &tok[4..];
-                    if let Ok(ipnet) = net.parse::<IpNet>() {
-                        if let Some(peer) = peer_ip {
-                            if ipnet.contains(&peer) {
-                                matched = true;
-                                return Ok(Some("pass".to_string()));
+    fn map_qual(q: char) -> &'static str {
+        match q {
+            '-' => "fail",
+            '~' => "softfail",
+            '?' => "neutral",
+            _ => "pass",
+        }
+    }
+
+    fn eval_spf_for_domain(domain: &str, peer: IpAddr, depth: u8, visited: &mut HashSet<String>) -> Option<String> {
+        if depth > 10 { return None; }
+        if visited.contains(domain) { return None; }
+        visited.insert(domain.to_string());
+        let resolver = resolver().ok()?;
+        let lookup = resolver.txt_lookup(domain).ok()?;
+        for txt in lookup.iter() {
+            let txt_str = txt.to_string();
+            if !txt_str.to_ascii_lowercase().starts_with("v=spf1") { continue; }
+            let mut seen_all: Option<char> = None;
+            for tok in txt_str.split_whitespace().skip(1) {
+                let mut chars = tok.chars();
+                let first = chars.next().unwrap_or('\0');
+                let (qual, mech) = if matches!(first, '+'|'-'|'~'|'?') { (first, chars.as_str()) } else { ('+', tok) };
+                // ip4/ip6
+                if mech.starts_with("ip4:") || mech.starts_with("ip6:") {
+                    let cid = &mech[4..];
+                    if let Ok(net) = cid.parse::<IpNet>() {
+                        if net.contains(&peer) {
+                            return Some(map_qual(qual).to_string());
+                        }
+                    }
+                } else if mech.starts_with("a") {
+                    // a or a:domain
+                    let target = if mech == "a" { domain.to_string() } else if mech.starts_with("a:") { mech[2..].to_string() } else { domain.to_string() };
+                    if let Ok(ips) = resolver.lookup_ip(target.as_str()) {
+                        for ip in ips.iter() {
+                            if ip == peer { return Some(map_qual(qual).to_string()); }
+                        }
+                    }
+                } else if mech.starts_with("mx") {
+                    // mx or mx:domain
+                    let target = if mech == "mx" { domain.to_string() } else if mech.starts_with("mx:") { mech[3..].to_string() } else { domain.to_string() };
+                    if let Ok(mxlookup) = resolver.mx_lookup(target.as_str()) {
+                        for mx in mxlookup.iter() {
+                            let host = mx.exchange().to_utf8();
+                            if let Ok(ips) = resolver.lookup_ip(host.as_str()) {
+                                for ip in ips.iter() {
+                                    if ip == peer { return Some(map_qual(qual).to_string()); }
+                                }
                             }
                         }
                     }
-                } else if tok.ends_with("all") {
-                    // could be -all, ~all, ?all
-                    seen_all = Some(tok);
+                } else if mech.starts_with("include:") {
+                    let inc = &mech[8..];
+                    let mut v2 = visited.clone();
+                    if let Some(res) = eval_spf_for_domain(inc, peer, depth.saturating_add(1), &mut v2) {
+                        if res == "pass" { return Some("pass".to_string()); }
+                        // otherwise continue
+                    }
+                } else if mech.ends_with("all") {
+                    // like -all, ~all, ?all, +all
+                    let q = mech.chars().next().unwrap_or('+');
+                    seen_all = Some(q);
                 }
             }
-            if matched { return Ok(Some("pass".to_string())); }
-            if let Some(a) = seen_all {
-                if a.starts_with("-") { return Ok(Some("fail".to_string())); }
-                if a.starts_with("~") { return Ok(Some("softfail".to_string())); }
-                return Ok(Some("neutral".to_string()));
-            }
-            return Ok(Some("neutral".to_string()));
+            if let Some(q) = seen_all { return Some(map_qual(q).to_string()); }
+            return Some("neutral".to_string());
         }
+        None
+    }
+
+    let mut visited = HashSet::new();
+    if let Some(res) = eval_spf_for_domain(domain, peer, 0, &mut visited) {
+        return Ok(Some(res));
     }
     Ok(None)
 }
@@ -342,12 +381,20 @@ fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&st
             }
         }
     }
-    if policy.is_none() { return Ok(None); }
+    let policy = policy.unwrap_or_else(|| "none".to_string());
 
     // DMARC alignment: prefer DKIM then SPF
     if let Some(dkim_s) = dkim {
         if dkim_s.starts_with("pass") {
-            // try to extract d= from any DKIM-Signature header we have
+            // attempt to extract d= from DKIM result or headers
+            if let Some(pos) = dkim_s.find("d=") {
+                let rem = &dkim_s[pos+2..];
+                let dval = rem.split_whitespace().next().unwrap_or("");
+                if dval == from_domain || dval.ends_with(&format!(".{}", from_domain)) {
+                    return Ok(Some("pass".to_string()));
+                }
+            }
+            // fallback: inspect DKIM-Signature headers for d= tag
             for (k, v) in headers.iter() {
                 if k.eq_ignore_ascii_case("DKIM-Signature") {
                     for part in v.split(';') {
@@ -378,7 +425,10 @@ fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&st
         }
     }
 
-    Ok(Some("fail".to_string()))
+    // If alignment failed, return policy decision (reject/quarantine/none)
+    if policy == "reject" { return Ok(Some("reject".to_string())); }
+    if policy == "quarantine" { return Ok(Some("quarantine".to_string())); }
+    Ok(Some("none".to_string()))
 }
 
 fn extract_addr_from_header(s: &str) -> Option<String> {
