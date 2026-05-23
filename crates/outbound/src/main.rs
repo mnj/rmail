@@ -48,6 +48,29 @@ async fn main() -> anyhow::Result<()> {
     let dead_letter_secs = (dead_letter_days.saturating_mul(24*3600)) as i64;
     let mut loop_counter: u64 = 0;
     loop {
+        loop_counter = loop_counter.wrapping_add(1);
+        // periodically run dead-letter cleanup (every ~60s)
+        if loop_counter % 600 == 0 {
+            let md = maildrop_dir.clone();
+            let secs = dead_letter_secs;
+            tokio::task::spawn_blocking(move || {
+                match rmail_queue_manager::dead_letter_cleanup(&md, secs) {
+                    Ok(moved) => println!("dead-letter cleanup moved {} messages", moved),
+                    Err(e) => eprintln!("dead-letter cleanup error: {}", e),
+                }
+            });
+        }
+
+        // periodically collect metrics
+        if loop_counter % 60 == 0 {
+            let md = maildrop_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                match rmail_queue_manager::collect_metrics(&md) {
+                    Ok(metrics) => println!("metrics queued={} inflight={} sent={} failed={} dead={}", metrics.queued, metrics.inflight, metrics.sent, metrics.failed, metrics.dead),
+                    Err(e) => eprintln!("metrics collection error: {}", e),
+                }
+            });
+        }
         // Try to claim an eligible message using the shared queue-manager library (blocking fs ops)
         let claim_res = tokio::task::spawn_blocking({
             let md = maildrop_dir.clone();
