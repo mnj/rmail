@@ -1,6 +1,7 @@
 // rmail_web: lightweight web UI for stats and logs
 
 use axum::{routing::get, Router, extract::Query, response::IntoResponse, Json};
+use axum::http::StatusCode;
 use serde::Serialize;
 use std::net::SocketAddr;
 use rmail_common::config::Config;
@@ -18,18 +19,18 @@ async fn health() -> impl IntoResponse {
     (axum::http::StatusCode::OK, "ok")
 }
 
-async fn stats_handler(Query(_params): Query<HashMap<String, String>>) -> impl IntoResponse {
+async fn stats_handler(Query(_params): Query<HashMap<String, String>>) -> Result<Json<Stats>, (StatusCode, String)> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = match Config::from_file(&cfg_path) {
         Ok(c) => c,
-        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("config error: {}", e)),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("config error: {}", e))),
     };
     let mail_root = PathBuf::from(cfg.global.mail_root);
     let res = tokio::task::spawn_blocking(move || scan_maildirs_sync(&mail_root)).await;
     match res {
-        Ok(Ok(stats)) => (axum::http::StatusCode::OK, Json(stats)),
-        Ok(Err(e)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("scan error: {}", e)),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("task join error: {}", e)),
+        Ok(Ok(stats)) => Ok(Json(stats)),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("scan error: {}", e))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("task join error: {}", e))),
     }
 }
 
@@ -97,7 +98,7 @@ async fn main() -> Result<()> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| {
         // fallback default settings
-        Config { global: rmail_common::config::Global { mail_root: "mail".into(), listen_addrs: None, smtps_port: None, submission_port: None, imaps_port: None, imap_port: None, tls_cert: None, tls_key: None, log_level: None }, mailboxes: None, catchalls: None }
+        Config { global: rmail_common::config::Global { mail_root: "mail".into(), listen_addrs: None, smtps_port: None, submission_port: None, imaps_port: None, imap_port: None, web_port: None, tls_cert: None, tls_key: None, log_level: None }, mailboxes: None, catchalls: None }
     });
     let port = cfg.global.web_port.unwrap_or(8080);
     let addr = SocketAddr::from(([0,0,0,0], port as u16));
@@ -109,6 +110,6 @@ async fn main() -> Result<()> {
         .route("/logs", get(logs_handler));
 
     println!("rMail web UI listening on {}", addr);
-    axum::Server::bind(&addr).serve(app.into_make_service()).await?;
+    hyper::Server::bind(&addr).serve(app.into_make_service()).await?;
     Ok(())
 }
