@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use rmail_common::config::Mailbox;
 use rmail_common::{auth, maildir, config::Config, db as rmail_db};
-use std::{sync::Arc, collections::HashMap};
+use std::{sync::{Arc, Mutex}, collections::HashMap, net::IpAddr};
+use std::time::{Instant, Duration};
+use once_cell::sync::Lazy;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -13,6 +15,18 @@ use tokio_rustls::TlsAcceptor;
 // so that boxed trait objects can be used with tokio::io::BufReader.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
+
+// Simple in-memory rate-limiter for authentication failures keyed by remote IP. This is a
+// best-effort defensive measure; for multi-process deployments a shared store (Redis, etc.)
+// should be used instead.
+#[derive(Clone)]
+struct AuthFailInfo {
+    count: u32,
+    first: Instant,
+    locked_until: Option<Instant>,
+}
+
+static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// SelectedMailbox holds state for the currently selected mailbox in an IMAP session.
 /// It maintains the mailbox domain/localpart, the persistent UIDVALIDITY value, and an
@@ -88,12 +102,12 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD listening on {}", addr);
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, false).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false).await {
                 eprintln!("IMAP client error: {}", e);
             }
         });
@@ -104,14 +118,14 @@ async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: S
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_clone, true).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_clone, Some(peer), true).await {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -133,7 +147,10 @@ fn unquote(s: &str) -> &str {
 // session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
 // and after a successful STARTTLS). Enforcing authentication methods (like LOGIN) only on
 // encrypted sessions prevents accidental credential disclosure over plain-text.
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, session_encrypted: bool) -> Result<()> {
+// session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
+// and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
+// for per-IP rate-limiting of authentication attempts.
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<tokio::net::SocketAddr>, session_encrypted: bool) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();
@@ -157,6 +174,15 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
         let args = parts.next().unwrap_or("");
         match cmd.as_str() {
             "LOGIN" => {
+                // Rate-limiting: block repeated failures per remote IP
+                if let Some(peer_addr) = peer {
+                    if let Some(rem) = auth_block_remaining(peer_addr.ip()) {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Too many failed auth attempts; try again in {}s\r\n", tag, rem.as_secs()).as_bytes()).await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                }
                 // Require an encrypted session for LOGIN to avoid sending cleartext passwords
                 if !session_encrypted {
                     let w = reader.get_mut();
@@ -195,6 +221,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 }
                 // If DB lookup didn't find a mailbox, report not found (DB is authoritative)
                 if mb.is_none() {
+                    if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
                     w.flush().await?;
@@ -205,21 +232,13 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         match auth::verify_password(pass, hash) {
                             Ok(true) => {
                                 authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
+                                if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
                                 let w = reader.get_mut();
                                 w.write_all(format!("{} OK LOGIN completed\r\n", tag).as_bytes()).await?;
                                 w.flush().await?;
                             },
-                            Ok(false) => {
-                                let w = reader.get_mut();
-                                w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes()).await?;
-                                w.flush().await?;
-                            },
-                            Err(e) => {
-                                let w = reader.get_mut();
-                                w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes()).await?;
-                                w.flush().await?;
-                                eprintln!("auth verify error: {}", e);
-                            }
+                            Ok(false) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes()).await?; w.flush().await?; },
+                            Err(e) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes()).await?; w.flush().await?; eprintln!("auth verify error: {}", e); }
                         }
                     } else {
                         let w = reader.get_mut();
@@ -227,6 +246,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         w.flush().await?;
                     }
                 } else {
+                    if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
                     w.flush().await?;
@@ -339,7 +359,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
                         // Pass the same tls_acceptor along and mark the session as encrypted.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, tls_acceptor.clone(), db_path.clone(), true));
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, tls_acceptor.clone(), db_path.clone(), peer, true));
                         return fut.await;
                     },
                     Err(e) => {
