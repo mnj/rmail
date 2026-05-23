@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use rmail_common::{config::Config, maildir};
 use argon2::{Argon2, password_hash::{SaltString, PasswordHasher}};
-use rand_core::OsRng;
+use rand::rngs::OsRng;
 
 /// rmail_ctl: minimal control CLI for managing mailboxes and generating password hashes.
 #[derive(Parser)]
@@ -51,9 +51,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Hash { password } => {
-            let salt = SaltString::generate(&mut OsRng);
+            let mut rng = OsRng;
+            let salt = SaltString::generate(&mut rng);
             let argon2 = Argon2::default();
-            let ph = argon2.hash_password(password.as_bytes(), &salt)?.to_string();
+            let ph = argon2.hash_password(password.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string();
             println!("{}", ph);
         }
         Commands::AddMailbox { address, password, password_hash, maildir: maildir_opt, config } => {
@@ -63,8 +64,9 @@ fn main() -> Result<()> {
             let ph = if let Some(h) = password_hash {
                 h
             } else if let Some(p) = password {
-                let salt = SaltString::generate(&mut OsRng);
-                Argon2::default().hash_password(p.as_bytes(), &salt)?.to_string()
+                let mut rng = OsRng;
+                let salt = SaltString::generate(&mut rng);
+                Argon2::default().hash_password(p.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string()
             } else {
                 String::new()
             };
