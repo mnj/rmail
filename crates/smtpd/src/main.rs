@@ -48,8 +48,9 @@ async fn main() -> Result<()> {
         let allowed = allowed.clone();
         let catchalls = catchalls.clone();
         let mail_root = mail_root.clone();
+        let acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_plain_listener(&addr, allowed, catchalls, mail_root).await {
+            if let Err(e) = run_plain_listener(&addr, allowed, catchalls, mail_root, acceptor).await {
                 eprintln!("Listener {} failed: {}", addr, e);
             }
         });
@@ -85,7 +86,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String) -> Result<()> {
+async fn run_plain_listener(addr: &str, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPD listening on {}", addr);
     loop {
@@ -93,8 +94,9 @@ async fn run_plain_listener(addr: &str, allowed: HashSet<String>, catchalls: Has
         let allowed = allowed.clone();
         let catchalls = catchalls.clone();
         let mail_root = mail_root.clone();
+        let acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, allowed, catchalls, mail_root).await {
+            if let Err(e) = process_stream(stream, allowed, catchalls, mail_root, acceptor).await {
                 eprintln!("client error: {}", e);
             }
         });
@@ -113,7 +115,7 @@ async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, allowed: Has
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(tls_stream, allowed, catchalls, mail_root).await {
+                    if let Err(e) = process_stream(tls_stream, allowed, catchalls, mail_root, None).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -134,7 +136,7 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
-async fn process_stream<S>(stream: S, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String) -> Result<()>
+async fn process_stream<S>(stream: S, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -231,9 +233,27 @@ where
             writer.flush().await?;
             break;
         } else if up.starts_with("STARTTLS") {
-            writer.write_all(b"454 TLS not available\r\n").await?;
-            writer.flush().await?;
-            // For now STARTTLS is not implemented; implicit SMTPS supported
+            // if we have an acceptor available, perform TLS handshake and continue inside TLS
+            if let Some(acceptor) = tls_acceptor {
+                writer.write_all(b"220 Ready to start TLS\r\n").await?;
+                writer.flush().await?;
+                // take ownership of the underlying stream and perform TLS accept
+                let inner = reader.into_inner();
+                match acceptor.accept(inner).await {
+                    Ok(tls_stream) => {
+                        // enter TLS-protected processing loop (no STARTTLS inside)
+                        return process_stream(tls_stream, allowed, catchalls, mail_root, None).await;
+                    }
+                    Err(e) => {
+                        eprintln!("TLS accept error: {}", e);
+                        // We can't continue; return error to close connection
+                        return Err(anyhow::anyhow!("TLS accept error: {}", e));
+                    }
+                }
+            } else {
+                writer.write_all(b"454 TLS not available\r\n").await?;
+                writer.flush().await?;
+            }
         } else {
             writer.write_all(b"502 Command not implemented\r\n").await?;
             writer.flush().await?;
