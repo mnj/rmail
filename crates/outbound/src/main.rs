@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use trust_dns_resolver::TokioAsyncResolver;
+use tokio_native_tls::TlsConnector as TokioTlsConnector;
+use native_tls::TlsConnector as NativeTlsConnector;
+
+// Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
+trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
 
 // Simple outbound delivery worker: scans <mail_root>/outbound/queue, moves files to inflight,
 // parses envelope metadata (X-RMail-Envelope-From/To) and performs a minimal SMTP conversation
@@ -89,7 +96,7 @@ async fn process_file(path: &Path) -> anyhow::Result<()> {
     deliver_to_remote(envelope_from.as_deref(), &rcpt, body_bytes).await
 }
 
-async fn read_response(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(u16, String)> {
+async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> anyhow::Result<(u16, String)> {
     let mut full = String::new();
     loop {
         let mut line = String::new();
@@ -110,25 +117,48 @@ async fn read_response(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(u16
 async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &[u8]) -> anyhow::Result<()> {
     let at = recipient.rfind('@').ok_or_else(|| anyhow::anyhow!("invalid recipient address"))?;
     let domain = &recipient[at+1..];
-    let addr = format!("{}:25", domain);
 
-    // Connect with timeout
-    let stream = match tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(&addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(anyhow::anyhow!("connect error: {}", e)),
-        Err(_) => return Err(anyhow::anyhow!("connect timeout")),
-    };
+    // Resolve MX records using system DNS configuration
+    let resolver = TokioAsyncResolver::tokio_from_system_conf().context("creating dns resolver")?;
+    let mut targets: Vec<String> = Vec::new();
+    if let Ok(mx) = resolver.mx_lookup(domain).await {
+        let mut mxs: Vec<(u16, String)> = mx.iter().map(|r| (r.preference(), r.exchange().to_utf8())).collect();
+        mxs.sort_by_key(|(p, _)| *p);
+        for (_pref, host) in mxs {
+            targets.push(host.trim_end_matches('.').to_string());
+        }
+    }
+    if targets.is_empty() { targets.push(domain.to_string()); }
 
-    let mut reader = BufReader::new(stream);
+    // Try targets in order
+    let mut stream_opt: Option<TcpStream> = None;
+    let mut selected_host = String::new();
+    for host in &targets {
+        let addr = format!("{}:25", host);
+        match tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(&addr)).await {
+            Ok(Ok(s)) => {
+                stream_opt = Some(s);
+                selected_host = host.clone();
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let stream = stream_opt.ok_or_else(|| anyhow::anyhow!("failed to connect to any MX/A host"))?;
+
+    // Use a boxed trait object so we can swap in a TLS stream after STARTTLS
+    let boxed: Box<dyn AsyncStream> = Box::new(stream);
+    let mut reader = BufReader::new(boxed);
 
     // Read banner
     let (code, _banner) = read_response(&mut reader).await?;
     if code >= 400 { return Err(anyhow::anyhow!("remote server error on connect: {}", code)); }
 
+    // EHLO
     let helo = format!("EHLO rmail\r\n");
     reader.get_mut().write_all(helo.as_bytes()).await?;
     reader.get_mut().flush().await?;
-    let (code, _ehlo) = read_response(&mut reader).await?;
+    let (code, ehlo_resp) = read_response(&mut reader).await?;
     if code >= 400 {
         // Try HELO if EHLO failed
         let helo = format!("HELO rmail\r\n");
@@ -136,6 +166,36 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
         reader.get_mut().flush().await?;
         let (code2, _helor) = read_response(&mut reader).await?;
         if code2 >= 400 { return Err(anyhow::anyhow!("HELO failed: {}", code2)); }
+    }
+
+    // If remote advertises STARTTLS, attempt upgrade
+    if ehlo_resp.to_uppercase().contains("STARTTLS") {
+        reader.get_mut().write_all(b"STARTTLS\r\n").await?;
+        reader.get_mut().flush().await?;
+        let (code, _resp) = read_response(&mut reader).await?;
+        if code != 220 { return Err(anyhow::anyhow!("STARTTLS rejected: {}", code)); }
+
+        // perform TLS handshake using system certificates
+        let inner = reader.into_inner();
+        let native = NativeTlsConnector::builder().build().context("building native tls connector")?;
+        let connector = TokioTlsConnector::from(native);
+        let server_name = selected_host.trim_end_matches('.');
+        let tls_stream = connector.connect(server_name, inner).await.context("TLS connect failed")?;
+        let boxed_tls: Box<dyn AsyncStream> = Box::new(tls_stream);
+        reader = BufReader::new(boxed_tls);
+
+        // EHLO again over TLS
+        let helo = format!("EHLO rmail\r\n");
+        reader.get_mut().write_all(helo.as_bytes()).await?;
+        reader.get_mut().flush().await?;
+        let (code, _ehlo2) = read_response(&mut reader).await?;
+        if code >= 400 {
+            let helo = format!("HELO rmail\r\n");
+            reader.get_mut().write_all(helo.as_bytes()).await?;
+            reader.get_mut().flush().await?;
+            let (code2, _helor) = read_response(&mut reader).await?;
+            if code2 >= 400 { return Err(anyhow::anyhow!("HELO failed after STARTTLS: {}", code2)); }
+        }
     }
 
     // MAIL FROM
