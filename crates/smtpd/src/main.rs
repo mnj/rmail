@@ -439,7 +439,10 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
 
                 if let Some(dbp) = db_path.as_ref() {
                     let dbp2 = dbp.clone();
-                    let user_lower = username.to_ascii_lowercase();
+                    // Apply SASLprep-like normalization to the provided username before lookup.
+                    // This helps with Unicode equivalence and common client encodings.
+                    let user_prep = auth::saslprep(&username);
+                    let user_lower = user_prep.to_ascii_lowercase();
                     match tokio::task::spawn_blocking(move || rmail_common::db::get_mailbox(&dbp2, &user_lower)).await {
                         Ok(Ok(Some(mb))) => {
                             if let Some(scram_json) = mb.scram {

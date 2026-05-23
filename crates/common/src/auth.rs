@@ -16,6 +16,7 @@ use sha2::{Sha256, Digest};
 use base64;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use unicode_normalization::UnicodeNormalization;
 
 /// Verify a password against a stored password hash.
 ///
@@ -117,4 +118,13 @@ pub fn verify_scram_proof(stored_verifier_json: &str, auth_message: &str, client
     mac2.update(auth_message.as_bytes());
     let server_signature = mac2.finalize().into_bytes();
     Ok(server_signature.to_vec())
+}
+
+/// Minimal SASLprep-like username normalization used for SCRAM username handling.
+///
+/// NOTE: This implementation applies Unicode NFKC normalization which covers the most
+/// common interoperability cases. Full SASLprep (stringprep) requires handling mapping
+/// tables and prohibited characters; consider using a dedicated crate for production.
+pub fn saslprep(input: &str) -> String {
+    input.nfkc().collect::<String>()
 }
