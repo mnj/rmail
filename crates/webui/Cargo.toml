@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.7"
-hyper = { version = "0.14", features = ["server", "tcp"] }
+# Minimal tokio-based HTTP server (no hyper/axum to avoid feature conflicts in this environment)
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
