@@ -164,8 +164,16 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
     let at = recipient.rfind('@').ok_or_else(|| anyhow::anyhow!("invalid recipient address"))?;
     let domain = &recipient[at+1..];
 
-    // Resolve MX records using system DNS configuration
-    let resolver = TokioAsyncResolver::tokio_from_system_conf().context("creating dns resolver")?;
+    // Resolve MX records using system DNS configuration. If RMAIL_REQUIRE_DNSSEC=1, enable DNSSEC validation in resolver options.
+    let require_dnssec_on_init = std::env::var("RMAIL_REQUIRE_DNSSEC").map(|v| {
+        let v = v.to_ascii_lowercase();
+        !(v == "0" || v == "false")
+    }).unwrap_or(false);
+    let (conf, mut opts) = trust_dns_resolver::system_conf::read_system_conf().context("reading system dns config")?;
+    if require_dnssec_on_init {
+        opts.validate = true;
+    }
+    let resolver = TokioAsyncResolver::tokio(conf, opts).context("creating dns resolver")?;
     let mut targets: Vec<String> = Vec::new();
     if let Ok(mx) = resolver.mx_lookup(domain).await {
         let mut mxs: Vec<(u16, String)> = mx.iter().map(|r| (r.preference(), r.exchange().to_utf8())).collect();
@@ -234,7 +242,7 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
             let mut tlsa_records: Vec<tlsa::TlsaRecord> = Vec::new();
             match resolver.lookup(tlsa_name.as_str(), RecordType::TLSA).await {
                 Ok(lookup) => {
-                    // iterate resource records and extract TLSA RData directly
+                    // iterate resource records and extract TLSA RData directly (DNSSEC validation is handled by resolver options if requested)
                     for record in lookup.record_iter() {
                         if let Some(rdata) = record.data() {
                             use trust_dns_resolver::proto::rr::RData;
@@ -331,6 +339,7 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                         let mut tlsa_records: Vec<tlsa::TlsaRecord> = Vec::new();
                         match resolver.lookup(tlsa_name.as_str(), RecordType::TLSA).await {
                             Ok(lookup) => {
+                                // iterate resource records and extract TLSA RData directly (DNSSEC validation is handled by resolver options if requested)
                                 for record in lookup.record_iter() {
                                     if let Some(rdata) = record.data() {
                                         use trust_dns_resolver::proto::rr::RData;
