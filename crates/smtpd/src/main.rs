@@ -9,6 +9,11 @@ mod tls;
 use tls::load_tls_acceptor;
 use tokio_rustls::TlsAcceptor;
 
+// Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait
+trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + ?Sized> AsyncStream for T {}
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // load config (example path)
@@ -144,7 +149,7 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
-async fn process_stream(stream: Box<dyn tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     {
