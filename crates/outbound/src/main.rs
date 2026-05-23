@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let base = PathBuf::from(mail_root);
     let maildrop_dir = base.join("outbound").join("maildrop");
     let queue_dir = maildrop_dir.join("queue");
-    let inflight_dir = base.join("outbound").join("inflight");
+    let inflight_dir = maildrop_dir.join("inflight");
     let sent_dir = base.join("outbound").join("sent");
     let failed_dir = base.join("outbound").join("failed");
 
@@ -43,71 +43,36 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Using on-disk outbound queue: {}", queue_dir.display());
     loop {
-        // Collect candidate .eml files with optional control JSON
-        let mut candidates: Vec<(PathBuf, Option<PathBuf>, i64, i32, u32, u32, Option<i64>)> = Vec::new();
-        let mut entries = tokio::fs::read_dir(&queue_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let p = entry.path();
-            if !p.is_file() { continue; }
-            // only consider .eml files
-            if p.extension().and_then(|e| e.to_str()).unwrap_or("") != "eml" { continue; }
-            let jsonp = p.with_extension("json");
-            // read control if present
-            let control = if tokio::fs::metadata(&jsonp).await.is_ok() {
-                match tokio::fs::read_to_string(&jsonp).await {
-                    Ok(s) => match serde_json::from_str::<rmail_common::outbound::QueueControl>(&s) {
-                        Ok(c) => c,
-                        Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
-                    },
-                    Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
-                }
-            } else {
-                rmail_common::outbound::QueueControl::default_with_timestamp(0)
-            };
-            let created_at = if control.created_at != 0 { control.created_at } else {
-                match tokio::fs::metadata(&p).await.and_then(|m| m.modified()) {
-                    Ok(t) => t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
-                    Err(_) => 0,
-                }
-            };
-            candidates.push((p, if tokio::fs::metadata(&jsonp).await.is_ok() { Some(jsonp) } else { None }, created_at, control.priority, control.attempts, control.max_attempts, control.next_try));
-        }
+        // Try to claim an eligible message using the shared queue-manager library (blocking fs ops)
+        let claim_res = tokio::task::spawn_blocking({
+            let md = maildrop_dir.clone();
+            move || rmail_queue_manager::claim_one(&md)
+        }).await;
 
-        // filter and sort by priority desc, next_try asc, created_at asc
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
-        candidates.retain(|c| if let Some(nt) = c.6 { nt <= now } else { true });
-        candidates.sort_by(|a, b| {
-            let pa = a.3;
-            let pb = b.3;
-            pb.cmp(&pa)
-                .then_with(|| a.6.unwrap_or(0).cmp(&b.6.unwrap_or(0)))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-
-        if candidates.is_empty() {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            continue;
-        }
-
-        // Claim the first candidate
-        let (eml_path, json_path_opt, _created_at, _priority, _attempts, _max_attempts, _next_try) = candidates.remove(0);
-        let fname = eml_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-        let inflight_eml = inflight_dir.join(&fname);
-        if let Err(e) = tokio::fs::rename(&eml_path, &inflight_eml).await {
-            eprintln!("claim rename failed for {}: {}", fname, e);
-            continue;
-        }
-        let inflight_json = inflight_eml.with_extension("json");
-        if let Some(jp) = &json_path_opt {
-            if let Err(e) = tokio::fs::rename(jp, &inflight_json).await {
-                eprintln!("failed to move control json to inflight for {}: {}", fname, e);
+        let claimed = match claim_res {
+            Ok(Ok(Some((inflight_eml, inflight_json)))) => Some((inflight_eml, inflight_json)),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
+                eprintln!("queue-manager claim_one failed: {}", e);
+                None
             }
-        } else {
-            let control = rmail_common::outbound::QueueControl::new(5, 0);
-            let _ = tokio::fs::write(&inflight_json, serde_json::to_string(&control)?).await;
-        }
+            Err(e) => {
+                eprintln!("claim task join failed: {}", e);
+                None
+            }
+        };
 
-        // increment attempts in inflight control
+        let (inflight_eml, inflight_json) = match claimed {
+            Some((e, j)) => (e, j),
+            None => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let fname = inflight_eml.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+
+        // read control JSON from inflight and increment attempts
         let mut control: rmail_common::outbound::QueueControl = match tokio::fs::read_to_string(&inflight_json).await {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| rmail_common::outbound::QueueControl::default_with_timestamp(0)),
             Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
@@ -140,10 +105,10 @@ async fn main() -> anyhow::Result<()> {
                     let _ = tokio::fs::write(&failed_json, serde_json::to_string(&c)?).await;
                 }
             } else {
-                // exponential backoff
-                let base: u64 = 60;
-                let backoff = base.saturating_mul(2u64.pow((control.attempts.saturating_sub(1)) as u32));
-                let next_try = now + backoff as i64;
+                // exponential backoff using shared helper
+                let backoff = rmail_queue_manager::next_backoff_seconds(control.attempts);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+                let next_try = now + backoff;
                 control.next_try = Some(next_try);
                 control.last_error = Some(err.clone());
                 let queue_eml = queue_dir.join(&fname);

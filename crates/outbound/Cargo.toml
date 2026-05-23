@@ -7,6 +7,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 rmail_common = { path = "../common" }
+rmail_queue_manager = { path = "../queue-manager" }
 tracing = "0.1"
 trust-dns-resolver = { version = "0.22", features = ["tokio"] }
 tokio-native-tls = "0.3"
