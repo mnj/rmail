@@ -233,6 +233,13 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
             let mech = parts.get(1).map(|s| s.to_ascii_uppercase()).unwrap_or_default();
             let initial = parts.get(2).map(|s| *s);
+            // Require encryption (implicit SMTPS or STARTTLS) for authentication in production
+            if tls_acceptor.is_some() {
+                let w = reader.get_mut();
+                w.write_all(b"538 Encryption required for authentication\r\n").await?;
+                w.flush().await?;
+                continue;
+            }
             if mech == "PLAIN" {
                 if let Some(b64) = initial {
                     match base64::decode(b64) {
