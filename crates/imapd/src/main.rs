@@ -93,7 +93,7 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<
         let acceptor = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, false).await {
                 eprintln!("IMAP client error: {}", e);
             }
         });
@@ -111,7 +111,7 @@ async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: S
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, None, db_clone).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_clone, true).await {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -130,7 +130,10 @@ fn unquote(s: &str) -> &str {
     }
 }
 
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+// session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
+// and after a successful STARTTLS). Enforcing authentication methods (like LOGIN) only on
+// encrypted sessions prevents accidental credential disclosure over plain-text.
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, session_encrypted: bool) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();
@@ -154,6 +157,13 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
         let args = parts.next().unwrap_or("");
         match cmd.as_str() {
             "LOGIN" => {
+                // Require an encrypted session for LOGIN to avoid sending cleartext passwords
+                if !session_encrypted {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Encryption required for authentication\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                    continue;
+                }
                 // LOGIN requires two args: user and password. Clients may quote them.
                 let mut a = args.trim().splitn(2, ' ');
                 let user_raw = a.next().unwrap_or("");
@@ -325,10 +335,11 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 w.flush().await?;
                 // perform TLS handshake and continue inside TLS context
                 let inner = reader.into_inner();
-                match tls_acceptor.unwrap().accept(inner).await {
+                match tls_acceptor.clone().unwrap().accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mailbox_map, mail_root, None, db_path.clone()));
+                        // Pass the same tls_acceptor along and mark the session as encrypted.
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, tls_acceptor.clone(), db_path.clone(), true));
                         return fut.await;
                     },
                     Err(e) => {
