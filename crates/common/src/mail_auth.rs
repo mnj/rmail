@@ -186,24 +186,9 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
                     if let Some(pos) = rec.iter().position(|&b| b == b':') {
                         let name = String::from_utf8_lossy(&rec[..pos]).to_string();
                         if name.eq_ignore_ascii_case("DKIM-Signature") {
-                            // remove the b= value (best-effort)
-                            let s = String::from_utf8_lossy(rec).to_string();
-                            if let Some(bpos) = s.rfind("b=") {
-                                // find end of b value (semicolon or end)
-                                let after = &s[bpos+2..];
-                                if let Some(semi) = after.find(';') {
-                                    let new_hdr = format!("{}b={};", &s[..bpos+2], &after[semi..]);
-                                    dkim_header_bytes = Some(new_hdr.into_bytes());
-                                } else {
-                                    // no semicolon, trim until CRLF
-                                    let up_to = s.trim_end_matches('\r').trim_end_matches('\n').to_string();
-                                    let base = &s[..bpos+2];
-                                    let new_hdr = format!("{}", base);
-                                    dkim_header_bytes = Some(new_hdr.into_bytes());
-                                }
-                            } else {
-                                dkim_header_bytes = Some(rec.clone());
-                            }
+                            // remove the b= value robustly by parsing semicolon-separated tags
+                            let new_hdr = remove_b_from_dkim_header(rec);
+                            dkim_header_bytes = Some(new_hdr);
                             break;
                         }
                     }
@@ -668,6 +653,27 @@ fn canonicalize_header_relaxed(rec: &[u8]) -> Vec<u8> {
     } else {
         rec.to_vec()
     }
+}
+
+fn remove_b_from_dkim_header(rec: &[u8]) -> Vec<u8> {
+    // Produce a DKIM-Signature header bytes with the b= tag emptied (best-effort).
+    // This parses semicolon-separated tag=value pairs and zeroes the b= value.
+    let s = String::from_utf8_lossy(rec).to_string();
+    if let Some(colon) = s.find(':') {
+        let name = &s[..colon];
+        let val = s[colon+1..].trim_end_matches('\r').trim_end_matches('\n').to_string();
+        // split into parts on ';'
+        let mut parts: Vec<String> = val.split(';').map(|p| p.to_string()).collect();
+        for part in parts.iter_mut() {
+            if part.trim_start().starts_with("b=") {
+                *part = "b=".to_string();
+            }
+        }
+        let new_val = parts.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("; ");
+        let new_hdr = format!("{}: {}\r\n", name, new_val);
+        return new_hdr.into_bytes();
+    }
+    rec.to_vec()
 }
 
 #[cfg(test)]
