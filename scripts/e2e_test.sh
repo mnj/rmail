@@ -16,12 +16,12 @@ trap cleanup EXIT
 # ensure a clean maildir
 rm -rf mail_test
 
-# start services
-cargo run -p rmail_smtpd > /tmp/rmail_smtpd.log 2>&1 & echo $! > /tmp/rmail_smtpd.pid
-sleep 0.5
-cargo run -p rmail_imapd > /tmp/rmail_imapd.log 2>&1 & echo $! > /tmp/rmail_imapd.pid
-sleep 0.5
-cargo run -p rmail_web > /tmp/rmail_web.log 2>&1 & echo $! > /tmp/rmail_web.pid
+# start services using prebuilt binaries to avoid compile delays
+./target/debug/rmail_smtpd > /tmp/rmail_smtpd.log 2>&1 & echo $! > /tmp/rmail_smtpd.pid
+sleep 1
+./target/debug/rmail_imapd > /tmp/rmail_imapd.log 2>&1 & echo $! > /tmp/rmail_imapd.pid
+sleep 1
+./target/debug/rmail_web > /tmp/rmail_web.log 2>&1 & echo $! > /tmp/rmail_web.pid
 sleep 1
 
 # send a test message
