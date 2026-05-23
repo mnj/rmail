@@ -339,10 +339,12 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                     Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
                 };
 
-                // match TLSA records using helper
-                if !tlsa::match_tlsa_records(&tlsa_records, &cert_der, &spki_der) {
+                // match TLSA records using helper (return matched usages so policy can be logged/applied)
+                let matched = tlsa::match_tlsa_usages(&tlsa_records, &cert_der, &spki_der);
+                if matched.is_empty() {
                     return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", selected_host));
                 }
+                eprintln!("DANE/TLSA matched usages {:?} for {}", matched, selected_host);
             }
         }
 
@@ -431,9 +433,11 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                                 Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
                             };
 
-                            if !tlsa::match_tlsa_records(&tlsa_records, &cert_der, &spki_der) {
+                            let matched = tlsa::match_tlsa_usages(&tlsa_records, &cert_der, &spki_der);
+                            if matched.is_empty() {
                                 return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", host));
                             }
+                            eprintln!("DANE/TLSA matched usages {:?} for {}", matched, host);
                         }
                     }
 
