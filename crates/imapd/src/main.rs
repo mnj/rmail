@@ -9,9 +9,10 @@ mod tls;
 use tls::load_tls_acceptor;
 use tokio_rustls::TlsAcceptor;
 
-// Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait
-trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + ?Sized> AsyncStream for T {}
+// Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
+// so that boxed trait objects can be used with tokio::io::BufReader.
+trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
 
 
 #[tokio::main]
