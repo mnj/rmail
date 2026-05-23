@@ -1,7 +1,15 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
-use crate::config::Mailbox;
+// Mailbox representation used by DB APIs
+#[derive(Debug, Clone)]
+pub struct Mailbox {
+    pub address: String,
+    pub password_hash: Option<String>,
+    pub maildir: Option<String>,
+    pub scram: Option<String>,
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json;
 

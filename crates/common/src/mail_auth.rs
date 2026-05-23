@@ -1,7 +1,8 @@
 use anyhow::Result;
 use std::net::IpAddr;
 use sha2::{Sha256, Digest};
-use base64;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use trust_dns_resolver::Resolver;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use ipnet::IpNet;
@@ -172,7 +173,7 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             let mut hasher = Sha256::new();
             hasher.update(&body_to_hash);
             let digest = hasher.finalize();
-            let computed = base64::engine::general_purpose::STANDARD.encode(digest);
+            let computed = BASE64.encode(digest);
             if computed.trim_end_matches('\n') != bh_val.trim() {
                 // body hash mismatch for this signature; mark that we tried and continue to next signature
                 tried_any = true;
@@ -251,7 +252,7 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             }
             if pubkey_b64.is_none() { tried_any = true; continue; }
             let pubkey_b64 = pubkey_b64.unwrap();
-            let pubkey_der = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
+            let pubkey_der = match BASE64.decode(pubkey_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
 
             // try to build PKey from DER, falling back to PEM wrapper
             let pkey = PKey::public_key_from_der(&pubkey_der).or_else(|_| {
@@ -260,7 +261,7 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             });
             let pkey = match pkey { Ok(pk) => pk, Err(_) => { tried_any = true; continue; } };
 
-            let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(sig_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
+            let sig_bytes = match BASE64.decode(sig_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
 
             // verify signature (rsa-sha256)
             let mut verifier = match Verifier::new(MessageDigest::sha256(), &pkey) { Ok(v) => v, Err(_) => { tried_any = true; continue; } };
