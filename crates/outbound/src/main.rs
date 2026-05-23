@@ -311,6 +311,99 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
             let (code2, _helor) = read_response(&mut reader).await?;
             if code2 >= 400 { return Err(anyhow::anyhow!("HELO failed after STARTTLS: {}", code2)); }
         }
+    } else {
+        // No STARTTLS: optionally attempt implicit TLS on port 465 if configured
+        let try_implicit = std::env::var("RMAIL_TRY_IMPLICIT_TLS").map(|v| {
+            let v = v.to_ascii_lowercase();
+            !(v == "0" || v == "false")
+        }).unwrap_or(true);
+
+        if try_implicit {
+            // close the plain connection and attempt TLS on port 465
+            let host = selected_host.clone();
+            match tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(format!("{}:465", host))).await {
+                Ok(Ok(tcp)) => {
+                    // perform optional DANE/TLSA verification for port 465
+                    let enable_dane = std::env::var("RMAIL_ENABLE_DANE").map(|v| { let v = v.to_ascii_lowercase(); !(v == "0" || v == "false") }).unwrap_or(false);
+                    if enable_dane {
+                        let port: u16 = 465;
+                        let tlsa_name = format!("_{}._tcp.{}", port, host);
+                        let mut tlsa_records: Vec<tlsa::TlsaRecord> = Vec::new();
+                        match resolver.lookup(tlsa_name.as_str(), RecordType::TLSA).await {
+                            Ok(lookup) => {
+                                for record in lookup.record_iter() {
+                                    if let Some(rdata) = record.data() {
+                                        use trust_dns_resolver::proto::rr::RData;
+                                        match rdata {
+                                            RData::TLSA(t) => {
+                                                let usage: u8 = t.cert_usage().into();
+                                                let selector: u8 = t.selector().into();
+                                                let mtype: u8 = t.matching().into();
+                                                let data = t.cert_data().to_vec();
+                                                tlsa_records.push(tlsa::TlsaRecord { usage, selector, mtype, data });
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => { eprintln!("TLSA lookup failed for {}: {}", tlsa_name, e); }
+                        }
+
+                        if !tlsa_records.is_empty() {
+                            let host_clone = host.clone();
+                            let addr = format!("{}:{}", host_clone, port);
+                            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+                                let tcp = std::net::TcpStream::connect(addr)?;
+                                tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                                tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+                                let mut b = SslConnector::builder(SslMethod::tls())?;
+                                b.set_verify(SslVerifyMode::NONE);
+                                let conn = b.build();
+                                let ssl_stream = conn.connect(host_clone.as_str(), tcp)?;
+                                let cert = ssl_stream.ssl().peer_certificate().ok_or_else(|| anyhow::anyhow!("no peer certificate"))?;
+                                let cert_der = cert.to_der()?;
+                                let pubkey = cert.public_key()?;
+                                let spki_der = pubkey.public_key_to_der()?;
+                                Ok((cert_der, spki_der))
+                            }).await;
+
+                            let (cert_der, spki_der) = match res {
+                                Ok(Ok(v)) => v,
+                                Ok(Err(e)) => { eprintln!("DANE TLS handshake failed: {}", e); return Err(e); }
+                                Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
+                            };
+
+                            if !tlsa::match_tlsa_records(&tlsa_records, &cert_der, &spki_der) {
+                                return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", host));
+                            }
+                        }
+                    }
+
+                    // proceed with normal TLS handshake
+                    let native = NativeTlsConnector::builder().build().context("building native tls connector")?;
+                    let connector = TokioTlsConnector::from(native);
+                    let server_name = host.trim_end_matches('.');
+                    let tls_stream = connector.connect(server_name, tcp).await.context("TLS connect failed (implicit)")?;
+                    let boxed_tls: Box<dyn AsyncStream> = Box::new(tls_stream);
+                    reader = BufReader::new(boxed_tls);
+
+                    // Read banner over TLS
+                    let (code, _banner) = read_response(&mut reader).await?;
+                    if code >= 400 { return Err(anyhow::anyhow!("remote server error on implicit TLS connect: {}", code)); }
+
+                    // EHLO over TLS
+                    let helo = format!("EHLO rmail\r\n");
+                    reader.get_mut().write_all(helo.as_bytes()).await?;
+                    reader.get_mut().flush().await?;
+                    let (code, _ehlo2) = read_response(&mut reader).await?;
+                    if code >= 400 { return Err(anyhow::anyhow!("HELO/EHLO failed after implicit TLS: {}", code)); }
+                }
+                _ => {
+                    // implicit TLS not available; continue with plain connection
+                }
+            }
+        }
     }
 
     // MAIL FROM
