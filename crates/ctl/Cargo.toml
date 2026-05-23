@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rmail_common = { path = "../common" }
+argon2 = "0.4"
+password-hash = "0.4"
+rand_core = "0.6"
+anyhow = "1.0"

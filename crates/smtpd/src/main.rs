@@ -152,6 +152,12 @@ fn extract_addr(s: &str) -> Option<String> {
 }
 
 async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: HashSet<String>, catchalls: HashMap<String, String>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
+    // Limits to protect against malformed or malicious clients
+    // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
+    // - MAX_MESSAGE_BYTES: overall DATA size cap to avoid OOM
+    const MAX_LINE_LEN: usize = 1000;
+    const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     {
@@ -159,45 +165,85 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
         w.write_all(b"220 rMail SMTPD ready\r\n").await?;
         w.flush().await?;
     }
+
+    // SMTP transaction state
     let mut rcpts: Vec<String> = Vec::new();
+    let mut mail_from: Option<String> = None;
+
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 { break; }
-        let cmd = line.trim_end().to_string();
-        let up = cmd.to_ascii_uppercase();
-        if up.starts_with("HELO") || up.starts_with("EHLO") {
+
+        // Protect against overly long lines
+        if line.len() > MAX_LINE_LEN {
             let w = reader.get_mut();
-            w.write_all(b"250 Hello\r\n").await?;
+            w.write_all(b"500 Line too long\r\n").await?;
             w.flush().await?;
+            // Skip this command and continue reading
+            continue;
+        }
+
+        // Trim CRLF safely
+        let cmd = line.trim_end_matches('\n').trim_end_matches('\r');
+        if cmd.is_empty() { continue; }
+        let up = cmd.to_ascii_uppercase();
+
+        // Simple command parsing; robust parsers can be added later.
+        if up.starts_with("HELO") || up.starts_with("EHLO") {
+            // Respond with basic capability. If TLS is available advertise STARTTLS.
+            let mut resp = String::from("250-Hello\r\n");
+            if tls_acceptor.is_some() {
+                resp.push_str("250-STARTTLS\r\n");
+            }
+            resp.push_str("250 OK\r\n");
+            let w = reader.get_mut();
+            w.write_all(resp.as_bytes()).await?;
+            w.flush().await?;
+            // reset transaction state
+            mail_from = None;
+            rcpts.clear();
         } else if up.starts_with("MAIL FROM:") {
+            // Parse MAIL FROM and set sender; on syntax error return 501
+            mail_from = extract_addr(cmd).or_else(|| {
+                if let Some(idx) = cmd.find(':') { extract_addr(&cmd[idx+1..]) } else { None }
+            });
+            if mail_from.is_none() {
+                let w = reader.get_mut();
+                w.write_all(b"501 Syntax: MAIL FROM:<address>\r\n").await?;
+                w.flush().await?;
+                continue;
+            }
+            rcpts.clear();
             let w = reader.get_mut();
             w.write_all(b"250 OK\r\n").await?;
             w.flush().await?;
-            rcpts.clear();
         } else if up.starts_with("RCPT TO:") {
-            if let Some(raw) = cmd.get(8..) {
-                if let Some(addr) = extract_addr(raw) {
-                    if allowed.contains(&addr) {
-                        rcpts.push(addr.clone());
+            // Require MAIL FROM before RCPT TO
+            if mail_from.is_none() {
+                let w = reader.get_mut();
+                w.write_all(b"503 Bad sequence of commands: MAIL required before RCPT\r\n").await?;
+                w.flush().await?;
+                continue;
+            }
+            let raw = cmd.get(8..).unwrap_or("");
+            if let Some(addr) = extract_addr(raw) {
+                if allowed.contains(&addr) {
+                    rcpts.push(addr.clone());
+                    let w = reader.get_mut();
+                    w.write_all(b"250 OK\r\n").await?;
+                    w.flush().await?;
+                } else if let Some(at) = addr.find('@') {
+                    let domain = &addr[at+1..];
+                    if let Some(target) = catchalls.get(domain) {
+                        // Deliver to catchall target
+                        rcpts.push(target.clone());
                         let w = reader.get_mut();
                         w.write_all(b"250 OK\r\n").await?;
                         w.flush().await?;
-                    } else if let Some(at) = addr.find('@') {
-                        let domain = &addr[at+1..];
-                        if let Some(target) = catchalls.get(domain) {
-                            rcpts.push(target.clone());
-                            let w = reader.get_mut();
-                            w.write_all(b"250 OK\r\n").await?;
-                            w.flush().await?;
-                        } else {
-                            let w = reader.get_mut();
-                            w.write_all(b"550 No such user\r\n").await?;
-                            w.flush().await?;
-                        }
                     } else {
                         let w = reader.get_mut();
-                        w.write_all(b"550 Bad address\r\n").await?;
+                        w.write_all(b"550 No such user\r\n").await?;
                         w.flush().await?;
                     }
                 } else {
@@ -207,10 +253,11 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
                 }
             } else {
                 let w = reader.get_mut();
-                w.write_all(b"550 Bad address\r\n").await?;
+                w.write_all(b"501 Syntax: RCPT TO:<address>\r\n").await?;
                 w.flush().await?;
             }
         } else if up.starts_with("DATA") {
+            // DATA requires recipients
             if rcpts.is_empty() {
                 let w = reader.get_mut();
                 w.write_all(b"554 No recipients\r\n").await?;
@@ -220,36 +267,70 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
             let w = reader.get_mut();
             w.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
             w.flush().await?;
-            // read data lines with dot-stuffing unescape
+
+            // Read message data with dot-stuff handling and enforce size limits
             let mut data: Vec<u8> = Vec::new();
             loop {
                 let mut dline = String::new();
                 let n = reader.read_line(&mut dline).await?;
                 if n == 0 { break; }
-                let d = if dline.ends_with('\n') { dline.trim_end_matches('\n').to_string() } else { dline.clone() };
-                let d = d.trim_end_matches('\r');
+
+                // Protect per-line length inside DATA too
+                if dline.len() > MAX_LINE_LEN {
+                    let w = reader.get_mut();
+                    w.write_all(b"500 Line too long in data\r\n").await?;
+                    w.flush().await?;
+                    data.clear();
+                    break;
+                }
+
+                // Normalize to a rust &str without trailing CR/LF
+                let mut d = dline.as_str();
+                if d.ends_with('\n') { d = &d[..d.len()-1]; }
+                if d.ends_with('\r') { d = &d[..d.len()-1]; }
+
                 if d == "." {
                     break;
                 }
-                let mut out = d.to_string();
-                if out.starts_with("..") {
-                    out.remove(0); // un-escape leading dot
-                }
+
+                // Un-dot-stuff per RFC5321: lines starting with ".." map to "."
+                let out = if d.starts_with("..") { &d[1..] } else { d };
                 data.extend_from_slice(out.as_bytes());
                 data.extend_from_slice(b"\r\n");
+
+                // Enforce overall message size to mitigate DoS
+                if data.len() > MAX_MESSAGE_BYTES {
+                    let w = reader.get_mut();
+                    w.write_all(b"552 Message size exceeds fixed maximum\r\n").await?;
+                    w.flush().await?;
+                    data.clear();
+                    break;
+                }
             }
-            for rcpt in &rcpts {
-                if let Some(at) = rcpt.find('@') {
-                    let local = &rcpt[..at];
-                    let domain = &rcpt[at+1..];
-                    let mr = PathBuf::from(&mail_root);
-                    match maildir::deliver(&mr, domain, local, &data) {
-                        Ok(path) => println!("Delivered to {} -> {:?}", rcpt, path),
-                        Err(e) => eprintln!("deliver error for {}: {}", rcpt, e),
+
+            // Attempt delivery to each recipient; errors are logged and yield temporary failure response
+            if !data.is_empty() {
+                for rcpt in &rcpts {
+                    if let Some(at) = rcpt.find('@') {
+                        let local = &rcpt[..at];
+                        let domain = &rcpt[at+1..];
+                        let mr = PathBuf::from(&mail_root);
+                        match maildir::deliver(&mr, domain, local, &data) {
+                            Ok(path) => println!("Delivered to {} -> {:?}", rcpt, path),
+                            Err(e) => {
+                                eprintln!("deliver error for {}: {}", rcpt, e);
+                                let w = reader.get_mut();
+                                w.write_all(b"451 Requested action aborted: local error in processing\r\n").await?;
+                                w.flush().await?;
+                            }
+                        }
                     }
                 }
             }
+
+            // reset transaction state after DATA
             rcpts.clear();
+            mail_from = None;
             let w = reader.get_mut();
             w.write_all(b"250 OK\r\n").await?;
             w.flush().await?;
@@ -268,7 +349,6 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
                 let inner = reader.into_inner();
                 match acceptor.accept(inner).await {
                     Ok(tls_stream) => {
-                        // enter TLS-protected processing loop (no STARTTLS inside)
                         // Box the recursive future to avoid infinitely-sized future from recursion
                         let fut = Box::pin(process_stream(Box::new(tls_stream), allowed, catchalls, mail_root, None));
                         return fut.await;
