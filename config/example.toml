@@ -19,3 +19,6 @@ db_path = "config/rmail.db"
 # directory used to serve ACME http-01 challenges (used by automated cert managers)
 acme_challenge_dir = "config/acme-challenges"
 
+# Experimental: enable DANE/TLSA verification for outbound deliveries via environment variable
+# RMAIL_ENABLE_DANE=1  (set to 0 or false to disable)
+
