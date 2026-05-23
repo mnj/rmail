@@ -221,6 +221,9 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
+// session_encrypted indicates whether the current TCP stream is protected by TLS (true for SMTPS and after a successful STARTTLS upgrade).
+// This allows the server to enforce that authentication mechanisms which transmit secrets
+// (such as AUTH PLAIN or LOGIN) are only accepted on encrypted sessions.
 async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
@@ -880,6 +883,10 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
         } else if up.starts_with("STARTTLS") {
             // if we have an acceptor available, perform TLS handshake and continue inside TLS
             if let Some(acceptor) = tls_acceptor {
+                // Signal readiness and pause plain-text protocol processing while the TLS handshake occurs.
+                // After a successful accept, control is transferred to a new process_stream invocation
+                // running over the negotiated TLS stream with session_encrypted=true to indicate
+                // that authentication is permitted and traffic is protected.
                 let w = reader.get_mut();
                 w.write_all(b"220 Ready to start TLS\r\n").await?;
                 w.flush().await?;
@@ -897,7 +904,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         return Err(anyhow::anyhow!("TLS accept error: {}", e));
                     }
                 }
-            } else {
+            } else {   
                 let w = reader.get_mut();
                 w.write_all(b"454 TLS not available\r\n").await?;
                 w.flush().await?;
