@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rmail_common::config::Mailbox;
+use rmail_common::db::Mailbox;
 use rmail_common::{auth, maildir, config::Config, db as rmail_db};
 use std::{sync::{Arc, Mutex}, collections::HashMap, net::{IpAddr, SocketAddr}};
 use std::time::{Instant, Duration};
