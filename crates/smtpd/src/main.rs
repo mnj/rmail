@@ -70,8 +70,9 @@ async fn handle_client(
                 w.write_all(b"250 OK\r\n").await?;
             } else if let Some(at) = addr_l.find('@') {
                 let domain = &addr_l[at + 1..];
-                if catchalls.contains_key(domain) {
-                    rcpts.push(addr.to_string());
+                if let Some(target) = catchalls.get(domain) {
+                    // redirect to the configured catchall target
+                    rcpts.push(target.clone());
                     w.write_all(b"250 OK\r\n").await?;
                 } else {
                     w.write_all(b"550 No such user\r\n").await?;
