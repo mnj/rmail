@@ -6,6 +6,7 @@ smtps_port = 465
 submission_port = 587
 imaps_port = 993
 imap_port = 143
+web_port = 8080
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "info"

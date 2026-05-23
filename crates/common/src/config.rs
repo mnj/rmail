@@ -11,6 +11,7 @@ pub struct Global {
     pub submission_port: Option<u16>,
     pub imaps_port: Option<u16>,
     pub imap_port: Option<u16>,
+    pub web_port: Option<u16>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub log_level: Option<String>,

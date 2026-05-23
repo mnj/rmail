@@ -4,4 +4,5 @@ members = [
   "crates/smtpd",
   "crates/imapd",
   "crates/ctl",
+  "crates/webui",
 ]
