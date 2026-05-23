@@ -75,7 +75,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
 // --- on-disk queue helper functions (synchronous) ---
 fn spool_dirs(base: &PathBuf) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let base = base.join("outbound");
-    (base.join("queue"), base.join("inflight"), base.join("sent"), base.join("failed"))
+    (base.join("maildrop").join("queue"), base.join("inflight"), base.join("sent"), base.join("failed"))
 }
 
 fn read_queue_entries(dir: &PathBuf) -> Result<Vec<serde_json::Value>> {
@@ -530,7 +530,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                     match tokio::task::spawn_blocking(move || {
                         let (queue, _i, _s, _f) = spool_dirs(&mr_clone);
                         match read_queue_entries(&queue) {
-                            Ok(list) => serde_json::to_string(&serde_json::json!({"queued": list})),
+                            Ok(list) => serde_json::to_string(&serde_json::json!({"queued": list})).map_err(|e| anyhow::anyhow!(e)),
                             Err(e) => Err(anyhow::anyhow!(format!("read error: {}", e)))
                         }
                     }).await {

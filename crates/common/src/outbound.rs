@@ -22,10 +22,10 @@ impl QueueControl {
     pub fn default_with_timestamp(ts: i64) -> Self { QueueControl { attempts: 0, max_attempts: 5, priority: 0, next_try: None, last_error: None, created_at: ts } }
 }
 
-/// Simple outbound queue: writes email files into <mail_root>/outbound/queue with an atomic tmp->final move.
+/// Simple outbound queue: writes email files into <mail_root>/outbound/maildrop/queue with an atomic tmp->final move.
 /// This is intentionally minimal — a more complete MTA would implement retry/backoff, SMTP delivery workers, and per-domain queuing.
 pub fn queue_outbound(maildir_root: &Path, recipient: &str, data: &[u8], envelope_from: Option<&str>) -> anyhow::Result<PathBuf> {
-    let outbound_dir = maildir_root.join("outbound");
+    let outbound_dir = maildir_root.join("outbound").join("maildrop");
     let tmp_dir = outbound_dir.join("tmp");
     let queue_dir = outbound_dir.join("queue");
     fs::create_dir_all(&tmp_dir)?;

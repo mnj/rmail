@@ -5,6 +5,8 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::fs;
 use std::io::{self, Write};
+use rmail_common::config::Config;
+use rmail_common::db;
 
 /// rmail_queuectl: inspect and manage the on-disk outbound queue (queue/inflight/sent/failed)
 #[derive(Parser)]
@@ -72,6 +74,28 @@ enum Commands {
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
     },
+    /// Manage alias mappings (requires configured DB)
+    Alias {
+        #[command(subcommand)]
+        action: AliasAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AliasAction {
+    /// Add an alias mapping: address -> target1 target2 ...
+    Add {
+        /// address to alias (e.g., user@example.com)
+        address: String,
+        /// one or more target addresses
+        targets: Vec<String>,
+    },
+    /// Remove an alias mapping for address
+    Remove {
+        address: String,
+    },
+    /// List all aliases
+    List {},
 }
 
 fn main() -> Result<()> {
@@ -88,13 +112,51 @@ fn main() -> Result<()> {
         Some(Commands::Requeue { name, pattern, yes }) => cmd_requeue(&root, name.as_deref(), pattern.as_deref(), yes)?,
         Some(Commands::Promote { name, pattern, priority, yes }) => cmd_promote(&root, name.as_deref(), pattern.as_deref(), priority, yes)?,
         Some(Commands::Delete { name, pattern, yes }) => cmd_delete(&root, name.as_deref(), pattern.as_deref(), yes)?,
+        Some(Commands::Alias { action }) => match action {
+            AliasAction::Add { address, targets } => cmd_alias_add(&root, &address, &targets)?,
+            AliasAction::Remove { address } => cmd_alias_remove(&root, &address)?,
+            AliasAction::List {} => cmd_alias_list(&root)?,
+        },
+    }
+    Ok(())
+}
+
+fn cmd_alias_add(root: &PathBuf, address: &str, targets: &Vec<String>) -> Result<()> {
+    // Use RMAIL_CONFIG or fall back to config/example.toml
+    let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg = Config::from_file(&cfg_path)?;
+    let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
+    let addr_lc = address.to_ascii_lowercase();
+    let tgt_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
+    db::add_alias(&dbp, &addr_lc, &tgt_refs)?;
+    println!("Added alias {} -> {:?}", address, targets);
+    Ok(())
+}
+
+fn cmd_alias_remove(root: &PathBuf, address: &str) -> Result<()> {
+    let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg = Config::from_file(&cfg_path)?;
+    let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
+    let addr_lc = address.to_ascii_lowercase();
+    db::remove_alias(&dbp, &addr_lc)?;
+    println!("Removed alias {}", address);
+    Ok(())
+}
+
+fn cmd_alias_list(root: &PathBuf) -> Result<()> {
+    let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg = Config::from_file(&cfg_path)?;
+    let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
+    let aliases = db::list_aliases(&dbp)?;
+    for (addr, targets) in aliases {
+        println!("{} -> {}", addr, targets.join(", "));
     }
     Ok(())
 }
 
 fn spool_dirs(base: &PathBuf) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let base = base.join("outbound");
-    (base.join("queue"), base.join("inflight"), base.join("sent"), base.join("failed"))
+    (base.join("maildrop").join("queue"), base.join("inflight"), base.join("sent"), base.join("failed"))
 }
 
 fn read_entries(dir: &PathBuf) -> Result<Vec<(String, Option<QueueControl>)>> {
@@ -245,7 +307,7 @@ fn cmd_list(root: &PathBuf, as_json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Outbound queue root: {}", root.join("outbound").display());
+    println!("Outbound queue root: {}", root.join("outbound").join("maildrop").display());
     println!("summary: queued={}, inflight={}, sent={}, failed={}", q.len(), i.len(), s.len(), f.len());
     if !q.is_empty() {
         println!("\nTop queued items:");
@@ -269,7 +331,7 @@ fn cmd_show(root: &PathBuf, name: &str, body_lines: usize) -> Result<()> {
         let header = &s[..split];
         let body = &s[split..];
         println!("Message: {}\n", eml.display());
-        println!("== Headers ==\n{}");
+        println!("== Headers ==");
         println!("{}", header);
         println!("== Body (first {} lines) ==", body_lines);
         for (i, line) in body.lines().take(body_lines).enumerate() {
@@ -321,10 +383,10 @@ fn cmd_requeue(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: b
     }
     if let Some(pat) = pattern {
         let matches = find_messages_matching(root, pat)?;
-        if matches.is_empty() { println!("No matches for pattern {}"); return Ok(()); }
+        if matches.is_empty() { println!("No matches for pattern {}", pat); return Ok(()); }
         println!("Found {} matches for pattern {}", matches.len(), pat);
         for (spool, eml, jsonp, fname) in matches {
-            if !confirm(&format!("Requeue {} from {}?", fname, spool), yes) { println!("skipping {}"); continue; }
+            if !confirm(&format!("Requeue {} from {}?", fname, spool), yes) { println!("skipping {}", fname); continue; }
             requeue_single(&spool, &eml, &jsonp, root)?;
         }
         return Ok(());
@@ -349,10 +411,10 @@ fn cmd_promote(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, priori
     }
     if let Some(pat) = pattern {
         let matches = find_messages_matching(root, pat)?;
-        if matches.is_empty() { println!("No matches for pattern {}"); return Ok(()); }
+        if matches.is_empty() { println!("No matches for pattern {}", pat); return Ok(()); }
         println!("Found {} matches for pattern {}", matches.len(), pat);
         for (spool, eml, jsonp, fname) in matches {
-            if !confirm(&format!("Promote {} from {} to priority {}?", fname, spool, priority), yes) { println!("skipping {}"); continue; }
+            if !confirm(&format!("Promote {} from {} to priority {}?", fname, spool, priority), yes) { println!("skipping {}", fname); continue; }
             let (queue, _i, _s, _f) = spool_dirs(root);
             let (_dst_eml, dst_json) = if spool == "queue" { (eml.clone(), jsonp.clone()) } else { move_with_json(&eml, &queue, &jsonp)? };
             let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
@@ -384,11 +446,11 @@ fn cmd_delete(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: bo
     }
     if let Some(pat) = pattern {
         let matches = find_messages_matching(root, pat)?;
-        if matches.is_empty() { println!("No matches for pattern {}"); return Ok(()); }
+        if matches.is_empty() { println!("No matches for pattern {}", pat); return Ok(()); }
         println!("Found {} matches for pattern {}", matches.len(), pat);
         for (spool, eml, jsonp, fname) in matches {
-            if !confirm(&format!("Delete {} from {}? (move to failed)", fname, spool), yes) { println!("skipping {}"); continue; }
-            let (_dst_eml, dst_json) = move_with_json(&eml, &spool.iter().map(|s| PathBuf::from(s)).collect::<Vec<_>>()[0], &jsonp).ok().unwrap_or((eml.clone(), jsonp.clone()));
+            if !confirm(&format!("Delete {} from {}? (move to failed)", fname, spool), yes) { println!("skipping {}", fname); continue; }
+            let (_dst_eml, dst_json) = (eml.clone(), jsonp.clone());
             // move_with_json above is a bit awkward for batch; simpler: move to failed directly
             let (_q, _i, _s, failed) = spool_dirs(root);
             let (_dst_eml2, dst_json2) = move_with_json(&eml, &failed, &jsonp)?;

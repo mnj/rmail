@@ -31,6 +31,11 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             domain TEXT PRIMARY KEY,
             target TEXT
         );
+        CREATE TABLE IF NOT EXISTS aliases (
+            address TEXT PRIMARY KEY,
+            targets TEXT NOT NULL,
+            created_at INTEGER
+        );
         CREATE TABLE IF NOT EXISTS uid_sequences (
             address TEXT PRIMARY KEY,
             last_uid INTEGER
@@ -172,6 +177,48 @@ pub fn set_catchall<P: AsRef<Path>>(path: P, domain: &str, target: &str) -> Resu
     let conn = Connection::open(path)?;
     conn.execute("INSERT OR REPLACE INTO catchalls (domain, target) VALUES (?1, ?2)", params![domain, target])?;
     Ok(())
+}
+
+/// Add or update an alias mapping. Targets is a JSON array of address strings (may include remote addresses).
+pub fn add_alias<P: AsRef<Path>>(path: P, address: &str, targets: &[&str]) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let targets_json = serde_json::to_string(targets)?;
+    conn.execute("INSERT OR REPLACE INTO aliases (address, targets, created_at) VALUES (?1, ?2, strftime('%s','now'))", params![address, targets_json])?;
+    Ok(())
+}
+
+/// Get alias targets for an exact address, or None if no alias exists.
+pub fn get_alias_targets<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Vec<String>>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT targets FROM aliases WHERE address = ?1")?;
+    let mut rows = stmt.query(params![address])?;
+    if let Some(row) = rows.next()? {
+        let targets_json: String = row.get(0)?;
+        let v: Vec<String> = serde_json::from_str(&targets_json).unwrap_or_default();
+        Ok(Some(v))
+    } else { Ok(None) }
+}
+
+/// Remove an alias mapping
+pub fn remove_alias<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute("DELETE FROM aliases WHERE address = ?1", params![address])?;
+    Ok(())
+}
+
+/// List aliases
+pub fn list_aliases<P: AsRef<Path>>(path: P) -> Result<Vec<(String, Vec<String>)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT address, targets FROM aliases ORDER BY address")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let addr: String = row.get(0)?;
+        let targets_json: String = row.get(1)?;
+        let targets: Vec<String> = serde_json::from_str(&targets_json).unwrap_or_default();
+        out.push((addr, targets));
+    }
+    Ok(out)
 }
 
 /// Allocate the next UID for a mailbox (atomic within a transaction)

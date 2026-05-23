@@ -3,6 +3,7 @@
 pub mod config;
 pub mod maildir;
 pub mod outbound;
+pub mod transport;
 pub mod auth;
 pub mod mail_auth;
 pub mod db;

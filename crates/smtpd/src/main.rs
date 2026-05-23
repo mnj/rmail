@@ -711,42 +711,78 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         Ok(Ok(false)) => {
                             if let Some(at) = addr.find('@') {
                                 let domain = addr[at+1..].to_string();
-                                let dbp3 = dbp.clone();
-                                match tokio::task::spawn_blocking(move || rmail_common::db::get_catchall(dbp3, &domain)).await {
-                                    Ok(Ok(Some(target))) => {
-                                        if rcpts.len() >= MAX_RCPT {
-                                            let w = reader.get_mut();
-                                            w.write_all(b"452 Too many recipients\r\n").await?;
-                                            w.flush().await?;
-                                        } else {
-                                            rcpts.push(target.clone());
-                                            let w = reader.get_mut();
-                                            w.write_all(b"250 OK\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    }
-                                    Ok(Ok(None)) => {
-                                        // Not a local recipient and no catchall configured for domain.
-                                        // Allow relay to remote recipients only if the client has authenticated.
-                                        if authenticated_user.is_some() {
+                                // First, check for alias mappings for this exact address
+                                let dbp_alias = dbp.clone();
+                                let addr_for_alias = addr.clone();
+                                match tokio::task::spawn_blocking(move || rmail_common::db::get_alias_targets(&dbp_alias, &addr_for_alias)).await {
+                                    Ok(Ok(Some(targets))) => {
+                                        // Expand alias targets (allow forwarding even when unauthenticated)
+                                        for t in targets {
                                             if rcpts.len() >= MAX_RCPT {
                                                 let w = reader.get_mut();
                                                 w.write_all(b"452 Too many recipients\r\n").await?;
                                                 w.flush().await?;
+                                                break;
                                             } else {
-                                                rcpts.push(addr.clone());
+                                                rcpts.push(t.clone());
                                                 let w = reader.get_mut();
                                                 w.write_all(b"250 OK\r\n").await?;
                                                 w.flush().await?;
                                             }
-                                        } else {
-                                            let w = reader.get_mut();
-                                            w.write_all(b"550 No such user\r\n").await?;
-                                            w.flush().await?;
+                                        }
+                                    }
+                                    Ok(Ok(None)) => {
+                                        // No alias; fallback to catchall logic
+                                        let dbp3 = dbp.clone();
+                                        match tokio::task::spawn_blocking(move || rmail_common::db::get_catchall(dbp3, &domain)).await {
+                                            Ok(Ok(Some(target))) => {
+                                                if rcpts.len() >= MAX_RCPT {
+                                                    let w = reader.get_mut();
+                                                    w.write_all(b"452 Too many recipients\r\n").await?;
+                                                    w.flush().await?;
+                                                } else {
+                                                    rcpts.push(target.clone());
+                                                    let w = reader.get_mut();
+                                                    w.write_all(b"250 OK\r\n").await?;
+                                                    w.flush().await?;
+                                                }
+                                            }
+                                            Ok(Ok(None)) => {
+                                                // Not a local recipient and no catchall configured for domain.
+                                                // Allow relay to remote recipients only if the client has authenticated.
+                                                if authenticated_user.is_some() {
+                                                    if rcpts.len() >= MAX_RCPT {
+                                                        let w = reader.get_mut();
+                                                        w.write_all(b"452 Too many recipients\r\n").await?;
+                                                        w.flush().await?;
+                                                    } else {
+                                                        rcpts.push(addr.clone());
+                                                        let w = reader.get_mut();
+                                                        w.write_all(b"250 OK\r\n").await?;
+                                                        w.flush().await?;
+                                                    }
+                                                } else {
+                                                    let w = reader.get_mut();
+                                                    w.write_all(b"550 No such user\r\n").await?;
+                                                    w.flush().await?;
+                                                }
+                                            }
+                                            Ok(Err(e)) => {
+                                                eprintln!("db get_catchall error: {}", e);
+                                                let w = reader.get_mut();
+                                                w.write_all(b"451 Temporary error\r\n").await?;
+                                                w.flush().await?;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("db task join error: {}", e);
+                                                let w = reader.get_mut();
+                                                w.write_all(b"451 Temporary error\r\n").await?;
+                                                w.flush().await?;
+                                            }
                                         }
                                     }
                                     Ok(Err(e)) => {
-                                        eprintln!("db get_catchall error: {}", e);
+                                        eprintln!("db get_alias_targets error: {}", e);
                                         let w = reader.get_mut();
                                         w.write_all(b"451 Temporary error\r\n").await?;
                                         w.flush().await?;
