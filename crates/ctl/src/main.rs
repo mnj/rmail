@@ -3,6 +3,7 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use rmail_common::{config::Config, maildir};
 use argon2::{Argon2, password_hash::{SaltString, PasswordHasher}};
 use rand::rngs::OsRng;
