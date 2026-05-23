@@ -68,6 +68,21 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Renew certificates via certbot and reload services
+    Renew {
+        /// Use LetsEncrypt staging endpoint for testing
+        #[arg(long)]
+        staging: bool,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Aggregate and enqueue DMARC RUA reports for unreported events in the DB
+    SendDmarcReports {
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -146,6 +161,93 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::SendDmarcReports { config } => {
+            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let cfg = Config::from_file(&cfg_path)?;
+            let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
+            let domains = rmail_common::db::get_unreported_dmarc_domains(&dbp)?;
+            if domains.is_empty() {
+                println!("No unreported DMARC events");
+            } else {
+                for domain in domains {
+                    let events = rmail_common::db::fetch_unreported_dmarc_events_for_domain(&dbp, &domain)?;
+                    if events.is_empty() { continue; }
+                    // Build a simple aggregate XML report
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                    let begin = events.first().map(|e| e.7).unwrap_or(now - 86400);
+                    let end = events.last().map(|e| e.7).unwrap_or(now);
+                    let report_id = format!("rmail-{}-{}", domain, now);
+                    let org_name = "rMail";
+                    let org_email = "dmarc-reports@localhost";
+                    let policy = rmail_common::mail_auth::get_dmarc_policy(&domain).unwrap_or(None).unwrap_or_else(|| "none".to_string());
+
+                    let mut records = String::new();
+                    for ev in events.iter() {
+                        // ev: (id, header_from, envelope_from, source_ip, dkim, spf, dmarc, created_at)
+                        let source_ip = ev.3.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+                        let header_from = ev.1.clone().unwrap_or_else(|| domain.clone());
+                        let dkim_res = ev.4.clone().unwrap_or_else(|| "none".to_string());
+                        let spf_res = ev.5.clone().unwrap_or_else(|| "none".to_string());
+                        let disposition = ev.6.clone().unwrap_or_else(|| "none".to_string());
+                        records.push_str(&format!(r#"  <record>
+    <row>
+      <source_ip>{}</source_ip>
+      <count>1</count>
+      <policy_evaluated>
+        <disposition>{}</disposition>
+        <dkim>{}</dkim>
+        <spf>{}</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>{}</header_from>
+    </identifiers>
+  </record>
+"#, source_ip, disposition, dkim_res, spf_res, header_from));
+                    }
+
+                    let xml = format!(r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<feedback>
+  <report_metadata>
+    <org_name>{}</org_name>
+    <email>{}</email>
+    <report_id>{}</report_id>
+    <date_range>
+      <begin>{}</begin>
+      <end>{}</end>
+    </date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>{}</domain>
+    <adkim>r</adkim>
+    <aspf>r</aspf>
+    <p>{}</p>
+    <sp>{}</sp>
+    <pct>100</pct>
+  </policy_published>
+{}
+</feedback>
+"#, org_name, org_email, report_id, begin, end, domain, policy, policy, records);
+
+                    // enqueue to each rua recipient
+                    let ruas = rmail_common::mail_auth::get_dmarc_rua(&domain)?;
+                    if ruas.is_empty() {
+                        eprintln!("No rua recipients found for {}", domain);
+                        continue;
+                    }
+                    for rua in ruas.iter() {
+                        // Build a simple email with XML body
+                        let email = format!("From: {}\r\nTo: {}\r\nSubject: DMARC aggregate report for {}\r\nMIME-Version: 1.0\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n{}", org_email, rua, domain, xml);
+                        let _ = rmail_common::db::enqueue_outbound(&dbp, rua, Some(org_email), email.as_bytes())?;
+                    }
+
+                    // mark events reported
+                    let ids: Vec<i64> = events.iter().map(|e| e.0).collect();
+                    rmail_common::db::mark_dmarc_events_reported(&dbp, &ids)?;
+                    println!("Enqueued DMARC report for {} -> {} recipients", domain, ruas.len());
+                }
+            }
+        },
         Commands::ObtainCert { domains, email, staging, config } => {
             let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
             let cfg = Config::from_file(&cfg_path)?;
@@ -176,6 +278,51 @@ fn main() -> Result<()> {
             fs::copy(&fullchain, &out_cert)?;
             fs::copy(&privkey, &out_key)?;
             println!("Obtained cert for {} -> {} / {}", primary_domain, out_cert, out_key);
+        }
+        Commands::Renew { staging, config } => {
+            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let cfg = Config::from_file(&cfg_path)?;
+            println!("Running certbot renew...");
+            let mut cmd = Command::new("certbot");
+            cmd.arg("renew").arg("--non-interactive");
+            if staging { cmd.arg("--staging"); }
+            let status = cmd.status().map_err(|e| anyhow::anyhow!(format!("failed to run certbot renew: {}", e)))?;
+            if !status.success() { return Err(anyhow::anyhow!(format!("certbot renew exited with status {}", status))); }
+            // Determine primary domain to copy (prefer tls_cert filename stem)
+            let primary_domain_opt = cfg.global.tls_cert.as_ref().and_then(|p| std::path::Path::new(p).file_stem().and_then(|os| os.to_str()).map(|s| s.to_string()));
+            let primary_domain = if let Some(d) = primary_domain_opt { d } else {
+                // fallback: pick first dir under /etc/letsencrypt/live
+                let live_root = Path::new("/etc/letsencrypt/live");
+                let first = std::fs::read_dir(live_root)?.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).next().ok_or_else(|| anyhow::anyhow!("no live certs found to copy"))?;
+                first
+            };
+            let live_dir = Path::new("/etc/letsencrypt/live").join(&primary_domain);
+            let fullchain = live_dir.join("fullchain.pem");
+            let privkey = live_dir.join("privkey.pem");
+            if !fullchain.exists() || !privkey.exists() { return Err(anyhow::anyhow!(format!("expected cert files not found in {}", live_dir.display()))); }
+            let out_cert = cfg.global.tls_cert.clone().unwrap_or(format!("config/certs/{}.crt", primary_domain));
+            let out_key = cfg.global.tls_key.clone().unwrap_or(format!("config/certs/{}.key", primary_domain));
+            if let Some(parent) = Path::new(&out_cert).parent() { fs::create_dir_all(parent)?; }
+            if let Some(parent) = Path::new(&out_key).parent() { fs::create_dir_all(parent)?; }
+            fs::copy(&fullchain, &out_cert)?;
+            fs::copy(&privkey, &out_key)?;
+            println!("Renewed cert for {} -> {} / {}", primary_domain, out_cert, out_key);
+            // reload services (try graceful reload then restart if reload fails)
+            let services = vec!["rmail-smtpd", "rmail-imapd", "rmail-web"];
+            for svc in services {
+                let r = Command::new("systemctl").arg("reload").arg(svc).status();
+                match r {
+                    Ok(s) if s.success() => println!("reloaded {}", svc),
+                    _ => {
+                        let r2 = Command::new("systemctl").arg("restart").arg(svc).status();
+                        match r2 {
+                            Ok(s2) if s2.success() => println!("restarted {}", svc),
+                            Ok(s2) => eprintln!("failed to reload/restart {}: exit {}", svc, s2),
+                            Err(e) => eprintln!("failed to run systemctl for {}: {}", svc, e),
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
