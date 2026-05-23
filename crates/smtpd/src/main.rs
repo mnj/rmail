@@ -125,14 +125,18 @@ async fn main() -> Result<()> {
         vec!["127.0.0.1:2525".to_string(), "[::1]:2525".to_string()]
     };
 
+    // DMARC enforcement flag
+    let enforce_dmarc = cfg.global.enforce_dmarc.unwrap_or(false);
+
     // spawn plain SMTP listeners
     for addr in listen_addrs.iter() {
         let addr = addr.clone();
         let mail_root_clone = mail_root.clone();
         let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
+        let enforce = enforce_dmarc;
         tokio::spawn(async move {
-            if let Err(e) = run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone).await {
+            if let Err(e) = run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone, enforce).await {
                 eprintln!("Listener {} failed: {}", addr, e);
             }
         });
@@ -148,8 +152,9 @@ async fn main() -> Result<()> {
             let mail_root_v4 = mail_root.clone();
             let ctx_v4 = s_ctx.clone();
             let db_v4 = db_path.clone();
+            let enforce_v4 = enforce_dmarc;
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v4, ctx_v4, mail_root_v4, db_v4).await {
+                if let Err(e) = run_smtps_listener(&addr_v4, ctx_v4, mail_root_v4, db_v4, enforce_v4).await {
                     eprintln!("SMTPS {} failed: {}", addr_v4, e);
                 }
             });
@@ -158,8 +163,9 @@ async fn main() -> Result<()> {
             let mail_root_v6 = mail_root.clone();
             let ctx_v6 = s_ctx.clone();
             let db_v6 = db_path.clone();
+            let enforce_v6 = enforce_dmarc;
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v6, ctx_v6, mail_root_v6, db_v6).await {
+                if let Err(e) = run_smtps_listener(&addr_v6, ctx_v6, mail_root_v6, db_v6, enforce_v6).await {
                     eprintln!("SMTPS {} failed: {}", addr_v6, e);
                 }
             });
@@ -174,7 +180,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>) -> Result<()> {
+async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, enforce_dmarc: bool) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPD listening on {}", addr);
     loop {
@@ -182,15 +188,16 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<t
         let mail_root = mail_root.clone();
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
+        let enforce = enforce_dmarc;
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false, enforce).await {
                 eprintln!("client error: {}", e);
             }
         });
     }
 }
 
-async fn run_smtps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: String, db_path: Option<String>) -> Result<()> {
+async fn run_smtps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: String, db_path: Option<String>, enforce_dmarc: bool) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPS listening on {}", addr);
     loop {
@@ -198,10 +205,11 @@ async fn run_smtps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: St
         let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
+        let enforce = enforce_dmarc;
         tokio::spawn(async move {
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(ctx.clone()), db_clone, Some(peer), true).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(ctx.clone()), db_clone, Some(peer), true, enforce).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -225,7 +233,7 @@ fn extract_addr(s: &str) -> Option<String> {
 // session_encrypted indicates whether the current TCP stream is protected by TLS (true for SMTPS and after a successful STARTTLS upgrade).
 // This allows the server to enforce that authentication mechanisms which transmit secrets
 // (such as AUTH PLAIN or LOGIN) are only accepted on encrypted sessions.
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool, enforce_dmarc: bool) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
     // - MAX_MESSAGE_BYTES: overall DATA size cap to avoid OOM
@@ -834,6 +842,8 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             if !data.is_empty() {
                 // account bytes received
                 metrics::add_bytes_received(data.len() as u64);
+                let mut any_accepted = false;
+                let mut any_rejected = false;
                 for rcpt in &rcpts {
                     if let Some(at) = rcpt.find('@') {
                         let local = rcpt[..at].to_string();
@@ -863,10 +873,21 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                 Err(e) => { eprintln!("mail auth join error: {}", e); (None, None, None) },
                             };
 
+                            // Enforce DMARC if configured: reject when DMARC policy indicates 'reject'
+                            if enforce_dmarc && dmarc_res.as_deref() == Some("reject") {
+                                let w = reader.get_mut();
+                                let msg = format!("554 5.7.1 Message rejected by DMARC policy for {}\r\n", rcpt);
+                                w.write_all(msg.as_bytes()).await?;
+                                w.flush().await?;
+                                any_rejected = true;
+                                continue;
+                            }
+
                             // measure per-recipient delivery latency
                             let start = std::time::Instant::now();
                             match maildir::deliver(&mr, &domain, &local, &data) {
                                 Ok(path) => {
+                                    any_accepted = true;
                                     let elapsed_us = start.elapsed().as_micros() as u64;
                                     // update metrics
                                     rmail_common::metrics::inc_deliveries();
@@ -908,6 +929,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                     }
                                 }
                                 Err(e) => {
+                                    any_rejected = true;
                                     rmail_common::metrics::inc_failed_deliveries();
                                     eprintln!("deliver error for {}: {}", rcpt, e);
                                     let w = reader.get_mut();
@@ -925,15 +947,18 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                 let data_c = data.clone();
                                 match tokio::task::spawn_blocking(move || rmail_common::db::enqueue_outbound(&dbp2, &rcpt_c, envelope.as_deref(), &data_c)).await {
                                     Ok(Ok(id)) => {
+                                        any_accepted = true;
                                         println!("Queued outbound to {} id={}", rcpt, id);
                                     }
                                     Ok(Err(e)) => {
+                                        any_rejected = true;
                                         eprintln!("failed to enqueue outbound {}: {}", rcpt, e);
                                         let w = reader.get_mut();
                                         w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
                                         w.flush().await?;
                                     }
                                     Err(e) => {
+                                        any_rejected = true;
                                         eprintln!("db task join error: {}", e);
                                         let w = reader.get_mut();
                                         w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
@@ -943,9 +968,11 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                             } else {
                                 match rmail_common::outbound::queue_outbound(&mr, rcpt, &data, mail_from.as_deref()) {
                                     Ok(path) => {
+                                        any_accepted = true;
                                         println!("Queued outbound to {} -> {:?}", rcpt, path);
                                     }
                                     Err(e) => {
+                                        any_rejected = true;
                                         eprintln!("failed to queue outbound {}: {}", rcpt, e);
                                         let w = reader.get_mut();
                                         w.write_all(b"451 Requested action aborted: temporary failure\r\n").await?;
@@ -956,6 +983,17 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         }
                     }
                 }
+
+                // Finalize DATA response based on per-recipient outcomes
+                let w = reader.get_mut();
+                if any_accepted {
+                    w.write_all(b"250 OK\r\n").await?;
+                } else if any_rejected {
+                    w.write_all(b"554 5.7.1 Message rejected by policy\r\n").await?;
+                } else {
+                    w.write_all(b"250 OK\r\n").await?;
+                }
+                w.flush().await?;
             }
 
             // reset transaction state after DATA
@@ -984,7 +1022,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 match acceptor_ctx.acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, Some(acceptor_ctx.clone()), db_path.clone(), peer, true));
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, Some(acceptor_ctx.clone()), db_path.clone(), peer, true, enforce_dmarc));
                         return fut.await;
                     }
                     Err(e) => {

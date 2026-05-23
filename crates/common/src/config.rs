@@ -23,6 +23,8 @@ pub struct Global {
     pub web_admin_password_hash: Option<String>,
     /// Directory to serve ACME http-01 challenges from (for production TLS automation)
     pub acme_challenge_dir: Option<String>,
+    /// If true, enforce DMARC policies (reject/quarantine) at SMTP time for inbound mail
+    pub enforce_dmarc: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
