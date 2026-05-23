@@ -70,23 +70,22 @@ fn get_header_value<'a>(headers: &'a [(String,String)], name: &str) -> Option<St
 }
 
 fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) -> Result<Option<String>> {
-    // Find all DKIM-Signature headers (if any) and try to validate the body hash (bh=) and signature when possible
+    // Improved DKIM verification: support simple/relaxed header+body canonicalization
     use openssl::pkey::PKey;
     use openssl::sign::Verifier;
     use openssl::hash::MessageDigest;
 
-    let mut found = false;
+    let mut found_any = false;
+    let mut tried_any = false;
 
     // build header records grouped by unfolded header (preserve original bytes)
     let mut records: Vec<Vec<u8>> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
     let mut i = 0usize;
     while i < header_bytes.len() {
-        // find next LF
         if let Some(rel) = header_bytes[i..].iter().position(|&b| b == b'\n') {
             let end = i + rel + 1;
             let slice = &header_bytes[i..end];
-            // continuation lines start with space or tab
             if slice.starts_with(b" ") || slice.starts_with(b"\t") {
                 cur.extend_from_slice(slice);
             } else {
@@ -100,175 +99,193 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
     }
     if !cur.is_empty() { records.push(cur); }
 
+    // Helper to find a DKIM-Signature record matching selector+domain (or first DKIM header if not found)
+    let find_dkim_rec = |selector: &str, domain: &str| -> Option<Vec<u8>> {
+        for rec in records.iter() {
+            // check header name
+            if let Some(pos) = rec.iter().position(|&b| b == b':') {
+                let name = String::from_utf8_lossy(&rec[..pos]).to_string();
+                if !name.eq_ignore_ascii_case("DKIM-Signature") { continue; }
+                // parse tags in the header value to find s= and d=
+                let val = String::from_utf8_lossy(&rec[pos+1..]).to_string();
+                let mut has_s = false;
+                let mut has_d = false;
+                for part in val.split(';') {
+                    let p = part.trim();
+                    if p.to_ascii_lowercase().starts_with("s=") {
+                        if p[2..].trim() == selector { has_s = true; }
+                    }
+                    if p.to_ascii_lowercase().starts_with("d=") {
+                        if p[2..].trim() == domain { has_d = true; }
+                    }
+                }
+                if has_s && has_d { return Some(rec.clone()); }
+            }
+        }
+        // fallback: return first DKIM-Signature header if specific match not found
+        for rec in records.iter() {
+            if let Some(pos) = rec.iter().position(|&b| b == b':') {
+                let name = String::from_utf8_lossy(&rec[..pos]).to_string();
+                if name.eq_ignore_ascii_case("DKIM-Signature") { return Some(rec.clone()); }
+            }
+        }
+        None
+    };
+
+    // iterate over structured headers to find DKIM-Signature occurrences and attempt verification
     for (k, v) in headers.iter() {
-        if k.eq_ignore_ascii_case("DKIM-Signature") {
-            found = true;
-            // parse semicolon-separated tag=value pairs
-            let mut bh: Option<String> = None;
-            let mut d: Option<String> = None;
-            let mut s: Option<String> = None;
-            let mut b_sig: Option<String> = None;
-            let mut a_alg: Option<String> = None;
-            let mut h_list: Option<String> = None;
-            for part in v.split(';') {
-                let p = part.trim();
-                if p.starts_with("bh=") { bh = Some(p[3..].trim().to_string()); }
-                else if p.starts_with("d=") { d = Some(p[2..].trim().to_string()); }
-                else if p.starts_with("s=") { s = Some(p[2..].trim().to_string()); }
-                else if p.starts_with("b=") { b_sig = Some(p[2..].trim().to_string()); }
-                else if p.starts_with("a=") { a_alg = Some(p[2..].trim().to_string()); }
-                else if p.starts_with("h=") { h_list = Some(p[2..].trim().to_string()); }
-            }
+        if !k.eq_ignore_ascii_case("DKIM-Signature") { continue; }
+        found_any = true;
 
-            // Determine canonicalization (c=)
-            let mut canon: Option<String> = None;
-            for part in v.split(';') {
-                let p = part.trim();
-                if p.starts_with("c=") { canon = Some(p[2..].trim().to_string()); }
-            }
+        // parse semicolon-separated tag=value pairs into a small map
+        let mut bh: Option<String> = None;
+        let mut d: Option<String> = None;
+        let mut s: Option<String> = None;
+        let mut b_sig: Option<String> = None;
+        let mut a_alg: Option<String> = None;
+        let mut h_list: Option<String> = None;
+        let mut canon: Option<String> = None;
+        for part in v.split(';') {
+            let p = part.trim();
+            if p.len() == 0 { continue; }
+            let lower = p.to_ascii_lowercase();
+            if lower.starts_with("bh=") { bh = Some(p[3..].trim().to_string()); }
+            else if lower.starts_with("d=") { d = Some(p[2..].trim().to_string()); }
+            else if lower.starts_with("s=") { s = Some(p[2..].trim().to_string()); }
+            else if lower.starts_with("b=") { b_sig = Some(p[2..].trim().to_string()); }
+            else if lower.starts_with("a=") { a_alg = Some(p[2..].trim().to_string()); }
+            else if lower.starts_with("h=") { h_list = Some(p[2..].trim().to_string()); }
+            else if lower.starts_with("c=") { canon = Some(p[2..].trim().to_string()); }
+        }
 
-            // Verify body hash if present (apply canonicalization if requested)
-            if let Some(bh_val) = bh.clone() {
-                let body_to_hash = if let Some(c) = canon.as_deref() {
-                    if c.starts_with("relaxed") {
-                        canonicalize_body_relaxed(body)
-                    } else {
-                        canonicalize_body_simple(body)
-                    }
-                } else {
-                    canonicalize_body_simple(body)
-                };
-                let mut hasher = Sha256::new();
-                hasher.update(&body_to_hash);
-                let digest = hasher.finalize();
-                let computed = base64::engine::general_purpose::STANDARD.encode(digest);
-                if computed.trim_end_matches('\n') != bh_val.trim() {
-                    return Ok(Some(format!("fail; bh_mismatch (computed={} expected={})", computed, bh_val)));
+        // determine canonicalization pair
+        let (header_canon, body_canon) = if let Some(cstr) = canon.clone() {
+            let mut sp = cstr.splitn(2, '/');
+            let h = sp.next().unwrap_or("simple").trim().to_ascii_lowercase();
+            let b = sp.next().unwrap_or("simple").trim().to_ascii_lowercase();
+            (h, b)
+        } else { ("simple".to_string(), "simple".to_string()) };
+
+        // If bh present, verify body hash first
+        if let Some(bh_val) = bh.clone() {
+            let body_to_hash = if body_canon.starts_with("relaxed") { canonicalize_body_relaxed(body) } else { canonicalize_body_simple(body) };
+            let mut hasher = Sha256::new();
+            hasher.update(&body_to_hash);
+            let digest = hasher.finalize();
+            let computed = base64::engine::general_purpose::STANDARD.encode(digest);
+            if computed.trim_end_matches('\n') != bh_val.trim() {
+                // body hash mismatch for this signature; mark that we tried and continue to next signature
+                tried_any = true;
+                continue;
+            }
+        }
+
+        // If signature is present and algorithm is supported, attempt verification
+        if let (Some(sig_b64), Some(selector), Some(domain)) = (b_sig.clone(), s.clone(), d.clone()) {
+            if let Some(a) = a_alg.clone() {
+                if !a.to_ascii_lowercase().contains("rsa-sha256") {
+                    // unsupported algorithm -> treat as tried but skip
+                    tried_any = true;
+                    continue;
                 }
             }
 
-            // If signature (b) present and algorithm is rsa-sha256, attempt full verification
-            if let (Some(sig_b64), Some(selector), Some(domain)) = (b_sig.clone(), s.clone(), d.clone()) {
-                // only support rsa-sha256 for now
-                if let Some(a) = a_alg.clone() {
-                    if !a.to_ascii_lowercase().contains("rsa-sha256") {
-                        return Ok(Some(format!("fail; unsupported_algo {}", a)));
-                    }
-                }
-
-                // construct signed header block by selecting headers listed in h= (best-effort)
-                let mut signed_parts: Vec<Vec<u8>> = Vec::new();
-                if let Some(hs) = h_list.clone() {
-                    let mut used = vec![false; records.len()];
-                    let fields: Vec<String> = hs.split(':').map(|s| s.trim().to_string()).collect();
-                    // iterate fields from last to first and pick the rightmost unused occurrence
-                    for fname in fields.iter().rev() {
-                        for idx in (0..records.len()).rev() {
-                            if used[idx] { continue; }
-                            // find colon position
-                            if let Some(pos) = records[idx].iter().position(|&b| b == b':') {
-                                let name_slice = &records[idx][..pos];
-                                let name = String::from_utf8_lossy(name_slice).to_string();
-                                if name.eq_ignore_ascii_case(fname) {
-                                    signed_parts.push(records[idx].clone());
-                                    used[idx] = true;
-                                    break;
-                                }
+            // Build list of signed header bytes according to h= list
+            let mut signed_parts: Vec<Vec<u8>> = Vec::new();
+            if let Some(hs) = h_list.clone() {
+                let mut used = vec![false; records.len()];
+                let fields: Vec<String> = hs.split(':').map(|s| s.trim().to_string()).collect();
+                for fname in fields.iter().rev() {
+                    for idx in (0..records.len()).rev() {
+                        if used[idx] { continue; }
+                        if let Some(pos) = records[idx].iter().position(|&b| b == b':') {
+                            let name_slice = &records[idx][..pos];
+                            let name = String::from_utf8_lossy(name_slice).to_string();
+                            if name.eq_ignore_ascii_case(fname) {
+                                signed_parts.push(records[idx].clone());
+                                used[idx] = true;
+                                break;
                             }
                         }
                     }
-                    signed_parts.reverse();
                 }
+                signed_parts.reverse();
+            }
 
-                // find DKIM-Signature record and create a version with b= emptied
-                let mut dkim_header_bytes: Option<Vec<u8>> = None;
-                for rec in records.iter() {
-                    if let Some(pos) = rec.iter().position(|&b| b == b':') {
-                        let name = String::from_utf8_lossy(&rec[..pos]).to_string();
-                        if name.eq_ignore_ascii_case("DKIM-Signature") {
-                            // remove the b= value robustly by parsing semicolon-separated tags
-                            let new_hdr = remove_b_from_dkim_header(rec);
-                            dkim_header_bytes = Some(new_hdr);
-                            break;
-                        }
-                    }
-                }
+            // find matching DKIM-Signature record to use (selector+domain), fallback to first DKIM header
+            if let Some(rec) = find_dkim_rec(&selector, &domain) {
+                let dkim_hdr = remove_b_from_dkim_header(&rec);
+                signed_parts.push(dkim_hdr);
+            } else {
+                // no matching DKIM header found; mark tried and continue
+                tried_any = true;
+                continue;
+            }
 
-                if let Some(mut dk) = dkim_header_bytes {
-                    // append DKIM header as the last signed header
-                    signed_parts.push(dk);
-                }
-
-                // concatenate all signed parts into a single byte vector applying header canonicalization as requested
-                let mut header_data: Vec<u8> = Vec::new();
-                for part in signed_parts.iter() {
-                    if let Some(c) = canon.as_deref() {
-                        if c.starts_with("relaxed") {
-                            let ch = canonicalize_header_relaxed(part);
-                            header_data.extend_from_slice(&ch);
-                        } else {
-                            header_data.extend_from_slice(part);
-                        }
-                    } else {
-                        header_data.extend_from_slice(part);
-                    }
-                }
-
-                // fetch public key via DNS TXT at selector._domainkey.domain
-                let resolver = match resolver() { Ok(r) => r, Err(_) => return Ok(Some("fail; dns_error".to_string())) };
-                let lookup_name = format!("{}.{}_domainkey.{}", selector, "", domain); // temporary
-                // Correct name: selector + "._domainkey." + domain
-                let lookup_name = format!("{}._domainkey.{}", selector, domain);
-
-                let txt_lookup = match resolver.txt_lookup(lookup_name.as_str()) { Ok(t) => t, Err(_) => return Ok(Some("fail; missing_pubkey".to_string())) };
-
-                let mut pubkey_b64: Option<String> = None;
-                for txt in txt_lookup.iter() {
-                    let txt_str = txt.to_string();
-                    for part in txt_str.split(';') {
-                        let p = part.trim();
-                        if p.starts_with("p=") {
-                            pubkey_b64 = Some(p[2..].trim().to_string());
-                        }
-                    }
-                }
-
-                if pubkey_b64.is_none() { return Ok(Some("fail; no_p_in_dns".to_string())); }
-                let pubkey_b64 = pubkey_b64.unwrap();
-                let pubkey_der = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64.as_bytes()) { Ok(b) => b, Err(_) => return Ok(Some("fail; pubkey_decode_error".to_string())) };
-
-                // try to build PKey from DER, falling back to PEM wrapper
-                let pkey = PKey::public_key_from_der(&pubkey_der).or_else(|_| {
-                    let pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", base64::engine::general_purpose::STANDARD.encode(&pubkey_der));
-                    PKey::public_key_from_pem(pem.as_bytes())
-                });
-
-                let pkey = match pkey {
-                    Ok(pk) => pk,
-                    Err(_) => return Ok(Some("fail; invalid_pubkey".to_string())),
-                };
-
-                let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(sig_b64.as_bytes()) { Ok(b) => b, Err(_) => return Ok(Some("fail; signature_decode_error".to_string())) };
-
-                // verify signature (rsa-sha256)
-                let mut verifier = match Verifier::new(MessageDigest::sha256(), &pkey) { Ok(v) => v, Err(_) => return Ok(Some("fail; verifier_init".to_string())) };
-                if verifier.update(&header_data).is_err() { return Ok(Some("fail; verifier_update".to_string())); }
-                match verifier.verify(&sig_bytes) {
-                    Ok(true) => return Ok(Some(format!("pass; d={}", domain))),
-                    Ok(false) => return Ok(Some("fail; signature_mismatch".to_string())),
-                    Err(_) => return Ok(Some("fail; signature_error".to_string())),
+            // concatenate canonicalized headers
+            let mut header_data: Vec<u8> = Vec::new();
+            for part in signed_parts.iter() {
+                if header_canon.starts_with("relaxed") {
+                    let ch = canonicalize_header_relaxed(part);
+                    header_data.extend_from_slice(&ch);
+                } else {
+                    // simple: use the header as-is (preserve bytes)
+                    header_data.extend_from_slice(part);
                 }
             }
 
-            // if we get here, we had DKIM headers but couldn't verify signature; treat as none/fail depending on bh
+            // fetch public key via DNS TXT at selector._domainkey.domain
+            let resolver = match resolver() { Ok(r) => r, Err(_) => { tried_any = true; continue; } };
+            let lookup_name = format!("{}._domainkey.{}", selector, domain);
+            let txt_lookup = match resolver.txt_lookup(lookup_name.as_str()) { Ok(t) => t, Err(_) => { tried_any = true; continue; } };
+
+            let mut pubkey_b64: Option<String> = None;
+            for txt in txt_lookup.iter() {
+                let txt_str = txt.to_string();
+                for part in txt_str.split(';') {
+                    let p = part.trim();
+                    if p.to_ascii_lowercase().starts_with("p=") {
+                        pubkey_b64 = Some(p[2..].trim().to_string());
+                    }
+                }
+            }
+            if pubkey_b64.is_none() { tried_any = true; continue; }
+            let pubkey_b64 = pubkey_b64.unwrap();
+            let pubkey_der = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
+
+            // try to build PKey from DER, falling back to PEM wrapper
+            let pkey = PKey::public_key_from_der(&pubkey_der).or_else(|_| {
+                let pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", base64::engine::general_purpose::STANDARD.encode(&pubkey_der));
+                PKey::public_key_from_pem(pem.as_bytes())
+            });
+            let pkey = match pkey { Ok(pk) => pk, Err(_) => { tried_any = true; continue; } };
+
+            let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(sig_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
+
+            // verify signature (rsa-sha256)
+            let mut verifier = match Verifier::new(MessageDigest::sha256(), &pkey) { Ok(v) => v, Err(_) => { tried_any = true; continue; } };
+            if verifier.update(&header_data).is_err() { tried_any = true; continue; }
+            match verifier.verify(&sig_bytes) {
+                Ok(true) => return Ok(Some(format!("pass; d={}", domain))),
+                Ok(false) => { tried_any = true; continue; }
+                Err(_) => { tried_any = true; continue; }
+            }
+        } else {
+            // no b/d/s tags found — mark that we observed a DKIM header but couldn't process it
+            tried_any = true;
+            continue;
+        }
+    }
+
+    if found_any {
+        if tried_any {
+            return Ok(Some("fail; dkim_unverified".to_string()));
+        } else {
+            // found DKIM-Signature headers but none were parseable/usable
             return Ok(Some("fail; dkim_unverified".to_string()));
         }
     }
-    if !found {
-        Ok(None)
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
 use once_cell::sync::Lazy;
@@ -656,23 +673,35 @@ fn canonicalize_header_relaxed(rec: &[u8]) -> Vec<u8> {
 }
 
 fn remove_b_from_dkim_header(rec: &[u8]) -> Vec<u8> {
-    // Produce a DKIM-Signature header bytes with the b= tag emptied (best-effort).
-    // This parses semicolon-separated tag=value pairs and zeroes the b= value.
+    // Remove the b= tag value while preserving the original header formatting as much as possible.
+    // This works on the raw header bytes and removes everything between the 'b=' and the next
+    // semicolon or the end-of-line (preserving CRLF).
     let s = String::from_utf8_lossy(rec).to_string();
-    if let Some(colon) = s.find(':') {
-        let name = &s[..colon];
-        let val = s[colon+1..].trim_end_matches('\r').trim_end_matches('\n').to_string();
-        // split into parts on ';'
-        let mut parts: Vec<String> = val.split(';').map(|p| p.to_string()).collect();
-        for part in parts.iter_mut() {
-            if part.trim_start().starts_with("b=") {
-                *part = "b=".to_string();
-            }
+    if let Some(colon_pos) = s.find(':') {
+        let rest = &s[colon_pos+1..];
+        let rest_lower = rest.to_ascii_lowercase();
+        if let Some(rel) = rest_lower.find("b=") {
+            // absolute start index of the 'b=' value in the original string
+            let val_start = colon_pos + 1 + rel + 2; // position after 'b='
+            let suffix = &s[val_start..];
+            // find end: semicolon or CRLF or LF or end of string
+            let end_idx = if let Some(semi) = suffix.find(';') {
+                val_start + semi
+            } else if let Some(crlf) = suffix.find("\r\n") {
+                val_start + crlf
+            } else if let Some(lf) = suffix.find('\n') {
+                val_start + lf
+            } else {
+                s.len()
+            };
+            // Rebuild string preserving everything except the b= value bytes
+            let mut out = String::new();
+            out.push_str(&s[..val_start]);
+            out.push_str(&s[end_idx..]);
+            return out.into_bytes();
         }
-        let new_val = parts.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("; ");
-        let new_hdr = format!("{}: {}\r\n", name, new_val);
-        return new_hdr.into_bytes();
     }
+    // fallback: return original bytes
     rec.to_vec()
 }
 
