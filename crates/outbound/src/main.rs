@@ -51,8 +51,7 @@ async fn main() -> anyhow::Result<()> {
         // Try to claim an eligible message using the shared queue-manager library (blocking fs ops)
         let claim_res = tokio::task::spawn_blocking({
             let md = maildrop_dir.clone();
-            // per-destination concurrent delivery limit
-            let limit = std::env::var("RMAIL_PER_DEST_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(5usize);
+            let limit = per_dest_limit;
             move || rmail_queue_manager::claim_one_with_limit(&md, limit)
         }).await;
 
