@@ -286,3 +286,12 @@ pub fn mark_outbound_failed<P: AsRef<Path>>(path: P, id: i64, last_error: Option
     conn.execute("UPDATE outbound_queue SET status = 'queued', last_error = ?1, next_try = ?2 WHERE id = ?3", params![last_error, next_try, id])?;
     Ok(())
 }
+
+/// Return the number of pending outbound items (not yet marked as 'sent'). This is a simple
+/// helper for metrics and web UI to show queue depth.
+pub fn count_outbound_pending<P: AsRef<Path>>(path: P) -> Result<i64> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM outbound_queue WHERE status != 'sent'")?;
+    let v: i64 = stmt.query_row([], |r| r.get(0))?;
+    Ok(v)
+}
