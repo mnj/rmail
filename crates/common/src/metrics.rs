@@ -10,6 +10,14 @@ pub static TLS_HANDSHAKES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static BYTES_RECEIVED_TOTAL: AtomicU64 = AtomicU64::new(0);
 // Authentication failures recorded by servers (incremented on each failed auth attempt)
 pub static AUTH_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+// Mail auth metrics
+pub static DKIM_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DKIM_FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static SPF_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static SPF_FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DMARC_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DMARC_QUARANTINE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DMARC_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc_deliveries() { DELIVERIES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_failed_deliveries() { DELIVERIES_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed); }
@@ -24,6 +32,14 @@ pub fn add_bytes_received(n: u64) { BYTES_RECEIVED_TOTAL.fetch_add(n, Ordering::
 /// Increment the total count of recorded authentication failures. This is a best-effort
 /// metric to track brute-force attempts and can be monitored via the web UI.
 pub fn inc_auth_failures() { AUTH_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed); }
+
+pub fn inc_dkim_pass() { DKIM_PASS_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_dkim_fail() { DKIM_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_spf_pass() { SPF_PASS_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_spf_fail() { SPF_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_dmarc_pass() { DMARC_PASS_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_dmarc_quarantine() { DMARC_QUARANTINE_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_dmarc_reject() { DMARC_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed); }
 
 pub fn gather_prometheus() -> String {
     let mut out = String::new();
@@ -54,5 +70,26 @@ pub fn gather_prometheus() -> String {
     out.push_str("# HELP rmail_auth_failures_total Total authentication failures recorded\n");
     out.push_str("# TYPE rmail_auth_failures_total counter\n");
     out.push_str(&format!("rmail_auth_failures_total {}\n", AUTH_FAILURES_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_dkim_pass_total DKIM verification pass count\n");
+    out.push_str("# TYPE rmail_dkim_pass_total counter\n");
+    out.push_str(&format!("rmail_dkim_pass_total {}\n", DKIM_PASS_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_dkim_fail_total DKIM verification failure count\n");
+    out.push_str("# TYPE rmail_dkim_fail_total counter\n");
+    out.push_str(&format!("rmail_dkim_fail_total {}\n", DKIM_FAIL_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_spf_pass_total SPF verification pass count\n");
+    out.push_str("# TYPE rmail_spf_pass_total counter\n");
+    out.push_str(&format!("rmail_spf_pass_total {}\n", SPF_PASS_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_spf_fail_total SPF verification failure count\n");
+    out.push_str("# TYPE rmail_spf_fail_total counter\n");
+    out.push_str(&format!("rmail_spf_fail_total {}\n", SPF_FAIL_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_dmarc_pass_total DMARC alignment pass count\n");
+    out.push_str("# TYPE rmail_dmarc_pass_total counter\n");
+    out.push_str(&format!("rmail_dmarc_pass_total {}\n", DMARC_PASS_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_dmarc_quarantine_total DMARC quarantine count\n");
+    out.push_str("# TYPE rmail_dmarc_quarantine_total counter\n");
+    out.push_str(&format!("rmail_dmarc_quarantine_total {}\n", DMARC_QUARANTINE_TOTAL.load(Ordering::Relaxed)));
+    out.push_str("# HELP rmail_dmarc_reject_total DMARC reject count\n");
+    out.push_str("# TYPE rmail_dmarc_reject_total counter\n");
+    out.push_str(&format!("rmail_dmarc_reject_total {}\n", DMARC_REJECT_TOTAL.load(Ordering::Relaxed)));
     out
 }
