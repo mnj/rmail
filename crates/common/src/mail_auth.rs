@@ -341,6 +341,39 @@ fn cached_lookup_ip(name: &str) -> Option<Vec<std::net::IpAddr>> {
     None
 }
 
+fn expand_spf_macros(s: &str, peer: IpAddr, mail_from: &str, current_domain: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let Some(next) = chars.next() {
+                match next {
+                    '%' => out.push('%'),
+                    '_' => out.push(' '),
+                    '-' => out.push_str("%20"),
+                    '{' => {
+                        let mut mac = String::new();
+                        while let Some(n) = chars.next() {
+                            if n == '}' { break; }
+                            mac.push(n);
+                        }
+                        let replacement = match mac.as_str() {
+                            "i" => peer.to_string(),
+                            "s" => mail_from.to_string(),
+                            "l" => mail_from.split('@').next().map(|s| s.to_string()).unwrap_or_else(|| "".to_string()),
+                            "d" => current_domain.to_string(),
+                            _ => "".to_string(),
+                        };
+                        out.push_str(&replacement);
+                    }
+                    _ => { out.push('%'); out.push(next); }
+                }
+            } else { out.push('%'); }
+        } else { out.push(ch); }
+    }
+    out
+}
+
 fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option<String>> {
     // Improved SPF: support ip4/ip6, a, mx, and include mechanisms (best-effort).
     use std::collections::HashSet;
@@ -360,38 +393,6 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
         }
     }
 
-    fn expand_spf_macros(s: &str, peer: IpAddr, mail_from: &str, current_domain: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '%' {
-                if let Some(next) = chars.next() {
-                    match next {
-                        '%' => out.push('%'),
-                        '_' => out.push(' '),
-                        '-' => out.push_str("%20"),
-                        '{' => {
-                            let mut mac = String::new();
-                            while let Some(n) = chars.next() {
-                                if n == '}' { break; }
-                                mac.push(n);
-                            }
-                            let replacement = match mac.as_str() {
-                                "i" => peer.to_string(),
-                                "s" => mail_from.unwrap_or("").to_string(),
-                                "l" => mail_from.and_then(|m| m.split('@').next().map(|s| s.to_string())).unwrap_or_else(|| "".to_string()),
-                                "d" => current_domain.to_string(),
-                                _ => "".to_string(),
-                            };
-                            out.push_str(&replacement);
-                        }
-                        _ => { out.push('%'); out.push(next); }
-                    }
-                } else { out.push('%'); }
-            } else { out.push(ch); }
-        }
-        out
-    }
 
     fn eval_spf_for_domain(domain: &str, peer: IpAddr, depth: u8, visited: &mut HashSet<String>, mail_from: &str) -> Option<String> {
         if depth > 10 { return None; }
@@ -650,5 +651,13 @@ mod tests {
         let input = b"From:   Alice <alice@example.com>\r\n";
         let out = canonicalize_header_relaxed(input);
         assert_eq!(String::from_utf8_lossy(&out), "from:Alice <alice@example.com>\r\n");
+    }
+
+    #[test]
+    fn test_expand_spf_macros() {
+        use std::net::IpAddr;
+        let peer: IpAddr = "1.2.3.4".parse().unwrap();
+        let res = expand_spf_macros("%{i}.spf.%{d}", peer, "local@example.com", "example.com");
+        assert_eq!(res, "1.2.3.4.spf.example.com");
     }
 }
