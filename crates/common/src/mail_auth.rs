@@ -16,12 +16,14 @@ use ipnet::IpNet;
 /// - DMARC: performs a TXT lookup for _dmarc.<from-domain> and applies simple alignment rules:
 ///   DKIM relaxed (d==From) or SPF aligned (envelope-from domain == From domain). Returns pass/fail/none.
 
-pub fn analyze_message(data: &[u8], peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<(Option<String>, Option<String>, Option<String>)> {
+pub fn analyze_message(data: &[u8], peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>)> {
     let (headers, header_bytes, body) = parse_headers_body(data);
     let dkim = verify_dkim(&headers, header_bytes, body)?;
     let spf = verify_spf(peer_ip, mail_from)?;
     let dmarc = verify_dmarc(&headers, dkim.as_deref(), spf.as_deref(), mail_from)?;
-    Ok((dkim, spf, dmarc))
+    // extract header-from address for reporting purposes
+    let header_from = get_header_value(&headers, "From").and_then(|s| extract_addr_from_header(&s));
+    Ok((dkim, spf, dmarc, header_from))
 }
 
 fn parse_headers_body<'a>(data: &'a [u8]) -> (Vec<(String, String)>, &'a [u8], &'a [u8]) {
@@ -556,6 +558,30 @@ fn extract_addr_from_header(s: &str) -> Option<String> {
         return Some(addr);
     }
     None
+}
+
+/// Parse the DMARC _dmarc TXT record for rua= addresses and return mailto: recipients.
+pub fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
+    let name = format!("_dmarc.{}", domain);
+    if let Some(txts) = cached_txt_lookup(&name) {
+        let mut out: Vec<String> = Vec::new();
+        for txt in txts.iter() {
+            for part in txt.split(';') {
+                let p = part.trim();
+                if p.starts_with("rua=") {
+                    let list = p[4..].trim();
+                    for addr in list.split(',') {
+                        let a = addr.trim();
+                        if a.to_ascii_lowercase().starts_with("mailto:") {
+                            out.push(a[7..].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
 }
 
 // Canonicalization helpers (simplified implementations)
