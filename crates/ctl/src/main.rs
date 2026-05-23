@@ -22,7 +22,16 @@ enum Commands {
         /// Password to hash (avoid passing on command line in production)
         password: String,
     },
-    /// Add a mailbox to the configured TOML file
+    /// Initialize the SQLite database schema
+    InitDb {
+        /// optional db path (defaults to config global.db_path)
+        #[arg(long)]
+        db_path: Option<String>,
+        /// optional config path
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Add a mailbox to the configured DB or fallback to TOML
     AddMailbox {
         /// mailbox address, e.g., user@example.com
         address: String,
@@ -39,7 +48,7 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// List configured mailboxes
+    /// List configured mailboxes (DB or TOML)
     List {
         /// optional config path
         #[arg(long)]
@@ -56,6 +65,15 @@ fn main() -> Result<()> {
             let argon2 = Argon2::default();
             let ph = argon2.hash_password(password.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string();
             println!("{}", ph);
+        },
+        Commands::InitDb { db_path, config } => {
+            let dbp = if let Some(p) = db_path { p } else {
+                let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+                let cfg = Config::from_file(&cfg_path)?;
+                cfg.global.db_path.ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
+            };
+            rmail_common::db::init_db(&dbp)?;
+            println!("Initialized DB at {}", dbp);
         }
         Commands::AddMailbox { address, password, password_hash, maildir: maildir_opt, config } => {
             let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
@@ -82,11 +100,20 @@ fn main() -> Result<()> {
                 };
                 // ensure directories exist
                 maildir::ensure_maildir(Path::new(&maildir_path))?;
-                // append mailbox to config file (simple append — robust editing can be added later)
-                let snippet = format!("\n[[mailboxes]]\naddress = \"{}\"\npassword_hash = \"{}\"\nmaildir = \"{}\"\n", address.to_ascii_lowercase(), ph, maildir_path);
-                let mut f = OpenOptions::new().append(true).create(true).open(&cfg_path)?;
-                f.write_all(snippet.as_bytes())?;
-                println!("Added mailbox {}", address);
+
+                // If db_path configured, insert into SQLite, otherwise fallback to TOML append
+                if let Some(dbp) = cfg.global.db_path.as_ref() {
+                    // ensure DB initialized
+                    rmail_common::db::init_db(dbp)?;
+                    rmail_common::db::add_mailbox(dbp, &address.to_ascii_lowercase(), if ph.is_empty() { None } else { Some(&ph) }, Some(&maildir_path))?;
+                    println!("Added mailbox {} into DB at {}", address, dbp);
+                } else {
+                    // append mailbox to config file (simple append — robust editing can be added later)
+                    let snippet = format!("\n[[mailboxes]]\naddress = \"{}\"\npassword_hash = \"{}\"\nmaildir = \"{}\"\n", address.to_ascii_lowercase(), ph, maildir_path);
+                    let mut f = OpenOptions::new().append(true).create(true).open(&cfg_path)?;
+                    f.write_all(snippet.as_bytes())?;
+                    println!("Added mailbox {} (config file)", address);
+                }
             } else {
                 eprintln!("Invalid address '{}'", address);
             }
@@ -94,12 +121,19 @@ fn main() -> Result<()> {
         Commands::List { config } => {
             let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
             let cfg = Config::from_file(&cfg_path)?;
-            if let Some(mboxes) = cfg.mailboxes {
-                for m in mboxes {
+            if let Some(dbp) = cfg.global.db_path.as_ref() {
+                // list from DB
+                for m in rmail_common::db::list_mailboxes(dbp)? {
                     println!("{}", m.address);
                 }
             } else {
-                println!("No mailboxes configured");
+                if let Some(mboxes) = cfg.mailboxes {
+                    for m in mboxes {
+                        println!("{}", m.address);
+                    }
+                } else {
+                    println!("No mailboxes configured");
+                }
             }
         }
     }
