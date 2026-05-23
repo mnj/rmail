@@ -539,3 +539,29 @@ fn canonicalize_header_relaxed(rec: &[u8]) -> Vec<u8> {
         rec.to_vec()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_canonicalize_body_relaxed() {
+        let input = b"  Hello   \r\nWorld\r\n\r\n\r\n";
+        let out = canonicalize_body_relaxed(input);
+        assert_eq!(String::from_utf8_lossy(&out), "Hello\r\nWorld\r\n");
+    }
+
+    #[test]
+    fn test_canonicalize_body_simple() {
+        let input = b"Line1\r\nLine2\r\n\r\n\r\n";
+        let out = canonicalize_body_simple(input);
+        assert_eq!(String::from_utf8_lossy(&out), "Line1\r\nLine2\r\n");
+    }
+
+    #[test]
+    fn test_canonicalize_header_relaxed() {
+        let input = b"From:   Alice <alice@example.com>\r\n";
+        let out = canonicalize_header_relaxed(input);
+        assert_eq!(String::from_utf8_lossy(&out), "from:Alice <alice@example.com>\r\n");
+    }
+}
