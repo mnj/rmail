@@ -24,11 +24,23 @@ fn tail_lines(s: &str, n: usize) -> String {
     out.join("\n")
 }
 
-fn scan_maildirs_sync(mail_root: &std::path::Path) -> Result<Stats> {
+fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Result<Stats> {
+    // If a DB is configured, derive stats from the DB for consistency and speed
+    if let Some(dbp) = db_path {
+        let mailboxes = rmail_common::db::list_mailboxes(dbp)?;
+        let mailbox_count = mailboxes.len();
+        let mut total_messages = 0usize;
+        for m in mailboxes {
+            let c = rmail_common::db::count_messages(dbp, &m.address)?;
+            total_messages += c as usize;
+        }
+        return Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0 });
+    }
+
     let mut mailbox_count = 0usize;
     let mut total_messages = 0usize;
     if !mail_root.exists() || !mail_root.is_dir() {
-    return Ok(Stats { mailboxes: 0, total_messages: 0, delivered_count: 0 });
+        return Ok(Stats { mailboxes: 0, total_messages: 0, delivered_count: 0 });
     }
     for domain_entry in std::fs::read_dir(mail_root)? {
         let domain_entry = domain_entry?;
@@ -54,7 +66,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path) -> Result<Stats> {
     Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0 })
 }
 
-async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>) {
+async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>, db_path: Option<String>) {
     let peer = match stream.peer_addr() { Ok(p) => p.to_string(), Err(_) => "unknown".to_string() };
     let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
@@ -128,7 +140,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
         match path {
             "/" => {
                 content_type = "text/html".to_string();
-                body = "<html><body><h1>rMail Web UI</h1><ul><li><a href='/health'>health</a></li><li><a href='/stats'>stats</a></li><li><a href='/logs?component=smtpd'>smtpd logs</a></li></ul></body></html>".to_string();
+        body = "<html><body><h1>rMail Web UI</h1><ul><li><a href='/health'>health</a></li><li><a href='/stats'>stats</a></li><li><a href='/metrics'>metrics</a></li><li><a href='/logs?component=smtpd'>smtpd logs</a></li></ul></body></html>".to_string();
             }
             "/health" => {
                 content_type = "text/plain".to_string();
@@ -142,48 +154,55 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                 } else {
                     // run blocking scan in threadpool
                     let mr_clone = mail_root.clone();
-                    match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mr_clone)).await {
-                        Ok(Ok(mut stats)) => {
-                            // attempt to read delivered count from metrics file
-                            let delivered = tokio::fs::read_to_string("/tmp/rmail_delivered.count").await.ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-                            stats.delivered_count = delivered;
-                            content_type = "application/json".to_string();
-                            body = match serde_json::to_string(&stats) { Ok(s) => s, Err(e) => { status = 500; format!("{{\"error\":\"{}\"}}", e) } };
-                        }
-                        Ok(Err(e)) => { status = 500; body = format!("scan error: {}", e); }
-                        Err(e) => { status = 500; body = format!("task join error: {}", e); }
-                    }
+            let db_clone = db_path.clone();
+            match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mr_clone, db_clone.as_deref())).await {
+                Ok(Ok(mut stats)) => {
+                    // attempt to read delivered count from metrics file (fallback)
+                    let delivered = tokio::fs::read_to_string("/tmp/rmail_delivered.count").await.ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+                    stats.delivered_count = delivered;
+                    content_type = "application/json".to_string();
+                    body = match serde_json::to_string(&stats) { Ok(s) => s, Err(e) => { status = 500; format!("{{\"error\":\"{}\"}}", e) } };
                 }
+                Ok(Err(e)) => { status = 500; body = format!("scan error: {}", e); }
+                Err(e) => { status = 500; body = format!("task join error: {}", e); }
+            }
+        }
+            }
+            "/metrics" => {
+        // Expose Prometheus-style metrics
+        let metrics_text = rmail_common::metrics::gather_prometheus();
+        content_type = "text/plain".to_string();
+        body = metrics_text;
             }
             "/logs" => {
-                if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    // parse query params for component and lines (simple parser, no percent-decoding)
-                    let params: HashMap<_, _> = query.split('&').filter_map(|kv| {
-                        if kv.is_empty() { return None; }
-                        let mut s = kv.splitn(2, '=');
-                        let k = s.next().unwrap_or("").to_string();
-                        let v = s.next().unwrap_or("").to_string();
-                        if k.is_empty() { None } else { Some((k, v)) }
-                    }).collect();
-                    let component = params.get("component").map(|s| s.as_str()).unwrap_or("smtpd");
-                    let mut lines: usize = params.get("lines").and_then(|s| s.parse().ok()).unwrap_or(200);
-                    lines = std::cmp::min(lines, 2000);
-                    let path = match component {
-                        "smtpd" => "/tmp/rmail_smtpd.log",
-                        "imapd" => "/tmp/rmail_imapd.log",
-                        _ => { status = 400; body = "invalid component".to_string(); "" }
-                    };
-                    if !path.is_empty() {
-                        match tokio::fs::read_to_string(path).await {
-                            Ok(s) => { content_type = "text/plain".to_string(); body = tail_lines(&s, lines); }
-                            Err(e) => { status = 500; body = format!("read error: {}", e); }
-                        }
-                    }
+        if !is_authorized(&headers) {
+            status = 401;
+            body = "Unauthorized".to_string();
+            extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
+        } else {
+            // parse query params for component and lines (simple parser, no percent-decoding)
+            let params: HashMap<_, _> = query.split('&').filter_map(|kv| {
+                if kv.is_empty() { return None; }
+                let mut s = kv.splitn(2, '=');
+                let k = s.next().unwrap_or("").to_string();
+                let v = s.next().unwrap_or("").to_string();
+                if k.is_empty() { None } else { Some((k, v)) }
+            }).collect();
+            let component = params.get("component").map(|s| s.as_str()).unwrap_or("smtpd");
+            let mut lines: usize = params.get("lines").and_then(|s| s.parse().ok()).unwrap_or(200);
+            lines = std::cmp::min(lines, 2000);
+            let path = match component {
+                "smtpd" => "/tmp/rmail_smtpd.log",
+                "imapd" => "/tmp/rmail_imapd.log",
+                _ => { status = 400; body = "invalid component".to_string(); "" }
+            };
+            if !path.is_empty() {
+                match tokio::fs::read_to_string(path).await {
+                    Ok(s) => { content_type = "text/plain".to_string(); body = tail_lines(&s, lines); }
+                    Err(e) => { status = 500; body = format!("read error: {}", e); }
                 }
+            }
+        }
             }
             _ => { status = 404; body = "Not Found".to_string(); }
         }
@@ -212,13 +231,15 @@ async fn main() -> Result<()> {
     let mail_root = PathBuf::from(cfg.global.mail_root);
     let admin_user = cfg.global.web_admin_user.clone();
     let admin_hash = cfg.global.web_admin_password_hash.clone();
+    let db_path = cfg.global.db_path.clone();
     loop {
         let (stream, _) = listener.accept().await?;
         let mr = mail_root.clone();
         let admin_user = admin_user.clone();
         let admin_hash = admin_hash.clone();
+        let db_path = db_path.clone();
         tokio::spawn(async move {
-            handle_connection(stream, mr, admin_user, admin_hash).await;
+            handle_connection(stream, mr, admin_user, admin_hash, db_path).await;
         });
     }
 }

@@ -258,13 +258,28 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                     let local = &addr[..at];
                     let domain = &addr[at+1..];
 
-                    // Load or build UID mapping for this Maildir. This maintains a persistent UIDVALIDITY
-                    // and a filename -> UID map stored under Maildir/uidmap.json to provide stable UIDs
-                    // across server restarts. list_messages provides stable ordering for sequence numbers.
                     let mr_clone = mail_root.clone();
                     let domain_c = domain.to_string();
                     let local_c = local.to_string();
-                    match tokio::task::spawn_blocking(move || maildir::load_uid_map(std::path::Path::new(&mr_clone), &domain_c, &local_c)).await {
+                    let dbp_opt = db_path.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        // Use DB to build selection state
+                        if let Some(dbp) = dbp_opt {
+                            let addr = format!("{}@{}", local_c, domain_c);
+                            let uidvalidity = rmail_common::db::get_mailbox_uidvalidity(&dbp, &addr)?;
+                            let list = rmail_common::db::list_messages(&dbp, &domain_c, &local_c)?;
+                            let mut out_msgs: Vec<(u64, std::path::PathBuf, Vec<String>)> = Vec::new();
+                            for (uid, filename, flags) in list.into_iter() {
+                                let new_path = std::path::Path::new(&mr_clone).join(&domain_c).join(&local_c).join("Maildir").join("new").join(&filename);
+                                let cur_path = std::path::Path::new(&mr_clone).join(&domain_c).join(&local_c).join("Maildir").join("cur").join(&filename);
+                                let path = if new_path.exists() { new_path } else { cur_path };
+                                out_msgs.push((uid, path, flags));
+                            }
+                            Ok((uidvalidity, out_msgs))
+                        } else {
+                            Err(anyhow::anyhow!("No DB configured"))
+                        }
+                    }).await {
                         Ok(Ok((uidvalidity, msgs))) => {
                             let count = msgs.len();
                             // store selection in session state
