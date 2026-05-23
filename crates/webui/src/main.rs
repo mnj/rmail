@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use rmail_common::config::Config;
 use std::path::PathBuf;
 use anyhow::Result;
+use base64;
+use rmail_common::auth;
 use std::collections::HashMap;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 struct Stats {
     mailboxes: usize,
     total_messages: usize,
+    delivered_count: u64,
 }
 
 fn tail_lines(s: &str, n: usize) -> String {
@@ -48,10 +51,10 @@ fn scan_maildirs_sync(mail_root: &std::path::Path) -> Result<Stats> {
             }
         }
     }
-    Ok(Stats { mailboxes: mailbox_count, total_messages })
+    Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0 })
 }
 
-async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf) {
+async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>) {
     let peer = match stream.peer_addr() { Ok(p) => p.to_string(), Err(_) => "unknown".to_string() };
     let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
@@ -62,13 +65,19 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
         Err(_) => return,
     }
     let req_line = first_line.trim_end_matches('\n').trim_end_matches('\r').to_string();
-    // read and discard headers until empty line
+    // read headers until empty line, store them in a map
+    let mut headers: HashMap<String, String> = HashMap::new();
     loop {
         let mut h = String::new();
         match reader.read_line(&mut h).await {
             Ok(0) => break,
             Ok(_) => {
                 if h == "\r\n" || h == "\n" { break; }
+                if let Some(colon) = h.find(':') {
+                    let name = h[..colon].trim().to_ascii_lowercase();
+                    let val = h[colon+1..].trim().to_string();
+                    headers.insert(name, val);
+                }
             }
             Err(_) => break,
         }
@@ -78,6 +87,33 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path_q = parts.next().unwrap_or("/");
+
+    // simple basic auth checker closure: returns true if no admin_user configured or credentials match
+    let is_authorized = |headers: &HashMap<String, String>| -> bool {
+        if admin_user.is_none() { return true; }
+        let expected_user = admin_user.as_ref().unwrap();
+        let expected_hash = match &admin_hash { Some(h) => h, None => return false };
+        if let Some(authz) = headers.get("authorization") {
+            if authz.len() > 6 && authz[..6].eq_ignore_ascii_case("Basic ") {
+                let b64 = authz[6..].trim();
+                if let Ok(bytes) = base64::decode(b64) {
+                    if let Ok(creds) = String::from_utf8(bytes) {
+                        if let Some(colon) = creds.find(':') {
+                            let u = &creds[..colon];
+                            let p = &creds[colon+1..];
+                            if u == expected_user {
+                                if let Ok(valid) = rmail_common::auth::verify_password(p, expected_hash) {
+                                    return valid;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    };
+    let mut extra_headers = String::new();
 
     // prepare response
     let mut status = 200;
@@ -99,37 +135,53 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                 body = "ok".to_string();
             }
             "/stats" => {
-                // run blocking scan
-                match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mail_root)).await {
-                    Ok(Ok(stats)) => {
-                        content_type = "application/json".to_string();
-                        body = match serde_json::to_string(&stats) { Ok(s) => s, Err(e) => { status = 500; format!("{{\"error\":\"{}\"}}", e) } };
+                if !is_authorized(&headers) {
+                    status = 401;
+                    body = "Unauthorized".to_string();
+                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
+                } else {
+                    // run blocking scan in threadpool
+                    let mr_clone = mail_root.clone();
+                    match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mr_clone)).await {
+                        Ok(Ok(mut stats)) => {
+                            // attempt to read delivered count from metrics file
+                            let delivered = tokio::fs::read_to_string("/tmp/rmail_delivered.count").await.ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+                            stats.delivered_count = delivered;
+                            content_type = "application/json".to_string();
+                            body = match serde_json::to_string(&stats) { Ok(s) => s, Err(e) => { status = 500; format!("{{\"error\":\"{}\"}}", e) } };
+                        }
+                        Ok(Err(e)) => { status = 500; body = format!("scan error: {}", e); }
+                        Err(e) => { status = 500; body = format!("task join error: {}", e); }
                     }
-                    Ok(Err(e)) => { status = 500; body = format!("scan error: {}", e); }
-                    Err(e) => { status = 500; body = format!("task join error: {}", e); }
                 }
             }
             "/logs" => {
-                // parse query params for component and lines (simple parser, no percent-decoding)
-                let params: HashMap<_, _> = query.split('&').filter_map(|kv| {
-                    if kv.is_empty() { return None; }
-                    let mut s = kv.splitn(2, '=');
-                    let k = s.next().unwrap_or("").to_string();
-                    let v = s.next().unwrap_or("").to_string();
-                    if k.is_empty() { None } else { Some((k, v)) }
-                }).collect();
-                let component = params.get("component").map(|s| s.as_str()).unwrap_or("smtpd");
-                let mut lines: usize = params.get("lines").and_then(|s| s.parse().ok()).unwrap_or(200);
-                lines = std::cmp::min(lines, 2000);
-                let path = match component {
-                    "smtpd" => "/tmp/rmail_smtpd.log",
-                    "imapd" => "/tmp/rmail_imapd.log",
-                    _ => { status = 400; body = "invalid component".to_string(); "" }
-                };
-                if !path.is_empty() {
-                    match tokio::fs::read_to_string(path).await {
-                        Ok(s) => { content_type = "text/plain".to_string(); body = tail_lines(&s, lines); }
-                        Err(e) => { status = 500; body = format!("read error: {}", e); }
+                if !is_authorized(&headers) {
+                    status = 401;
+                    body = "Unauthorized".to_string();
+                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
+                } else {
+                    // parse query params for component and lines (simple parser, no percent-decoding)
+                    let params: HashMap<_, _> = query.split('&').filter_map(|kv| {
+                        if kv.is_empty() { return None; }
+                        let mut s = kv.splitn(2, '=');
+                        let k = s.next().unwrap_or("").to_string();
+                        let v = s.next().unwrap_or("").to_string();
+                        if k.is_empty() { None } else { Some((k, v)) }
+                    }).collect();
+                    let component = params.get("component").map(|s| s.as_str()).unwrap_or("smtpd");
+                    let mut lines: usize = params.get("lines").and_then(|s| s.parse().ok()).unwrap_or(200);
+                    lines = std::cmp::min(lines, 2000);
+                    let path = match component {
+                        "smtpd" => "/tmp/rmail_smtpd.log",
+                        "imapd" => "/tmp/rmail_imapd.log",
+                        _ => { status = 400; body = "invalid component".to_string(); "" }
+                    };
+                    if !path.is_empty() {
+                        match tokio::fs::read_to_string(path).await {
+                            Ok(s) => { content_type = "text/plain".to_string(); body = tail_lines(&s, lines); }
+                            Err(e) => { status = 500; body = format!("read error: {}", e); }
+                        }
                     }
                 }
             }
@@ -138,7 +190,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
     }
 
     // write response (HTTP/1.1)
-    let response = format!("HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n{}", status, if status==200 { "OK" } else { "ERR" }, body.as_bytes().len(), content_type, body);
+    let response = format!("HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n{}\r\n{}", status, if status==200 { "OK" } else { "ERR" }, body.as_bytes().len(), content_type, extra_headers, body);
     // take ownership of underlying stream and write once
     let mut stream = reader.into_inner();
     let _ = stream.write_all(response.as_bytes()).await;
@@ -158,11 +210,15 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("rMail web UI listening on {}", addr);
     let mail_root = PathBuf::from(cfg.global.mail_root);
+    let admin_user = cfg.global.web_admin_user.clone();
+    let admin_hash = cfg.global.web_admin_password_hash.clone();
     loop {
         let (stream, _) = listener.accept().await?;
         let mr = mail_root.clone();
+        let admin_user = admin_user.clone();
+        let admin_hash = admin_hash.clone();
         tokio::spawn(async move {
-            handle_connection(stream, mr).await;
+            handle_connection(stream, mr, admin_user, admin_hash).await;
         });
     }
 }

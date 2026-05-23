@@ -10,6 +10,10 @@ web_port = 8080
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "info"
+# optional web admin user (for /stats and /logs endpoints)
+web_admin_user = "admin"
+# generate a hash using rmail_ctl hash and paste here
+web_admin_password_hash = "argon2$PLACEHOLDER"
 
 [[mailboxes]]
 address = "user@example.local"

@@ -1,0 +1,9 @@
+[Unit]
+Description=rMail IMAP socket
+
+[Socket]
+ListenStream=0.0.0.0:143
+ListenStream=[::]:143
+
+[Install]
+WantedBy=sockets.target

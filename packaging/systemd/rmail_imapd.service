@@ -1,0 +1,17 @@
+[Unit]
+Description=rMail IMAP daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/rmail_imapd --config /etc/rmail/config.toml
+User=rmail
+Group=rmail
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

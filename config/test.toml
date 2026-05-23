@@ -10,6 +10,9 @@ web_port = 18080
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "debug"
+# optional web admin user for local testing
+web_admin_user = "admin"
+web_admin_password_hash = "plain:password"
 
 [[mailboxes]]
 address = "user@example.local"

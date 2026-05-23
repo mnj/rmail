@@ -15,6 +15,10 @@ pub struct Global {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub log_level: Option<String>,
+    /// Optional web admin username for the lightweight web UI
+    pub web_admin_user: Option<String>,
+    /// Argon2 password hash for administrative web UI access (optional)
+    pub web_admin_password_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

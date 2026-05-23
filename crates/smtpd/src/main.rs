@@ -14,9 +14,25 @@ use tokio_rustls::TlsAcceptor;
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
 
+/// Increment an on-disk counter for delivered messages. Uses an atomic write via a temporary file
+/// so that concurrent processes won't corrupt the counter file. This is intentionally simple and
+/// avoids pulling in heavier metrics crates — it's a lightweight local metric for the Web UI.
+async fn increment_delivery_counter() -> Result<()> {
+    let path = std::path::Path::new("/tmp/rmail_delivered.count");
+    let mut count: u64 = 0;
+    if let Ok(s) = tokio::fs::read_to_string(path).await {
+        count = s.trim().parse::<u64>().unwrap_or(0);
+    }
+    count = count.saturating_add(1);
+    let tmp = path.with_extension("tmp");
+    tokio::fs::write(&tmp, count.to_string()).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<()> { 
     // load config (example path)
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
@@ -329,7 +345,13 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
                         let domain = &rcpt[at+1..];
                         let mr = PathBuf::from(&mail_root);
                         match maildir::deliver(&mr, domain, local, &data) {
-                            Ok(path) => println!("Delivered to {} -> {:?}", rcpt, path),
+                            Ok(path) => {
+                                println!("Delivered to {} -> {:?}", rcpt, path);
+                                // update simple on-disk metric; failures are non-fatal
+                                if let Err(e) = increment_delivery_counter().await {
+                                    eprintln!("metrics update failed: {}", e);
+                                }
+                            }
                             Err(e) => {
                                 eprintln!("deliver error for {}: {}", rcpt, e);
                                 let w = reader.get_mut();

@@ -275,6 +275,108 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                     }
                 }
             },
+            "FETCH" => {
+                if authed_mailbox.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let args = args.trim();
+                let mut a = args.splitn(2, ' ');
+                let seq_set = a.next().unwrap_or("");
+                let _what = a.next().unwrap_or("");
+                let addr = authed_mailbox.as_ref().unwrap();
+                if let Some(at) = addr.find('@') {
+                    let local = &addr[..at];
+                    let domain = &addr[at+1..];
+                    let msgs = maildir::list_messages(&std::path::Path::new(&mail_root), domain, local)?;
+                    let total = msgs.len();
+                    let seqs: Vec<usize> = if seq_set == "1:*" {
+                        (1..=total).collect()
+                    } else if seq_set.contains(':') {
+                        let mut parts = seq_set.split(':');
+                        let start = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                        let end = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(total);
+                        (start..=end).collect()
+                    } else {
+                        if let Ok(v) = seq_set.parse::<usize>() { vec![v] } else { vec![] }
+                    };
+                    for seq in seqs {
+                        if seq == 0 || seq > total { continue; }
+                        let idx = seq - 1;
+                        let data = maildir::read_message(&std::path::Path::new(&mail_root), domain, local, idx)?;
+                        let w = reader.get_mut();
+                        w.write_all(format!("* {} FETCH (RFC822 {{{}}}\r\n", seq, data.len()).as_bytes()).await?;
+                        w.write_all(&data).await?;
+                        w.write_all(b"\r\n)\r\n").await?;
+                        w.flush().await?;
+                    }
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                } else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                }
+            },
+            "UID" => {
+                // minimal UID support: treat UID numbers as sequence numbers for now
+                let mut a = args.trim().splitn(2, ' ');
+                let subcmd = a.next().unwrap_or("").to_uppercase();
+                let subargs = a.next().unwrap_or("");
+                if subcmd.as_str() == "FETCH" {
+                    let mut b = subargs.splitn(2, ' ');
+                    let uid_set = b.next().unwrap_or("");
+                    let _what = b.next().unwrap_or("");
+                    // reuse FETCH logic but treat uid_set as sequence set
+                    if authed_mailbox.is_none() {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                    let addr = authed_mailbox.as_ref().unwrap();
+                    if let Some(at) = addr.find('@') {
+                        let local = &addr[..at];
+                        let domain = &addr[at+1..];
+                        let msgs = maildir::list_messages(&std::path::Path::new(&mail_root), domain, local)?;
+                        let total = msgs.len();
+                        let seqs: Vec<usize> = if uid_set == "1:*" {
+                            (1..=total).collect()
+                        } else if uid_set.contains(':') {
+                            let mut parts = uid_set.split(':');
+                            let start = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                            let end = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(total);
+                            (start..=end).collect()
+                        } else {
+                            if let Ok(v) = uid_set.parse::<usize>() { vec![v] } else { vec![] }
+                        };
+                        for seq in seqs {
+                            if seq == 0 || seq > total { continue; }
+                            let idx = seq - 1;
+                            let data = maildir::read_message(&std::path::Path::new(&mail_root), domain, local, idx)?;
+                            let w = reader.get_mut();
+                            w.write_all(format!("* {} FETCH (UID {} RFC822 {{{}}}\r\n", seq, seq, data.len()).as_bytes()).await?;
+                            w.write_all(&data).await?;
+                            w.write_all(b"\r\n)\r\n").await?;
+                            w.flush().await?;
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes()).await?;
+                        w.flush().await?;
+                    } else {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
+                        w.flush().await?;
+                    }
+                } else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
+                }
+            },
             "LOGOUT" => {
                 let w = reader.get_mut();
                 w.write_all(b"* BYE Logging out\r\n").await?;

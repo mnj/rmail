@@ -54,3 +54,35 @@ pub fn count_messages(maildir_root: &Path, domain: &str, localpart: &str) -> any
     }
     Ok(count)
 }
+
+/// List all message file paths in Maildir (new + cur), sorted by filename for stable ordering.
+pub fn list_messages(maildir_root: &Path, domain: &str, localpart: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
+    ensure_maildir(&mailbox_dir)?;
+    let mut msgs = Vec::new();
+    for sub in &["new", "cur"] {
+        let dir = mailbox_dir.join(sub);
+        if dir.exists() && dir.is_dir() {
+            for entry in fs::read_dir(dir)? {
+                let e = entry?;
+                if e.file_type()?.is_file() {
+                    msgs.push(e.path());
+                }
+            }
+        }
+    }
+    // Sort by filename to provide stable ordering for IMAP sequence numbers
+    msgs.sort_by_key(|p| p.file_name().and_then(|n| n.to_str().map(|s| s.to_owned())).unwrap_or_default());
+    Ok(msgs)
+}
+
+/// Read the message bytes at the given zero-based index from the Maildir (combined new+cur ordering).
+pub fn read_message(maildir_root: &Path, domain: &str, localpart: &str, index: usize) -> anyhow::Result<Vec<u8>> {
+    let msgs = list_messages(maildir_root, domain, localpart)?;
+    if let Some(path) = msgs.get(index) {
+        let data = fs::read(path)?;
+        Ok(data)
+    } else {
+        Err(anyhow::anyhow!("no message at index"))
+    }
+}

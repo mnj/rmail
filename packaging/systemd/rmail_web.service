@@ -1,0 +1,16 @@
+[Unit]
+Description=rMail web UI
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/rmail_web --config /etc/rmail/config.toml
+User=rmail
+Group=rmail
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
