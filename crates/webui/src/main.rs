@@ -16,6 +16,7 @@ struct Stats {
     mailboxes: usize,
     total_messages: usize,
     delivered_count: u64,
+    outbound_pending: Option<i64>,
 }
 
 fn tail_lines(s: &str, n: usize) -> String {
@@ -34,7 +35,9 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
             let c = rmail_common::db::count_messages(dbp, &m.address)?;
             total_messages += c as usize;
         }
-        return Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0 });
+    // outbound queue depth when DB is authoritative
+    let outbound_pending = rmail_common::db::count_outbound_pending(dbp)?;
+    return Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0, outbound_pending: Some(outbound_pending) });
     }
 
     let mut mailbox_count = 0usize;
@@ -170,7 +173,20 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
             }
             "/metrics" => {
         // Expose Prometheus-style metrics
-        let metrics_text = rmail_common::metrics::gather_prometheus();
+        let mut metrics_text = rmail_common::metrics::gather_prometheus();
+        // Append DB-backed metrics (outbound queue depth) when available
+        if let Some(dbp) = db_path.as_ref() {
+            match rmail_common::db::count_outbound_pending(dbp) {
+                Ok(n) => {
+                    metrics_text.push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
+                    metrics_text.push_str("# TYPE rmail_outbound_pending gauge\n");
+                    metrics_text.push_str(&format!("rmail_outbound_pending {}\n", n));
+                }
+                Err(e) => {
+                    eprintln!("failed to read outbound queue size: {}", e);
+                }
+            }
+        }
         content_type = "text/plain".to_string();
         body = metrics_text;
             }
