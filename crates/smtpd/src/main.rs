@@ -420,8 +420,22 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     }
                 };
 
-                // client-first-bare is the part after the GS2 header "n,,"
-                let client_first_bare = if let Some(idx) = client_first_msg.find(",,") { client_first_msg[idx+2..].to_string() } else { client_first_msg.clone() };
+                // Extract GS2 header and client-first-bare. GS2 header indicates whether the
+                // client requests channel-binding. For interoperability we accept the common
+                // "n,," (no channel binding) header. Full channel-binding (e.g., tls-unique)
+                // requires access to the TLS exporter and is not implemented here yet.
+                let client_first_bare = if let Some(idx) = client_first_msg.find(",,") {
+                    let gs2_header = &client_first_msg[..idx+2];
+                    // Only accept the common "n,," GS2 header (no channel binding). If a client
+                    // indicates channel-binding (flags 'y' or 'p=...'), reject explicitly.
+                    if !gs2_header.eq("n,,") {
+                        let w = reader.get_mut();
+                        w.write_all(b"538 Channel-binding requested but not supported\r\n").await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                    client_first_msg[idx+2..].to_string()
+                } else { client_first_msg.clone() };
 
                 // parse username (n=) and client nonce (r=) from client-first-bare
                 let mut username = String::new();
