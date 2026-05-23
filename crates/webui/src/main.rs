@@ -69,7 +69,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
     Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0, outbound_pending: None })
 }
 
-async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>, db_path: Option<String>) {
+async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>, db_path: Option<String>, acme_challenge_dir: Option<String>) {
     let peer = match stream.peer_addr() { Ok(p) => p.to_string(), Err(_) => "unknown".to_string() };
     let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
@@ -140,6 +140,19 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
         body = "Method Not Allowed".to_string();
     } else {
         let (path, query) = if let Some(pos) = path_q.find('?') { (&path_q[..pos], &path_q[pos+1..]) } else { (path_q, "") };
+        // Serve ACME http-01 challenge files from configured directory
+        if path.starts_with("/.well-known/acme-challenge/") {
+            let token = &path["/.well-known/acme-challenge/".len()..];
+            if let Some(acme_dir) = acme_challenge_dir.as_ref() {
+                let fpath = std::path::Path::new(acme_dir).join(token);
+                match tokio::fs::read_to_string(fpath).await {
+                    Ok(s) => { content_type = "text/plain".to_string(); body = s; }
+                    Err(_) => { status = 404; body = "Not Found".to_string(); }
+                }
+            } else {
+                status = 404; body = "Not Found".to_string();
+            }
+        } else {
         match path {
             "/" => {
                 content_type = "text/html".to_string();
@@ -222,6 +235,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
             }
             _ => { status = 404; body = "Not Found".to_string(); }
         }
+}
     }
 
     // write response (HTTP/1.1)
@@ -248,14 +262,16 @@ async fn main() -> Result<()> {
     let admin_user = cfg.global.web_admin_user.clone();
     let admin_hash = cfg.global.web_admin_password_hash.clone();
     let db_path = cfg.global.db_path.clone();
+    let acme_dir = cfg.global.acme_challenge_dir.clone();
     loop {
         let (stream, _) = listener.accept().await?;
         let mr = mail_root.clone();
         let admin_user = admin_user.clone();
         let admin_hash = admin_hash.clone();
         let db_path = db_path.clone();
+        let acme_dir = acme_dir.clone();
         tokio::spawn(async move {
-            handle_connection(stream, mr, admin_user, admin_hash, db_path).await;
+            handle_connection(stream, mr, admin_user, admin_hash, db_path, acme_dir).await;
         });
     }
 }
