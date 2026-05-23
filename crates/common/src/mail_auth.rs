@@ -284,10 +284,61 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
     }
 }
 
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+use std::collections::HashMap;
+use std::time::{Instant, Duration};
+
 fn resolver() -> Result<Resolver> {
     // Use system-configured resolvers
     let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default())?;
     Ok(resolver)
+}
+
+// Simple DNS caches to avoid repeated lookups during message analysis
+static TXT_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<String>)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static A_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<std::net::IpAddr>)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+
+fn cached_txt_lookup(name: &str) -> Option<Vec<String>> {
+    let mut cache = TXT_CACHE.lock().unwrap();
+    if let Some((ts, val)) = cache.get(name) {
+        if ts.elapsed() < DNS_CACHE_TTL {
+            return Some(val.clone());
+        }
+    }
+    drop(cache);
+    if let Ok(res) = resolver() {
+        if let Ok(lookup) = res.txt_lookup(name) {
+            let mut vals: Vec<String> = Vec::new();
+            for txt in lookup.iter() {
+                vals.push(txt.to_string());
+            }
+            let mut cache = TXT_CACHE.lock().unwrap();
+            cache.insert(name.to_string(), (Instant::now(), vals.clone()));
+            return Some(vals);
+        }
+    }
+    None
+}
+
+fn cached_lookup_ip(name: &str) -> Option<Vec<std::net::IpAddr>> {
+    let mut cache = A_CACHE.lock().unwrap();
+    if let Some((ts, val)) = cache.get(name) {
+        if ts.elapsed() < DNS_CACHE_TTL {
+            return Some(val.clone());
+        }
+    }
+    drop(cache);
+    if let Ok(res) = resolver() {
+        if let Ok(lookup) = res.lookup_ip(name) {
+            let mut ips: Vec<std::net::IpAddr> = lookup.iter().collect();
+            let mut cache = A_CACHE.lock().unwrap();
+            cache.insert(name.to_string(), (Instant::now(), ips.clone()));
+            return Some(ips);
+        }
+    }
+    None
 }
 
 fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option<String>> {
@@ -309,13 +360,46 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
         }
     }
 
-    fn eval_spf_for_domain(domain: &str, peer: IpAddr, depth: u8, visited: &mut HashSet<String>) -> Option<String> {
+    fn expand_spf_macros(s: &str, peer: IpAddr, mail_from: &str, current_domain: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                if let Some(next) = chars.next() {
+                    match next {
+                        '%' => out.push('%'),
+                        '_' => out.push(' '),
+                        '-' => out.push_str("%20"),
+                        '{' => {
+                            let mut mac = String::new();
+                            while let Some(n) = chars.next() {
+                                if n == '}' { break; }
+                                mac.push(n);
+                            }
+                            let replacement = match mac.as_str() {
+                                "i" => peer.to_string(),
+                                "s" => mail_from.unwrap_or("").to_string(),
+                                "l" => mail_from.and_then(|m| m.split('@').next().map(|s| s.to_string())).unwrap_or_else(|| "".to_string()),
+                                "d" => current_domain.to_string(),
+                                _ => "".to_string(),
+                            };
+                            out.push_str(&replacement);
+                        }
+                        _ => { out.push('%'); out.push(next); }
+                    }
+                } else { out.push('%'); }
+            } else { out.push(ch); }
+        }
+        out
+    }
+
+    fn eval_spf_for_domain(domain: &str, peer: IpAddr, depth: u8, visited: &mut HashSet<String>, mail_from: &str) -> Option<String> {
         if depth > 10 { return None; }
         if visited.contains(domain) { return None; }
         visited.insert(domain.to_string());
-        let resolver = resolver().ok()?;
-        let lookup = resolver.txt_lookup(domain).ok()?;
-        for txt in lookup.iter() {
+        // try cached TXT lookup first
+        let txts = cached_txt_lookup(domain)?;
+        for txt in txts.iter() {
             let txt_str = txt.to_string();
             if !txt_str.to_ascii_lowercase().starts_with("v=spf1") { continue; }
             let mut seen_all: Option<char> = None;
@@ -333,29 +417,32 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
                     }
                 } else if mech.starts_with("a") {
                     // a or a:domain
-                    let target = if mech == "a" { domain.to_string() } else if mech.starts_with("a:") { mech[2..].to_string() } else { domain.to_string() };
-                    if let Ok(ips) = resolver.lookup_ip(target.as_str()) {
+                    let target = if mech == "a" { domain.to_string() } else if mech.starts_with("a:") { expand_spf_macros(&mech[2..], peer, mail_from, domain) } else { domain.to_string() };
+                    if let Some(ips) = cached_lookup_ip(target.as_str()) {
                         for ip in ips.iter() {
-                            if ip == peer { return Some(map_qual(qual).to_string()); }
+                            if *ip == peer { return Some(map_qual(qual).to_string()); }
                         }
                     }
                 } else if mech.starts_with("mx") {
                     // mx or mx:domain
                     let target = if mech == "mx" { domain.to_string() } else if mech.starts_with("mx:") { mech[3..].to_string() } else { domain.to_string() };
-                    if let Ok(mxlookup) = resolver.mx_lookup(target.as_str()) {
-                        for mx in mxlookup.iter() {
-                            let host = mx.exchange().to_utf8();
-                            if let Ok(ips) = resolver.lookup_ip(host.as_str()) {
-                                for ip in ips.iter() {
-                                    if ip == peer { return Some(map_qual(qual).to_string()); }
+                    if let Ok(resolver) = resolver() {
+                        if let Ok(mxlookup) = resolver.mx_lookup(target.as_str()) {
+                            for mx in mxlookup.iter() {
+                                let host = mx.exchange().to_utf8();
+                                if let Some(ips) = cached_lookup_ip(host.as_str()) {
+                                    for ip in ips.iter() {
+                                        if *ip == peer { return Some(map_qual(qual).to_string()); }
+                                    }
                                 }
                             }
                         }
                     }
                 } else if mech.starts_with("include:") {
-                    let inc = &mech[8..];
+                    let inc_raw = &mech[8..];
+                    let inc = expand_spf_macros(inc_raw, peer, mail_from, domain);
                     let mut v2 = visited.clone();
-                    if let Some(res) = eval_spf_for_domain(inc, peer, depth.saturating_add(1), &mut v2) {
+                    if let Some(res) = eval_spf_for_domain(&inc, peer, depth.saturating_add(1), &mut v2, mail_from) {
                         if res == "pass" { return Some("pass".to_string()); }
                         // otherwise continue
                     }
@@ -372,7 +459,7 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
     }
 
     let mut visited = HashSet::new();
-    if let Some(res) = eval_spf_for_domain(domain, peer, 0, &mut visited) {
+    if let Some(res) = eval_spf_for_domain(domain, peer, 0, &mut visited, mf) {
         return Ok(Some(res));
     }
     Ok(None)
