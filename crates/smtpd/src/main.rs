@@ -867,10 +867,10 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                             let data_for_analysis = data.clone();
                             let peer_ip_for_analysis = peer.map(|p| p.ip());
                             let mail_from_clone_analysis = mail_from.clone();
-                            let (dkim_res, spf_res, dmarc_res) = match tokio::task::spawn_blocking(move || rmail_common::mail_auth::analyze_message(&data_for_analysis, peer_ip_for_analysis, mail_from_clone_analysis.as_deref())).await {
-                                Ok(Ok((dkim, spf, dmarc))) => (dkim, spf, dmarc),
-                                Ok(Err(e)) => { eprintln!("mail auth analyze error: {}", e); (None, None, None) },
-                                Err(e) => { eprintln!("mail auth join error: {}", e); (None, None, None) },
+                            let (dkim_res, spf_res, dmarc_res, header_from_res) = match tokio::task::spawn_blocking(move || rmail_common::mail_auth::analyze_message(&data_for_analysis, peer_ip_for_analysis, mail_from_clone_analysis.as_deref())).await {
+                                Ok(Ok((dkim, spf, dmarc, header_from))) => (dkim, spf, dmarc, header_from),
+                                Ok(Err(e)) => { eprintln!("mail auth analyze error: {}", e); (None, None, None, None) },
+                                Err(e) => { eprintln!("mail auth join error: {}", e); (None, None, None, None) },
                             };
 
                             // Record mail auth metrics
@@ -887,6 +887,23 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                     "reject" => rmail_common::metrics::inc_dmarc_reject(),
                                     _ => {}
                                 }
+                            }
+
+                            // persist DMARC event into DB for reporting (non-blocking)
+                            if let Some(dbp) = db_path.as_ref() {
+                                let dbp2 = dbp.clone();
+                                let db_domain = domain.clone();
+                                let header_from_clone = header_from_res.clone();
+                                let envelope_from_clone = mail_from.clone();
+                                let peer_ip_for_db = peer.map(|p| p.ip().to_string());
+                                let dkim_clone = dkim_res.clone();
+                                let spf_clone = spf_res.clone();
+                                let dmarc_clone = dmarc_res.clone();
+                                tokio::spawn(async move {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = rmail_common::db::add_dmarc_event(&dbp2, &db_domain, header_from_clone.as_deref(), envelope_from_clone.as_deref(), peer_ip_for_db.as_deref(), dkim_clone.as_deref(), spf_clone.as_deref(), dmarc_clone.as_deref(), None);
+                                    }).await;
+                                });
                             }
 
                             // Enforce DMARC if configured: reject when DMARC policy indicates 'reject'
