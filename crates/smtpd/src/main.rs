@@ -45,12 +45,12 @@ async fn main() -> Result<()> {
     // spawn plain SMTP listeners
     for addr in listen_addrs.iter() {
         let addr = addr.clone();
-        let allowed = allowed.clone();
-        let catchalls = catchalls.clone();
-        let mail_root = mail_root.clone();
-        let acceptor = tls_acceptor.clone();
+        let allowed_clone = allowed.clone();
+        let catchalls_clone = catchalls.clone();
+        let mail_root_clone = mail_root.clone();
+        let acceptor_clone = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_plain_listener(&addr, allowed, catchalls, mail_root, acceptor).await {
+            if let Err(e) = run_plain_listener(&addr, allowed_clone, catchalls_clone, mail_root_clone, acceptor_clone).await {
                 eprintln!("Listener {} failed: {}", addr, e);
             }
         });
@@ -61,17 +61,25 @@ async fn main() -> Result<()> {
         if let Some(port) = cfg.global.smtps_port {
             let addr_v4 = format!("0.0.0.0:{}", port);
             let addr_v6 = format!("[::]:{}", port);
-            let allowed = allowed.clone();
-            let catchalls = catchalls.clone();
-            let mail_root = mail_root.clone();
-            let acceptor = s_acceptor.clone();
+
+            // v4 listener
+            let allowed_v4 = allowed.clone();
+            let catchalls_v4 = catchalls.clone();
+            let mail_root_v4 = mail_root.clone();
+            let acceptor_v4 = s_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v4, acceptor, allowed, catchalls, mail_root.clone()).await {
+                if let Err(e) = run_smtps_listener(&addr_v4, acceptor_v4, allowed_v4, catchalls_v4, mail_root_v4).await {
                     eprintln!("SMTPS {} failed: {}", addr_v4, e);
                 }
             });
+
+            // v6 listener
+            let allowed_v6 = allowed.clone();
+            let catchalls_v6 = catchalls.clone();
+            let mail_root_v6 = mail_root.clone();
+            let acceptor_v6 = s_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v6, s_acceptor.clone(), allowed, catchalls, mail_root).await {
+                if let Err(e) = run_smtps_listener(&addr_v6, acceptor_v6, allowed_v6, catchalls_v6, mail_root_v6).await {
                     eprintln!("SMTPS {} failed: {}", addr_v6, e);
                 }
             });
@@ -142,9 +150,11 @@ where
 {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let writer = reader.get_mut();
-    writer.write_all(b"220 rMail SMTPD ready\r\n").await?;
-    writer.flush().await?;
+    {
+        let w = reader.get_mut();
+        w.write_all(b"220 rMail SMTPD ready\r\n").await?;
+        w.flush().await?;
+    }
     let mut rcpts: Vec<String> = Vec::new();
     loop {
         line.clear();
@@ -153,49 +163,59 @@ where
         let cmd = line.trim_end().to_string();
         let up = cmd.to_ascii_uppercase();
         if up.starts_with("HELO") || up.starts_with("EHLO") {
-            writer.write_all(b"250 Hello\r\n").await?;
-            writer.flush().await?;
+            let w = reader.get_mut();
+            w.write_all(b"250 Hello\r\n").await?;
+            w.flush().await?;
         } else if up.starts_with("MAIL FROM:") {
-            writer.write_all(b"250 OK\r\n").await?;
-            writer.flush().await?;
+            let w = reader.get_mut();
+            w.write_all(b"250 OK\r\n").await?;
+            w.flush().await?;
             rcpts.clear();
         } else if up.starts_with("RCPT TO:") {
             if let Some(raw) = cmd.get(8..) {
                 if let Some(addr) = extract_addr(raw) {
                     if allowed.contains(&addr) {
                         rcpts.push(addr.clone());
-                        writer.write_all(b"250 OK\r\n").await?;
-                        writer.flush().await?;
+                        let w = reader.get_mut();
+                        w.write_all(b"250 OK\r\n").await?;
+                        w.flush().await?;
                     } else if let Some(at) = addr.find('@') {
                         let domain = &addr[at+1..];
                         if let Some(target) = catchalls.get(domain) {
                             rcpts.push(target.clone());
-                            writer.write_all(b"250 OK\r\n").await?;
-                            writer.flush().await?;
+                            let w = reader.get_mut();
+                            w.write_all(b"250 OK\r\n").await?;
+                            w.flush().await?;
                         } else {
-                            writer.write_all(b"550 No such user\r\n").await?;
-                            writer.flush().await?;
+                            let w = reader.get_mut();
+                            w.write_all(b"550 No such user\r\n").await?;
+                            w.flush().await?;
                         }
                     } else {
-                        writer.write_all(b"550 Bad address\r\n").await?;
-                        writer.flush().await?;
+                        let w = reader.get_mut();
+                        w.write_all(b"550 Bad address\r\n").await?;
+                        w.flush().await?;
                     }
                 } else {
-                    writer.write_all(b"550 Bad address\r\n").await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(b"550 Bad address\r\n").await?;
+                    w.flush().await?;
                 }
             } else {
-                writer.write_all(b"550 Bad address\r\n").await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(b"550 Bad address\r\n").await?;
+                w.flush().await?;
             }
         } else if up.starts_with("DATA") {
             if rcpts.is_empty() {
-                writer.write_all(b"554 No recipients\r\n").await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(b"554 No recipients\r\n").await?;
+                w.flush().await?;
                 continue;
             }
-            writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
-            writer.flush().await?;
+            let w = reader.get_mut();
+            w.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
+            w.flush().await?;
             // read data lines with dot-stuffing unescape
             let mut data: Vec<u8> = Vec::new();
             loop {
@@ -226,17 +246,20 @@ where
                 }
             }
             rcpts.clear();
-            writer.write_all(b"250 OK\r\n").await?;
-            writer.flush().await?;
+            let w = reader.get_mut();
+            w.write_all(b"250 OK\r\n").await?;
+            w.flush().await?;
         } else if up.starts_with("QUIT") {
-            writer.write_all(b"221 Bye\r\n").await?;
-            writer.flush().await?;
+            let w = reader.get_mut();
+            w.write_all(b"221 Bye\r\n").await?;
+            w.flush().await?;
             break;
         } else if up.starts_with("STARTTLS") {
             // if we have an acceptor available, perform TLS handshake and continue inside TLS
             if let Some(acceptor) = tls_acceptor {
-                writer.write_all(b"220 Ready to start TLS\r\n").await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(b"220 Ready to start TLS\r\n").await?;
+                w.flush().await?;
                 // take ownership of the underlying stream and perform TLS accept
                 let inner = reader.into_inner();
                 match acceptor.accept(inner).await {
@@ -251,12 +274,14 @@ where
                     }
                 }
             } else {
-                writer.write_all(b"454 TLS not available\r\n").await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(b"454 TLS not available\r\n").await?;
+                w.flush().await?;
             }
         } else {
-            writer.write_all(b"502 Command not implemented\r\n").await?;
-            writer.flush().await?;
+            let w = reader.get_mut();
+            w.write_all(b"502 Command not implemented\r\n").await?;
+            w.flush().await?;
         }
     }
     Ok(())

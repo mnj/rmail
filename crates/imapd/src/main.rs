@@ -117,9 +117,11 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader = BufReader::new(stream);
-    let mut writer = reader.get_mut();
-    writer.write_all(b"* OK rMail IMAPD ready\r\n").await?;
-    writer.flush().await?;
+    {
+        let w = reader.get_mut();
+        w.write_all(b"* OK rMail IMAPD ready\r\n").await?;
+        w.flush().await?;
+    }
     let mut line = String::new();
     let mut authed_mailbox: Option<String> = None; // store address lowercase
 
@@ -167,46 +169,61 @@ where
                         match auth::verify_password(pass, hash) {
                             Ok(true) => {
                                 authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
-                                writer.write_all(format!("{} OK LOGIN completed\r\n", tag).as_bytes()).await?;
+                                let w = reader.get_mut();
+                                w.write_all(format!("{} OK LOGIN completed\r\n", tag).as_bytes()).await?;
+                                w.flush().await?;
                             },
                             Ok(false) => {
-                                writer.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes()).await?;
+                                let w = reader.get_mut();
+                                w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes()).await?;
+                                w.flush().await?;
                             },
                             Err(e) => {
-                                writer.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes()).await?;
+                                let w = reader.get_mut();
+                                w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes()).await?;
+                                w.flush().await?;
                                 eprintln!("auth verify error: {}", e);
                             }
                         }
                     } else {
-                        writer.write_all(format!("{} NO No password set for account\r\n", tag).as_bytes()).await?;
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO No password set for account\r\n", tag).as_bytes()).await?;
+                        w.flush().await?;
                     }
                 } else {
-                    writer.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                 }
-                writer.flush().await?;
             },
             "LIST" => {
                 // Require authentication to list user's mailboxes in this simple implementation
                 if authed_mailbox.is_none() {
-                    writer.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                     continue;
                 }
                 // Return INBOX only
-                writer.write_all(b"* LIST (""\\HasNoChildren"") \"/\" \"INBOX\"\r\n").await?;
-                writer.write_all(format!("{} OK LIST completed\r\n", tag).as_bytes()).await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(b"* LIST (\"\\HasNoChildren\") \"/\" \"INBOX\"\r\n").await?;
+                w.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK LIST completed\r\n", tag).as_bytes()).await?;
+                w.flush().await?;
             },
             "SELECT" => {
                 if authed_mailbox.is_none() {
-                    writer.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                     continue;
                 }
                 let mailbox_name = args.trim();
                 if mailbox_name.to_uppercase() != "INBOX" {
-                    writer.write_all(format!("{} NO Only INBOX supported\r\n", tag).as_bytes()).await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Only INBOX supported\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                     continue;
                 }
                 let addr = authed_mailbox.as_ref().unwrap();
@@ -215,23 +232,31 @@ where
                     let local = &addr[..at];
                     let domain = &addr[at+1..];
                     let count = maildir::count_messages(&std::path::Path::new(&mail_root), domain, local)?;
-                    writer.write_all(format!("* {} EXISTS\r\n", count).as_bytes()).await?;
-                    writer.write_all(b"* 0 RECENT\r\n").await?;
-                    writer.write_all(format!("{} OK [READ-WRITE] SELECT completed\r\n", tag).as_bytes()).await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("* {} EXISTS\r\n", count).as_bytes()).await?;
+                    w.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(b"* 0 RECENT\r\n").await?;
+                    w.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} OK [READ-WRITE] SELECT completed\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                 } else {
-                    writer.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                 }
             },
             "STARTTLS" => {
                 if tls_acceptor.is_none() {
-                    writer.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes()).await?;
-                    writer.flush().await?;
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes()).await?;
+                    w.flush().await?;
                     continue;
                 }
-                writer.write_all(format!("{} OK Begin TLS negotiation now\r\n", tag).as_bytes()).await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK Begin TLS negotiation now\r\n", tag).as_bytes()).await?;
+                w.flush().await?;
                 // perform TLS handshake and continue inside TLS context
                 let inner = reader.into_inner();
                 match tls_acceptor.unwrap().accept(inner).await {
@@ -245,14 +270,18 @@ where
                 }
             },
             "LOGOUT" => {
-                writer.write_all(b"* BYE Logging out\r\n").await?;
-                writer.write_all(format!("{} OK LOGOUT completed\r\n", tag).as_bytes()).await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(b"* BYE Logging out\r\n").await?;
+                w.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK LOGOUT completed\r\n", tag).as_bytes()).await?;
+                w.flush().await?;
                 break;
             },
             _ => {
-                writer.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes()).await?;
-                writer.flush().await?;
+                let w = reader.get_mut();
+                w.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes()).await?;
+                w.flush().await?;
             }
         }
     }

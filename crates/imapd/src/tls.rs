@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 
-use rustls::{Certificate, PrivateKey, ServerConfig};
+use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use tokio_rustls::TlsAcceptor;
 
