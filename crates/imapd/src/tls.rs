@@ -8,6 +8,7 @@ use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use tokio_rustls::TlsAcceptor;
 use sha2::{Sha256, Digest};
 
+#[allow(dead_code)]
 pub struct TlsContext {
     pub acceptor: TlsAcceptor,
     pub server_end_point: Vec<u8>,

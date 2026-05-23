@@ -306,7 +306,7 @@ static A_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<std::net::IpAddr>)>>> =
 const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn cached_txt_lookup(name: &str) -> Option<Vec<String>> {
-    let mut cache = TXT_CACHE.lock().unwrap();
+    let cache = TXT_CACHE.lock().unwrap();
     if let Some((ts, val)) = cache.get(name) {
         if ts.elapsed() < DNS_CACHE_TTL {
             return Some(val.clone());
@@ -328,7 +328,7 @@ fn cached_txt_lookup(name: &str) -> Option<Vec<String>> {
 }
 
 fn cached_lookup_ip(name: &str) -> Option<Vec<std::net::IpAddr>> {
-    let mut cache = A_CACHE.lock().unwrap();
+    let cache = A_CACHE.lock().unwrap();
     if let Some((ts, val)) = cache.get(name) {
         if ts.elapsed() < DNS_CACHE_TTL {
             return Some(val.clone());
@@ -337,7 +337,7 @@ fn cached_lookup_ip(name: &str) -> Option<Vec<std::net::IpAddr>> {
     drop(cache);
     if let Ok(res) = resolver() {
         if let Ok(lookup) = res.lookup_ip(name) {
-            let mut ips: Vec<std::net::IpAddr> = lookup.iter().collect();
+            let ips: Vec<std::net::IpAddr> = lookup.iter().collect();
             let mut cache = A_CACHE.lock().unwrap();
             cache.insert(name.to_string(), (Instant::now(), ips.clone()));
             return Some(ips);

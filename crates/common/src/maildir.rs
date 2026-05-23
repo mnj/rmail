@@ -147,7 +147,7 @@ pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyho
     };
 
     // Load flags map (uid -> [flags])
-    let mut flags_map: HashMap<String, Vec<String>> = if uidflags_path.exists() {
+    let flags_map: HashMap<String, Vec<String>> = if uidflags_path.exists() {
         let s = fs::read_to_string(&uidflags_path)?;
         match serde_json::from_str(&s) {
             Ok(m) => m,

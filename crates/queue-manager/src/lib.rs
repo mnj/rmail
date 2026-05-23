@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use rmail_common::outbound::QueueControl;
 
 /// Exponential backoff base in seconds (60s * 2^(attempts-1))
@@ -59,6 +58,7 @@ fn read_envelope_to(eml_path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct QueueEntry {
     pub filename: String,
@@ -127,7 +127,7 @@ fn count_inflight_by_domain(maildrop_dir: &Path) -> Result<HashMap<String, usize
 /// Claim an eligible message respecting per-destination concurrency limits.
 /// Returns the inflight eml/json paths if a claim succeeded.
 pub fn claim_one_with_limit(maildrop_dir: &Path, per_destination_limit: usize) -> Result<Option<(PathBuf, PathBuf)>> {
-    let queue_dir = maildrop_dir.join("queue");
+    let _queue_dir = maildrop_dir.join("queue");
     let inflight_dir = maildrop_dir.join("inflight");
     fs::create_dir_all(&inflight_dir).with_context(|| format!("creating inflight dir {:?}", inflight_dir))?;
 

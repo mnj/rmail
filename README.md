@@ -1,6 +1,9 @@
+# Warning
+This is not a serious project, just testing smaller AI models, and how far they can be pushed.
+
 # rMail
 
-rMail — inbound-only SMTP and IMAP servers in Rust (2024 edition).
+rMail — inbound-only SMTP and IMAP servers in Rust.
 
 Repository layout:
 - crates/common — shared utilities and config parsing

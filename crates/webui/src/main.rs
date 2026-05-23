@@ -1,7 +1,6 @@
 // rmail_web: minimal tokio-based HTTP UI for stats and logs (no hyper/axum)
 
 use serde::Serialize;
-use std::net::SocketAddr;
 use rmail_common::config::Config;
 use std::path::PathBuf;
 use anyhow::Result;
@@ -12,7 +11,6 @@ use tokio::net::TcpListener;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use serde_json::json;
 use rmail_common::outbound::QueueControl;
-use std::fs;
 
 #[derive(Serialize)]
 struct Stats {
@@ -226,7 +224,7 @@ fn promote_single_sync(spool: &str, eml: &PathBuf, jsonp: &Option<PathBuf>, root
     Ok(())
 }
 
-fn delete_single_sync(spool: &str, eml: &PathBuf, jsonp: &Option<PathBuf>, root: &PathBuf) -> Result<()> {
+fn delete_single_sync(_spool: &str, eml: &PathBuf, jsonp: &Option<PathBuf>, root: &PathBuf) -> Result<()> {
     let (_queue, _inflight, _sent, failed) = spool_dirs(root);
     let (_dst_eml, dst_json) = move_with_json_sync(eml, &failed, jsonp)?;
     if let Some(jp) = dst_json {
@@ -238,7 +236,7 @@ fn delete_single_sync(spool: &str, eml: &PathBuf, jsonp: &Option<PathBuf>, root:
     Ok(())
 }
 
-async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>, db_path: Option<String>, acme_challenge_dir: Option<String>) {
+async fn handle_connection(stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>, db_path: Option<String>, acme_challenge_dir: Option<String>) {
     let peer = match stream.peer_addr() { Ok(p) => p.to_string(), Err(_) => "unknown".to_string() };
     let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
@@ -286,7 +284,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                             let u = &creds[..colon];
                             let p = &creds[colon+1..];
                             if u == expected_user {
-                                if let Ok(valid) = rmail_common::auth::verify_password(p, expected_hash) {
+                                if let Ok(valid) = auth::verify_password(p, expected_hash) {
                                     return valid;
                                 }
                             }
@@ -486,7 +484,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                                         Err(anyhow::anyhow!("not found"))
                                     } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
                                         let matches = find_messages_matching_sync(&mr_clone, pattern)?;
-                                        for (spool, eml, jsonp, fname) in matches { promote_single_sync(&spool, &eml, &jsonp, &mr_clone, priority)?; }
+                                        for (spool, eml, jsonp, _fname) in matches { promote_single_sync(&spool, &eml, &jsonp, &mr_clone, priority)?; }
                                         Ok(())
                                     } else { Err(anyhow::anyhow!("missing name or pattern")) }
                                 }).await;
@@ -512,7 +510,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                                         Err(anyhow::anyhow!("not found"))
                                     } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
                                         let matches = find_messages_matching_sync(&mr_clone, pattern)?;
-                                        for (spool, eml, jsonp, fname) in matches { delete_single_sync(&spool, &eml, &jsonp, &mr_clone)?; }
+                                        for (spool, eml, jsonp, _fname) in matches { delete_single_sync(&spool, &eml, &jsonp, &mr_clone)?; }
                                         Ok(())
                                     } else { Err(anyhow::anyhow!("missing name or pattern")) }
                                 }).await;
@@ -572,7 +570,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                                                 Err(anyhow::anyhow!("not found"))
                                             } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
                                                 let matches = find_messages_matching_sync(&mr_clone, pattern)?;
-                                                for (spool, eml, jsonp, fname) in matches { promote_single_sync(&spool, &eml, &jsonp, &mr_clone, priority)?; }
+                                                for (spool, eml, jsonp, _fname) in matches { promote_single_sync(&spool, &eml, &jsonp, &mr_clone, priority)?; }
                                                 Ok(())
                                             } else { Err(anyhow::anyhow!("missing name or pattern")) }
                                         }).await;
@@ -585,7 +583,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
                                                 Err(anyhow::anyhow!("not found"))
                                             } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
                                                 let matches = find_messages_matching_sync(&mr_clone, pattern)?;
-                                                for (spool, eml, jsonp, fname) in matches { delete_single_sync(&spool, &eml, &jsonp, &mr_clone)?; }
+                                                for (spool, eml, jsonp, _fname) in matches { delete_single_sync(&spool, &eml, &jsonp, &mr_clone)?; }
                                                 Ok(())
                                             } else { Err(anyhow::anyhow!("missing name or pattern")) }
                                         }).await;

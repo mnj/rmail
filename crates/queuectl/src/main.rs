@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rmail_common::outbound::QueueControl;
 use serde_json::json;
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn cmd_alias_add(root: &PathBuf, address: &str, targets: &Vec<String>) -> Result<()> {
+fn cmd_alias_add(_root: &PathBuf, address: &str, targets: &Vec<String>) -> Result<()> {
     // Use RMAIL_CONFIG or fall back to config/example.toml
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path)?;
@@ -133,7 +133,7 @@ fn cmd_alias_add(root: &PathBuf, address: &str, targets: &Vec<String>) -> Result
     Ok(())
 }
 
-fn cmd_alias_remove(root: &PathBuf, address: &str) -> Result<()> {
+fn cmd_alias_remove(_root: &PathBuf, address: &str) -> Result<()> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path)?;
     let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
@@ -143,7 +143,7 @@ fn cmd_alias_remove(root: &PathBuf, address: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_alias_list(root: &PathBuf) -> Result<()> {
+fn cmd_alias_list(_root: &PathBuf) -> Result<()> {
     let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path)?;
     let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
@@ -400,7 +400,7 @@ fn cmd_promote(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, priori
         if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
             if !confirm(&format!("Promote {} from {} to priority {}?", fname, spool, priority), yes) { println!("aborted"); return Ok(()); }
             let (queue, _i, _s, _f) = spool_dirs(root);
-            let (dst_eml, dst_json) = if spool == "queue" { (eml.clone(), jsonp.clone()) } else { move_with_json(&eml, &queue, &jsonp)? };
+            let (_dst_eml, dst_json) = if spool == "queue" { (eml.clone(), jsonp.clone()) } else { move_with_json(&eml, &queue, &jsonp)? };
             let mut ctrl = read_control_opt(&dst_json).unwrap_or_else(|| QueueControl::default_with_timestamp(0));
             ctrl.priority = priority;
             let jpath = queue.join(format!("{}.json", ensure_ext(&fname)));
@@ -450,7 +450,7 @@ fn cmd_delete(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: bo
         println!("Found {} matches for pattern {}", matches.len(), pat);
         for (spool, eml, jsonp, fname) in matches {
             if !confirm(&format!("Delete {} from {}? (move to failed)", fname, spool), yes) { println!("skipping {}", fname); continue; }
-            let (_dst_eml, dst_json) = (eml.clone(), jsonp.clone());
+            let (_dst_eml, _dst_json) = (eml.clone(), jsonp.clone());
             // move_with_json above is a bit awkward for batch; simpler: move to failed directly
             let (_q, _i, _s, failed) = spool_dirs(root);
             let (_dst_eml2, dst_json2) = move_with_json(&eml, &failed, &jsonp)?;

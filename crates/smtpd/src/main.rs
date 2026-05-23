@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use std::sync::Mutex;
 use std::net::{SocketAddr, IpAddr};
 use std::time::{Instant, Duration};
 use once_cell::sync::Lazy;
 
-use rmail_common::{config::Config, maildir, metrics, auth, db};
+use rmail_common::{config::Config, maildir, metrics, auth};
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 mod tls;
 use tls::load_tls_context;

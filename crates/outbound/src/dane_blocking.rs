@@ -7,6 +7,7 @@ use std::net::TcpStream;
 // even if PKIX verification would fail. This function performs a blocking TLS handshake (verify NONE)
 // and runs the SMTP conversation synchronously on the TLS socket.
 
+#[allow(dead_code)]
 pub fn deliver_blocking(host: &str, port: u16, envelope_from: Option<&str>, recipient: &str, body: &[u8]) -> Result<()> {
     let addr = format!("{}:{}", host, port);
     let tcp = TcpStream::connect(&addr)?;
@@ -16,7 +17,7 @@ pub fn deliver_blocking(host: &str, port: u16, envelope_from: Option<&str>, reci
     let mut b = SslConnector::builder(SslMethod::tls())?;
     b.set_verify(SslVerifyMode::NONE);
     let conn = b.build();
-    let mut ssl_stream = conn.connect(host, tcp)?;
+    let ssl_stream = conn.connect(host, tcp)?;
 
     let mut reader = BufReader::new(ssl_stream);
 

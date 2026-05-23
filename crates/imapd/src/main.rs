@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use rmail_common::db::Mailbox;
-use rmail_common::{auth, maildir, config::Config, db as rmail_db};
+use rmail_common::{auth, config::Config};
 use std::{sync::{Arc, Mutex}, collections::HashMap, net::{IpAddr, SocketAddr}};
 use std::time::{Instant, Duration};
 use once_cell::sync::Lazy;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 mod tls;
 use tls::load_tls_context;
@@ -68,6 +68,7 @@ fn reset_auth_failures(ip: IpAddr) {
 /// ordered Vec of (UID, PathBuf) where the order corresponds to IMAP sequence numbers.
 /// This lightweight structure is recomputed on SELECT and reused for subsequent FETCH/UID commands
 /// during the session to provide stable UIDs and predictable sequence numbers.
+#[allow(dead_code)]
 struct SelectedMailbox {
     pub domain: String,
     pub local: String,

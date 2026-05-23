@@ -6,17 +6,8 @@ use tokio::net::TcpStream;
 use trust_dns_resolver::TokioAsyncResolver;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use native_tls::TlsConnector as NativeTlsConnector;
-use rmail_common::db;
-use rmail_common::transport;
-use std::collections::HashSet;
 mod tlsa;
 mod dane_blocking;
-use trust_dns_resolver::proto::rr::RecordType;
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
-use openssl::x509::X509;
-use openssl::pkey::PKey;
-use openssl::sha::{sha256, sha512};
-use hex;
 
 // Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}

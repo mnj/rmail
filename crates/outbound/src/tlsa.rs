@@ -1,5 +1,6 @@
 use openssl::sha::{sha256, sha512};
 
+#[allow(dead_code)]
 pub struct TlsaRecord {
     pub usage: u8,
     pub selector: u8,
@@ -11,6 +12,7 @@ pub struct TlsaRecord {
 /// This function performs the selector (0=cert, 1=SPKI) and matching type (0=exact,1=sha256,2=sha512)
 /// comparisons. It intentionally does NOT interpret cert-usage semantics (0..3); callers should
 /// handle usage-based policy (PKIX verification, trust-anchor semantics) as appropriate.
+#[allow(dead_code)]
 pub fn match_tlsa_records(recs: &[TlsaRecord], cert_der: &[u8], spki_der: &[u8]) -> bool {
     for r in recs {
         let target = if r.selector == 0 { cert_der } else { spki_der };
@@ -34,6 +36,7 @@ pub fn match_tlsa_records(recs: &[TlsaRecord], cert_der: &[u8], spki_der: &[u8])
 /// Return a vector of certUsage values from records that match the provided cert/SPKI.
 /// This lets callers know which usage types matched so they can apply DANE policy (PKIX
 /// validation requirements, trust-anchor behavior) accordingly.
+#[allow(dead_code)]
 pub fn match_tlsa_usages(recs: &[TlsaRecord], cert_der: &[u8], spki_der: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     for r in recs {

@@ -6,16 +6,15 @@
 //! - Accepts PHC-style password hashes (e.g. argon2id strings produced by password-hash compatible libraries)
 //! - For testing only: supports a "plain:..." prefix to store plaintext passwords (DO NOT USE IN PRODUCTION)
 
-use anyhow::Context;
 use argon2::{Argon2, PasswordVerifier};
 use password_hash::PasswordHash;
+use base64::Engine;
 
 use pbkdf2::pbkdf2;
 use hmac::Hmac;
 use hmac::Mac;
 use hmac::digest::KeyInit;
 use sha2::{Sha256, Digest};
-use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use unicode_normalization::UnicodeNormalization;
