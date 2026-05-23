@@ -268,7 +268,9 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, allowed: 
                 match acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // enter TLS-protected processing loop (no STARTTLS inside)
-                        return process_stream(Box::new(tls_stream), allowed, catchalls, mail_root, None).await;
+                        // Box the recursive future to avoid infinitely-sized future from recursion
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), allowed, catchalls, mail_root, None));
+                        return fut.await;
                     }
                     Err(e) => {
                         eprintln!("TLS accept error: {}", e);

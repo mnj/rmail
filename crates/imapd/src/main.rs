@@ -264,7 +264,9 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 let inner = reader.into_inner();
                 match tls_acceptor.unwrap().accept(inner).await {
                     Ok(tls_stream) => {
-                        return process_stream(tls_stream, mailbox_map, mail_root, None).await;
+                        // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mailbox_map, mail_root, None));
+                        return fut.await;
                     },
                     Err(e) => {
                         eprintln!("TLS accept failed: {}", e);
