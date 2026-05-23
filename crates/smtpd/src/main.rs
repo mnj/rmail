@@ -18,7 +18,8 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStre
 #[tokio::main]
 async fn main() -> Result<()> {
     // load config (example path)
-    let cfg = Config::from_file("config/example.toml").context("loading config/example.toml")?;
+    let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
 
     let mut allowed: HashSet<String> = HashSet::new();
     if let Some(mboxes) = &cfg.mailboxes {

@@ -17,7 +17,8 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStre
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = Config::from_file("config/example.toml").context("loading config/example.toml")?;
+    let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
     let mail_root = cfg.global.mail_root.clone();
 
     // Build mailbox map: address -> Mailbox (lowercased)

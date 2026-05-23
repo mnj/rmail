@@ -1,0 +1,19 @@
+# Test config for running rMail services on non-privileged ports
+[global]
+mail_root = "mail_test"
+listen_addrs = ["127.0.0.1:2525", "[::1]:2525"]
+smtps_port = 2465
+submission_port = 2587
+imaps_port = 1993
+imap_port = 1143
+tls_cert = "config/certs/localhost.crt"
+tls_key = "config/certs/localhost.key"
+log_level = "debug"
+
+[[mailboxes]]
+address = "user@example.local"
+password_hash = "plain:password"
+maildir = "mail_test/example.local/user/Maildir"
+
+[catchalls]
+"example.local" = "postmaster@example.local"
