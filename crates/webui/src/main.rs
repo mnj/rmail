@@ -203,6 +203,37 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
         content_type = "text/plain".to_string();
         body = metrics_text;
             }
+            "/dmarc" => {
+                // DMARC reporting overview: domains with unreported events and counts
+                if !is_authorized(&headers) {
+                    status = 401;
+                    body = "Unauthorized".to_string();
+                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
+                } else if let Some(dbp) = db_path.as_ref() {
+                    // fetch unreported domains and counts in blocking thread
+                    match tokio::task::spawn_blocking({ let dbp = dbp.clone(); move || rmail_common::db::get_unreported_dmarc_domains(&dbp) }).await {
+                        Ok(Ok(domains)) => {
+                            let mut out: Vec<serde_json::Value> = Vec::new();
+                            for d in domains {
+                                match rmail_common::db::fetch_unreported_dmarc_events_for_domain(dbp.as_str(), &d) {
+                                    Ok(evts) => {
+                                        out.push(serde_json::json!({"domain": d, "events": evts.len()}));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("failed to fetch events for {}: {}", d, e);
+                                    }
+                                }
+                            }
+                            content_type = "application/json".to_string();
+                            body = serde_json::to_string(&out).unwrap_or_else(|e| { status = 500; format!("{{\"error\":\"{}\"}}", e) });
+                        }
+                        Ok(Err(e)) => { status = 500; body = format!("db error: {}", e); }
+                        Err(e) => { status = 500; body = format!("task join error: {}", e); }
+                    }
+                } else {
+                    status = 400; body = "DB not configured".to_string();
+                }
+            }
             "/logs" => {
         if !is_authorized(&headers) {
             status = 401;
