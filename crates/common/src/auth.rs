@@ -128,3 +128,67 @@ pub fn verify_scram_proof(stored_verifier_json: &str, auth_message: &str, client
 pub fn saslprep(input: &str) -> String {
     input.nfkc().collect::<String>()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64;
+    use pbkdf2::pbkdf2;
+    use hmac::Hmac;
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    #[test]
+    fn test_saslprep_basic() {
+        // basic ASCII input should be unchanged
+        assert_eq!(saslprep("simple"), "simple");
+    }
+
+    #[test]
+    fn test_scram_roundtrip() {
+        let password = "correct horse battery staple";
+        let iterations = 4096u32;
+        let verifier_json = create_scram_verifier(password, iterations).expect("create verifier");
+        let (salt_b64, iter) = parse_scram_verifier(&verifier_json).expect("parse verifier");
+        assert_eq!(iter, iterations);
+        let salt = base64::decode(&salt_b64).expect("decode salt");
+
+        // derive salted_password using PBKDF2-HMAC-SHA256 (must match create_scram_verifier)
+        let mut salted_password = [0u8; 32];
+        pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iter as usize, &mut salted_password);
+
+        // client_key = HMAC(salted_password, "Client Key")
+        let mut mac = HmacSha256::new_from_slice(&salted_password).unwrap();
+        mac.update(b"Client Key");
+        let client_key = mac.finalize().into_bytes();
+
+        // stored_key = H(client_key)
+        let stored_key = Sha256::digest(&client_key);
+
+        // server_key = HMAC(salted_password, "Server Key")
+        let mut mac2 = HmacSha256::new_from_slice(&salted_password).unwrap();
+        mac2.update(b"Server Key");
+        let server_key = mac2.finalize().into_bytes();
+
+        // Construct a sample auth_message (client-first-bare,server-first,client-final-without-proof)
+        let auth_message = "n=user,r=clientnonce,server-first,n=client-final";
+
+        // client_signature = HMAC(stored_key, auth_message)
+        let mut mac3 = HmacSha256::new_from_slice(&stored_key).unwrap();
+        mac3.update(auth_message.as_bytes());
+        let client_signature = mac3.finalize().into_bytes();
+
+        // client_proof = client_key XOR client_signature
+        let client_proof: Vec<u8> = client_key.iter().zip(client_signature.iter()).map(|(a,b)| a ^ b).collect();
+        let client_proof_b64 = base64::encode(&client_proof);
+
+        // Verify using the library call
+        let server_sig = verify_scram_proof(&verifier_json, auth_message, &client_proof_b64).expect("verify");
+
+        // Expected server_signature = HMAC(server_key, auth_message)
+        let mut mac4 = HmacSha256::new_from_slice(&server_key).unwrap();
+        mac4.update(auth_message.as_bytes());
+        let expected = mac4.finalize().into_bytes();
+        assert_eq!(server_sig, expected.as_ref());
+    }
+}
