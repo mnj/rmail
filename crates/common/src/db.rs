@@ -370,7 +370,7 @@ pub fn fetch_unreported_dmarc_events_for_domain<P: AsRef<Path>>(path: P, domain:
 
 /// Mark a list of DMARC event ids as reported
 pub fn mark_dmarc_events_reported<P: AsRef<Path>>(path: P, ids: &[i64]) -> Result<()> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
     for id in ids {
         tx.execute("UPDATE dmarc_events SET reported = 1 WHERE id = ?1", params![id])?;
