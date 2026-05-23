@@ -151,7 +151,7 @@ pub fn set_catchall<P: AsRef<Path>>(path: P, domain: &str, target: &str) -> Resu
 
 /// Allocate the next UID for a mailbox (atomic within a transaction)
 fn allocate_uid<P: AsRef<Path>>(path: P, address: &str) -> Result<u64> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
     tx.execute("INSERT OR IGNORE INTO uid_sequences (address, last_uid) VALUES (?1, 0)", params![address])?;
     let last: i64 = tx.query_row("SELECT last_uid FROM uid_sequences WHERE address = ?1", params![address], |r| r.get(0))?;
@@ -253,7 +253,7 @@ pub fn enqueue_outbound<P: AsRef<Path>>(path: P, recipient: &str, envelope_from:
 /// Claim the next outbound item for processing. This atomically marks the row as inflight
 /// and increments the attempts counter. Returns (id, recipient, envelope_from, data, attempts).
 pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Option<String>, Vec<u8>, i64)>> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     // Select one queued row eligible for delivery
@@ -265,6 +265,9 @@ pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Op
         let envelope_from: Option<String> = row.get(2)?;
         let data: Vec<u8> = row.get(3)?;
         let attempts: i64 = row.get(4)?;
+        // Drop query handles before committing the transaction to avoid borrow issues
+        drop(rows);
+        drop(stmt);
         tx.execute("UPDATE outbound_queue SET status = 'inflight', attempts = attempts + 1 WHERE id = ?1", params![id])?;
         tx.commit()?;
         return Ok(Some((id, recipient, envelope_from, data, attempts + 1)));

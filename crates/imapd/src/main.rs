@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rmail_common::config::Mailbox;
 use rmail_common::{auth, maildir, config::Config, db as rmail_db};
-use std::{sync::{Arc, Mutex}, collections::HashMap, net::IpAddr};
+use std::{sync::{Arc, Mutex}, collections::HashMap, net::{IpAddr, SocketAddr}};
 use std::time::{Instant, Duration};
 use once_cell::sync::Lazy;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,6 +26,42 @@ struct AuthFailInfo {
 }
 
 static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Check whether the remote IP is currently blocked from authenticating. Returns remaining block Duration if blocked.
+fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
+    let m = AUTH_FAILS.lock().unwrap();
+    if let Some(info) = m.get(&ip) {
+        if let Some(until) = info.locked_until {
+            let now = Instant::now();
+            if until > now {
+                return Some(until - now);
+            }
+        }
+    }
+    None
+}
+
+/// Record a failed auth attempt for the IP and apply a temporary lockout if threshold exceeded.
+fn record_auth_failure(ip: IpAddr) {
+    let mut m = AUTH_FAILS.lock().unwrap();
+    let now = Instant::now();
+    let entry = m.entry(ip).or_insert(AuthFailInfo { count: 0, first: now, locked_until: None });
+    entry.count = entry.count.saturating_add(1);
+    // Increment global metric for monitoring
+    rmail_common::metrics::inc_auth_failures();
+    // if 5 failures within short window, lock for 30 minutes
+    if entry.count >= 5 {
+        entry.locked_until = Some(now + Duration::from_secs(30 * 60));
+        entry.count = 0;
+        entry.first = now;
+    }
+}
+
+/// Reset any recorded failures for this IP (on successful authentication)
+fn reset_auth_failures(ip: IpAddr) {
+    let mut m = AUTH_FAILS.lock().unwrap();
+    m.remove(&ip);
+}
 
 /// SelectedMailbox holds state for the currently selected mailbox in an IMAP session.
 /// It maintains the mailbox domain/localpart, the persistent UIDVALIDITY value, and an
@@ -149,7 +185,7 @@ fn unquote(s: &str) -> &str {
 // session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
 // and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
 // for per-IP rate-limiting of authentication attempts.
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<tokio::net::SocketAddr>, session_encrypted: bool) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();
@@ -450,21 +486,21 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     let sel = selected.as_ref().unwrap();
                     // Build list of UIDs to return, handling ranges
                     let uids: Vec<u64> = if uid_set == "1:*" {
-                        sel.msgs.iter().map(|(u,_)| *u).collect()
+                        sel.msgs.iter().map(|(u,_,_)| *u).collect()
                     } else if uid_set.contains(':') {
                         let mut parts = uid_set.split(':');
                         let start = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
-                        let end = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| sel.msgs.last().map(|(u,_)| *u).unwrap_or(start));
-                        sel.msgs.iter().filter_map(|(u,_)| {
+                        let end = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| sel.msgs.last().map(|(u,_,_)| *u).unwrap_or(start));
+                        sel.msgs.iter().filter_map(|(u,_,_)| {
                             if *u >= start && *u <= end { Some(*u) } else { None }
                         }).collect()
                     } else {
                         if let Ok(v) = uid_set.parse::<u64>() { vec![v] } else { vec![] }
                     };
                     for uid in uids {
-                        if let Some(pos) = sel.msgs.iter().position(|(u,_)| *u == uid) {
+                        if let Some(pos) = sel.msgs.iter().position(|(u,_,_)| *u == uid) {
                             let seq = pos + 1;
-                            let uid = *sel.msgs[pos].0;
+                            let uid = sel.msgs[pos].0;
                             let flags = sel.msgs[pos].2.clone();
                             let path = sel.msgs[pos].1.clone();
                             match tokio::task::spawn_blocking(move || std::fs::read(path)).await {

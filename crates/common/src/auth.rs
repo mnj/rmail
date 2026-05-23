@@ -12,6 +12,8 @@ use password_hash::PasswordHash;
 
 use pbkdf2::pbkdf2;
 use hmac::Hmac;
+use hmac::Mac;
+use hmac::digest::KeyInit;
 use sha2::{Sha256, Digest};
 use base64;
 use rand::rngs::OsRng;
@@ -51,10 +53,10 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
 
     // Derive salted_password using PBKDF2-HMAC-SHA256
     let mut salted_password = [0u8; 32];
-    pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations as usize, &mut salted_password);
+    pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted_password);
 
     // client_key = HMAC(salted_password, "Client Key")
-    let mut mac = HmacSha256::new_from_slice(&salted_password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac.update(b"Client Key");
     let client_key = mac.finalize().into_bytes();
 
@@ -62,7 +64,7 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
     let stored_key = Sha256::digest(&client_key);
 
     // server_key = HMAC(salted_password, "Server Key")
-    let mut mac2 = HmacSha256::new_from_slice(&salted_password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac2.update(b"Server Key");
     let server_key = mac2.finalize().into_bytes();
 
@@ -94,7 +96,7 @@ pub fn verify_scram_proof(stored_verifier_json: &str, auth_message: &str, client
     let server_key = base64::decode(server_key_b64).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     // client_signature = HMAC(stored_key, auth_message)
-    let mut mac = HmacSha256::new_from_slice(&stored_key).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac.update(auth_message.as_bytes());
     let client_signature = mac.finalize().into_bytes();
 
@@ -114,7 +116,7 @@ pub fn verify_scram_proof(stored_verifier_json: &str, auth_message: &str, client
     }
 
     // server_signature = HMAC(server_key, auth_message)
-    let mut mac2 = HmacSha256::new_from_slice(&server_key).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&server_key).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac2.update(auth_message.as_bytes());
     let server_signature = mac2.finalize().into_bytes();
     Ok(server_signature.to_vec())
@@ -174,10 +176,10 @@ mod tests {
 
         // derive salted_password using PBKDF2-HMAC-SHA256 (must match create_scram_verifier)
         let mut salted_password = [0u8; 32];
-        pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iter as usize, &mut salted_password);
+        pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iter, &mut salted_password);
 
         // client_key = HMAC(salted_password, "Client Key")
-        let mut mac = HmacSha256::new_from_slice(&salted_password).unwrap();
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();
         mac.update(b"Client Key");
         let client_key = mac.finalize().into_bytes();
 
@@ -185,7 +187,7 @@ mod tests {
         let stored_key = Sha256::digest(&client_key);
 
         // server_key = HMAC(salted_password, "Server Key")
-        let mut mac2 = HmacSha256::new_from_slice(&salted_password).unwrap();
+        let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();
         mac2.update(b"Server Key");
         let server_key = mac2.finalize().into_bytes();
 
@@ -193,7 +195,7 @@ mod tests {
         let auth_message = "n=user,r=clientnonce,server-first,n=client-final";
 
         // client_signature = HMAC(stored_key, auth_message)
-        let mut mac3 = HmacSha256::new_from_slice(&stored_key).unwrap();
+        let mut mac3 = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).unwrap();
         mac3.update(auth_message.as_bytes());
         let client_signature = mac3.finalize().into_bytes();
 
@@ -205,10 +207,10 @@ mod tests {
         let server_sig = verify_scram_proof(&verifier_json, auth_message, &client_proof_b64).expect("verify");
 
         // Expected server_signature = HMAC(server_key, auth_message)
-        let mut mac4 = HmacSha256::new_from_slice(&server_key).unwrap();
+        let mut mac4 = <HmacSha256 as KeyInit>::new_from_slice(&server_key).unwrap();
         mac4.update(auth_message.as_bytes());
         let expected = mac4.finalize().into_bytes();
-        assert_eq!(server_sig, expected.as_ref());
+        assert_eq!(server_sig, expected.as_slice());
     }
 
     #[test]

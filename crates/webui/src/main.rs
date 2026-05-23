@@ -43,7 +43,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
     let mut mailbox_count = 0usize;
     let mut total_messages = 0usize;
     if !mail_root.exists() || !mail_root.is_dir() {
-        return Ok(Stats { mailboxes: 0, total_messages: 0, delivered_count: 0 });
+        return Ok(Stats { mailboxes: 0, total_messages: 0, delivered_count: 0, outbound_pending: None });
     }
     for domain_entry in std::fs::read_dir(mail_root)? {
         let domain_entry = domain_entry?;
@@ -66,7 +66,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
             }
         }
     }
-    Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0 })
+    Ok(Stats { mailboxes: mailbox_count, total_messages, delivered_count: 0, outbound_pending: None })
 }
 
 async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf, admin_user: Option<String>, admin_hash: Option<String>, db_path: Option<String>) {

@@ -658,7 +658,6 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 w.flush().await?;
             }
         } else if up.starts_with("MAIL FROM:") {
-        } else if up.starts_with("MAIL FROM:") {
             // Parse MAIL FROM and set sender; on syntax error return 501
             mail_from = extract_addr(cmd).or_else(|| {
                 if let Some(idx) = cmd.find(':') { extract_addr(&cmd[idx+1..]) } else { None }
@@ -779,11 +778,6 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 w.write_all(b"501 Syntax: RCPT TO:<address>\r\n").await?;
                 w.flush().await?;
             }
-        } else {
-            let w = reader.get_mut();
-            w.write_all(b"501 Syntax: RCPT TO:<address>\r\n").await?;
-            w.flush().await?;
-        }
         } else if up.starts_with("DATA") {
             // DATA requires recipients
             if rcpts.is_empty() {
@@ -873,14 +867,16 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                     // persist metadata to DB if configured
                                     if let Some(dbp) = db_path.as_ref() {
                                         let dbp2 = dbp.clone();
-                                        let domain_c = domain.clone();
-                                        let local_c = local.clone();
+                                        let db_domain = domain.clone();
+                                        let db_local = local.clone();
+                                        let print_domain = db_domain.clone();
+                                        let print_local = db_local.clone();
                                         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                                         let size = data.len() as i64;
                                         tokio::spawn(async move {
-                                            match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &domain_c, &local_c, &fname, size, None, None, None)).await {
+                                            match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &db_domain, &db_local, &fname, size, None, None, None)).await {
                                                 Ok(Ok(uid)) => {
-                                                    println!("Recorded message UID {} for {}@{}", uid, local_c, domain_c);
+                                                    println!("Recorded message UID {} for {}@{}", uid, print_local, print_domain);
                                                 }
                                                 Ok(Err(e)) => {
                                                     eprintln!("db add_message error: {}", e);
