@@ -14,11 +14,20 @@ pub fn ensure_maildir(path: &Path) -> anyhow::Result<()> {
 /// Deliver email bytes to Maildir using atomic tmp->new move.
 /// This follows classic Maildir semantics (tmp -> new).
 pub fn deliver(maildir_root: &Path, domain: &str, localpart: &str, data: &[u8]) -> anyhow::Result<PathBuf> {
+    // Sanity-check domain and localpart to avoid path traversal attacks
+    for s in [domain, localpart] {
+        if s.contains('/') || s.contains('\\') || s.contains('\0') || s.contains("..") {
+            return Err(anyhow::anyhow!("invalid mailbox name"));
+        }
+    }
+
     let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
     ensure_maildir(&mailbox_dir)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let pid = std::process::id();
-    let filename = format!("{}.{}", now, pid);
+    // include a short random component to reduce collision risk across processes
+    let rand: u64 = rand::random();
+    let filename = format!("{}.{}.{}", now, pid, rand);
     let tmp_path = mailbox_dir.join("tmp").join(&filename);
     let new_path = mailbox_dir.join("new").join(&filename);
     let mut f = File::create(&tmp_path)?;
