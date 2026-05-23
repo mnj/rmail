@@ -182,7 +182,7 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<
         let acceptor = tls_acceptor.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer)).await {
+            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false).await {
                 eprintln!("client error: {}", e);
             }
         });
@@ -200,7 +200,7 @@ async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: S
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, None, db_clone, Some(peer)).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_clone, Some(peer), true).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -221,7 +221,7 @@ fn extract_addr(s: &str) -> Option<String> {
     }
 }
 
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<SocketAddr>) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
     // - MAX_MESSAGE_BYTES: overall DATA size cap to avoid OOM
@@ -266,7 +266,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
         if up.starts_with("HELO") || up.starts_with("EHLO") {
             // Respond with basic capability. If TLS is available advertise STARTTLS.
             let mut resp = String::from("250-Hello\r\n");
-            if tls_acceptor.is_some() {
+            if !session_encrypted && tls_acceptor.is_some() {
                 resp.push_str("250-STARTTLS\r\n");
             }
             // advertise AUTH mechanisms if DB is configured (we support AUTH PLAIN, LOGIN and SCRAM-SHA-256)
@@ -295,7 +295,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 }
             }
             // Require encryption (implicit SMTPS or STARTTLS) for authentication in production
-            if tls_acceptor.is_some() {
+            if !session_encrypted {
                 let w = reader.get_mut();
                 w.write_all(b"538 Encryption required for authentication\r\n").await?;
                 w.flush().await?;
@@ -888,7 +888,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 match acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, None, db_path.clone(), peer));
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_path.clone(), peer, true));
                         return fut.await;
                     }
                     Err(e) => {
