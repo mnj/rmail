@@ -483,9 +483,24 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                         }
                                     }
                                     Ok(Ok(None)) => {
-                                        let w = reader.get_mut();
-                                        w.write_all(b"550 No such user\r\n").await?;
-                                        w.flush().await?;
+                                        // Not a local recipient and no catchall configured for domain.
+                                        // Allow relay to remote recipients only if the client has authenticated.
+                                        if authenticated_user.is_some() {
+                                            if rcpts.len() >= MAX_RCPT {
+                                                let w = reader.get_mut();
+                                                w.write_all(b"452 Too many recipients\r\n").await?;
+                                                w.flush().await?;
+                                            } else {
+                                                rcpts.push(addr.clone());
+                                                let w = reader.get_mut();
+                                                w.write_all(b"250 OK\r\n").await?;
+                                                w.flush().await?;
+                                            }
+                                        } else {
+                                            let w = reader.get_mut();
+                                            w.write_all(b"550 No such user\r\n").await?;
+                                            w.flush().await?;
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         eprintln!("db get_catchall error: {}", e);
