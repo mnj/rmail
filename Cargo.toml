@@ -5,4 +5,5 @@ members = [
   "crates/imapd",
   "crates/ctl",
   "crates/webui",
+  "crates/outbound",
 ]

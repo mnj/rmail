@@ -679,7 +679,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                             }
                         } else {
                             // queue outbound for remote recipients (requires authentication in RCPT stage)
-                            match rmail_common::outbound::queue_outbound(&mr, rcpt, &data) {
+                            match rmail_common::outbound::queue_outbound(&mr, rcpt, &data, mail_from.as_deref()) {
                                 Ok(path) => {
                                     println!("Queued outbound to {} -> {:?}", rcpt, path);
                                 }
