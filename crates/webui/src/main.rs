@@ -444,6 +444,85 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, mail_root: PathBuf
             }
         }
             }
+            "/api/queue/requeue" => {
+                if method != "POST" { status = 405; body = "Method Not Allowed".to_string(); }
+                else {
+                    if !is_authorized(&headers) { status = 401; body = "Unauthorized".to_string(); extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string(); }
+                    else {
+                        let b = String::from_utf8_lossy(&body_bytes).to_string();
+                        match serde_json::from_str::<serde_json::Value>(&b) {
+                            Ok(val) => {
+                                let mr_clone = mail_root.clone();
+                                let res = tokio::task::spawn_blocking(move || {
+                                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+                                        if let Ok(Some((spool, eml, jsonp))) = find_message_sync(&mr_clone, &ensure_ext(name)) { return requeue_single_sync(&spool, &eml, &jsonp, &mr_clone); }
+                                        Err(anyhow::anyhow!("not found"))
+                                    } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
+                                        let matches = find_messages_matching_sync(&mr_clone, pattern)?;
+                                        for (spool, eml, jsonp, _fname) in matches { requeue_single_sync(&spool, &eml, &jsonp, &mr_clone)?; }
+                                        Ok(())
+                                    } else { Err(anyhow::anyhow!("missing name or pattern")) }
+                                }).await;
+                                match res { Ok(Ok(_)) => { content_type = "application/json".to_string(); body = json!({"result":"ok"}).to_string(); }, Ok(Err(e)) => { status=500; body = format!("error: {}", e); }, Err(e) => { status=500; body = format!("task join error: {}", e); } }
+                            }
+                            Err(_) => { status = 400; body = "invalid JSON".to_string(); }
+                        }
+                    }
+                }
+            }
+            "/api/queue/promote" => {
+                if method != "POST" { status = 405; body = "Method Not Allowed".to_string(); }
+                else {
+                    if !is_authorized(&headers) { status = 401; body = "Unauthorized".to_string(); extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string(); }
+                    else {
+                        let b = String::from_utf8_lossy(&body_bytes).to_string();
+                        match serde_json::from_str::<serde_json::Value>(&b) {
+                            Ok(val) => {
+                                let priority = val.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                                let mr_clone = mail_root.clone();
+                                let res = tokio::task::spawn_blocking(move || {
+                                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+                                        if let Ok(Some((spool, eml, jsonp))) = find_message_sync(&mr_clone, &ensure_ext(name)) { return promote_single_sync(&spool, &eml, &jsonp, &mr_clone, priority); }
+                                        Err(anyhow::anyhow!("not found"))
+                                    } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
+                                        let matches = find_messages_matching_sync(&mr_clone, pattern)?;
+                                        for (spool, eml, jsonp, fname) in matches { promote_single_sync(&spool, &eml, &jsonp, &mr_clone, priority)?; }
+                                        Ok(())
+                                    } else { Err(anyhow::anyhow!("missing name or pattern")) }
+                                }).await;
+                                match res { Ok(Ok(_)) => { content_type = "application/json".to_string(); body = json!({"result":"ok"}).to_string(); }, Ok(Err(e)) => { status=500; body = format!("error: {}", e); }, Err(e) => { status=500; body = format!("task join error: {}", e); } }
+                            }
+                            Err(_) => { status = 400; body = "invalid JSON".to_string(); }
+                        }
+                    }
+                }
+            }
+            "/api/queue/delete" => {
+                if method != "POST" { status = 405; body = "Method Not Allowed".to_string(); }
+                else {
+                    if !is_authorized(&headers) { status = 401; body = "Unauthorized".to_string(); extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string(); }
+                    else {
+                        let b = String::from_utf8_lossy(&body_bytes).to_string();
+                        match serde_json::from_str::<serde_json::Value>(&b) {
+                            Ok(val) => {
+                                let mr_clone = mail_root.clone();
+                                let res = tokio::task::spawn_blocking(move || {
+                                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+                                        if let Ok(Some((spool, eml, jsonp))) = find_message_sync(&mr_clone, &ensure_ext(name)) { return delete_single_sync(&spool, &eml, &jsonp, &mr_clone); }
+                                        Err(anyhow::anyhow!("not found"))
+                                    } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
+                                        let matches = find_messages_matching_sync(&mr_clone, pattern)?;
+                                        for (spool, eml, jsonp, fname) in matches { delete_single_sync(&spool, &eml, &jsonp, &mr_clone)?; }
+                                        Ok(())
+                                    } else { Err(anyhow::anyhow!("missing name or pattern")) }
+                                }).await;
+                                match res { Ok(Ok(_)) => { content_type = "application/json".to_string(); body = json!({"result":"ok"}).to_string(); }, Ok(Err(e)) => { status=500; body = format!("error: {}", e); }, Err(e) => { status=500; body = format!("task join error: {}", e); } }
+                            }
+                            Err(_) => { status = 400; body = "invalid JSON".to_string(); }
+                        }
+                    }
+                }
+            }
             "/api/queue" => {
                 if !is_authorized(&headers) { status = 401; body = "Unauthorized".to_string(); extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string(); }
                 else {
