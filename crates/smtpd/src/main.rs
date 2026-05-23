@@ -873,6 +873,22 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                 Err(e) => { eprintln!("mail auth join error: {}", e); (None, None, None) },
                             };
 
+                            // Record mail auth metrics
+                            if let Some(dk) = dkim_res.as_deref() {
+                                if dk.starts_with("pass") { rmail_common::metrics::inc_dkim_pass(); } else { rmail_common::metrics::inc_dkim_fail(); }
+                            }
+                            if let Some(sf) = spf_res.as_deref() {
+                                if sf == "pass" { rmail_common::metrics::inc_spf_pass(); } else { rmail_common::metrics::inc_spf_fail(); }
+                            }
+                            if let Some(dm) = dmarc_res.as_deref() {
+                                match dm {
+                                    "pass" => rmail_common::metrics::inc_dmarc_pass(),
+                                    "quarantine" => rmail_common::metrics::inc_dmarc_quarantine(),
+                                    "reject" => rmail_common::metrics::inc_dmarc_reject(),
+                                    _ => {}
+                                }
+                            }
+
                             // Enforce DMARC if configured: reject when DMARC policy indicates 'reject'
                             if enforce_dmarc && dmarc_res.as_deref() == Some("reject") {
                                 let w = reader.get_mut();
