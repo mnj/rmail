@@ -7,4 +7,5 @@ members = [
   "crates/webui",
   "crates/outbound",
   "crates/queuectl",
+  "crates/queue-manager",
 ]
