@@ -36,6 +36,12 @@ pub fn deliver(maildir_root: &Path, domain: &str, localpart: &str, data: &[u8]) 
     Ok(new_path)
 }
 
+/// Deliver to quarantine Maildir under a quarantine/ prefix inside the mailroot.
+pub fn deliver_quarantine(maildir_root: &Path, domain: &str, localpart: &str, data: &[u8]) -> anyhow::Result<PathBuf> {
+    let qroot = maildir_root.join("quarantine");
+    deliver(&qroot, domain, localpart, data)
+}
+
 /// Count messages in Maildir (new + cur). Used by IMAP SELECT to report EXISTS.
 pub fn count_messages(maildir_root: &Path, domain: &str, localpart: &str) -> anyhow::Result<usize> {
     let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
