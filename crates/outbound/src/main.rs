@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 use trust_dns_resolver::TokioAsyncResolver;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use native_tls::TlsConnector as NativeTlsConnector;
+use rmail_common::db;
 
 // Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
@@ -29,38 +30,76 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&sent_dir).await?;
     tokio::fs::create_dir_all(&failed_dir).await?;
 
-    loop {
-        // Read queue directory
-        let mut entries = tokio::fs::read_dir(&queue_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let p = entry.path();
-            if !p.is_file() { continue; }
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-            let inflight = inflight_dir.join(&fname);
-            // Atomically move into inflight to claim work
-            match tokio::fs::rename(&p, &inflight).await {
-                Ok(_) => {}
-                Err(e) => { eprintln!("rename to inflight failed {}: {}", fname, e); continue; }
-            }
-
-            // Process the file
-            let res = process_file(&inflight).await;
-            if res.is_ok() {
-                let sentp = sent_dir.join(&fname);
-                if let Err(e) = tokio::fs::rename(&inflight, &sentp).await {
-                    eprintln!("failed to move to sent {}: {}", fname, e);
+    // If RMAIL_DB_PATH is set, use SQLite-backed outbound queue. Otherwise fall back to
+    // the on-disk queue in <mail_root>/outbound/queue.
+    if let Ok(db_path) = std::env::var("RMAIL_DB_PATH") {
+        println!("Using DB-backed outbound queue: {}", db_path);
+        loop {
+            // Claim one outbound item atomically in a blocking SQLite transaction
+            match tokio::task::spawn_blocking({ let db_path = db_path.clone(); move || db::claim_outbound(&db_path) }).await {
+                Ok(Ok(Some((id, recipient, envelope_from, data, _attempts)))) => {
+                    // Attempt delivery
+                    match deliver_to_remote(envelope_from.as_deref(), &recipient, &data).await {
+                        Ok(_) => {
+                            if let Err(e) = tokio::task::spawn_blocking({ let db_path = db_path.clone(); move || db::mark_outbound_sent(&db_path, id) }).await {
+                                eprintln!("failed to mark outbound id {} as sent: {:?}", id, e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("delivery failed for id {} recipient {}: {}", id, recipient, e);
+                            // schedule a retry after a fixed backoff (could be exponential)
+                            let _ = tokio::task::spawn_blocking({ let db_path = db_path.clone(); let err = e.to_string(); move || db::mark_outbound_failed(&db_path, id, Some(&err), Some(300)) }).await;
+                        }
+                    }
                 }
-            } else {
-                eprintln!("delivery failed for {}: {:?}", fname, res.err());
-                let failedp = failed_dir.join(&fname);
-                if let Err(e) = tokio::fs::rename(&inflight, &failedp).await {
-                    eprintln!("failed to move to failed {}: {}", fname, e);
+                Ok(Ok(None)) => {
+                    // nothing to do
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("db claim error: {}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    eprintln!("spawn_blocking join error: {:?}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
+    } else {
+        loop {
+            // Read queue directory
+            let mut entries = tokio::fs::read_dir(&queue_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if !p.is_file() { continue; }
+                let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                let inflight = inflight_dir.join(&fname);
+                // Atomically move into inflight to claim work
+                match tokio::fs::rename(&p, &inflight).await {
+                    Ok(_) => {}
+                    Err(e) => { eprintln!("rename to inflight failed {}: {}", fname, e); continue; }
+                }
 
-        // Sleep between polls
-        tokio::time::sleep(Duration::from_secs(5)).await;
+                // Process the file
+                let res = process_file(&inflight).await;
+                if res.is_ok() {
+                    let sentp = sent_dir.join(&fname);
+                    if let Err(e) = tokio::fs::rename(&inflight, &sentp).await {
+                        eprintln!("failed to move to sent {}: {}", fname, e);
+                    }
+                } else {
+                    eprintln!("delivery failed for {}: {:?}", fname, res.err());
+                    let failedp = failed_dir.join(&fname);
+                    if let Err(e) = tokio::fs::rename(&inflight, &failedp).await {
+                        eprintln!("failed to move to failed {}: {}", fname, e);
+                    }
+                }
+            }
+
+            // Sleep between polls
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 }
 

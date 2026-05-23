@@ -43,6 +43,22 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             FOREIGN KEY(address) REFERENCES mailboxes(address)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS messages_address_uid ON messages(address, uid);
+
+        -- outbound_queue stores messages that need to be delivered to remote MX hosts. The
+        -- queue is authoritative in SQLite so multiple worker processes can coordinate work
+        -- by claiming rows in a transaction. Data is stored as a BLOB; in production this
+        -- may be replaced with a file reference for very large messages.
+        CREATE TABLE IF NOT EXISTS outbound_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient TEXT NOT NULL,
+            envelope_from TEXT,
+            data BLOB NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            next_try INTEGER DEFAULT 0,
+            created_at INTEGER
+        );
         "#,
     )?;
     Ok(())
@@ -220,5 +236,53 @@ pub fn delete_message_record<P: AsRef<Path>>(path: P, domain: &str, local: &str,
     let conn = Connection::open(path)?;
     let address = format!("{}@{}", local, domain);
     conn.execute("DELETE FROM messages WHERE address = ?1 AND uid = ?2", params![address, uid as i64])?;
+    Ok(())
+}
+
+/// Enqueue an outbound delivery into the SQLite queue. Returns the inserted row id.
+pub fn enqueue_outbound<P: AsRef<Path>>(path: P, recipient: &str, envelope_from: Option<&str>, data: &[u8]) -> Result<i64> {
+    let conn = Connection::open(path)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    conn.execute(
+        "INSERT INTO outbound_queue (recipient, envelope_from, data, status, attempts, next_try, created_at) VALUES (?1, ?2, ?3, 'queued', 0, 0, ?4)",
+        params![recipient, envelope_from, data, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Claim the next outbound item for processing. This atomically marks the row as inflight
+/// and increments the attempts counter. Returns (id, recipient, envelope_from, data, attempts).
+pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Option<String>, Vec<u8>, i64)>> {
+    let conn = Connection::open(path)?;
+    let tx = conn.transaction()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    // Select one queued row eligible for delivery
+    let mut stmt = tx.prepare("SELECT id, recipient, envelope_from, data, attempts FROM outbound_queue WHERE status = 'queued' AND (next_try IS NULL OR next_try <= ?1) ORDER BY created_at LIMIT 1")?;
+    let mut rows = stmt.query(params![now])?;
+    if let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let recipient: String = row.get(1)?;
+        let envelope_from: Option<String> = row.get(2)?;
+        let data: Vec<u8> = row.get(3)?;
+        let attempts: i64 = row.get(4)?;
+        tx.execute("UPDATE outbound_queue SET status = 'inflight', attempts = attempts + 1 WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        return Ok(Some((id, recipient, envelope_from, data, attempts + 1)));
+    }
+    Ok(None)
+}
+
+/// Mark an outbound item as successfully delivered.
+pub fn mark_outbound_sent<P: AsRef<Path>>(path: P, id: i64) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute("UPDATE outbound_queue SET status = 'sent' WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Mark an outbound item as failed and schedule a retry after `retry_after_seconds` if provided.
+pub fn mark_outbound_failed<P: AsRef<Path>>(path: P, id: i64, last_error: Option<&str>, retry_after_seconds: Option<i64>) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let next_try = if let Some(s) = retry_after_seconds { (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64) + s } else { 0 };
+    conn.execute("UPDATE outbound_queue SET status = 'queued', last_error = ?1, next_try = ?2 WHERE id = ?3", params![last_error, next_try, id])?;
     Ok(())
 }
