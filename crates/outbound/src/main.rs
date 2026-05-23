@@ -7,7 +7,9 @@ use trust_dns_resolver::TokioAsyncResolver;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use native_tls::TlsConnector as NativeTlsConnector;
 use rmail_common::db;
+use std::collections::HashSet;
 mod tlsa;
+mod dane_blocking;
 use trust_dns_resolver::proto::rr::RecordType;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
@@ -315,10 +317,10 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
             }
 
             if !tlsa_records.is_empty() {
-                // perform a blocking TLS handshake (no cert verification) to obtain peer cert/SPKI
+                // perform a blocking TLS handshake (no cert verification) to obtain peer cert/SPKI and full chain
                 let host_clone = selected_host.clone();
                 let addr = format!("{}:{}", host_clone, port);
-                let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+                let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
                     let tcp = std::net::TcpStream::connect(addr)?;
                     tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
                     tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
@@ -326,25 +328,54 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                     b.set_verify(SslVerifyMode::NONE);
                     let conn = b.build();
                     let ssl_stream = conn.connect(host_clone.as_str(), tcp)?;
+                    // gather peer cert and chain certs into vector of (cert_der, spki_der)
                     let cert = ssl_stream.ssl().peer_certificate().ok_or_else(|| anyhow::anyhow!("no peer certificate"))?;
                     let cert_der = cert.to_der()?;
-                    let pubkey = cert.public_key()?;
-                    let spki_der = pubkey.public_key_to_der()?;
-                    Ok((cert_der, spki_der))
+                    let spki_der = cert.public_key()?.public_key_to_der()?;
+                    let mut chain: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    chain.push((cert_der, spki_der));
+                    if let Some(stack) = ssl_stream.ssl().peer_cert_chain() {
+                        for c in stack.iter() {
+                            let der = c.to_der()?;
+                            let sp = c.public_key()?.public_key_to_der()?;
+                            chain.push((der, sp));
+                        }
+                    }
+                    Ok(chain)
                 }).await;
 
-                let (cert_der, spki_der) = match res {
+                let chain = match res {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => { eprintln!("DANE TLS handshake failed: {}", e); return Err(e); }
                     Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
                 };
 
-                // match TLSA records using helper (return matched usages so policy can be logged/applied)
-                let matched = tlsa::match_tlsa_usages(&tlsa_records, &cert_der, &spki_der);
-                if matched.is_empty() {
+                // match TLSA records against full chain
+                let mut matched_usages: HashSet<u8> = HashSet::new();
+                for (cert_der, spki_der) in chain.iter() {
+                    let mut m = tlsa::match_tlsa_usages(&tlsa_records, cert_der, spki_der);
+                    for u in m.drain(..) { matched_usages.insert(u); }
+                }
+                if matched_usages.is_empty() {
                     return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", selected_host));
                 }
-                eprintln!("DANE/TLSA matched usages {:?} for {}", matched, selected_host);
+                eprintln!("DANE/TLSA matched usages {:?} for {}", matched_usages, selected_host);
+
+                // If DANE usages (2 or 3) matched, perform a blocking OpenSSL-backed SMTP delivery that accepts the DANE TLS
+                if matched_usages.contains(&2) || matched_usages.contains(&3) {
+                    let host_block = selected_host.clone();
+                    let env_from = envelope_from.map(|s| s.to_string());
+                    let rcpt = recipient.to_string();
+                    let body_vec = body.to_vec();
+                    let res_block = tokio::task::spawn_blocking(move || {
+                        dane_blocking::deliver_blocking(&host_block, port, env_from.as_deref(), &rcpt, &body_vec)
+                    }).await;
+                    match res_block {
+                        Ok(Ok(())) => { return Ok(()); }
+                        Ok(Err(e)) => { eprintln!("DANE blocking delivery failed: {}", e); return Err(e); }
+                        Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
+                    }
+                }
             }
         }
 
@@ -412,7 +443,7 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                         if !tlsa_records.is_empty() {
                             let host_clone = host.clone();
                             let addr = format!("{}:{}", host_clone, port);
-                            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+                            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
                                 let tcp = std::net::TcpStream::connect(addr)?;
                                 tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
                                 tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
@@ -422,22 +453,49 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                                 let ssl_stream = conn.connect(host_clone.as_str(), tcp)?;
                                 let cert = ssl_stream.ssl().peer_certificate().ok_or_else(|| anyhow::anyhow!("no peer certificate"))?;
                                 let cert_der = cert.to_der()?;
-                                let pubkey = cert.public_key()?;
-                                let spki_der = pubkey.public_key_to_der()?;
-                                Ok((cert_der, spki_der))
+                                let spki_der = cert.public_key()?.public_key_to_der()?;
+                                let mut chain: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                                chain.push((cert_der, spki_der));
+                                if let Some(stack) = ssl_stream.ssl().peer_cert_chain() {
+                                    for c in stack.iter() {
+                                        let der = c.to_der()?;
+                                        let sp = c.public_key()?.public_key_to_der()?;
+                                        chain.push((der, sp));
+                                    }
+                                }
+                                Ok(chain)
                             }).await;
 
-                            let (cert_der, spki_der) = match res {
+                            let chain = match res {
                                 Ok(Ok(v)) => v,
                                 Ok(Err(e)) => { eprintln!("DANE TLS handshake failed: {}", e); return Err(e); }
                                 Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
                             };
 
-                            let matched = tlsa::match_tlsa_usages(&tlsa_records, &cert_der, &spki_der);
-                            if matched.is_empty() {
+                            let mut matched_usages: HashSet<u8> = HashSet::new();
+                            for (cert_der, spki_der) in chain.iter() {
+                                let mut m = tlsa::match_tlsa_usages(&tlsa_records, cert_der, spki_der);
+                                for u in m.drain(..) { matched_usages.insert(u); }
+                            }
+                            if matched_usages.is_empty() {
                                 return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", host));
                             }
-                            eprintln!("DANE/TLSA matched usages {:?} for {}", matched, host);
+                            eprintln!("DANE/TLSA matched usages {:?} for {}", matched_usages, host);
+
+                            if matched_usages.contains(&2) || matched_usages.contains(&3) {
+                                let host_block = host.clone();
+                                let env_from = envelope_from.map(|s| s.to_string());
+                                let rcpt = recipient.to_string();
+                                let body_vec = body.to_vec();
+                                let res_block = tokio::task::spawn_blocking(move || {
+                                    dane_blocking::deliver_blocking(&host_block, port, env_from.as_deref(), &rcpt, &body_vec)
+                                }).await;
+                                match res_block {
+                                    Ok(Ok(())) => { return Ok(()); }
+                                    Ok(Err(e)) => { eprintln!("DANE blocking delivery failed: {}", e); return Err(e); }
+                                    Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
+                                }
+                            }
                         }
                     }
 
