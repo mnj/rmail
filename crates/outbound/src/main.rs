@@ -7,6 +7,7 @@ use trust_dns_resolver::TokioAsyncResolver;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use native_tls::TlsConnector as NativeTlsConnector;
 use rmail_common::db;
+mod tlsa;
 use trust_dns_resolver::proto::rr::RecordType;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
@@ -239,7 +240,7 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                         if let (Some(us), Some(sel), Some(mt), Some(data)) = (parts.next(), parts.next(), parts.next(), parts.next()) {
                             if let (Ok(usage), Ok(selector), Ok(mtype)) = (us.parse::<u8>(), sel.parse::<u8>(), mt.parse::<u8>()) {
                                 if let Ok(bytes) = hex::decode(data) {
-                                    tlsa_records.push((usage, selector, mtype, bytes));
+                                    tlsa_records.push(tlsa::TlsaRecord { usage, selector, mtype, data: bytes });
                                 }
                             }
                         }
@@ -275,25 +276,8 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
                     Err(e) => { return Err(anyhow::anyhow!("spawn_blocking join error: {:?}", e)); }
                 };
 
-                // match TLSA records
-                let mut matched = false;
-                for (usage, sel, mtype, assoc) in tlsa_records.iter() {
-                    let target = if *sel == 0 { cert_der.as_slice() } else { spki_der.as_slice() };
-                    let ok = match *mtype {
-                        0 => target == assoc.as_slice(),
-                        1 => {
-                            let dg = sha256(target);
-                            dg.as_slice() == assoc.as_slice()
-                        }
-                        2 => {
-                            let dg = sha512(target);
-                            dg.as_slice() == assoc.as_slice()
-                        }
-                        _ => false,
-                    };
-                    if ok { matched = true; break; }
-                }
-                if !matched {
+                // match TLSA records using helper
+                if !tlsa::match_tlsa_records(&tlsa_records, &cert_der, &spki_der) {
                     return Err(anyhow::anyhow!("DANE/TLSA verification failed for {}", selected_host));
                 }
             }
