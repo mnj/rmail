@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Global {
     pub mail_root: String,
     pub listen_addrs: Option<Vec<String>>,
@@ -16,14 +16,14 @@ pub struct Global {
     pub log_level: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Mailbox {
     pub address: String,
     pub password_hash: Option<String>,
     pub maildir: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub global: Global,
     pub mailboxes: Option<Vec<Mailbox>>,
