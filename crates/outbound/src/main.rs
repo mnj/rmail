@@ -234,14 +234,20 @@ async fn deliver_to_remote(envelope_from: Option<&str>, recipient: &str, body: &
             let mut tlsa_records: Vec<(u8,u8,u8,Vec<u8>)> = Vec::new();
             match resolver.lookup(tlsa_name.as_str(), RecordType::TLSA).await {
                 Ok(lookup) => {
-                    for rec in lookup.iter() {
-                        let s = rec.to_string();
-                        let mut parts = s.split_whitespace();
-                        if let (Some(us), Some(sel), Some(mt), Some(data)) = (parts.next(), parts.next(), parts.next(), parts.next()) {
-                            if let (Ok(usage), Ok(selector), Ok(mtype)) = (us.parse::<u8>(), sel.parse::<u8>(), mt.parse::<u8>()) {
-                                if let Ok(bytes) = hex::decode(data) {
-                                    tlsa_records.push(tlsa::TlsaRecord { usage, selector, mtype, data: bytes });
+                    // iterate resource records and extract TLSA RData directly
+                    for record in lookup.record_iter() {
+                        if let Some(rdata) = record.data() {
+                            use trust_dns_resolver::proto::rr::RData;
+                            match rdata {
+                                RData::TLSA(t) => {
+                                    // TLSA fields: usage, selector, matching, certificate (Vec<u8>)
+                                    let usage = t.usage();
+                                    let selector = t.selector();
+                                    let mtype = t.matching();
+                                    let data = t.certificate().to_vec();
+                                    tlsa_records.push(tlsa::TlsaRecord { usage, selector, mtype, data });
                                 }
+                                _ => {}
                             }
                         }
                     }
