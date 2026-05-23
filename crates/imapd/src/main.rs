@@ -8,8 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 mod tls;
-use tls::load_tls_acceptor;
-use tokio_rustls::TlsAcceptor;
+use tls::load_tls_context;
 
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
 // so that boxed trait objects can be used with tokio::io::BufReader.
@@ -54,22 +53,22 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // TLS acceptor if certs present
-    let tls_acceptor = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
-        match load_tls_acceptor(cert, key) {
-            Ok(a) => Some(Arc::new(a)),
+    // TLS context if certs present
+    let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
+        match load_tls_context(cert, key) {
+            Ok(ctx) => Some(ctx),
             Err(e) => { eprintln!("Failed to load TLS: {}", e); None }
         }
     } else {
         None
     };
 
-    // Plain IMAP listener (supports STARTTLS if tls_acceptor present)
+    // Plain IMAP listener (supports STARTTLS if tls_context present)
     let imap_port = cfg.global.imap_port.unwrap_or(143);
     let imap_addr = format!("0.0.0.0:{}", imap_port);
     let db_path = cfg.global.db_path.clone();
     let mail_root_clone = mail_root.clone();
-    let acceptor_clone = tls_acceptor.clone();
+    let acceptor_clone = tls_context.clone();
     let db_clone = db_path.clone();
     tokio::spawn(async move {
         if let Err(e) = run_plain_listener(&imap_addr, mail_root_clone, acceptor_clone, db_clone).await {
@@ -78,14 +77,14 @@ async fn main() -> Result<()> {
     });
 
     // IMAPS (implicit TLS) listener
-    if let Some(acceptor) = tls_acceptor.clone() {
+    if let Some(ctx) = tls_context.clone() {
         if let Some(imaps_port) = cfg.global.imaps_port {
             let imaps_addr = format!("0.0.0.0:{}", imaps_port);
             let mail_root = mail_root.clone();
-            let acceptor = acceptor.clone();
+            let ctx2 = ctx.clone();
             let db_clone = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_imaps_listener(&imaps_addr, acceptor, mail_root, db_clone).await {
+                if let Err(e) = run_imaps_listener(&imaps_addr, ctx2, mail_root, db_clone).await {
                     eprintln!("IMAPS listener failed: {}", e);
                 }
             });
@@ -98,13 +97,13 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
         let mail_root = mail_root.clone();
-        let acceptor = tls_acceptor.clone();
+        let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false).await {
@@ -114,18 +113,18 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<
     }
 }
 
-async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: String, db_path: Option<String>) -> Result<()> {
+async fn run_imaps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: String, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+        let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
+            match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_clone, Some(peer), true).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(ctx.clone()), db_clone, Some(peer), true).await {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -150,7 +149,7 @@ fn unquote(s: &str) -> &str {
 // session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
 // and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
 // for per-IP rate-limiting of authentication attempts.
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<tokio::net::SocketAddr>, session_encrypted: bool) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<tokio::net::SocketAddr>, session_encrypted: bool) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();
@@ -344,7 +343,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 }
             },
             "STARTTLS" => {
-                if tls_acceptor.is_none() {
+                if tls_ctx.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes()).await?;
                     w.flush().await?;
@@ -355,11 +354,11 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 w.flush().await?;
                 // perform TLS handshake and continue inside TLS context
                 let inner = reader.into_inner();
-                match tls_acceptor.clone().unwrap().accept(inner).await {
+                match tls_ctx.clone().unwrap().acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        // Pass the same tls_acceptor along and mark the session as encrypted.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, tls_acceptor.clone(), db_path.clone(), peer, true));
+                        // Pass the same tls_ctx along and mark the session as encrypted.
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, tls_ctx.clone(), db_path.clone(), peer, true));
                         return fut.await;
                     },
                     Err(e) => {
@@ -368,6 +367,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     }
                 }
             },
+
             "FETCH" => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();

@@ -129,6 +129,25 @@ pub fn saslprep(input: &str) -> String {
     input.nfkc().collect::<String>()
 }
 
+/// Verify the tls-server-end-point channel binding value sent by the client (c=).
+/// The client sends base64(gs2_header || channel_binding_data). For tls-server-end-point
+/// channel binding data is the certificate fingerprint (SHA-256 of the DER bytes). This
+/// function returns Ok(()) if the provided c_b64 matches the expected value.
+pub fn verify_tls_server_end_point_binding(gs2_header: &str, server_end_point: &[u8], c_b64: &str) -> anyhow::Result<()> {
+    let decoded = base64::decode(c_b64).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let gh = gs2_header.as_bytes();
+    if decoded.len() != gh.len() + server_end_point.len() {
+        return Err(anyhow::anyhow!("channel-binding length mismatch"));
+    }
+    if &decoded[..gh.len()] != gh {
+        return Err(anyhow::anyhow!("gs2 header mismatch in channel binding"));
+    }
+    if &decoded[gh.len()..] != server_end_point {
+        return Err(anyhow::anyhow!("server_end_point mismatch in channel binding"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +209,25 @@ mod tests {
         mac4.update(auth_message.as_bytes());
         let expected = mac4.finalize().into_bytes();
         assert_eq!(server_sig, expected.as_ref());
+    }
+
+    #[test]
+    fn test_verify_tls_server_end_point_binding_ok() {
+        let gs2 = "p=tls-server-end-point,,";
+        let server_ep = vec![1u8,2u8,3u8,4u8,5u8];
+        let mut combined = gs2.as_bytes().to_vec();
+        combined.extend_from_slice(&server_ep);
+        let c_b64 = base64::encode(&combined);
+        assert!(verify_tls_server_end_point_binding(gs2, &server_ep, &c_b64).is_ok());
+    }
+
+    #[test]
+    fn test_verify_tls_server_end_point_binding_fail() {
+        let gs2 = "p=tls-server-end-point,,";
+        let server_ep = vec![1u8,2u8,3u8,4u8,5u8];
+        let mut combined = gs2.as_bytes().to_vec();
+        combined.extend_from_slice(&[9u8,9u8,9u8]);
+        let c_b64 = base64::encode(&combined);
+        assert!(verify_tls_server_end_point_binding(gs2, &server_ep, &c_b64).is_err());
     }
 }

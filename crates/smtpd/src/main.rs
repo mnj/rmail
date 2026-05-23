@@ -11,8 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 mod tls;
-use tls::load_tls_acceptor;
-use tokio_rustls::TlsAcceptor;
+use tls::load_tls_context;
 use rand::RngCore;
 
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
@@ -107,10 +106,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // build TLS acceptor if certificate paths present
-    let tls_acceptor = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
-        match load_tls_acceptor(cert, key) {
-            Ok(a) => Some(Arc::new(a)),
+    // build TLS context if certificate paths present (includes acceptor and channel-binding info)
+    let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
+        match load_tls_context(cert, key) {
+            Ok(ctx) => Some(ctx),
             Err(e) => {
                 eprintln!("Failed to load TLS config: {}", e);
                 None
@@ -130,7 +129,7 @@ async fn main() -> Result<()> {
     for addr in listen_addrs.iter() {
         let addr = addr.clone();
         let mail_root_clone = mail_root.clone();
-        let acceptor_clone = tls_acceptor.clone();
+        let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             if let Err(e) = run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone).await {
@@ -140,27 +139,27 @@ async fn main() -> Result<()> {
     }
 
     // spawn SMTPS listener (implicit TLS) if configured
-    if let Some(s_acceptor) = tls_acceptor.clone() {
+    if let Some(s_ctx) = tls_context.clone() {
         if let Some(port) = cfg.global.smtps_port {
             let addr_v4 = format!("0.0.0.0:{}", port);
             let addr_v6 = format!("[::]:{}", port);
 
             // v4 listener
             let mail_root_v4 = mail_root.clone();
-            let acceptor_v4 = s_acceptor.clone();
+            let ctx_v4 = s_ctx.clone();
             let db_v4 = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v4, acceptor_v4, mail_root_v4, db_v4).await {
+                if let Err(e) = run_smtps_listener(&addr_v4, ctx_v4, mail_root_v4, db_v4).await {
                     eprintln!("SMTPS {} failed: {}", addr_v4, e);
                 }
             });
 
             // v6 listener
             let mail_root_v6 = mail_root.clone();
-            let acceptor_v6 = s_acceptor.clone();
+            let ctx_v6 = s_ctx.clone();
             let db_v6 = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_smtps_listener(&addr_v6, acceptor_v6, mail_root_v6, db_v6).await {
+                if let Err(e) = run_smtps_listener(&addr_v6, ctx_v6, mail_root_v6, db_v6).await {
                     eprintln!("SMTPS {} failed: {}", addr_v6, e);
                 }
             });
@@ -175,13 +174,13 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
+async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPD listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
         let mail_root = mail_root.clone();
-        let acceptor = tls_acceptor.clone();
+        let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false).await {
@@ -191,18 +190,18 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_acceptor: Option<
     }
 }
 
-async fn run_smtps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mail_root: String, db_path: Option<String>) -> Result<()> {
+async fn run_smtps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: String, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPS listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+        let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
+            match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_clone, Some(peer), true).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(ctx.clone()), db_clone, Some(peer), true).await {
                         eprintln!("tls client error: {}", e);
                     }
                 }
@@ -226,7 +225,7 @@ fn extract_addr(s: &str) -> Option<String> {
 // session_encrypted indicates whether the current TCP stream is protected by TLS (true for SMTPS and after a successful STARTTLS upgrade).
 // This allows the server to enforce that authentication mechanisms which transmit secrets
 // (such as AUTH PLAIN or LOGIN) are only accepted on encrypted sessions.
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
     // - MAX_MESSAGE_BYTES: overall DATA size cap to avoid OOM
@@ -271,7 +270,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
         if up.starts_with("HELO") || up.starts_with("EHLO") {
             // Respond with basic capability. If TLS is available advertise STARTTLS.
             let mut resp = String::from("250-Hello\r\n");
-            if !session_encrypted && tls_acceptor.is_some() {
+            if !session_encrypted && tls_ctx.is_some() {
                 resp.push_str("250-STARTTLS\r\n");
             }
             // advertise AUTH mechanisms if DB is configured (we support AUTH PLAIN, LOGIN and SCRAM-SHA-256)
@@ -422,22 +421,21 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     }
                 };
 
-                // Extract GS2 header and client-first-bare. GS2 header indicates whether the
-                // client requests channel-binding. For interoperability we accept the common
-                // "n,," (no channel binding) header. Full channel-binding (e.g., tls-unique)
-                // requires access to the TLS exporter and is not implemented here yet.
-                let client_first_bare = if let Some(idx) = client_first_msg.find(",,") {
-                    let gs2_header = &client_first_msg[..idx+2];
-                    // Only accept the common "n,," GS2 header (no channel binding). If a client
-                    // indicates channel-binding (flags 'y' or 'p=...'), reject explicitly.
-                    if !gs2_header.eq("n,,") {
+                // Extract GS2 header (the part before ",,") and client-first-bare. GS2 header
+                // indicates whether the client requests channel-binding. We support either the
+                // common "n,," (no channel binding) or "p=tls-server-end-point,," (server-end-point
+                // channel binding) when TLS is in use. Other GS2 variants are rejected.
+                let (gs2_header_owned, client_first_bare) = if let Some(idx) = client_first_msg.find(",,") {
+                    let gs2_header = client_first_msg[..idx+2].to_string();
+                    // accept 'n,,' or 'p=tls-server-end-point,,'
+                    if !(gs2_header == "n,," || gs2_header.starts_with("p=tls-server-end-point")) {
                         let w = reader.get_mut();
                         w.write_all(b"538 Channel-binding requested but not supported\r\n").await?;
                         w.flush().await?;
                         continue;
                     }
-                    client_first_msg[idx+2..].to_string()
-                } else { client_first_msg.clone() };
+                    (gs2_header, client_first_msg[idx+2..].to_string())
+                } else { (String::new(), client_first_msg.clone()) };
 
                 // parse username (n=) and client nonce (r=) from client-first-bare
                 let mut username = String::new();
@@ -492,6 +490,43 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                         if let Some(pos) = client_final_msg.find(",p=") {
                                             let client_final_wo_proof = client_final_msg[..pos].to_string();
                                             let client_proof_b64 = &client_final_msg[pos+3..];
+
+                                            // If channel-binding was requested (gs2 header != "n,,"), verify it now.
+                                            if !gs2_header_owned.is_empty() && !gs2_header_owned.eq("n,,") {
+                                                // Only support tls-server-end-point; ensure TLS is active and we have server endpoint info
+                                                if !session_encrypted || tls_ctx.is_none() {
+                                                    if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
+                                                    let w = reader.get_mut();
+                                                    w.write_all(b"538 Channel-binding required but TLS not active\r\n").await?;
+                                                    w.flush().await?;
+                                                    continue;
+                                                }
+                                                // Extract c= value from client_final_wo_proof
+                                                let c_b64_opt = client_final_wo_proof.split(',').find_map(|kv| kv.strip_prefix("c="));
+                                                if c_b64_opt.is_none() {
+                                                    if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
+                                                    let w = reader.get_mut();
+                                                    w.write_all(b"501 Missing c= channel-binding in client-final\r\n").await?;
+                                                    w.flush().await?;
+                                                    continue;
+                                                }
+                                                let c_b64 = c_b64_opt.unwrap();
+                                                // Validate binding: gs2_header + server_end_point should match decoded c=
+                                                let tctx = tls_ctx.as_ref().unwrap();
+                                                match rmail_common::auth::verify_tls_server_end_point_binding(&gs2_header_owned, &tctx.server_end_point, c_b64) {
+                                                    Ok(()) => {
+                                                        // ok
+                                                    }
+                                                    Err(_) => {
+                                                        if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
+                                                        let w = reader.get_mut();
+                                                        w.write_all(b"535 Authentication failed\r\n").await?;
+                                                        w.flush().await?;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+
                                             let auth_message = format!("{},{},{}", client_first_bare, server_first_msg, client_final_wo_proof);
 
                                             match rmail_common::auth::verify_scram_proof(&scram_json, &auth_message, client_proof_b64) {
@@ -926,7 +961,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
             break;
         } else if up.starts_with("STARTTLS") {
             // if we have an acceptor available, perform TLS handshake and continue inside TLS
-            if let Some(acceptor) = tls_acceptor {
+            if let Some(acceptor_ctx) = tls_ctx {
                 // Signal readiness and pause plain-text protocol processing while the TLS handshake occurs.
                 // After a successful accept, control is transferred to a new process_stream invocation
                 // running over the negotiated TLS stream with session_encrypted=true to indicate
@@ -936,10 +971,10 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 w.flush().await?;
                 // take ownership of the underlying stream and perform TLS accept
                 let inner = reader.into_inner();
-                match acceptor.accept(inner).await {
+                match acceptor_ctx.acceptor.accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, Some(acceptor.clone()), db_path.clone(), peer, true));
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, Some(acceptor_ctx.clone()), db_path.clone(), peer, true));
                         return fut.await;
                     }
                     Err(e) => {
