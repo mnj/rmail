@@ -118,10 +118,26 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
                 else if p.starts_with("h=") { h_list = Some(p[2..].trim().to_string()); }
             }
 
-            // Verify body hash if present
+            // Determine canonicalization (c=)
+            let mut canon: Option<String> = None;
+            for part in v.split(';') {
+                let p = part.trim();
+                if p.starts_with("c=") { canon = Some(p[2..].trim().to_string()); }
+            }
+
+            // Verify body hash if present (apply canonicalization if requested)
             if let Some(bh_val) = bh.clone() {
+                let body_to_hash = if let Some(c) = canon.as_deref() {
+                    if c.starts_with("relaxed") {
+                        canonicalize_body_relaxed(body)
+                    } else {
+                        canonicalize_body_simple(body)
+                    }
+                } else {
+                    canonicalize_body_simple(body)
+                };
                 let mut hasher = Sha256::new();
-                hasher.update(body);
+                hasher.update(&body_to_hash);
                 let digest = hasher.finalize();
                 let computed = base64::engine::general_purpose::STANDARD.encode(digest);
                 if computed.trim_end_matches('\n') != bh_val.trim() {
@@ -196,10 +212,19 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
                     signed_parts.push(dk);
                 }
 
-                // concatenate all signed parts into a single byte vector (simple canonicalization)
+                // concatenate all signed parts into a single byte vector applying header canonicalization as requested
                 let mut header_data: Vec<u8> = Vec::new();
                 for part in signed_parts.iter() {
-                    header_data.extend_from_slice(part);
+                    if let Some(c) = canon.as_deref() {
+                        if c.starts_with("relaxed") {
+                            let ch = canonicalize_header_relaxed(part);
+                            header_data.extend_from_slice(&ch);
+                        } else {
+                            header_data.extend_from_slice(part);
+                        }
+                    } else {
+                        header_data.extend_from_slice(part);
+                    }
                 }
 
                 // fetch public key via DNS TXT at selector._domainkey.domain
@@ -443,4 +468,74 @@ fn extract_addr_from_header(s: &str) -> Option<String> {
         return Some(addr);
     }
     None
+}
+
+// Canonicalization helpers (simplified implementations)
+fn canonicalize_body_simple(body: &[u8]) -> Vec<u8> {
+    // Remove trailing CRLFs and ensure a single CRLF at the end
+    let mut v = body.to_vec();
+    while v.ends_with(b"\r\n") || v.ends_with(b"\n") {
+        if v.ends_with(b"\r\n") { v.truncate(v.len()-2); }
+        else { v.truncate(v.len()-1); }
+    }
+    v.extend_from_slice(b"\r\n");
+    v
+}
+
+fn canonicalize_body_relaxed(body: &[u8]) -> Vec<u8> {
+    // Trim trailing empty lines, collapse WSP to single SP and trim WSP at line ends
+    let s = String::from_utf8_lossy(body).to_string();
+    // normalize line endings
+    let s = s.replace("\r\n", "\n");
+    let mut lines: Vec<String> = s.split('\n').map(|ln| {
+        // collapse WSP sequences to a single space and trim
+        let mut out = String::new();
+        let mut last_ws = false;
+        for ch in ln.chars() {
+            if ch == ' ' || ch == '\t' {
+                if !last_ws { out.push(' '); last_ws = true; }
+            } else {
+                out.push(ch);
+                last_ws = false;
+            }
+        }
+        out.trim().to_string()
+    }).collect();
+    // remove trailing empty lines
+    while let Some(last) = lines.last() {
+        if last.is_empty() { lines.pop(); } else { break; }
+    }
+    let mut out = lines.join("\r\n");
+    out.push_str("\r\n");
+    out.into_bytes()
+}
+
+fn canonicalize_header_relaxed(rec: &[u8]) -> Vec<u8> {
+    // Convert to string, split name/value, lowercase name, unfold WSP, collapse runs
+    let s = String::from_utf8_lossy(rec).to_string();
+    // remove trailing CRLF if present
+    let s = s.trim_end_matches('\r').trim_end_matches('\n');
+    // find first colon
+    if let Some(colon) = s.find(':') {
+        let name = s[..colon].trim().to_ascii_lowercase();
+        let mut value = s[colon+1..].to_string();
+        // unfold: replace CRLF + WSP with single SP and replace any LF with space
+        value = value.replace("\r\n", "\n").replace('\n', " ");
+        // collapse WSP sequences
+        let mut out = String::new();
+        let mut last_ws = false;
+        for ch in value.chars() {
+            if ch == ' ' || ch == '\t' {
+                if !last_ws { out.push(' '); last_ws = true; }
+            } else {
+                out.push(ch);
+                last_ws = false;
+            }
+        }
+        let value_norm = out.trim();
+        let canon = format!("{}:{}\r\n", name, value_norm);
+        canon.into_bytes()
+    } else {
+        rec.to_vec()
+    }
 }
