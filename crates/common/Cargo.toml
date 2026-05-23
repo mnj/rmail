@@ -19,3 +19,8 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.21"
 unicode-normalization = "0.1"
+
+# DNS / mail auth helpers
+trust-dns-resolver = "0.22"
+ipnet = "2.4"
+twoway = "0.2"

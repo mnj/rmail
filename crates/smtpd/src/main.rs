@@ -853,6 +853,16 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         };
 
                         if is_local {
+                            // perform message auth analysis (DKIM/SPF/DMARC) in blocking thread
+                            let data_for_analysis = data.clone();
+                            let peer_ip_for_analysis = peer.map(|p| p.ip());
+                            let mail_from_clone_analysis = mail_from.clone();
+                            let (dkim_res, spf_res, dmarc_res) = match tokio::task::spawn_blocking(move || rmail_common::mail_auth::analyze_message(&data_for_analysis, peer_ip_for_analysis, mail_from_clone_analysis.as_deref())).await {
+                                Ok(Ok((dkim, spf, dmarc))) => (dkim, spf, dmarc),
+                                Ok(Err(e)) => { eprintln!("mail auth analyze error: {}", e); (None, None, None) },
+                                Err(e) => { eprintln!("mail auth join error: {}", e); (None, None, None) },
+                            };
+
                             // measure per-recipient delivery latency
                             let start = std::time::Instant::now();
                             match maildir::deliver(&mr, &domain, &local, &data) {
@@ -873,8 +883,12 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                         let print_local = db_local.clone();
                                         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                                         let size = data.len() as i64;
+                                        // clone analysis results into spawn
+                                        let dkim_clone = dkim_res.clone();
+                                        let spf_clone = spf_res.clone();
+                                        let dmarc_clone = dmarc_res.clone();
                                         tokio::spawn(async move {
-                                            match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &db_domain, &db_local, &fname, size, None, None, None)).await {
+                                            match tokio::task::spawn_blocking(move || rmail_common::db::add_message(&dbp2, &db_domain, &db_local, &fname, size, dkim_clone.as_deref(), spf_clone.as_deref(), dmarc_clone.as_deref())).await {
                                                 Ok(Ok(uid)) => {
                                                     println!("Recorded message UID {} for {}@{}", uid, print_local, print_domain);
                                                 }
