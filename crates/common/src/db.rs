@@ -59,6 +59,23 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             next_try INTEGER DEFAULT 0,
             created_at INTEGER
         );
+
+        -- dmarc_events stores individual DMARC evaluation events which are later aggregated
+        -- into periodic DMARC aggregate reports (rua). Events are marked reported after being
+        -- included in an aggregate report.
+        CREATE TABLE IF NOT EXISTS dmarc_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            header_from TEXT,
+            envelope_from TEXT,
+            source_ip TEXT,
+            dkim_result TEXT,
+            spf_result TEXT,
+            dmarc_result TEXT,
+            headers TEXT,
+            created_at INTEGER,
+            reported INTEGER DEFAULT 0
+        );
         "#,
     )?;
     Ok(())
@@ -297,4 +314,59 @@ pub fn count_outbound_pending<P: AsRef<Path>>(path: P) -> Result<i64> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM outbound_queue WHERE status != 'sent'")?;
     let v: i64 = stmt.query_row([], |r| r.get(0))?;
     Ok(v)
+}
+
+/// Record a DMARC evaluation event for later aggregation into rua reports. Returns inserted id.
+pub fn add_dmarc_event<P: AsRef<Path>>(path: P, domain: &str, header_from: Option<&str>, envelope_from: Option<&str>, source_ip: Option<&str>, dkim: Option<&str>, spf: Option<&str>, dmarc: Option<&str>, headers: Option<&str>) -> Result<i64> {
+    let conn = Connection::open(path)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    conn.execute(
+        "INSERT INTO dmarc_events (domain, header_from, envelope_from, source_ip, dkim_result, spf_result, dmarc_result, headers, created_at, reported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+        params![domain, header_from, envelope_from, source_ip, dkim, spf, dmarc, headers, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Return domains which have unreported DMARC events (reported = 0)
+pub fn get_unreported_dmarc_domains<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT DISTINCT domain FROM dmarc_events WHERE reported = 0")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let domain: String = row.get(0)?;
+        out.push(domain);
+    }
+    Ok(out)
+}
+
+/// Fetch unreported DMARC events for a specific domain
+pub fn fetch_unreported_dmarc_events_for_domain<P: AsRef<Path>>(path: P, domain: &str) -> Result<Vec<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, i64)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT id, header_from, envelope_from, source_ip, dkim_result, spf_result, dmarc_result, created_at FROM dmarc_events WHERE domain = ?1 AND reported = 0 ORDER BY created_at")?;
+    let mut rows = stmt.query(params![domain])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let header_from: Option<String> = row.get(1)?;
+        let envelope_from: Option<String> = row.get(2)?;
+        let source_ip: Option<String> = row.get(3)?;
+        let dkim: Option<String> = row.get(4)?;
+        let spf: Option<String> = row.get(5)?;
+        let dmarc: Option<String> = row.get(6)?;
+        let created_at: i64 = row.get(7)?;
+        out.push((id, header_from, envelope_from, source_ip, dkim, spf, dmarc, created_at));
+    }
+    Ok(out)
+}
+
+/// Mark a list of DMARC event ids as reported
+pub fn mark_dmarc_events_reported<P: AsRef<Path>>(path: P, ids: &[i64]) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let tx = conn.transaction()?;
+    for id in ids {
+        tx.execute("UPDATE dmarc_events SET reported = 1 WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+    Ok(())
 }
