@@ -584,6 +584,22 @@ pub fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
+/// Retrieve the published DMARC policy (p=) for a domain, if any.
+pub fn get_dmarc_policy(domain: &str) -> Result<Option<String>> {
+    let name = format!("_dmarc.{}", domain);
+    if let Some(txts) = cached_txt_lookup(&name) {
+        for txt in txts.iter() {
+            for part in txt.split(';') {
+                let p = part.trim();
+                if p.starts_with("p=") {
+                    return Ok(Some(p[2..].trim().to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 // Canonicalization helpers (simplified implementations)
 fn canonicalize_body_simple(body: &[u8]) -> Vec<u8> {
     // Remove trailing CRLFs and ensure a single CRLF at the end
