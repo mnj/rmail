@@ -42,6 +42,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&failed_dir).await?;
 
     println!("Using on-disk outbound queue: {}", queue_dir.display());
+    let per_dest_limit_env = std::env::var("RMAIL_PER_DEST_LIMIT").ok();
+    let per_dest_limit: usize = per_dest_limit_env.as_ref().and_then(|s| s.parse().ok()).unwrap_or(5usize);
+    let dead_letter_days: u64 = std::env::var("RMAIL_DEAD_LETTER_DAYS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let dead_letter_secs = (dead_letter_days.saturating_mul(24*3600)) as i64;
+    let mut loop_counter: u64 = 0;
     loop {
         // Try to claim an eligible message using the shared queue-manager library (blocking fs ops)
         let claim_res = tokio::task::spawn_blocking({
