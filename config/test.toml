@@ -13,6 +13,10 @@ log_level = "debug"
 # optional web admin user for local testing
 web_admin_user = "admin"
 web_admin_password_hash = "plain:password"
+# local test DB path for mailboxes/catchalls
+db_path = "config/rmail_test.db"
+# ACME challenge dir for local testing (empty by default)
+acme_challenge_dir = "config/acme-challenges"
 
 [[mailboxes]]
 address = "user@example.local"

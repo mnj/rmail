@@ -93,17 +93,19 @@ use std::collections::HashMap;
 ///
 /// This function ensures a mailbox-specific UIDVALIDITY is present (stored in Maildir/uidvalidity)
 /// and a filename -> UID map persisted in Maildir/uidmap.json. It returns the UIDVALIDITY and an
-/// ordered Vec of (UID, PathBuf) matching the stable ordering used for IMAP sequence numbers.
+/// ordered Vec of (UID, PathBuf, flags) matching the stable ordering used for IMAP sequence numbers.
 ///
+/// Flags are stored in Maildir/uidflags.json as a mapping from UID (string) -> array of flag strings.
 /// Implementation notes:
 /// - Filenames are used as stable identifiers; if a filename has an existing UID it is reused.
 /// - New files receive monotonically increasing UIDs written back to the uidmap.json atomically.
 /// - UIDVALIDITY is generated from time XOR randomness when first created.
-pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyhow::Result<(u64, Vec<(u64, PathBuf)>)> {
+pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyhow::Result<(u64, Vec<(u64, PathBuf, Vec<String>)>)> {
     let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
     ensure_maildir(&mailbox_dir)?;
     let uidvalidity_path = mailbox_dir.join("uidvalidity");
     let uidmap_path = mailbox_dir.join("uidmap.json");
+    let uidflags_path = mailbox_dir.join("uidflags.json");
 
     // Load or initialize UIDVALIDITY
     let uidvalidity: u64 = if uidvalidity_path.exists() {
@@ -138,10 +140,24 @@ pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyho
         HashMap::new()
     };
 
+    // Load flags map (uid -> [flags])
+    let mut flags_map: HashMap<String, Vec<String>> = if uidflags_path.exists() {
+        let s = fs::read_to_string(&uidflags_path)?;
+        match serde_json::from_str(&s) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("warning: failed to parse uidflags.json: {} — rebuilding", e);
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     // Build ordered list of messages and assign UIDs to new files
     let msgs_paths = list_messages(maildir_root, domain, localpart)?;
     let mut max_uid = map.values().cloned().max().unwrap_or(0);
-    let mut out: Vec<(u64, PathBuf)> = Vec::new();
+    let mut out: Vec<(u64, PathBuf, Vec<String>)> = Vec::new();
     for p in msgs_paths.into_iter() {
         if let Some(fname_os) = p.file_name() {
             if let Some(fname) = fname_os.to_str() {
@@ -152,7 +168,8 @@ pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyho
                     map.insert(fname.to_string(), max_uid);
                     max_uid
                 };
-                out.push((uid, p));
+                let flags = flags_map.get(&uid.to_string()).cloned().unwrap_or_default();
+                out.push((uid, p, flags));
             }
         }
     }
@@ -163,5 +180,106 @@ pub fn load_uid_map(maildir_root: &Path, domain: &str, localpart: &str) -> anyho
     fs::write(&tmp, json)?;
     fs::rename(&tmp, &uidmap_path)?;
 
+    // Persist flags map (may be empty)
+    let tmpf = uidflags_path.with_extension("tmp");
+    let fj = serde_json::to_string(&flags_map)?;
+    fs::write(&tmpf, fj)?;
+    fs::rename(&tmpf, &uidflags_path)?;
+
     Ok((uidvalidity, out))
+}
+
+/// Helper: map uid -> filename (if present)
+fn uid_to_filename_map(uidmap_path: &Path) -> anyhow::Result<HashMap<u64, String>> {
+    let mut out = HashMap::new();
+    if uidmap_path.exists() {
+        let s = fs::read_to_string(uidmap_path)?;
+        let m: HashMap<String, u64> = serde_json::from_str(&s)?;
+        for (fname, uid) in m.into_iter() {
+            out.insert(uid, fname);
+        }
+    }
+    Ok(out)
+}
+
+/// Get path for a given UID if it exists in new/cur
+pub fn uid_to_path(maildir_root: &Path, domain: &str, localpart: &str, uid: u64) -> anyhow::Result<Option<PathBuf>> {
+    let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
+    let uidmap_path = mailbox_dir.join("uidmap.json");
+    let map = uid_to_filename_map(&uidmap_path)?;
+    if let Some(fname) = map.get(&uid) {
+        for sub in &["new", "cur"] {
+            let p = mailbox_dir.join(sub).join(fname);
+            if p.exists() && p.is_file() {
+                return Ok(Some(p));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Set flags for a uid (overwrites existing flags for the UID)
+pub fn set_uid_flags(maildir_root: &Path, domain: &str, localpart: &str, uid: u64, flags: Vec<String>) -> anyhow::Result<()> {
+    let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
+    ensure_maildir(&mailbox_dir)?;
+    let uidflags_path = mailbox_dir.join("uidflags.json");
+    let mut flags_map: HashMap<String, Vec<String>> = if uidflags_path.exists() {
+        let s = fs::read_to_string(&uidflags_path)?;
+        serde_json::from_str(&s)?
+    } else {
+        HashMap::new()
+    };
+    flags_map.insert(uid.to_string(), flags);
+    let tmp = uidflags_path.with_extension("tmp");
+    let fj = serde_json::to_string(&flags_map)?;
+    fs::write(&tmp, fj)?;
+    fs::rename(&tmp, &uidflags_path)?;
+    Ok(())
+}
+
+/// Delete a message by UID: removes file and updates uidmap + uidflags atomically
+pub fn delete_message_by_uid(maildir_root: &Path, domain: &str, localpart: &str, uid: u64) -> anyhow::Result<()> {
+    let mailbox_dir = maildir_root.join(domain).join(localpart).join("Maildir");
+    ensure_maildir(&mailbox_dir)?;
+    let uidmap_path = mailbox_dir.join("uidmap.json");
+    let uidflags_path = mailbox_dir.join("uidflags.json");
+
+    // load uidmap
+    let mut map: HashMap<String, u64> = if uidmap_path.exists() {
+        let s = fs::read_to_string(&uidmap_path)?;
+        serde_json::from_str(&s)?
+    } else {
+        HashMap::new()
+    };
+
+    // find filename for uid
+    let fname_opt = map.iter().find_map(|(k, &v)| if v == uid { Some(k.clone()) } else { None });
+    if let Some(fname) = fname_opt {
+        // remove file if exists in new or cur
+        for sub in &["new", "cur"] {
+            let p = mailbox_dir.join(sub).join(&fname);
+            if p.exists() && p.is_file() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+        // remove entries from uidmap and uidflags
+        map.remove(&fname);
+        let tmp = uidmap_path.with_extension("tmp");
+        let json = serde_json::to_string(&map)?;
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &uidmap_path)?;
+
+        let mut flags_map: HashMap<String, Vec<String>> = if uidflags_path.exists() {
+            let s = fs::read_to_string(&uidflags_path)?;
+            serde_json::from_str(&s)?
+        } else {
+            HashMap::new()
+        };
+        flags_map.remove(&uid.to_string());
+        let tmpf = uidflags_path.with_extension("tmp");
+        let fj = serde_json::to_string(&flags_map)?;
+        fs::write(&tmpf, fj)?;
+        fs::rename(&tmpf, &uidflags_path)?;
+    }
+    Ok(())
 }

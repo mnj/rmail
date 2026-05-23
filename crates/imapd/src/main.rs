@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rmail_common::config::Mailbox;
-use rmail_common::{auth, maildir, config::Config};
+use rmail_common::{auth, maildir, config::Config, db as rmail_db};
 use std::{sync::Arc, collections::HashMap};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,7 +23,7 @@ struct SelectedMailbox {
     pub domain: String,
     pub local: String,
     pub uidvalidity: u64,
-    pub msgs: Vec<(u64, std::path::PathBuf)>,
+    pub msgs: Vec<(u64, std::path::PathBuf, Vec<String>)>,
 }
 
 
@@ -55,11 +55,13 @@ async fn main() -> Result<()> {
     // Plain IMAP listener (supports STARTTLS if tls_acceptor present)
     let imap_port = cfg.global.imap_port.unwrap_or(143);
     let imap_addr = format!("0.0.0.0:{}", imap_port);
+    let db_path = cfg.global.db_path.clone();
     let mailbox_map_clone = mailbox_map.clone();
     let mail_root_clone = mail_root.clone();
     let acceptor_clone = tls_acceptor.clone();
+    let db_clone = db_path.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_plain_listener(&imap_addr, mailbox_map_clone, mail_root_clone, acceptor_clone).await {
+        if let Err(e) = run_plain_listener(&imap_addr, mailbox_map_clone, mail_root_clone, acceptor_clone, db_clone).await {
             eprintln!("IMAP plain listener failed: {}", e);
         }
     });
@@ -71,8 +73,9 @@ async fn main() -> Result<()> {
             let mailbox_map = mailbox_map.clone();
             let mail_root = mail_root.clone();
             let acceptor = acceptor.clone();
+            let db_clone = db_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_imaps_listener(&imaps_addr, acceptor, mailbox_map, mail_root).await {
+                if let Err(e) = run_imaps_listener(&imaps_addr, acceptor, mailbox_map, mail_root, db_clone).await {
                     eprintln!("IMAPS listener failed: {}", e);
                 }
             });
@@ -85,7 +88,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
+async fn run_plain_listener(addr: &str, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD listening on {}", addr);
     loop {
@@ -93,15 +96,16 @@ async fn run_plain_listener(addr: &str, mailbox_map: Arc<HashMap<String, Mailbox
         let mailbox_map = mailbox_map.clone();
         let mail_root = mail_root.clone();
         let acceptor = tls_acceptor.clone();
+        let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mailbox_map, mail_root, acceptor).await {
+            if let Err(e) = process_stream(Box::new(stream), mailbox_map, mail_root, acceptor, db_clone).await {
                 eprintln!("IMAP client error: {}", e);
             }
         });
     }
 }
 
-async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String) -> Result<()> {
+async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, db_path: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
@@ -109,10 +113,11 @@ async fn run_imaps_listener(addr: &str, acceptor: Arc<TlsAcceptor>, mailbox_map:
         let acceptor = acceptor.clone();
         let mailbox_map = mailbox_map.clone();
         let mail_root = mail_root.clone();
+        let db_clone = db_path.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mailbox_map, mail_root, None).await {
+                    if let Err(e) = process_stream(Box::new(tls_stream), mailbox_map, mail_root, None, db_clone).await {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -131,7 +136,7 @@ fn unquote(s: &str) -> &str {
     }
 }
 
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
+async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_map: Arc<HashMap<String, Mailbox>>, mail_root: String, tls_acceptor: Option<Arc<TlsAcceptor>>, db_path: Option<String>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();
@@ -161,26 +166,50 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 let pass_raw = a.next().unwrap_or("");
                 let user = unquote(user_raw);
                 let pass = unquote(pass_raw);
-                // find mailbox
+                // find mailbox (prefer DB if configured)
                 let mut mb: Option<Mailbox> = None;
-                if user.contains('@') {
-                    mb = mailbox_map.get(&user.to_ascii_lowercase()).cloned();
-                } else {
-                    // try unique localpart match
-                    let mut found = None;
-                    for (addr, m) in mailbox_map.iter() {
-                        if let Some(at) = addr.find('@') {
-                            if &addr[..at] == user {
-                                if found.is_some() {
-                                    found = None; // ambiguous
-                                    break;
-                                } else {
-                                    found = Some(m.clone());
+                if let Some(dbp) = db_path.as_ref() {
+                    let dbp2 = dbp.clone();
+                    let user_lookup = user.to_ascii_lowercase();
+                    if user_lookup.contains('@') {
+                        match tokio::task::spawn_blocking(move || rmail_common::db::get_mailbox(dbp2, &user_lookup)).await {
+                            Ok(Ok(Some(m))) => mb = Some(m),
+                            Ok(Ok(None)) => {},
+                            Ok(Err(e)) => eprintln!("db get_mailbox error: {}", e),
+                            Err(e) => eprintln!("db task join error: {}", e),
+                        }
+                    } else {
+                        let dbp3 = dbp.clone();
+                        let user_local = user.to_string();
+                        match tokio::task::spawn_blocking(move || rmail_common::db::find_mailbox_by_localpart(dbp3, &user_local)).await {
+                            Ok(Ok(Some(m))) => mb = Some(m),
+                            Ok(Ok(None)) => {},
+                            Ok(Err(e)) => eprintln!("db query error: {}", e),
+                            Err(e) => eprintln!("db task join error: {}", e),
+                        }
+                    }
+                }
+                // fallback to config file list
+                if mb.is_none() {
+                    if user.contains('@') {
+                        mb = mailbox_map.get(&user.to_ascii_lowercase()).cloned();
+                    } else {
+                        // try unique localpart match
+                        let mut found = None;
+                        for (addr, m) in mailbox_map.iter() {
+                            if let Some(at) = addr.find('@') {
+                                if &addr[..at] == user {
+                                    if found.is_some() {
+                                        found = None; // ambiguous
+                                        break;
+                                    } else {
+                                        found = Some(m.clone());
+                                    }
                                 }
                             }
                         }
+                        mb = found;
                     }
-                    mb = found;
                 }
                 if let Some(mailbox) = mb {
                     if let Some(ref hash) = mailbox.password_hash {
@@ -253,8 +282,11 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                     // Load or build UID mapping for this Maildir. This maintains a persistent UIDVALIDITY
                     // and a filename -> UID map stored under Maildir/uidmap.json to provide stable UIDs
                     // across server restarts. list_messages provides stable ordering for sequence numbers.
-                    match maildir::load_uid_map(std::path::Path::new(&mail_root), domain, local) {
-                        Ok((uidvalidity, msgs)) => {
+                    let mr_clone = mail_root.clone();
+                    let domain_c = domain.to_string();
+                    let local_c = local.to_string();
+                    match tokio::task::spawn_blocking(move || maildir::load_uid_map(std::path::Path::new(&mr_clone), &domain_c, &local_c)).await {
+                        Ok(Ok((uidvalidity, msgs))) => {
                             let count = msgs.len();
                             // store selection in session state
                             selected = Some(SelectedMailbox { domain: domain.to_string(), local: local.to_string(), uidvalidity, msgs });
@@ -268,11 +300,17 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                             w.write_all(format!("{} OK [UIDVALIDITY {}] [READ-WRITE] SELECT completed\r\n", tag, uidvalidity).as_bytes()).await?;
                             w.flush().await?;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             let w = reader.get_mut();
                             w.write_all(format!("{} NO Error opening mailbox\r\n", tag).as_bytes()).await?;
                             w.flush().await?;
                             eprintln!("load_uid_map error: {}", e);
+                        }
+                        Err(e) => {
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes()).await?;
+                            w.flush().await?;
+                            eprintln!("task join error: {}", e);
                         }
                     }
                 } else {
@@ -296,7 +334,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 match tls_acceptor.unwrap().accept(inner).await {
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mailbox_map, mail_root, None));
+                        let fut = Box::pin(process_stream(Box::new(tls_stream), mailbox_map, mail_root, None, db_path.clone()));
                         return fut.await;
                     },
                     Err(e) => {
@@ -338,20 +376,30 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 for seq in seqs {
                     if seq == 0 || seq > total { continue; }
                     let idx = seq - 1;
-                    let path = &sel.msgs[idx].1;
-                    match std::fs::read(path) {
-                        Ok(data) => {
+                    let uid = sel.msgs[idx].0;
+                    let flags = sel.msgs[idx].2.clone();
+                    let path = sel.msgs[idx].1.clone();
+                    // read data in blocking thread
+                    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+                        Ok(Ok(data)) => {
+                            let flags_str = flags.join(" ");
                             let w = reader.get_mut();
-                            w.write_all(format!("* {} FETCH (RFC822 {{{}}}\r\n", seq, data.len()).as_bytes()).await?;
+                            w.write_all(format!("* {} FETCH (FLAGS ({}) UID {} RFC822 {{{}}}\r\n", seq, flags_str, uid, data.len()).as_bytes()).await?;
                             w.write_all(&data).await?;
                             w.write_all(b"\r\n)\r\n").await?;
                             w.flush().await?;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             let w = reader.get_mut();
                             w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes()).await?;
                             w.flush().await?;
                             eprintln!("read message error: {}", e);
+                        }
+                        Err(e) => {
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes()).await?;
+                            w.flush().await?;
+                            eprintln!("task join error: {}", e);
                         }
                     }
                 }
@@ -359,6 +407,7 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                 w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes()).await?;
                 w.flush().await?;
             },
+
             "UID" => {
                 let mut a = args.trim().splitn(2, ' ');
                 let subcmd = a.next().unwrap_or("").to_uppercase();
@@ -390,20 +439,29 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mailbox_m
                     for uid in uids {
                         if let Some(pos) = sel.msgs.iter().position(|(u,_)| *u == uid) {
                             let seq = pos + 1;
-                            let path = &sel.msgs[pos].1;
-                            match std::fs::read(path) {
-                                Ok(data) => {
+                            let uid = *sel.msgs[pos].0;
+                            let flags = sel.msgs[pos].2.clone();
+                            let path = sel.msgs[pos].1.clone();
+                            match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+                                Ok(Ok(data)) => {
+                                    let flags_str = flags.join(" ");
                                     let w = reader.get_mut();
-                                    w.write_all(format!("* {} FETCH (UID {} RFC822 {{{}}}\r\n", seq, uid, data.len()).as_bytes()).await?;
+                                    w.write_all(format!("* {} FETCH (FLAGS ({}) UID {} RFC822 {{{}}}\r\n", seq, flags_str, uid, data.len()).as_bytes()).await?;
                                     w.write_all(&data).await?;
                                     w.write_all(b"\r\n)\r\n").await?;
                                     w.flush().await?;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     let w = reader.get_mut();
                                     w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes()).await?;
                                     w.flush().await?;
                                     eprintln!("read message error: {}", e);
+                                }
+                                Err(e) => {
+                                    let w = reader.get_mut();
+                                    w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes()).await?;
+                                    w.flush().await?;
+                                    eprintln!("task join error: {}", e);
                                 }
                             }
                         }

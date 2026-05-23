@@ -14,6 +14,10 @@ log_level = "info"
 web_admin_user = "admin"
 # generate a hash using rmail_ctl hash and paste here
 web_admin_password_hash = "argon2$PLACEHOLDER"
+# optional SQLite DB for mailboxes and catchalls (preferred for production)
+db_path = "config/rmail.db"
+# directory used to serve ACME http-01 challenges (used by automated cert managers)
+acme_challenge_dir = "config/acme-challenges"
 
 [[mailboxes]]
 address = "user@example.local"
