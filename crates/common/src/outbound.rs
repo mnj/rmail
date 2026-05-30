@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct QueueControl {
@@ -16,15 +16,48 @@ pub struct QueueControl {
 
 impl QueueControl {
     pub fn new(max_attempts: u32, priority: i32) -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        QueueControl { attempts: 0, max_attempts, priority, next_try: None, last_error: None, created_at: now }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        QueueControl {
+            attempts: 0,
+            max_attempts,
+            priority,
+            next_try: None,
+            last_error: None,
+            created_at: now,
+        }
     }
-    pub fn default_with_timestamp(ts: i64) -> Self { QueueControl { attempts: 0, max_attempts: 5, priority: 0, next_try: None, last_error: None, created_at: ts } }
+    pub fn default_with_timestamp(ts: i64) -> Self {
+        QueueControl {
+            attempts: 0,
+            max_attempts: 5,
+            priority: 0,
+            next_try: None,
+            last_error: None,
+            created_at: ts,
+        }
+    }
+}
+
+pub fn control_path_for_eml(eml_path: &Path) -> PathBuf {
+    let parent = eml_path.parent().unwrap_or_else(|| Path::new("."));
+    let fname = eml_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("message.eml");
+    parent.join(format!("{}.json", fname))
 }
 
 /// Simple outbound queue: writes email files into <mail_root>/outbound/maildrop/queue with an atomic tmp->final move.
 /// This is intentionally minimal — a more complete MTA would implement retry/backoff, SMTP delivery workers, and per-domain queuing.
-pub fn queue_outbound(maildir_root: &Path, recipient: &str, data: &[u8], envelope_from: Option<&str>) -> anyhow::Result<PathBuf> {
+pub fn queue_outbound(
+    maildir_root: &Path,
+    recipient: &str,
+    data: &[u8],
+    envelope_from: Option<&str>,
+) -> anyhow::Result<PathBuf> {
     let outbound_dir = maildir_root.join("outbound").join("maildrop");
     let tmp_dir = outbound_dir.join("tmp");
     let queue_dir = outbound_dir.join("queue");
@@ -32,9 +65,10 @@ pub fn queue_outbound(maildir_root: &Path, recipient: &str, data: &[u8], envelop
     fs::create_dir_all(&queue_dir)?;
 
     // sanitize recipient for filename (keeps only alnum and replaces others with underscore)
-    let safe: String = recipient.chars().map(|c| {
-        if c.is_ascii_alphanumeric() { c } else { '_' }
-    }).collect();
+    let safe: String = recipient
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let pid = std::process::id();
@@ -59,11 +93,26 @@ pub fn queue_outbound(maildir_root: &Path, recipient: &str, data: &[u8], envelop
     // write control JSON to tmp and then move to queue dir
     let control = QueueControl::new(5, 0);
     let control_json = serde_json::to_string(&control)?;
-    let tmp_json = tmp_dir.join(format!("{}.json", &filename));
+    let tmp_json = control_path_for_eml(&tmp_path);
     fs::write(&tmp_json, control_json.as_bytes())?;
 
     fs::rename(&tmp_path, &final_path)?;
-    let final_json = queue_dir.join(format!("{}.json", &filename));
+    let final_json = control_path_for_eml(&final_path);
     fs::rename(&tmp_json, &final_json)?;
     Ok(final_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_path_for_eml;
+    use std::path::Path;
+
+    #[test]
+    fn control_sidecar_uses_eml_json_suffix() {
+        let path = Path::new("/tmp/message.eml");
+        assert_eq!(
+            control_path_for_eml(path),
+            Path::new("/tmp/message.eml.json")
+        );
+    }
 }

@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use rmail_common::db::Mailbox;
 use rmail_common::{auth, config::Config};
-use std::{sync::{Arc, Mutex}, collections::HashMap, net::{IpAddr, SocketAddr}};
-use std::time::{Instant, Duration};
-use once_cell::sync::Lazy;
+use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -25,7 +29,8 @@ struct AuthFailInfo {
     locked_until: Option<Instant>,
 }
 
-static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Check whether the remote IP is currently blocked from authenticating. Returns remaining block Duration if blocked.
 fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
@@ -45,7 +50,11 @@ fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
 fn record_auth_failure(ip: IpAddr) {
     let mut m = AUTH_FAILS.lock().unwrap();
     let now = Instant::now();
-    let entry = m.entry(ip).or_insert(AuthFailInfo { count: 0, first: now, locked_until: None });
+    let entry = m.entry(ip).or_insert(AuthFailInfo {
+        count: 0,
+        first: now,
+        locked_until: None,
+    });
     entry.count = entry.count.saturating_add(1);
     // Increment global metric for monitoring
     rmail_common::metrics::inc_auth_failures();
@@ -76,10 +85,67 @@ struct SelectedMailbox {
     pub msgs: Vec<(u64, std::path::PathBuf, Vec<String>)>,
 }
 
+async fn load_selected_mailbox(
+    mail_root: &str,
+    db_path: Option<String>,
+    address: &str,
+) -> Result<SelectedMailbox> {
+    let at = address
+        .find('@')
+        .ok_or_else(|| anyhow::anyhow!("invalid mailbox address"))?;
+    let local = address[..at].to_string();
+    let domain = address[at + 1..].to_string();
+    let mr_clone = mail_root.to_string();
+    let domain_c = domain.clone();
+    let local_c = local.clone();
+    match tokio::task::spawn_blocking(move || {
+        if let Some(dbp) = db_path {
+            let addr = format!("{}@{}", local_c, domain_c);
+            let uidvalidity = rmail_common::db::get_mailbox_uidvalidity(&dbp, &addr)?;
+            let list = rmail_common::db::list_messages(&dbp, &domain_c, &local_c)?;
+            let mut out_msgs: Vec<(u64, std::path::PathBuf, Vec<String>)> = Vec::new();
+            for (uid, filename, flags) in list {
+                let new_path = std::path::Path::new(&mr_clone)
+                    .join(&domain_c)
+                    .join(&local_c)
+                    .join("Maildir")
+                    .join("new")
+                    .join(&filename);
+                let cur_path = std::path::Path::new(&mr_clone)
+                    .join(&domain_c)
+                    .join(&local_c)
+                    .join("Maildir")
+                    .join("cur")
+                    .join(&filename);
+                let path = if new_path.exists() {
+                    new_path
+                } else {
+                    cur_path
+                };
+                out_msgs.push((uid, path, flags));
+            }
+            Ok(SelectedMailbox {
+                domain: domain_c,
+                local: local_c,
+                uidvalidity,
+                msgs: out_msgs,
+            })
+        } else {
+            Err(anyhow::anyhow!("No DB configured"))
+        }
+    })
+    .await
+    {
+        Ok(Ok(sel)) => Ok(sel),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(anyhow::anyhow!("task join error: {}", e)),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg_path = std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg_path =
+        std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
     let mail_root = cfg.global.mail_root.clone();
 
@@ -94,7 +160,10 @@ async fn main() -> Result<()> {
     let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
         match load_tls_context(cert, key) {
             Ok(ctx) => Some(ctx),
-            Err(e) => { eprintln!("Failed to load TLS: {}", e); None }
+            Err(e) => {
+                eprintln!("Failed to load TLS: {}", e);
+                None
+            }
         }
     } else {
         None
@@ -108,7 +177,9 @@ async fn main() -> Result<()> {
     let acceptor_clone = tls_context.clone();
     let db_clone = db_path.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_plain_listener(&imap_addr, mail_root_clone, acceptor_clone, db_clone).await {
+        if let Err(e) =
+            run_plain_listener(&imap_addr, mail_root_clone, acceptor_clone, db_clone).await
+        {
             eprintln!("IMAP plain listener failed: {}", e);
         }
     });
@@ -134,7 +205,12 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>) -> Result<()> {
+async fn run_plain_listener(
+    addr: &str,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD listening on {}", addr);
     loop {
@@ -143,14 +219,28 @@ async fn run_plain_listener(addr: &str, mail_root: String, tls_ctx: Option<Arc<t
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(Box::new(stream), mail_root, acceptor, db_clone, Some(peer), false).await {
+            if let Err(e) = process_stream(
+                Box::new(stream),
+                mail_root,
+                acceptor,
+                db_clone,
+                Some(peer),
+                false,
+            )
+            .await
+            {
                 eprintln!("IMAP client error: {}", e);
             }
         });
     }
 }
 
-async fn run_imaps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: String, db_path: Option<String>) -> Result<()> {
+async fn run_imaps_listener(
+    addr: &str,
+    ctx: Arc<tls::TlsContext>,
+    mail_root: String,
+    db_path: Option<String>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
@@ -161,7 +251,16 @@ async fn run_imaps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: St
         tokio::spawn(async move {
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(Box::new(tls_stream), mail_root, Some(ctx.clone()), db_clone, Some(peer), true).await {
+                    if let Err(e) = process_stream(
+                        Box::new(tls_stream),
+                        mail_root,
+                        Some(ctx.clone()),
+                        db_clone,
+                        Some(peer),
+                        true,
+                    )
+                    .await
+                    {
                         eprintln!("IMAPS client error: {}", e);
                     }
                 }
@@ -174,7 +273,7 @@ async fn run_imaps_listener(addr: &str, ctx: Arc<tls::TlsContext>, mail_root: St
 fn unquote(s: &str) -> &str {
     let s = s.trim();
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        &s[1..(s.len()-1)]
+        &s[1..(s.len() - 1)]
     } else {
         s
     }
@@ -186,7 +285,14 @@ fn unquote(s: &str) -> &str {
 // session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
 // and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
 // for per-IP rate-limiting of authentication attempts.
-async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root: String, tls_ctx: Option<Arc<tls::TlsContext>>, db_path: Option<String>, peer: Option<SocketAddr>, session_encrypted: bool) -> Result<()> {
+async fn process_stream(
+    stream: Box<dyn AsyncStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+) -> Result<()> {
     let mut reader = BufReader::new(stream);
     {
         let w = reader.get_mut();
@@ -201,9 +307,13 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let input = line.trim_end_matches("\r\n");
-        if input.is_empty() { continue; }
+        if input.is_empty() {
+            continue;
+        }
         let mut parts = input.splitn(3, ' ');
         let tag = parts.next().unwrap_or("*");
         let cmd = parts.next().unwrap_or("").to_uppercase();
@@ -214,7 +324,15 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 if let Some(peer_addr) = peer {
                     if let Some(rem) = auth_block_remaining(peer_addr.ip()) {
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Too many failed auth attempts; try again in {}s\r\n", tag, rem.as_secs()).as_bytes()).await?;
+                        w.write_all(
+                            format!(
+                                "{} NO Too many failed auth attempts; try again in {}s\r\n",
+                                tag,
+                                rem.as_secs()
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                         continue;
                     }
@@ -222,7 +340,10 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 // Require an encrypted session for LOGIN to avoid sending cleartext passwords
                 if !session_encrypted {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO Encryption required for authentication\r\n", tag).as_bytes()).await?;
+                    w.write_all(
+                        format!("{} NO Encryption required for authentication\r\n", tag).as_bytes(),
+                    )
+                    .await?;
                     w.flush().await?;
                     continue;
                 }
@@ -238,18 +359,26 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     let dbp2 = dbp.clone();
                     let user_lookup = user.to_ascii_lowercase();
                     if user_lookup.contains('@') {
-                        match tokio::task::spawn_blocking(move || rmail_common::db::get_mailbox(dbp2, &user_lookup)).await {
+                        match tokio::task::spawn_blocking(move || {
+                            rmail_common::db::get_mailbox(dbp2, &user_lookup)
+                        })
+                        .await
+                        {
                             Ok(Ok(Some(m))) => mb = Some(m),
-                            Ok(Ok(None)) => {},
+                            Ok(Ok(None)) => {}
                             Ok(Err(e)) => eprintln!("db get_mailbox error: {}", e),
                             Err(e) => eprintln!("db task join error: {}", e),
                         }
                     } else {
                         let dbp3 = dbp.clone();
                         let user_local = user.to_string();
-                        match tokio::task::spawn_blocking(move || rmail_common::db::find_mailbox_by_localpart(dbp3, &user_local)).await {
+                        match tokio::task::spawn_blocking(move || {
+                            rmail_common::db::find_mailbox_by_localpart(dbp3, &user_local)
+                        })
+                        .await
+                        {
                             Ok(Ok(Some(m))) => mb = Some(m),
-                            Ok(Ok(None)) => {},
+                            Ok(Ok(None)) => {}
                             Ok(Err(e)) => eprintln!("db query error: {}", e),
                             Err(e) => eprintln!("db task join error: {}", e),
                         }
@@ -257,9 +386,12 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 }
                 // If DB lookup didn't find a mailbox, report not found (DB is authoritative)
                 if mb.is_none() {
-                    if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
+                    if let Some(peer_addr) = peer {
+                        record_auth_failure(peer_addr.ip());
+                    }
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO No such user\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
@@ -268,126 +400,135 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         match auth::verify_password(pass, hash) {
                             Ok(true) => {
                                 authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
-                                if let Some(peer_addr) = peer { reset_auth_failures(peer_addr.ip()); }
+                                if let Some(peer_addr) = peer {
+                                    reset_auth_failures(peer_addr.ip());
+                                }
                                 let w = reader.get_mut();
-                                w.write_all(format!("{} OK LOGIN completed\r\n", tag).as_bytes()).await?;
+                                w.write_all(format!("{} OK LOGIN completed\r\n", tag).as_bytes())
+                                    .await?;
                                 w.flush().await?;
-                            },
-                            Ok(false) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes()).await?; w.flush().await?; },
-                            Err(e) => { if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); } let w = reader.get_mut(); w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes()).await?; w.flush().await?; eprintln!("auth verify error: {}", e); }
+                            }
+                            Ok(false) => {
+                                if let Some(peer_addr) = peer {
+                                    record_auth_failure(peer_addr.ip());
+                                }
+                                let w = reader.get_mut();
+                                w.write_all(
+                                    format!("{} NO Authentication failed\r\n", tag).as_bytes(),
+                                )
+                                .await?;
+                                w.flush().await?;
+                            }
+                            Err(e) => {
+                                if let Some(peer_addr) = peer {
+                                    record_auth_failure(peer_addr.ip());
+                                }
+                                let w = reader.get_mut();
+                                w.write_all(
+                                    format!("{} NO Authentication error\r\n", tag).as_bytes(),
+                                )
+                                .await?;
+                                w.flush().await?;
+                                eprintln!("auth verify error: {}", e);
+                            }
                         }
                     } else {
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO No password set for account\r\n", tag).as_bytes()).await?;
+                        w.write_all(
+                            format!("{} NO No password set for account\r\n", tag).as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                 } else {
-                    if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
+                    if let Some(peer_addr) = peer {
+                        record_auth_failure(peer_addr.ip());
+                    }
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO No such user\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO No such user\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                 }
-            },
+            }
             "LIST" => {
                 // Require authentication to list user's mailboxes in this simple implementation
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
                 // Return INBOX only
                 let w = reader.get_mut();
-                w.write_all(b"* LIST (\"\\HasNoChildren\") \"/\" \"INBOX\"\r\n").await?;
+                w.write_all(b"* LIST (\"\\HasNoChildren\") \"/\" \"INBOX\"\r\n")
+                    .await?;
                 w.flush().await?;
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK LIST completed\r\n", tag).as_bytes()).await?;
+                w.write_all(format!("{} OK LIST completed\r\n", tag).as_bytes())
+                    .await?;
                 w.flush().await?;
-            },
+            }
             "SELECT" => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
                 let mailbox_name = args.trim();
                 if mailbox_name.to_uppercase() != "INBOX" {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO Only INBOX supported\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO Only INBOX supported\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
                 let addr = authed_mailbox.as_ref().unwrap();
-                // determine maildir path
-                if let Some(at) = addr.find('@') {
-                    let local = &addr[..at];
-                    let domain = &addr[at+1..];
-
-                    let mr_clone = mail_root.clone();
-                    let domain_c = domain.to_string();
-                    let local_c = local.to_string();
-                    let dbp_opt = db_path.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        // Use DB to build selection state
-                        if let Some(dbp) = dbp_opt {
-                            let addr = format!("{}@{}", local_c, domain_c);
-                            let uidvalidity = rmail_common::db::get_mailbox_uidvalidity(&dbp, &addr)?;
-                            let list = rmail_common::db::list_messages(&dbp, &domain_c, &local_c)?;
-                            let mut out_msgs: Vec<(u64, std::path::PathBuf, Vec<String>)> = Vec::new();
-                            for (uid, filename, flags) in list.into_iter() {
-                                let new_path = std::path::Path::new(&mr_clone).join(&domain_c).join(&local_c).join("Maildir").join("new").join(&filename);
-                                let cur_path = std::path::Path::new(&mr_clone).join(&domain_c).join(&local_c).join("Maildir").join("cur").join(&filename);
-                                let path = if new_path.exists() { new_path } else { cur_path };
-                                out_msgs.push((uid, path, flags));
-                            }
-                            Ok((uidvalidity, out_msgs))
-                        } else {
-                            Err(anyhow::anyhow!("No DB configured"))
-                        }
-                    }).await {
-                        Ok(Ok((uidvalidity, msgs))) => {
-                            let count = msgs.len();
-                            // store selection in session state
-                            selected = Some(SelectedMailbox { domain: domain.to_string(), local: local.to_string(), uidvalidity, msgs });
-                            let w = reader.get_mut();
-                            w.write_all(format!("* {} EXISTS\r\n", count).as_bytes()).await?;
-                            w.flush().await?;
-                            let w = reader.get_mut();
-                            w.write_all(b"* 0 RECENT\r\n").await?;
-                            w.flush().await?;
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} OK [UIDVALIDITY {}] [READ-WRITE] SELECT completed\r\n", tag, uidvalidity).as_bytes()).await?;
-                            w.flush().await?;
-                        }
-                        Ok(Err(e)) => {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} NO Error opening mailbox\r\n", tag).as_bytes()).await?;
-                            w.flush().await?;
-                            eprintln!("load_uid_map error: {}", e);
-                        }
-                        Err(e) => {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes()).await?;
-                            w.flush().await?;
-                            eprintln!("task join error: {}", e);
-                        }
+                match load_selected_mailbox(&mail_root, db_path.clone(), addr).await {
+                    Ok(sel) => {
+                        let count = sel.msgs.len();
+                        let uidvalidity = sel.uidvalidity;
+                        selected = Some(sel);
+                        let w = reader.get_mut();
+                        w.write_all(format!("* {} EXISTS\r\n", count).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        let w = reader.get_mut();
+                        w.write_all(b"* 0 RECENT\r\n").await?;
+                        w.flush().await?;
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!(
+                                "{} OK [UIDVALIDITY {}] [READ-WRITE] SELECT completed\r\n",
+                                tag, uidvalidity
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
                     }
-                } else {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Internal error parsing address\r\n", tag).as_bytes()).await?;
-                    w.flush().await?;
+                    Err(e) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Error opening mailbox\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        eprintln!("load_selected_mailbox error: {}", e);
+                    }
                 }
-            },
+            }
             "STARTTLS" => {
                 if tls_ctx.is_none() {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK Begin TLS negotiation now\r\n", tag).as_bytes()).await?;
+                w.write_all(format!("{} OK Begin TLS negotiation now\r\n", tag).as_bytes())
+                    .await?;
                 w.flush().await?;
                 // perform TLS handshake and continue inside TLS context
                 let inner = reader.into_inner();
@@ -395,31 +536,44 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     Ok(tls_stream) => {
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
                         // Pass the same tls_ctx along and mark the session as encrypted.
-                        let fut = Box::pin(process_stream(Box::new(tls_stream), mail_root, tls_ctx.clone(), db_path.clone(), peer, true));
+                        let fut = Box::pin(process_stream(
+                            Box::new(tls_stream),
+                            mail_root,
+                            tls_ctx.clone(),
+                            db_path.clone(),
+                            peer,
+                            true,
+                        ));
                         return fut.await;
-                    },
+                    }
                     Err(e) => {
                         eprintln!("TLS accept failed: {}", e);
                         return Err(anyhow::anyhow!("TLS accept failed: {}", e));
                     }
                 }
-            },
+            }
 
             "FETCH" => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
                 // Ensure a mailbox has been selected with SELECT first
                 if selected.is_none() {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
                 let args = args.trim();
+                if let Some(addr) = authed_mailbox.as_ref() {
+                    selected =
+                        Some(load_selected_mailbox(&mail_root, db_path.clone(), addr).await?);
+                }
                 let mut a = args.splitn(2, ' ');
                 let seq_set = a.next().unwrap_or("");
                 let _what = a.next().unwrap_or("");
@@ -429,14 +583,26 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     (1..=total).collect()
                 } else if seq_set.contains(':') {
                     let mut parts = seq_set.split(':');
-                    let start = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-                    let end = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(total);
+                    let start = parts
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(1);
+                    let end = parts
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(total);
                     (start..=end).collect()
                 } else {
-                    if let Ok(v) = seq_set.parse::<usize>() { vec![v] } else { vec![] }
+                    if let Ok(v) = seq_set.parse::<usize>() {
+                        vec![v]
+                    } else {
+                        vec![]
+                    }
                 };
                 for seq in seqs {
-                    if seq == 0 || seq > total { continue; }
+                    if seq == 0 || seq > total {
+                        continue;
+                    }
                     let idx = seq - 1;
                     let uid = sel.msgs[idx].0;
                     let flags = sel.msgs[idx].2.clone();
@@ -446,29 +612,42 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         Ok(Ok(data)) => {
                             let flags_str = flags.join(" ");
                             let w = reader.get_mut();
-                            w.write_all(format!("* {} FETCH (FLAGS ({}) UID {} RFC822 {{{}}}\r\n", seq, flags_str, uid, data.len()).as_bytes()).await?;
+                            w.write_all(
+                                format!(
+                                    "* {} FETCH (FLAGS ({}) UID {} RFC822 {{{}}}\r\n",
+                                    seq,
+                                    flags_str,
+                                    uid,
+                                    data.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
                             w.write_all(&data).await?;
                             w.write_all(b"\r\n)\r\n").await?;
                             w.flush().await?;
                         }
                         Ok(Err(e)) => {
                             let w = reader.get_mut();
-                            w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes()).await?;
+                            w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes())
+                                .await?;
                             w.flush().await?;
                             eprintln!("read message error: {}", e);
                         }
                         Err(e) => {
                             let w = reader.get_mut();
-                            w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes()).await?;
+                            w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes())
+                                .await?;
                             w.flush().await?;
                             eprintln!("task join error: {}", e);
                         }
                     }
                 }
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes()).await?;
+                w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes())
+                    .await?;
                 w.flush().await?;
-            },
+            }
 
             "UID" => {
                 let mut a = args.trim().splitn(2, ' ');
@@ -477,9 +656,14 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                 if subcmd.as_str() == "FETCH" {
                     if selected.is_none() {
                         let w = reader.get_mut();
-                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes()).await?;
+                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
+                            .await?;
                         w.flush().await?;
                         continue;
+                    }
+                    if let Some(addr) = authed_mailbox.as_ref() {
+                        selected =
+                            Some(load_selected_mailbox(&mail_root, db_path.clone(), addr).await?);
                     }
                     let mut b = subargs.splitn(2, ' ');
                     let uid_set = b.next().unwrap_or("");
@@ -487,19 +671,38 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                     let sel = selected.as_ref().unwrap();
                     // Build list of UIDs to return, handling ranges
                     let uids: Vec<u64> = if uid_set == "1:*" {
-                        sel.msgs.iter().map(|(u,_,_)| *u).collect()
+                        sel.msgs.iter().map(|(u, _, _)| *u).collect()
                     } else if uid_set.contains(':') {
                         let mut parts = uid_set.split(':');
-                        let start = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
-                        let end = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| sel.msgs.last().map(|(u,_,_)| *u).unwrap_or(start));
-                        sel.msgs.iter().filter_map(|(u,_,_)| {
-                            if *u >= start && *u <= end { Some(*u) } else { None }
-                        }).collect()
+                        let start = parts
+                            .next()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(1);
+                        let end = parts
+                            .next()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or_else(|| {
+                                sel.msgs.last().map(|(u, _, _)| *u).unwrap_or(start)
+                            });
+                        sel.msgs
+                            .iter()
+                            .filter_map(|(u, _, _)| {
+                                if *u >= start && *u <= end {
+                                    Some(*u)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
                     } else {
-                        if let Ok(v) = uid_set.parse::<u64>() { vec![v] } else { vec![] }
+                        if let Ok(v) = uid_set.parse::<u64>() {
+                            vec![v]
+                        } else {
+                            vec![]
+                        }
                     };
                     for uid in uids {
-                        if let Some(pos) = sel.msgs.iter().position(|(u,_,_)| *u == uid) {
+                        if let Some(pos) = sel.msgs.iter().position(|(u, _, _)| *u == uid) {
                             let seq = pos + 1;
                             let uid = sel.msgs[pos].0;
                             let flags = sel.msgs[pos].2.clone();
@@ -508,20 +711,36 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                                 Ok(Ok(data)) => {
                                     let flags_str = flags.join(" ");
                                     let w = reader.get_mut();
-                                    w.write_all(format!("* {} FETCH (FLAGS ({}) UID {} RFC822 {{{}}}\r\n", seq, flags_str, uid, data.len()).as_bytes()).await?;
+                                    w.write_all(
+                                        format!(
+                                            "* {} FETCH (FLAGS ({}) UID {} RFC822 {{{}}}\r\n",
+                                            seq,
+                                            flags_str,
+                                            uid,
+                                            data.len()
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await?;
                                     w.write_all(&data).await?;
                                     w.write_all(b"\r\n)\r\n").await?;
                                     w.flush().await?;
                                 }
                                 Ok(Err(e)) => {
                                     let w = reader.get_mut();
-                                    w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes()).await?;
+                                    w.write_all(
+                                        format!("{} NO Error reading message\r\n", tag).as_bytes(),
+                                    )
+                                    .await?;
                                     w.flush().await?;
                                     eprintln!("read message error: {}", e);
                                 }
                                 Err(e) => {
                                     let w = reader.get_mut();
-                                    w.write_all(format!("{} NO Internal error\r\n", tag).as_bytes()).await?;
+                                    w.write_all(
+                                        format!("{} NO Internal error\r\n", tag).as_bytes(),
+                                    )
+                                    .await?;
                                     w.flush().await?;
                                     eprintln!("task join error: {}", e);
                                 }
@@ -529,26 +748,30 @@ async fn process_stream(stream: Box<dyn AsyncStream + Send + 'static>, mail_root
                         }
                     }
                     let w = reader.get_mut();
-                    w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                 } else {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes()).await?;
+                    w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes())
+                        .await?;
                     w.flush().await?;
                 }
-            },
+            }
             "LOGOUT" => {
                 let w = reader.get_mut();
                 w.write_all(b"* BYE Logging out\r\n").await?;
                 w.flush().await?;
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK LOGOUT completed\r\n", tag).as_bytes()).await?;
+                w.write_all(format!("{} OK LOGOUT completed\r\n", tag).as_bytes())
+                    .await?;
                 w.flush().await?;
                 break;
-            },
+            }
             _ => {
                 let w = reader.get_mut();
-                w.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes()).await?;
+                w.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes())
+                    .await?;
                 w.flush().await?;
             }
         }

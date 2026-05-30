@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 // Mailbox representation used by DB APIs
 #[derive(Debug, Clone)]
@@ -10,11 +10,12 @@ pub struct Mailbox {
     pub scram: Option<String>,
 }
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Initialize SQLite DB schema if not present
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path = path.as_ref();
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", &"WAL")?;
     conn.execute_batch(
@@ -68,6 +69,8 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             data BLOB NOT NULL,
             status TEXT NOT NULL DEFAULT 'queued',
             attempts INTEGER NOT NULL DEFAULT 0,
+            priority INTEGER DEFAULT 0,
+            max_attempts INTEGER DEFAULT 5,
             last_error TEXT,
             next_try INTEGER DEFAULT 0,
             created_at INTEGER
@@ -91,11 +94,18 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
         );
         "#,
     )?;
+    ensure_outbound_columns(path)?;
     Ok(())
 }
 
 /// Add or replace mailbox
-pub fn add_mailbox<P: AsRef<Path>>(path: P, address: &str, password_hash: Option<&str>, maildir: Option<&str>, scram: Option<&str>) -> Result<()> {
+pub fn add_mailbox<P: AsRef<Path>>(
+    path: P,
+    address: &str,
+    password_hash: Option<&str>,
+    maildir: Option<&str>,
+    scram: Option<&str>,
+) -> Result<()> {
     let conn = Connection::open(path)?;
     conn.execute(
         "INSERT OR REPLACE INTO mailboxes (address, password_hash, maildir, created_at, scram) VALUES (?1, ?2, ?3, strftime('%s','now'), ?4)",
@@ -107,14 +117,21 @@ pub fn add_mailbox<P: AsRef<Path>>(path: P, address: &str, password_hash: Option
 /// Get mailbox by exact address
 pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mailbox>> {
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare("SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address = ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address = ?1",
+    )?;
     let mut rows = stmt.query(params![address])?;
     if let Some(row) = rows.next()? {
         let address: String = row.get(0)?;
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
         let scram: Option<String> = row.get(3)?;
-        Ok(Some(Mailbox { address, password_hash, maildir, scram }))
+        Ok(Some(Mailbox {
+            address,
+            password_hash,
+            maildir,
+            scram,
+        }))
     } else {
         Ok(None)
     }
@@ -123,17 +140,26 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
 /// Find unique mailbox by localpart (address like local@*) — returns None if ambiguous
 pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result<Option<Mailbox>> {
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare("SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address LIKE ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address LIKE ?1",
+    )?;
     let like = format!("{}@%", local);
     let mut rows = stmt.query(params![like])?;
     let mut found: Option<Mailbox> = None;
     while let Some(row) = rows.next()? {
-        if found.is_some() { return Ok(None); } // ambiguous
+        if found.is_some() {
+            return Ok(None);
+        } // ambiguous
         let address: String = row.get(0)?;
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
         let scram: Option<String> = row.get(3)?;
-        found = Some(Mailbox { address, password_hash, maildir, scram });
+        found = Some(Mailbox {
+            address,
+            password_hash,
+            maildir,
+            scram,
+        });
     }
     Ok(found)
 }
@@ -146,7 +172,8 @@ pub fn mailbox_exists<P: AsRef<Path>>(path: P, address: &str) -> Result<bool> {
 /// List all mailboxes
 pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare("SELECT address, password_hash, maildir, scram FROM mailboxes ORDER BY address")?;
+    let mut stmt = conn
+        .prepare("SELECT address, password_hash, maildir, scram FROM mailboxes ORDER BY address")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -154,7 +181,12 @@ pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
         let scram: Option<String> = row.get(3)?;
-        out.push(Mailbox { address, password_hash, maildir, scram });
+        out.push(Mailbox {
+            address,
+            password_hash,
+            maildir,
+            scram,
+        });
     }
     Ok(out)
 }
@@ -175,7 +207,10 @@ pub fn get_catchall<P: AsRef<Path>>(path: P, domain: &str) -> Result<Option<Stri
 /// Set a catchall mapping
 pub fn set_catchall<P: AsRef<Path>>(path: P, domain: &str, target: &str) -> Result<()> {
     let conn = Connection::open(path)?;
-    conn.execute("INSERT OR REPLACE INTO catchalls (domain, target) VALUES (?1, ?2)", params![domain, target])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO catchalls (domain, target) VALUES (?1, ?2)",
+        params![domain, target],
+    )?;
     Ok(())
 }
 
@@ -196,7 +231,9 @@ pub fn get_alias_targets<P: AsRef<Path>>(path: P, address: &str) -> Result<Optio
         let targets_json: String = row.get(0)?;
         let v: Vec<String> = serde_json::from_str(&targets_json).unwrap_or_default();
         Ok(Some(v))
-    } else { Ok(None) }
+    } else {
+        Ok(None)
+    }
 }
 
 /// Remove an alias mapping
@@ -225,20 +262,42 @@ pub fn list_aliases<P: AsRef<Path>>(path: P) -> Result<Vec<(String, Vec<String>)
 fn allocate_uid<P: AsRef<Path>>(path: P, address: &str) -> Result<u64> {
     let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
-    tx.execute("INSERT OR IGNORE INTO uid_sequences (address, last_uid) VALUES (?1, 0)", params![address])?;
-    let last: i64 = tx.query_row("SELECT last_uid FROM uid_sequences WHERE address = ?1", params![address], |r| r.get(0))?;
+    tx.execute(
+        "INSERT OR IGNORE INTO uid_sequences (address, last_uid) VALUES (?1, 0)",
+        params![address],
+    )?;
+    let last: i64 = tx.query_row(
+        "SELECT last_uid FROM uid_sequences WHERE address = ?1",
+        params![address],
+        |r| r.get(0),
+    )?;
     let next = last + 1;
-    tx.execute("UPDATE uid_sequences SET last_uid = ?1 WHERE address = ?2", params![next, address])?;
+    tx.execute(
+        "UPDATE uid_sequences SET last_uid = ?1 WHERE address = ?2",
+        params![next, address],
+    )?;
     tx.commit()?;
     Ok(next as u64)
 }
 
 /// Add a message record after writing the file to Maildir. Returns assigned UID.
-pub fn add_message<P: AsRef<Path>>(path: P, domain: &str, local: &str, filename: &str, size: i64, dkim: Option<&str>, spf: Option<&str>, dmarc: Option<&str>) -> Result<u64> {
+pub fn add_message<P: AsRef<Path>>(
+    path: P,
+    domain: &str,
+    local: &str,
+    filename: &str,
+    size: i64,
+    dkim: Option<&str>,
+    spf: Option<&str>,
+    dmarc: Option<&str>,
+) -> Result<u64> {
     let conn = Connection::open(&path)?;
     let address = format!("{}@{}", local, domain);
     // Ensure mailbox exists in case it wasn't created via ctl
-    conn.execute("INSERT OR IGNORE INTO mailboxes (address, created_at) VALUES (?1, strftime('%s','now'))", params![&address])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO mailboxes (address, created_at) VALUES (?1, strftime('%s','now'))",
+        params![&address],
+    )?;
     // Allocate UID
     let uid = allocate_uid(&path, &address)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
@@ -250,17 +309,27 @@ pub fn add_message<P: AsRef<Path>>(path: P, domain: &str, local: &str, filename:
 }
 
 /// List messages for a mailbox ordered by filename (stable ordering)
-pub fn list_messages<P: AsRef<Path>>(path: P, domain: &str, local: &str) -> Result<Vec<(u64, String, Vec<String>)>> {
+pub fn list_messages<P: AsRef<Path>>(
+    path: P,
+    domain: &str,
+    local: &str,
+) -> Result<Vec<(u64, String, Vec<String>)>> {
     let conn = Connection::open(path)?;
     let address = format!("{}@{}", local, domain);
-    let mut stmt = conn.prepare("SELECT uid, filename, flags FROM messages WHERE address = ?1 ORDER BY filename")?;
+    let mut stmt = conn.prepare(
+        "SELECT uid, filename, flags FROM messages WHERE address = ?1 ORDER BY filename",
+    )?;
     let mut rows = stmt.query(params![address])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let uid: i64 = row.get(0)?;
         let filename: String = row.get(1)?;
         let flags_json: Option<String> = row.get(2)?;
-        let flags: Vec<String> = if let Some(s) = flags_json { serde_json::from_str(&s).unwrap_or_default() } else { Vec::new() };
+        let flags: Vec<String> = if let Some(s) = flags_json {
+            serde_json::from_str(&s).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         out.push((uid as u64, filename, flags));
     }
     Ok(out)
@@ -277,16 +346,27 @@ pub fn count_messages<P: AsRef<Path>>(path: P, address: &str) -> Result<i64> {
 /// Get or create UIDVALIDITY for a mailbox
 pub fn get_mailbox_uidvalidity<P: AsRef<Path>>(path: P, address: &str) -> Result<u64> {
     let conn = Connection::open(path)?;
-    let res: Result<Option<i64>, rusqlite::Error> = conn.query_row("SELECT uidvalidity FROM mailboxes WHERE address = ?1", params![address], |r| r.get(0)).map(|v: Option<i64>| v);
+    let res: Result<Option<i64>, rusqlite::Error> = conn
+        .query_row(
+            "SELECT uidvalidity FROM mailboxes WHERE address = ?1",
+            params![address],
+            |r| r.get(0),
+        )
+        .map(|v: Option<i64>| v);
     match res {
         Ok(Some(v)) => Ok(v as u64),
         Ok(None) => {
-            let v = (SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64) ^ (rand::random::<u64>());
-            conn.execute("UPDATE mailboxes SET uidvalidity = ?1 WHERE address = ?2", params![v as i64, address])?;
+            let v = (SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
+                ^ (rand::random::<u64>());
+            conn.execute(
+                "UPDATE mailboxes SET uidvalidity = ?1 WHERE address = ?2",
+                params![v as i64, address],
+            )?;
             Ok(v)
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            let v = (SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64) ^ (rand::random::<u64>());
+            let v = (SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
+                ^ (rand::random::<u64>());
             conn.execute("INSERT INTO mailboxes (address, created_at, uidvalidity) VALUES (?1, strftime('%s','now'), ?2)", params![address, v as i64])?;
             Ok(v)
         }
@@ -295,24 +375,46 @@ pub fn get_mailbox_uidvalidity<P: AsRef<Path>>(path: P, address: &str) -> Result
 }
 
 /// Set flags for a UID
-pub fn set_message_flags<P: AsRef<Path>>(path: P, domain: &str, local: &str, uid: u64, flags: Vec<String>) -> Result<()> {
+pub fn set_message_flags<P: AsRef<Path>>(
+    path: P,
+    domain: &str,
+    local: &str,
+    uid: u64,
+    flags: Vec<String>,
+) -> Result<()> {
     let conn = Connection::open(path)?;
     let address = format!("{}@{}", local, domain);
     let flags_json = serde_json::to_string(&flags)?;
-    conn.execute("UPDATE messages SET flags = ?1 WHERE address = ?2 AND uid = ?3", params![flags_json, address, uid as i64])?;
+    conn.execute(
+        "UPDATE messages SET flags = ?1 WHERE address = ?2 AND uid = ?3",
+        params![flags_json, address, uid as i64],
+    )?;
     Ok(())
 }
 
 /// Remove message record by UID (DB-only). Caller may also delete the file on disk.
-pub fn delete_message_record<P: AsRef<Path>>(path: P, domain: &str, local: &str, uid: u64) -> Result<()> {
+pub fn delete_message_record<P: AsRef<Path>>(
+    path: P,
+    domain: &str,
+    local: &str,
+    uid: u64,
+) -> Result<()> {
     let conn = Connection::open(path)?;
     let address = format!("{}@{}", local, domain);
-    conn.execute("DELETE FROM messages WHERE address = ?1 AND uid = ?2", params![address, uid as i64])?;
+    conn.execute(
+        "DELETE FROM messages WHERE address = ?1 AND uid = ?2",
+        params![address, uid as i64],
+    )?;
     Ok(())
 }
 
 /// Enqueue an outbound delivery into the SQLite queue. Returns the inserted row id.
-pub fn enqueue_outbound<P: AsRef<Path>>(path: P, recipient: &str, envelope_from: Option<&str>, data: &[u8]) -> Result<i64> {
+pub fn enqueue_outbound<P: AsRef<Path>>(
+    path: P,
+    recipient: &str,
+    envelope_from: Option<&str>,
+    data: &[u8],
+) -> Result<i64> {
     let conn = Connection::open(path)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     conn.execute(
@@ -324,7 +426,9 @@ pub fn enqueue_outbound<P: AsRef<Path>>(path: P, recipient: &str, envelope_from:
 
 /// Claim the next outbound item for processing. This atomically marks the row as inflight
 /// and increments the attempts counter. Returns (id, recipient, envelope_from, data, attempts).
-pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Option<String>, Vec<u8>, i64)>> {
+pub fn claim_outbound<P: AsRef<Path>>(
+    path: P,
+) -> Result<Option<(i64, String, Option<String>, Vec<u8>, i64)>> {
     let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
@@ -340,7 +444,10 @@ pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Op
         // Drop query handles before committing the transaction to avoid borrow issues
         drop(rows);
         drop(stmt);
-        tx.execute("UPDATE outbound_queue SET status = 'inflight', attempts = attempts + 1 WHERE id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE outbound_queue SET status = 'inflight', attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
         tx.commit()?;
         return Ok(Some((id, recipient, envelope_from, data, attempts + 1)));
     }
@@ -350,15 +457,24 @@ pub fn claim_outbound<P: AsRef<Path>>(path: P) -> Result<Option<(i64, String, Op
 /// Mark an outbound item as successfully delivered.
 pub fn mark_outbound_sent<P: AsRef<Path>>(path: P, id: i64) -> Result<()> {
     let conn = Connection::open(path)?;
-    conn.execute("UPDATE outbound_queue SET status = 'sent' WHERE id = ?1", params![id])?;
+    conn.execute(
+        "UPDATE outbound_queue SET status = 'sent' WHERE id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
 /// Mark an outbound item as failed and schedule a retry after `retry_after_seconds` if provided.
-pub fn mark_outbound_failed<P: AsRef<Path>>(path: P, id: i64, last_error: Option<&str>, retry_after_seconds: Option<i64>) -> Result<()> {
+pub fn mark_outbound_failed<P: AsRef<Path>>(
+    path: P,
+    id: i64,
+    last_error: Option<&str>,
+    retry_after_seconds: Option<i64>,
+) -> Result<()> {
     let conn = Connection::open(path)?;
     // Fetch current attempts and configured max_attempts (default 5)
-    let mut stmt = conn.prepare("SELECT attempts, max_attempts FROM outbound_queue WHERE id = ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT attempts, max_attempts FROM outbound_queue WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
     let (attempts, max_attempts) = if let Some(row) = rows.next()? {
         let a: i64 = row.get(0)?;
@@ -370,9 +486,16 @@ pub fn mark_outbound_failed<P: AsRef<Path>>(path: P, id: i64, last_error: Option
 
     if attempts >= max_attempts {
         // Move to dead-letter state
-        conn.execute("UPDATE outbound_queue SET status = 'dead', last_error = ?1 WHERE id = ?2", params![last_error, id])?;
+        conn.execute(
+            "UPDATE outbound_queue SET status = 'dead', last_error = ?1 WHERE id = ?2",
+            params![last_error, id],
+        )?;
     } else {
-        let next_try = if let Some(s) = retry_after_seconds { (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64) + s } else { 0 };
+        let next_try = if let Some(s) = retry_after_seconds {
+            (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64) + s
+        } else {
+            0
+        };
         conn.execute("UPDATE outbound_queue SET status = 'queued', last_error = ?1, next_try = ?2 WHERE id = ?3", params![last_error, next_try, id])?;
     }
     Ok(())
@@ -388,7 +511,17 @@ pub fn count_outbound_pending<P: AsRef<Path>>(path: P) -> Result<i64> {
 }
 
 /// Record a DMARC evaluation event for later aggregation into rua reports. Returns inserted id.
-pub fn add_dmarc_event<P: AsRef<Path>>(path: P, domain: &str, header_from: Option<&str>, envelope_from: Option<&str>, source_ip: Option<&str>, dkim: Option<&str>, spf: Option<&str>, dmarc: Option<&str>, headers: Option<&str>) -> Result<i64> {
+pub fn add_dmarc_event<P: AsRef<Path>>(
+    path: P,
+    domain: &str,
+    header_from: Option<&str>,
+    envelope_from: Option<&str>,
+    source_ip: Option<&str>,
+    dkim: Option<&str>,
+    spf: Option<&str>,
+    dmarc: Option<&str>,
+    headers: Option<&str>,
+) -> Result<i64> {
     let conn = Connection::open(path)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     conn.execute(
@@ -412,7 +545,21 @@ pub fn get_unreported_dmarc_domains<P: AsRef<Path>>(path: P) -> Result<Vec<Strin
 }
 
 /// Fetch unreported DMARC events for a specific domain
-pub fn fetch_unreported_dmarc_events_for_domain<P: AsRef<Path>>(path: P, domain: &str) -> Result<Vec<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, i64)>> {
+pub fn fetch_unreported_dmarc_events_for_domain<P: AsRef<Path>>(
+    path: P,
+    domain: &str,
+) -> Result<
+    Vec<(
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+    )>,
+> {
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare("SELECT id, header_from, envelope_from, source_ip, dkim_result, spf_result, dmarc_result, created_at FROM dmarc_events WHERE domain = ?1 AND reported = 0 ORDER BY created_at")?;
     let mut rows = stmt.query(params![domain])?;
@@ -426,7 +573,16 @@ pub fn fetch_unreported_dmarc_events_for_domain<P: AsRef<Path>>(path: P, domain:
         let spf: Option<String> = row.get(5)?;
         let dmarc: Option<String> = row.get(6)?;
         let created_at: i64 = row.get(7)?;
-        out.push((id, header_from, envelope_from, source_ip, dkim, spf, dmarc, created_at));
+        out.push((
+            id,
+            header_from,
+            envelope_from,
+            source_ip,
+            dkim,
+            spf,
+            dmarc,
+            created_at,
+        ));
     }
     Ok(out)
 }
@@ -436,7 +592,10 @@ pub fn mark_dmarc_events_reported<P: AsRef<Path>>(path: P, ids: &[i64]) -> Resul
     let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
     for id in ids {
-        tx.execute("UPDATE dmarc_events SET reported = 1 WHERE id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE dmarc_events SET reported = 1 WHERE id = ?1",
+            params![id],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -451,14 +610,50 @@ pub fn ensure_outbound_columns<P: AsRef<Path>>(path: P) -> Result<()> {
     let mut has_max_attempts = false;
     while let Some(r) = rows.next()? {
         let col: String = r.get(1)?;
-        if col == "priority" { has_priority = true; }
-        if col == "max_attempts" { has_max_attempts = true; }
+        if col == "priority" {
+            has_priority = true;
+        }
+        if col == "max_attempts" {
+            has_max_attempts = true;
+        }
     }
     if !has_priority {
-        let _ = conn.execute("ALTER TABLE outbound_queue ADD COLUMN priority INTEGER DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE outbound_queue ADD COLUMN priority INTEGER DEFAULT 0",
+            [],
+        );
     }
     if !has_max_attempts {
-        let _ = conn.execute("ALTER TABLE outbound_queue ADD COLUMN max_attempts INTEGER DEFAULT 5", []);
+        let _ = conn.execute(
+            "ALTER TABLE outbound_queue ADD COLUMN max_attempts INTEGER DEFAULT 5",
+            [],
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init_db;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    #[test]
+    fn init_db_provisions_outbound_queue_columns() {
+        let td = tempdir().expect("tempdir");
+        let db_path = td.path().join("test.db");
+        init_db(&db_path).expect("init db");
+
+        let conn = Connection::open(&db_path).expect("open db");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(outbound_queue)")
+            .expect("pragma");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query");
+        let columns: Vec<String> = rows.map(|r| r.expect("column")).collect();
+
+        assert!(columns.iter().any(|c| c == "priority"));
+        assert!(columns.iter().any(|c| c == "max_attempts"));
+    }
 }

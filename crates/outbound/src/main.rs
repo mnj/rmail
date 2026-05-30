@@ -1,13 +1,13 @@
 use anyhow::Context;
+use native_tls::TlsConnector as NativeTlsConnector;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use trust_dns_resolver::TokioAsyncResolver;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
-use native_tls::TlsConnector as NativeTlsConnector;
-mod tlsa;
+use trust_dns_resolver::TokioAsyncResolver;
 mod dane_blocking;
+mod tlsa;
 
 // Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
@@ -34,9 +34,15 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Using on-disk outbound queue: {}", queue_dir.display());
     let per_dest_limit_env = std::env::var("RMAIL_PER_DEST_LIMIT").ok();
-    let per_dest_limit: usize = per_dest_limit_env.as_ref().and_then(|s| s.parse().ok()).unwrap_or(5usize);
-    let dead_letter_days: u64 = std::env::var("RMAIL_DEAD_LETTER_DAYS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-    let dead_letter_secs = (dead_letter_days.saturating_mul(24*3600)) as i64;
+    let per_dest_limit: usize = per_dest_limit_env
+        .as_ref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5usize);
+    let dead_letter_days: u64 = std::env::var("RMAIL_DEAD_LETTER_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let dead_letter_secs = (dead_letter_days.saturating_mul(24 * 3600)) as i64;
     let mut loop_counter: u64 = 0;
     loop {
         loop_counter = loop_counter.wrapping_add(1);
@@ -55,11 +61,12 @@ async fn main() -> anyhow::Result<()> {
         // periodically collect metrics
         if loop_counter % 60 == 0 {
             let md = maildrop_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                match rmail_queue_manager::collect_metrics(&md) {
-                    Ok(metrics) => println!("metrics queued={} inflight={} sent={} failed={} dead={}", metrics.queued, metrics.inflight, metrics.sent, metrics.failed, metrics.dead),
-                    Err(e) => eprintln!("metrics collection error: {}", e),
-                }
+            tokio::task::spawn_blocking(move || match rmail_queue_manager::collect_metrics(&md) {
+                Ok(metrics) => println!(
+                    "metrics queued={} inflight={} sent={} failed={} dead={}",
+                    metrics.queued, metrics.inflight, metrics.sent, metrics.failed, metrics.dead
+                ),
+                Err(e) => eprintln!("metrics collection error: {}", e),
             });
         }
         // Try to claim an eligible message using the shared queue-manager library (blocking fs ops)
@@ -67,7 +74,8 @@ async fn main() -> anyhow::Result<()> {
             let md = maildrop_dir.clone();
             let limit = per_dest_limit;
             move || rmail_queue_manager::claim_one_with_limit(&md, limit)
-        }).await;
+        })
+        .await;
 
         let claimed = match claim_res {
             Ok(Ok(Some((inflight_eml, inflight_json)))) => Some((inflight_eml, inflight_json)),
@@ -90,13 +98,20 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let fname = inflight_eml.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let fname = inflight_eml
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
 
         // read control JSON from inflight and increment attempts
-        let mut control: rmail_common::outbound::QueueControl = match tokio::fs::read_to_string(&inflight_json).await {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| rmail_common::outbound::QueueControl::default_with_timestamp(0)),
-            Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
-        };
+        let mut control: rmail_common::outbound::QueueControl =
+            match tokio::fs::read_to_string(&inflight_json).await {
+                Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| {
+                    rmail_common::outbound::QueueControl::default_with_timestamp(0)
+                }),
+                Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
+            };
         control.attempts = control.attempts.saturating_add(1);
         tokio::fs::write(&inflight_json, serde_json::to_string(&control)?).await?;
 
@@ -105,18 +120,21 @@ async fn main() -> anyhow::Result<()> {
 
         if res.is_ok() {
             let sent_eml = sent_dir.join(&fname);
-            let sent_json = sent_eml.with_extension("json");
+            let sent_json = rmail_common::outbound::control_path_for_eml(&sent_eml);
             if let Err(e) = tokio::fs::rename(&inflight_eml, &sent_eml).await {
                 eprintln!("failed to move to sent {}: {}", fname, e);
             } else {
                 let _ = tokio::fs::rename(&inflight_json, &sent_json).await;
             }
         } else {
-            let err = res.err().map(|e| e.to_string()).unwrap_or_else(|| "unknown".to_string());
+            let err = res
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
             eprintln!("delivery failed for {}: {}", fname, err);
             if control.attempts >= control.max_attempts {
                 let failed_eml = failed_dir.join(&fname);
-                let failed_json = failed_eml.with_extension("json");
+                let failed_json = rmail_common::outbound::control_path_for_eml(&failed_eml);
                 if let Err(e) = tokio::fs::rename(&inflight_eml, &failed_eml).await {
                     eprintln!("failed to move to failed {}: {}", fname, e);
                 } else {
@@ -127,13 +145,17 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 // exponential backoff using shared helper
                 let backoff = rmail_queue_manager::next_backoff_seconds(control.attempts);
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64;
                 let next_try = now + backoff;
                 control.next_try = Some(next_try);
                 control.last_error = Some(err.clone());
                 let queue_eml = queue_dir.join(&fname);
-                let queue_json = queue_eml.with_extension("json");
-                if let Err(e) = tokio::fs::write(&queue_json, serde_json::to_string(&control)?).await {
+                let queue_json = rmail_common::outbound::control_path_for_eml(&queue_eml);
+                if let Err(e) =
+                    tokio::fs::write(&queue_json, serde_json::to_string(&control)?).await
+                {
                     eprintln!("failed to write control json for retry {}: {}", fname, e);
                 }
                 if let Err(e) = tokio::fs::rename(&inflight_eml, &queue_eml).await {
@@ -151,7 +173,10 @@ async fn process_file(path: &Path, base: &Path) -> anyhow::Result<()> {
     let data = tokio::fs::read(path).await?;
     // Find header/body split (we write metadata headers followed by CRLF CRLF)
     let split_seq = b"\r\n\r\n";
-    let header_end = data.windows(split_seq.len()).position(|w| w == split_seq).map(|p| p + split_seq.len());
+    let header_end = data
+        .windows(split_seq.len())
+        .position(|w| w == split_seq)
+        .map(|p| p + split_seq.len());
     let (headers_bytes, body_bytes) = if let Some(hend) = header_end {
         (&data[..hend], &data[hend..])
     } else {
@@ -171,20 +196,28 @@ async fn process_file(path: &Path, base: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let rcpt = if let Some(r) = envelope_to { r } else {
-        return Err(anyhow::anyhow!("no envelope recipient found in queued message"));
+    let rcpt = if let Some(r) = envelope_to {
+        r
+    } else {
+        return Err(anyhow::anyhow!(
+            "no envelope recipient found in queued message"
+        ));
     };
 
     // Attempt delivery
     deliver_to_remote(base, envelope_from.as_deref(), &rcpt, body_bytes).await
 }
 
-async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> anyhow::Result<(u16, String)> {
+async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<(u16, String)> {
     let mut full = String::new();
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
-        if n == 0 { return Err(anyhow::anyhow!("connection closed by peer")); }
+        if n == 0 {
+            return Err(anyhow::anyhow!("connection closed by peer"));
+        }
         full.push_str(&line);
         // Look for end of multiline reply ("<code><space>")
         if line.len() >= 4 {
@@ -197,40 +230,63 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> an
     }
 }
 
-async fn smtp_send_with_reader(reader: &mut BufReader<Box<dyn AsyncStream>>, envelope_from: Option<&str>, recipient: &str, body: &[u8]) -> anyhow::Result<()> {
+async fn smtp_send_with_reader(
+    reader: &mut BufReader<Box<dyn AsyncStream>>,
+    envelope_from: Option<&str>,
+    recipient: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
     // MAIL FROM
     let mfrom = envelope_from.unwrap_or("<>");
     let mailcmd = format!("MAIL FROM:<{}>\r\n", mfrom);
     reader.get_mut().write_all(mailcmd.as_bytes()).await?;
     reader.get_mut().flush().await?;
     let (code, _resp) = read_response(&mut *reader).await?;
-    if code >= 400 { return Err(anyhow::anyhow!("MAIL FROM rejected: {}", code)); }
+    if code >= 400 {
+        return Err(anyhow::anyhow!("MAIL FROM rejected: {}", code));
+    }
 
     // RCPT TO
     let rcptcmd = format!("RCPT TO:<{}>\r\n", recipient);
     reader.get_mut().write_all(rcptcmd.as_bytes()).await?;
     reader.get_mut().flush().await?;
     let (code, _resp) = read_response(&mut *reader).await?;
-    if code >= 400 { return Err(anyhow::anyhow!("RCPT TO rejected: {}", code)); }
+    if code >= 400 {
+        return Err(anyhow::anyhow!("RCPT TO rejected: {}", code));
+    }
 
     // DATA
     reader.get_mut().write_all(b"DATA\r\n").await?;
     reader.get_mut().flush().await?;
     let (code, _resp) = read_response(&mut *reader).await?;
-    if code != 354 { return Err(anyhow::anyhow!("DATA not accepted: {}", code)); }
+    if code != 354 {
+        return Err(anyhow::anyhow!("DATA not accepted: {}", code));
+    }
 
-    // Prepare body with dot-stuffing. Use lossily-decoded string to keep implementation simple.
-    let body_str = String::from_utf8_lossy(body);
-    let mut stuffed = body_str.replace("\r\n.", "\r\n..");
-    if stuffed.starts_with('.') { stuffed.insert(0, '.'); }
-    if !stuffed.ends_with("\r\n") { stuffed.push_str("\r\n"); }
-
-    reader.get_mut().write_all(stuffed.as_bytes()).await?;
+    for segment in body.split_inclusive(|b| *b == b'\n') {
+        let mut line = segment;
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+            if line.ends_with(b"\r") {
+                line = &line[..line.len() - 1];
+            }
+        }
+        if line.starts_with(b".") {
+            reader.get_mut().write_all(b".").await?;
+        }
+        reader.get_mut().write_all(line).await?;
+        reader.get_mut().write_all(b"\r\n").await?;
+    }
     reader.get_mut().write_all(b".\r\n").await?;
     reader.get_mut().flush().await?;
 
     let (code, _resp) = read_response(&mut *reader).await?;
-    if code >= 400 { return Err(anyhow::anyhow!("DATA not accepted after sending body: {}", code)); }
+    if code >= 400 {
+        return Err(anyhow::anyhow!(
+            "DATA not accepted after sending body: {}",
+            code
+        ));
+    }
 
     // QUIT
     reader.get_mut().write_all(b"QUIT\r\n").await?;
@@ -240,16 +296,26 @@ async fn smtp_send_with_reader(reader: &mut BufReader<Box<dyn AsyncStream>>, env
     Ok(())
 }
 
-async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: &str, body: &[u8]) -> anyhow::Result<()> {
-    let at = recipient.rfind('@').ok_or_else(|| anyhow::anyhow!("invalid recipient address"))?;
-    let domain = &recipient[at+1..];
+async fn deliver_to_remote(
+    base: &Path,
+    envelope_from: Option<&str>,
+    recipient: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let at = recipient
+        .rfind('@')
+        .ok_or_else(|| anyhow::anyhow!("invalid recipient address"))?;
+    let domain = &recipient[at + 1..];
 
     // Resolve MX records using system DNS configuration. If RMAIL_REQUIRE_DNSSEC=1, enable DNSSEC validation in resolver options.
-    let require_dnssec_on_init = std::env::var("RMAIL_REQUIRE_DNSSEC").map(|v| {
-        let v = v.to_ascii_lowercase();
-        !(v == "0" || v == "false")
-    }).unwrap_or(false);
-    let (conf, mut opts) = trust_dns_resolver::system_conf::read_system_conf().context("reading system dns config")?;
+    let require_dnssec_on_init = std::env::var("RMAIL_REQUIRE_DNSSEC")
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            !(v == "0" || v == "false")
+        })
+        .unwrap_or(false);
+    let (conf, mut opts) =
+        trust_dns_resolver::system_conf::read_system_conf().context("reading system dns config")?;
     if require_dnssec_on_init {
         opts.validate = true;
     }
@@ -257,18 +323,32 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
     // transport may indicate implicit TLS (smtps) or explicit SMTP. Track optional port.
     let mut targets: Vec<(String, Option<u16>)> = Vec::new();
     match rmail_common::transport::lookup_transport(base, domain) {
-        Ok(rmail_common::transport::Transport::Smtp(Some(h))) => { targets.push((h, None)); }
+        Ok(rmail_common::transport::Transport::Smtp(Some(h))) => {
+            targets.push((h, None));
+        }
         Ok(rmail_common::transport::Transport::Smtp(None)) => { /* fallthrough to MX lookup */ }
-        Ok(rmail_common::transport::Transport::Smtps(Some(h))) => { targets.push((h, Some(465))); }
+        Ok(rmail_common::transport::Transport::Smtps(Some(h))) => {
+            targets.push((h, Some(465)));
+        }
         Ok(rmail_common::transport::Transport::Smtps(None)) => { /* fallthrough to MX lookup */ }
-        Ok(rmail_common::transport::Transport::Error(msg)) => { return Err(anyhow::anyhow!(format!("transport map error for {}: {}", domain, msg))); }
-        Err(e) => { eprintln!("transport map lookup failed for {}: {}", domain, e); }
+        Ok(rmail_common::transport::Transport::Error(msg)) => {
+            return Err(anyhow::anyhow!(format!(
+                "transport map error for {}: {}",
+                domain, msg
+            )));
+        }
+        Err(e) => {
+            eprintln!("transport map lookup failed for {}: {}", domain, e);
+        }
     }
 
     // If transport map didn't provide a next-hop, perform MX lookup.
     if targets.is_empty() {
         if let Ok(mx) = resolver.mx_lookup(domain).await {
-            let mut mxs: Vec<(u16, String)> = mx.iter().map(|r| (r.preference(), r.exchange().to_utf8())).collect();
+            let mut mxs: Vec<(u16, String)> = mx
+                .iter()
+                .map(|r| (r.preference(), r.exchange().to_utf8()))
+                .collect();
             mxs.sort_by_key(|(p, _)| *p);
             for (_pref, host) in mxs {
                 targets.push((host.trim_end_matches('.').to_string(), None));
@@ -276,7 +356,9 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
         }
     }
 
-    if targets.is_empty() { targets.push((domain.to_string(), None)); }
+    if targets.is_empty() {
+        targets.push((domain.to_string(), None));
+    }
 
     // Try targets in order (connect to specified port if provided)
     let mut stream_opt: Option<TcpStream> = None;
@@ -299,10 +381,15 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
 
     // Create boxed stream: implicit TLS on port 465, otherwise plain stream
     let boxed_stream: Box<dyn AsyncStream> = if selected_port == 465 {
-        let native = NativeTlsConnector::builder().build().context("building native tls connector")?;
+        let native = NativeTlsConnector::builder()
+            .build()
+            .context("building native tls connector")?;
         let connector = TokioTlsConnector::from(native);
         let server_name = selected_host.trim_end_matches('.');
-        let tls_stream = connector.connect(server_name, stream).await.context("TLS connect failed (implicit)")?;
+        let tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .context("TLS connect failed (implicit)")?;
         Box::new(tls_stream)
     } else {
         Box::new(stream)
@@ -312,7 +399,9 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
 
     // Read banner
     let (code, _banner) = read_response(&mut reader).await?;
-    if code >= 400 { return Err(anyhow::anyhow!("remote server error on connect: {}", code)); }
+    if code >= 400 {
+        return Err(anyhow::anyhow!("remote server error on connect: {}", code));
+    }
 
     // EHLO
     let helo = format!("EHLO rmail\r\n");
@@ -325,7 +414,9 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
         reader.get_mut().write_all(helo.as_bytes()).await?;
         reader.get_mut().flush().await?;
         let (code2, _helor) = read_response(&mut reader).await?;
-        if code2 >= 400 { return Err(anyhow::anyhow!("HELO failed: {}", code2)); }
+        if code2 >= 400 {
+            return Err(anyhow::anyhow!("HELO failed: {}", code2));
+        }
     }
 
     // If we did not use implicit TLS and server supports STARTTLS, upgrade
@@ -333,13 +424,20 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
         reader.get_mut().write_all(b"STARTTLS\r\n").await?;
         reader.get_mut().flush().await?;
         let (code, _resp) = read_response(&mut reader).await?;
-        if code != 220 { return Err(anyhow::anyhow!("STARTTLS rejected: {}", code)); }
+        if code != 220 {
+            return Err(anyhow::anyhow!("STARTTLS rejected: {}", code));
+        }
 
         let inner = reader.into_inner();
-        let native = NativeTlsConnector::builder().build().context("building native tls connector")?;
+        let native = NativeTlsConnector::builder()
+            .build()
+            .context("building native tls connector")?;
         let connector = TokioTlsConnector::from(native);
         let server_name = selected_host.trim_end_matches('.');
-        let tls_stream = connector.connect(server_name, inner).await.context("TLS connect failed")?;
+        let tls_stream = connector
+            .connect(server_name, inner)
+            .await
+            .context("TLS connect failed")?;
         let boxed_tls: Box<dyn AsyncStream> = Box::new(tls_stream);
         reader = BufReader::new(boxed_tls);
 
@@ -353,7 +451,9 @@ async fn deliver_to_remote(base: &Path, envelope_from: Option<&str>, recipient: 
             reader.get_mut().write_all(helo.as_bytes()).await?;
             reader.get_mut().flush().await?;
             let (code2, _helor) = read_response(&mut reader).await?;
-            if code2 >= 400 { return Err(anyhow::anyhow!("HELO failed after STARTTLS: {}", code2)); }
+            if code2 >= 400 {
+                return Err(anyhow::anyhow!("HELO failed after STARTTLS: {}", code2));
+            }
         }
     }
 
