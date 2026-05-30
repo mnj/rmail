@@ -81,7 +81,7 @@ mkdir -p /var/lib/rmail /var/log/rmail /etc/rmail
 chown -R rmail:rmail /var/lib/rmail /var/log/rmail
 systemctl daemon-reload || true
 if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
-  systemctl enable --now \
+  systemctl enable \
     rmail_smtpd.service \
     rmail_imapd.service \
     rmail_web.service \
