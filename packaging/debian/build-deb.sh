@@ -80,6 +80,13 @@ fi
 mkdir -p /var/lib/rmail /var/log/rmail /etc/rmail
 chown -R rmail:rmail /var/lib/rmail /var/log/rmail
 systemctl daemon-reload || true
+if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
+  systemctl enable --now \
+    rmail_smtpd.service \
+    rmail_imapd.service \
+    rmail_web.service \
+    rmail_outbound.service >/dev/null 2>&1 || true
+fi
 EOF
 chmod 0755 "${PKG_ROOT}/DEBIAN/postinst"
 

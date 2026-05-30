@@ -177,13 +177,18 @@ Then edit:
 - `/etc/rmail/config.toml`
 - `/etc/default/rmail`
 
-And start services:
+On first package install, the maintainer script will also try to:
+
+- create the `rmail` system user/group if missing
+- `enable --now` the four systemd services
+
+After editing the config, restart them:
 
 ```bash
-sudo systemctl enable --now rmail_smtpd.service
-sudo systemctl enable --now rmail_imapd.service
-sudo systemctl enable --now rmail_web.service
-sudo systemctl enable --now rmail_outbound.service
+sudo systemctl restart rmail_smtpd.service
+sudo systemctl restart rmail_imapd.service
+sudo systemctl restart rmail_web.service
+sudo systemctl restart rmail_outbound.service
 ```
 
 ## Upgrading The Debian Package
@@ -221,6 +226,8 @@ The package now marks these as Debian conffiles:
 - `/etc/default/rmail`
 
 That means your local edits are preserved across upgrades unless you explicitly replace them.
+
+On upgrades, the package does not auto-enable services again; it only does `enable --now` on the initial install path.
 
 ## Current Limits
 
