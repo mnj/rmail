@@ -184,7 +184,7 @@ fn spool_dirs(base: &PathBuf) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let base = base.join("outbound");
     (
         base.join("maildrop").join("queue"),
-        base.join("inflight"),
+        base.join("maildrop").join("inflight"),
         base.join("sent"),
         base.join("failed"),
     )

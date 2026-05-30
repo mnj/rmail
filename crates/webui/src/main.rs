@@ -17,7 +17,7 @@ struct Stats {
     mailboxes: usize,
     total_messages: usize,
     delivered_count: u64,
-    outbound_pending: Option<i64>,
+    outbound_pending: usize,
 }
 
 fn tail_lines(s: &str, n: usize) -> String {
@@ -26,26 +26,7 @@ fn tail_lines(s: &str, n: usize) -> String {
     out.join("\n")
 }
 
-fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Result<Stats> {
-    // If a DB is configured, derive stats from the DB for consistency and speed
-    if let Some(dbp) = db_path {
-        let mailboxes = rmail_common::db::list_mailboxes(dbp)?;
-        let mailbox_count = mailboxes.len();
-        let mut total_messages = 0usize;
-        for m in mailboxes {
-            let c = rmail_common::db::count_messages(dbp, &m.address)?;
-            total_messages += c as usize;
-        }
-        // outbound queue depth when DB is authoritative
-        let outbound_pending = rmail_common::db::count_outbound_pending(dbp)?;
-        return Ok(Stats {
-            mailboxes: mailbox_count,
-            total_messages,
-            delivered_count: 0,
-            outbound_pending: Some(outbound_pending),
-        });
-    }
-
+fn scan_maildirs_sync(mail_root: &std::path::Path) -> Result<Stats> {
     let mut mailbox_count = 0usize;
     let mut total_messages = 0usize;
     if !mail_root.exists() || !mail_root.is_dir() {
@@ -53,7 +34,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
             mailboxes: 0,
             total_messages: 0,
             delivered_count: 0,
-            outbound_pending: None,
+            outbound_pending: 0,
         });
     }
     for domain_entry in std::fs::read_dir(mail_root)? {
@@ -89,7 +70,7 @@ fn scan_maildirs_sync(mail_root: &std::path::Path, db_path: Option<&str>) -> Res
         mailboxes: mailbox_count,
         total_messages,
         delivered_count: 0,
-        outbound_pending: None,
+        outbound_pending: count_queue_entries_sync(mail_root)?,
     })
 }
 
@@ -98,10 +79,27 @@ fn spool_dirs(base: &PathBuf) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let base = base.join("outbound");
     (
         base.join("maildrop").join("queue"),
-        base.join("inflight"),
+        base.join("maildrop").join("inflight"),
         base.join("sent"),
         base.join("failed"),
     )
+}
+
+fn count_queue_entries_sync(root: &std::path::Path) -> Result<usize> {
+    let queue_dir = root.join("outbound").join("maildrop").join("queue");
+    if !queue_dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(queue_dir)? {
+        let ent = entry?;
+        if ent.file_type()?.is_file()
+            && ent.path().extension().and_then(|s| s.to_str()) == Some("eml")
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn read_queue_entries(dir: &PathBuf) -> Result<Vec<serde_json::Value>> {
@@ -510,12 +508,7 @@ async fn handle_connection(
                 } else {
                     // run blocking scan in threadpool
                     let mr_clone = mail_root.clone();
-                    let db_clone = db_path.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        scan_maildirs_sync(&mr_clone, db_clone.as_deref())
-                    })
-                    .await
-                    {
+                    match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mr_clone)).await {
                         Ok(Ok(mut stats)) => {
                             // attempt to read delivered count from metrics file (fallback)
                             let delivered = tokio::fs::read_to_string("/tmp/rmail_delivered.count")
@@ -555,17 +548,14 @@ async fn handle_connection(
                 } else {
                     // Expose Prometheus-style metrics
                     let mut metrics_text = rmail_common::metrics::gather_prometheus();
-                    // Append DB-backed metrics (outbound queue depth) when available
-                    if let Some(dbp) = db_path.as_ref() {
-                        match rmail_common::db::count_outbound_pending(dbp) {
-                            Ok(n) => {
-                                metrics_text.push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
-                                metrics_text.push_str("# TYPE rmail_outbound_pending gauge\n");
-                                metrics_text.push_str(&format!("rmail_outbound_pending {}\n", n));
-                            }
-                            Err(e) => {
-                                eprintln!("failed to read outbound queue size: {}", e);
-                            }
+                    match count_queue_entries_sync(&mail_root) {
+                        Ok(n) => {
+                            metrics_text.push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
+                            metrics_text.push_str("# TYPE rmail_outbound_pending gauge\n");
+                            metrics_text.push_str(&format!("rmail_outbound_pending {}\n", n));
+                        }
+                        Err(e) => {
+                            eprintln!("failed to read outbound queue size: {}", e);
                         }
                     }
                     content_type = "text/plain".to_string();

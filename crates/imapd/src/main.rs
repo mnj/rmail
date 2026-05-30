@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use rmail_common::db::Mailbox;
-use rmail_common::{auth, config::Config};
+use rmail_common::{auth, config::Config, maildir};
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
@@ -85,60 +85,134 @@ struct SelectedMailbox {
     pub msgs: Vec<(u64, std::path::PathBuf, Vec<String>)>,
 }
 
-async fn load_selected_mailbox(
-    mail_root: &str,
-    db_path: Option<String>,
-    address: &str,
-) -> Result<SelectedMailbox> {
+async fn load_selected_mailbox(mail_root: &str, address: &str) -> Result<SelectedMailbox> {
     let at = address
         .find('@')
         .ok_or_else(|| anyhow::anyhow!("invalid mailbox address"))?;
     let local = address[..at].to_string();
     let domain = address[at + 1..].to_string();
-    let mr_clone = mail_root.to_string();
+    let mail_root = mail_root.to_string();
     let domain_c = domain.clone();
     let local_c = local.clone();
     match tokio::task::spawn_blocking(move || {
-        if let Some(dbp) = db_path {
-            let addr = format!("{}@{}", local_c, domain_c);
-            let uidvalidity = rmail_common::db::get_mailbox_uidvalidity(&dbp, &addr)?;
-            let list = rmail_common::db::list_messages(&dbp, &domain_c, &local_c)?;
-            let mut out_msgs: Vec<(u64, std::path::PathBuf, Vec<String>)> = Vec::new();
-            for (uid, filename, flags) in list {
-                let new_path = std::path::Path::new(&mr_clone)
-                    .join(&domain_c)
-                    .join(&local_c)
-                    .join("Maildir")
-                    .join("new")
-                    .join(&filename);
-                let cur_path = std::path::Path::new(&mr_clone)
-                    .join(&domain_c)
-                    .join(&local_c)
-                    .join("Maildir")
-                    .join("cur")
-                    .join(&filename);
-                let path = if new_path.exists() {
-                    new_path
-                } else {
-                    cur_path
-                };
-                out_msgs.push((uid, path, flags));
-            }
-            Ok(SelectedMailbox {
-                domain: domain_c,
-                local: local_c,
-                uidvalidity,
-                msgs: out_msgs,
-            })
-        } else {
-            Err(anyhow::anyhow!("No DB configured"))
-        }
+        let (uidvalidity, msgs) =
+            maildir::load_uid_map(std::path::Path::new(&mail_root), &domain_c, &local_c)?;
+        Ok(SelectedMailbox {
+            domain: domain_c,
+            local: local_c,
+            uidvalidity,
+            msgs,
+        })
     })
     .await
     {
         Ok(Ok(sel)) => Ok(sel),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(anyhow::anyhow!("task join error: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_stream;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+
+    async fn read_until_contains(
+        reader: &mut BufReader<tokio::io::DuplexStream>,
+        needle: &str,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read line");
+            if line.is_empty() {
+                break;
+            }
+            out.push(line.clone());
+            if line.contains(needle) {
+                return out;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fetch_refreshes_after_new_delivery() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Subject: one\r\n\r\nfirst\r\n",
+        )
+        .expect("deliver first");
+
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        assert!(greeting.starts_with("* OK"));
+
+        reader
+            .get_mut()
+            .write_all(b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\n")
+            .await
+            .expect("write login/select");
+        reader.get_mut().flush().await.expect("flush");
+
+        let select_lines = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(select_lines.iter().any(|l| l.contains("* 1 EXISTS")));
+
+        rmail_common::maildir::deliver(
+            td.path().join("mail").as_path(),
+            "example.test",
+            "user",
+            b"Subject: two\r\n\r\nsecond\r\n",
+        )
+        .expect("deliver second");
+
+        reader
+            .get_mut()
+            .write_all(b"A003 FETCH 1:* RFC822\r\nA004 LOGOUT\r\n")
+            .await
+            .expect("write fetch");
+        reader.get_mut().flush().await.expect("flush");
+
+        let fetch_lines = read_until_contains(&mut reader, "A003 OK").await;
+        let fetched = fetch_lines
+            .iter()
+            .filter(|l| l.starts_with("* ") && l.contains(" FETCH "))
+            .count();
+        assert_eq!(fetched, 2);
+
+        let logout_lines = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(logout_lines.iter().any(|l| l.starts_with("* BYE")));
+
+        server_task.await.expect("join").expect("server");
     }
 }
 
@@ -486,7 +560,7 @@ async fn process_stream(
                     continue;
                 }
                 let addr = authed_mailbox.as_ref().unwrap();
-                match load_selected_mailbox(&mail_root, db_path.clone(), addr).await {
+                match load_selected_mailbox(&mail_root, addr).await {
                     Ok(sel) => {
                         let count = sel.msgs.len();
                         let uidvalidity = sel.uidvalidity;
@@ -571,8 +645,7 @@ async fn process_stream(
                 }
                 let args = args.trim();
                 if let Some(addr) = authed_mailbox.as_ref() {
-                    selected =
-                        Some(load_selected_mailbox(&mail_root, db_path.clone(), addr).await?);
+                    selected = Some(load_selected_mailbox(&mail_root, addr).await?);
                 }
                 let mut a = args.splitn(2, ' ');
                 let seq_set = a.next().unwrap_or("");
@@ -662,8 +735,7 @@ async fn process_stream(
                         continue;
                     }
                     if let Some(addr) = authed_mailbox.as_ref() {
-                        selected =
-                            Some(load_selected_mailbox(&mail_root, db_path.clone(), addr).await?);
+                        selected = Some(load_selected_mailbox(&mail_root, addr).await?);
                     }
                     let mut b = subargs.splitn(2, ' ');
                     let uid_set = b.next().unwrap_or("");

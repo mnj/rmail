@@ -1389,7 +1389,7 @@ async fn process_stream(
                             let data_for_analysis = data.clone();
                             let peer_ip_for_analysis = peer.map(|p| p.ip());
                             let mail_from_clone_analysis = mail_from.clone();
-                            let (dkim_res, spf_res, dmarc_res, header_from_res) =
+                            let (dkim_res, spf_res, dmarc_res, _header_from_res) =
                                 match tokio::task::spawn_blocking(move || {
                                     rmail_common::mail_auth::analyze_message(
                                         &data_for_analysis,
@@ -1436,34 +1436,6 @@ async fn process_stream(
                                 }
                             }
 
-                            // persist DMARC event into DB for reporting (non-blocking)
-                            if let Some(dbp) = db_path.as_ref() {
-                                let dbp2 = dbp.clone();
-                                let db_domain = domain.clone();
-                                let header_from_clone = header_from_res.clone();
-                                let envelope_from_clone = mail_from.clone();
-                                let peer_ip_for_db = peer.map(|p| p.ip().to_string());
-                                let dkim_clone = dkim_res.clone();
-                                let spf_clone = spf_res.clone();
-                                let dmarc_clone = dmarc_res.clone();
-                                tokio::spawn(async move {
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let _ = rmail_common::db::add_dmarc_event(
-                                            &dbp2,
-                                            &db_domain,
-                                            header_from_clone.as_deref(),
-                                            envelope_from_clone.as_deref(),
-                                            peer_ip_for_db.as_deref(),
-                                            dkim_clone.as_deref(),
-                                            spf_clone.as_deref(),
-                                            dmarc_clone.as_deref(),
-                                            None,
-                                        );
-                                    })
-                                    .await;
-                                });
-                            }
-
                             // Enforce DMARC if configured: reject when DMARC policy indicates 'reject'
                             if enforce_dmarc && dmarc_res.as_deref() == Some("reject") {
                                 let w = reader.get_mut();
@@ -1495,54 +1467,6 @@ async fn process_stream(
                                         );
 
                                         println!("Quarantined to {} -> {:?}", rcpt, path);
-                                        // persist metadata to DB if configured
-                                        if let Some(dbp) = db_path.as_ref() {
-                                            let dbp2 = dbp.clone();
-                                            let db_domain = domain.clone();
-                                            let db_local = local.clone();
-                                            let print_domain = db_domain.clone();
-                                            let print_local = db_local.clone();
-                                            let fname = path
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let size = data.len() as i64;
-                                            // clone analysis results into spawn
-                                            let dkim_clone = dkim_res.clone();
-                                            let spf_clone = spf_res.clone();
-                                            let dmarc_clone = dmarc_res.clone();
-                                            tokio::spawn(async move {
-                                                match tokio::task::spawn_blocking(move || {
-                                                    rmail_common::db::add_message(
-                                                        &dbp2,
-                                                        &db_domain,
-                                                        &db_local,
-                                                        &fname,
-                                                        size,
-                                                        dkim_clone.as_deref(),
-                                                        spf_clone.as_deref(),
-                                                        dmarc_clone.as_deref(),
-                                                    )
-                                                })
-                                                .await
-                                                {
-                                                    Ok(Ok(uid)) => {
-                                                        println!(
-                                                            "Recorded quarantined message UID {} for {}@{}",
-                                                            uid, print_local, print_domain
-                                                        );
-                                                    }
-                                                    Ok(Err(e)) => {
-                                                        eprintln!("db add_message error: {}", e);
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("db task join error: {}", e);
-                                                    }
-                                                }
-                                            });
-                                        }
-
                                         // update simple on-disk metric; failures are non-fatal
                                         if let Err(e) = increment_delivery_counter().await {
                                             eprintln!("metrics update failed: {}", e);
@@ -1572,54 +1496,6 @@ async fn process_stream(
                                         );
 
                                         println!("Delivered to {} -> {:?}", rcpt, path);
-                                        // persist metadata to DB if configured
-                                        if let Some(dbp) = db_path.as_ref() {
-                                            let dbp2 = dbp.clone();
-                                            let db_domain = domain.clone();
-                                            let db_local = local.clone();
-                                            let print_domain = db_domain.clone();
-                                            let print_local = db_local.clone();
-                                            let fname = path
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let size = data.len() as i64;
-                                            // clone analysis results into spawn
-                                            let dkim_clone = dkim_res.clone();
-                                            let spf_clone = spf_res.clone();
-                                            let dmarc_clone = dmarc_res.clone();
-                                            tokio::spawn(async move {
-                                                match tokio::task::spawn_blocking(move || {
-                                                    rmail_common::db::add_message(
-                                                        &dbp2,
-                                                        &db_domain,
-                                                        &db_local,
-                                                        &fname,
-                                                        size,
-                                                        dkim_clone.as_deref(),
-                                                        spf_clone.as_deref(),
-                                                        dmarc_clone.as_deref(),
-                                                    )
-                                                })
-                                                .await
-                                                {
-                                                    Ok(Ok(uid)) => {
-                                                        println!(
-                                                            "Recorded message UID {} for {}@{}",
-                                                            uid, print_local, print_domain
-                                                        );
-                                                    }
-                                                    Ok(Err(e)) => {
-                                                        eprintln!("db add_message error: {}", e);
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("db task join error: {}", e);
-                                                    }
-                                                }
-                                            });
-                                        }
-
                                         // update simple on-disk metric; failures are non-fatal
                                         if let Err(e) = increment_delivery_counter().await {
                                             eprintln!("metrics update failed: {}", e);
@@ -1754,6 +1630,9 @@ async fn process_stream(
 #[cfg(test)]
 mod tests {
     use super::parse_mail_from_arg;
+    use super::process_stream;
+    use std::path::Path;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
 
     #[test]
     fn parse_mail_from_accepts_null_sender() {
@@ -1766,5 +1645,77 @@ mod tests {
             parse_mail_from_arg("MAIL FROM:<User@Example.com>"),
             Some(Some("user@example.com".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn smtp_data_preserves_non_utf8_bytes() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                false,
+                false,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("greeting");
+        assert!(line.starts_with("220 "));
+
+        reader
+            .get_mut()
+            .write_all(
+                b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbinary:\xff\r\n.\r\nQUIT\r\n",
+            )
+            .await
+            .expect("write session");
+        reader.get_mut().flush().await.expect("flush");
+
+        let mut responses = Vec::new();
+        loop {
+            let mut resp = String::new();
+            reader.read_line(&mut resp).await.expect("read response");
+            if resp.is_empty() {
+                break;
+            }
+            let is_bye = resp.starts_with("221 Bye");
+            responses.push(resp);
+            if is_bye {
+                break;
+            }
+        }
+        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
+        assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+
+        server_task.await.expect("join").expect("server");
+
+        let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
+        let entries: Vec<_> = std::fs::read_dir(&delivered_dir)
+            .expect("read maildir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let body = std::fs::read(&entries[0]).expect("read message");
+        assert!(body.windows(8).any(|w| w == b"binary:\xff"));
+        assert!(Path::new(&entries[0]).exists());
     }
 }
