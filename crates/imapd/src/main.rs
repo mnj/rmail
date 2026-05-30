@@ -243,33 +243,47 @@ async fn main() -> Result<()> {
         None
     };
 
+    let db_path = cfg.global.db_path.clone();
     // Plain IMAP listener (supports STARTTLS if tls_context present)
     let imap_port = cfg.global.imap_port.unwrap_or(143);
-    let imap_addr = format!("0.0.0.0:{}", imap_port);
-    let db_path = cfg.global.db_path.clone();
-    let mail_root_clone = mail_root.clone();
-    let acceptor_clone = tls_context.clone();
-    let db_clone = db_path.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            run_plain_listener(&imap_addr, mail_root_clone, acceptor_clone, db_clone).await
-        {
-            eprintln!("IMAP plain listener failed: {}", e);
-        }
-    });
+    let imap_addrs = cfg
+        .global
+        .imap_listen_addrs
+        .clone()
+        .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imap_port)]);
+    for addr in imap_addrs {
+        let mail_root_clone = mail_root.clone();
+        let acceptor_clone = tls_context.clone();
+        let db_clone = db_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone).await
+            {
+                eprintln!("IMAP plain listener {} failed: {}", addr, e);
+            }
+        });
+    }
 
     // IMAPS (implicit TLS) listener
     if let Some(ctx) = tls_context.clone() {
         if let Some(imaps_port) = cfg.global.imaps_port {
-            let imaps_addr = format!("0.0.0.0:{}", imaps_port);
-            let mail_root = mail_root.clone();
-            let ctx2 = ctx.clone();
-            let db_clone = db_path.clone();
-            tokio::spawn(async move {
-                if let Err(e) = run_imaps_listener(&imaps_addr, ctx2, mail_root, db_clone).await {
-                    eprintln!("IMAPS listener failed: {}", e);
-                }
-            });
+            let imaps_addrs = cfg
+                .global
+                .imaps_listen_addrs
+                .clone()
+                .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imaps_port)]);
+            for addr in imaps_addrs {
+                let mail_root_clone = mail_root.clone();
+                let ctx_clone = ctx.clone();
+                let db_clone = db_path.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        run_imaps_listener(&addr, ctx_clone, mail_root_clone, db_clone).await
+                    {
+                        eprintln!("IMAPS listener {} failed: {}", addr, e);
+                    }
+                });
+            }
         }
     }
 

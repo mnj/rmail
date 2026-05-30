@@ -1,11 +1,20 @@
 # Example rMail configuration (TOML)
 [global]
 mail_root = "mail"
+# Plain SMTP listeners, typically port 25 for inbound MX traffic
 listen_addrs = ["0.0.0.0:25", "[::]:25"]
+# Optional explicit SMTPS listeners; if unset, smtps_port binds wildcard v4+v6
+smtps_listen_addrs = ["0.0.0.0:465", "[::]:465"]
 smtps_port = 465
 submission_port = 587
+# Optional explicit IMAPS listeners; if unset, imaps_port binds wildcard v4 only
+imaps_listen_addrs = ["0.0.0.0:993", "[::]:993"]
 imaps_port = 993
+# Optional explicit IMAP listeners; if unset, imap_port binds wildcard v4 only
+imap_listen_addrs = ["0.0.0.0:143", "[::]:143"]
 imap_port = 143
+# Web UI defaults to localhost unless explicitly set
+web_listen_addrs = ["127.0.0.1:8080"]
 web_port = 8080
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
@@ -21,4 +30,3 @@ acme_challenge_dir = "config/acme-challenges"
 
 # Experimental: enable DANE/TLSA verification for outbound deliveries via environment variable
 # RMAIL_ENABLE_DANE=1  (set to 0 or false to disable)
-

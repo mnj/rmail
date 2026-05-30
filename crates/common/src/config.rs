@@ -5,11 +5,20 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Global {
     pub mail_root: String,
+    /// Plain SMTP bind addresses, e.g. ["0.0.0.0:25", "[::]:25"]
     pub listen_addrs: Option<Vec<String>>,
+    /// Implicit TLS SMTP bind addresses; if unset, smtps_port binds wildcard v4+v6
+    pub smtps_listen_addrs: Option<Vec<String>>,
     pub smtps_port: Option<u16>,
     pub submission_port: Option<u16>,
+    /// IMAPS bind addresses; if unset, imaps_port binds wildcard v4 only for compatibility
+    pub imaps_listen_addrs: Option<Vec<String>>,
     pub imaps_port: Option<u16>,
+    /// Plain IMAP bind addresses; if unset, imap_port binds wildcard v4 only for compatibility
+    pub imap_listen_addrs: Option<Vec<String>>,
     pub imap_port: Option<u16>,
+    /// Web UI bind addresses; if unset, web_port binds 127.0.0.1 only
+    pub web_listen_addrs: Option<Vec<String>>,
     pub web_port: Option<u16>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,

@@ -1095,10 +1095,14 @@ async fn main() -> Result<()> {
             global: rmail_common::config::Global {
                 mail_root: "mail".into(),
                 listen_addrs: None,
+                smtps_listen_addrs: None,
                 smtps_port: None,
                 submission_port: None,
+                imaps_listen_addrs: None,
                 imaps_port: None,
+                imap_listen_addrs: None,
                 imap_port: None,
+                web_listen_addrs: None,
                 web_port: None,
                 tls_cert: None,
                 tls_key: None,
@@ -1111,24 +1115,46 @@ async fn main() -> Result<()> {
             },
         }
     });
-    let port = cfg.global.web_port.unwrap_or(8080);
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    println!("rMail web UI listening on {}", addr);
     let mail_root = PathBuf::from(cfg.global.mail_root);
     let admin_user = cfg.global.web_admin_user.clone();
     let admin_hash = cfg.global.web_admin_password_hash.clone();
     let db_path = cfg.global.db_path.clone();
     let acme_dir = cfg.global.acme_challenge_dir.clone();
-    loop {
-        let (stream, _) = listener.accept().await?;
+    let port = cfg.global.web_port.unwrap_or(8080);
+    let bind_addrs = cfg
+        .global
+        .web_listen_addrs
+        .clone()
+        .unwrap_or_else(|| vec![format!("127.0.0.1:{}", port)]);
+    for addr in bind_addrs {
+        let listener = TcpListener::bind(&addr).await?;
+        println!("rMail web UI listening on {}", addr);
         let mr = mail_root.clone();
         let admin_user = admin_user.clone();
         let admin_hash = admin_hash.clone();
         let db_path = db_path.clone();
         let acme_dir = acme_dir.clone();
         tokio::spawn(async move {
-            handle_connection(stream, mr, admin_user, admin_hash, db_path, acme_dir).await;
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("web listener {} accept error: {}", addr, e);
+                        break;
+                    }
+                };
+                let mr = mr.clone();
+                let admin_user = admin_user.clone();
+                let admin_hash = admin_hash.clone();
+                let db_path = db_path.clone();
+                let acme_dir = acme_dir.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, mr, admin_user, admin_hash, db_path, acme_dir).await;
+                });
+            }
         });
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
 }

@@ -153,34 +153,26 @@ async fn main() -> Result<()> {
     // spawn SMTPS listener (implicit TLS) if configured
     if let Some(s_ctx) = tls_context.clone() {
         if let Some(port) = cfg.global.smtps_port {
-            let addr_v4 = format!("0.0.0.0:{}", port);
-            let addr_v6 = format!("[::]:{}", port);
+            let smtps_addrs = cfg
+                .global
+                .smtps_listen_addrs
+                .clone()
+                .unwrap_or_else(|| vec![format!("0.0.0.0:{}", port), format!("[::]:{}", port)]);
 
-            // v4 listener
-            let mail_root_v4 = mail_root.clone();
-            let ctx_v4 = s_ctx.clone();
-            let db_v4 = db_path.clone();
-            let enforce_v4 = enforce_dmarc;
-            tokio::spawn(async move {
-                if let Err(e) =
-                    run_smtps_listener(&addr_v4, ctx_v4, mail_root_v4, db_v4, enforce_v4).await
-                {
-                    eprintln!("SMTPS {} failed: {}", addr_v4, e);
-                }
-            });
-
-            // v6 listener
-            let mail_root_v6 = mail_root.clone();
-            let ctx_v6 = s_ctx.clone();
-            let db_v6 = db_path.clone();
-            let enforce_v6 = enforce_dmarc;
-            tokio::spawn(async move {
-                if let Err(e) =
-                    run_smtps_listener(&addr_v6, ctx_v6, mail_root_v6, db_v6, enforce_v6).await
-                {
-                    eprintln!("SMTPS {} failed: {}", addr_v6, e);
-                }
-            });
+            for addr in smtps_addrs {
+                let mail_root_clone = mail_root.clone();
+                let ctx_clone = s_ctx.clone();
+                let db_clone = db_path.clone();
+                let enforce = enforce_dmarc;
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        run_smtps_listener(&addr, ctx_clone, mail_root_clone, db_clone, enforce)
+                            .await
+                    {
+                        eprintln!("SMTPS {} failed: {}", addr, e);
+                    }
+                });
+            }
         }
     } else {
         println!("TLS not configured; SMTPS disabled (implicit TLS)");
