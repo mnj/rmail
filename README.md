@@ -12,3 +12,5 @@ Repository layout:
 - crates/ctl — CLI for account management
 
 See config/example.toml for configuration examples. Test TLS certs are generated in config/certs/ and are ignored by git.
+
+Deployment and packaging guidance lives in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).

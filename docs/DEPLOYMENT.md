@@ -1,0 +1,174 @@
+# Deployment Guide
+
+This document covers:
+
+- installing `rmail_*` daemons as systemd services on Ubuntu 24.04 or newer
+- building a `.deb` package from this repository, even if your development host is not Debian-based
+
+## Overview
+
+The daemons are:
+
+- `rmail_smtpd`: inbound SMTP
+- `rmail_imapd`: IMAP
+- `rmail_web`: admin/status web UI
+- `rmail_outbound`: outbound queue worker
+
+The runtime model is:
+
+- configuration lives in `/etc/rmail/config.toml`
+- service environment lives in `/etc/default/rmail`
+- mail and queue state live under `/var/lib/rmail`
+- logs can be read from `journalctl`; the units also allow `/var/log/rmail` if you later add file logging
+
+## Manual Install On Ubuntu 24.04+
+
+### 1. Build the binaries
+
+From the repository root:
+
+```bash
+cargo build --release
+```
+
+### 2. Create the service user and directories
+
+```bash
+sudo addgroup --system rmail
+sudo adduser --system --ingroup rmail --home /var/lib/rmail --no-create-home --disabled-login rmail
+sudo install -d -o rmail -g rmail /var/lib/rmail /var/log/rmail /etc/rmail
+```
+
+### 3. Install binaries
+
+```bash
+sudo install -m 0755 target/release/rmail_smtpd /usr/bin/rmail_smtpd
+sudo install -m 0755 target/release/rmail_imapd /usr/bin/rmail_imapd
+sudo install -m 0755 target/release/rmail_web /usr/bin/rmail_web
+sudo install -m 0755 target/release/rmail_outbound /usr/bin/rmail_outbound
+```
+
+### 4. Install config and environment files
+
+```bash
+sudo install -m 0644 config/example.toml /etc/rmail/config.toml
+sudo install -m 0644 packaging/systemd/rmail.env /etc/default/rmail
+```
+
+Then edit both files:
+
+- set real domains, passwords, cert paths, and ports in `/etc/rmail/config.toml`
+- set `RMAIL_CONFIG=/etc/rmail/config.toml` in `/etc/default/rmail`
+- set `RMAIL_MAIL_ROOT=/var/lib/rmail` in `/etc/default/rmail`
+
+Important:
+
+- `rmail_outbound` reads `RMAIL_MAIL_ROOT`; it does not read the TOML file directly
+- `rmail_web` currently binds to `127.0.0.1` by default, which is a safer default for admin access
+
+### 5. Install systemd units
+
+```bash
+sudo install -m 0644 packaging/systemd/rmail_smtpd.service /usr/lib/systemd/system/rmail_smtpd.service
+sudo install -m 0644 packaging/systemd/rmail_imapd.service /usr/lib/systemd/system/rmail_imapd.service
+sudo install -m 0644 packaging/systemd/rmail_web.service /usr/lib/systemd/system/rmail_web.service
+sudo install -m 0644 packaging/systemd/rmail_outbound.service /usr/lib/systemd/system/rmail_outbound.service
+sudo systemctl daemon-reload
+```
+
+### 6. Enable and start services
+
+```bash
+sudo systemctl enable --now rmail_smtpd.service
+sudo systemctl enable --now rmail_imapd.service
+sudo systemctl enable --now rmail_web.service
+sudo systemctl enable --now rmail_outbound.service
+```
+
+### 7. Verify
+
+```bash
+sudo systemctl status rmail_smtpd.service rmail_imapd.service rmail_web.service rmail_outbound.service
+journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_outbound.service -n 200 --no-pager
+```
+
+## Notes On Privileged Ports
+
+The service units use:
+
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+```
+
+That allows binding privileged ports like `25`, `143`, `465`, and `993` without running the daemons as root.
+
+## Why There Are No `.socket` Units
+
+Older packaging in this repository included systemd socket units, but the daemons do not currently implement socket activation. Shipping `.socket` units would be misleading and would not work correctly. If socket activation is wanted later, the daemons need explicit support for inherited listeners.
+
+## Building A Debian Package
+
+This repository includes:
+
+```text
+packaging/debian/build-deb.sh
+```
+
+### 1. Build release binaries
+
+```bash
+cargo build --release
+```
+
+### 2. Ensure `dpkg-deb` is available
+
+On Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y dpkg-dev
+```
+
+On Arch, install the Debian packaging toolchain:
+
+```bash
+sudo pacman -S dpkg
+```
+
+### 3. Build the package
+
+```bash
+./packaging/debian/build-deb.sh 0.1.0 amd64
+```
+
+That emits:
+
+```text
+target/debian/rmail_0.1.0_amd64.deb
+```
+
+### 4. Install on Ubuntu
+
+```bash
+sudo apt install ./target/debian/rmail_0.1.0_amd64.deb
+```
+
+Then edit:
+
+- `/etc/rmail/config.toml`
+- `/etc/default/rmail`
+
+And start services:
+
+```bash
+sudo systemctl enable --now rmail_smtpd.service
+sudo systemctl enable --now rmail_imapd.service
+sudo systemctl enable --now rmail_web.service
+sudo systemctl enable --now rmail_outbound.service
+```
+
+## Current Limits
+
+- The package script assumes you already built the Rust binaries locally.
+- The generated `.deb` is simple and does not yet declare library/runtime dependencies beyond `systemd`.
+- The package installs a sample config; you still need to provision real TLS certs, mailbox config, and any DNS/MX records yourself.

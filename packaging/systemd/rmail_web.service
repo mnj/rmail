@@ -3,11 +3,21 @@ Description=rMail web UI
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/rmail_web --config /etc/rmail/config.toml
+Type=simple
+EnvironmentFile=-/etc/default/rmail
+Environment=RMAIL_CONFIG=/etc/rmail/config.toml
+WorkingDirectory=/var/lib/rmail
+ExecStart=/usr/bin/rmail_web
 User=rmail
 Group=rmail
+StateDirectory=rmail
+LogsDirectory=rmail
+RuntimeDirectory=rmail
+ConfigurationDirectory=rmail
+ReadWritePaths=/var/lib/rmail /var/log/rmail /tmp
 PrivateTmp=true
 ProtectSystem=full
+ProtectHome=true
 NoNewPrivileges=true
 Restart=on-failure
 RestartSec=5s

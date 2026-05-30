@@ -1,16 +1,16 @@
 [Unit]
-Description=rMail IMAP daemon
-After=network.target
+Description=rMail outbound delivery worker
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/rmail
-Environment=RMAIL_CONFIG=/etc/rmail/config.toml
+Environment=RMAIL_MAIL_ROOT=/var/lib/rmail
 WorkingDirectory=/var/lib/rmail
-ExecStart=/usr/bin/rmail_imapd
+ExecStart=/usr/bin/rmail_outbound
 User=rmail
 Group=rmail
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 StateDirectory=rmail
 LogsDirectory=rmail
 RuntimeDirectory=rmail
