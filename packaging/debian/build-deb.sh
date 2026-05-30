@@ -60,6 +60,11 @@ Description: rMail SMTP, IMAP, web, and outbound daemons
  Minimal Rust mail stack packaged for systemd-based Linux distributions.
 EOF
 
+cat > "${PKG_ROOT}/DEBIAN/conffiles" <<'EOF'
+/etc/rmail/config.toml
+/etc/default/rmail
+EOF
+
 cat > "${PKG_ROOT}/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e

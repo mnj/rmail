@@ -177,6 +177,29 @@ sudo systemctl enable --now rmail_web.service
 sudo systemctl enable --now rmail_outbound.service
 ```
 
+## Upgrading The Debian Package
+
+If you installed `0.1.0` and build `0.2.0`, upgrade with:
+
+```bash
+sudo apt install ./target/debian/rmail_0.2.0_amd64.deb
+```
+
+or:
+
+```bash
+sudo dpkg -i ./target/debian/rmail_0.2.0_amd64.deb
+```
+
+`apt install ./...deb` is preferred on Ubuntu.
+
+The package now marks these as Debian conffiles:
+
+- `/etc/rmail/config.toml`
+- `/etc/default/rmail`
+
+That means your local edits are preserved across upgrades unless you explicitly replace them.
+
 ## Current Limits
 
 - The package script assumes you already built the Rust binaries locally.

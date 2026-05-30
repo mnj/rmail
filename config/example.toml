@@ -13,8 +13,8 @@ imaps_port = 993
 # Optional explicit IMAP listeners; if unset, imap_port binds wildcard v4 only
 imap_listen_addrs = ["0.0.0.0:143", "[::]:143"]
 imap_port = 143
-# Web UI defaults to localhost unless explicitly set
-web_listen_addrs = ["127.0.0.1:8080"]
+# Web UI defaults to localhost unless explicitly set; dual-stack localhost is supported
+web_listen_addrs = ["127.0.0.1:8080", "[::1]:8080"]
 web_port = 8080
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
