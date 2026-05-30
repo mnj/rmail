@@ -114,13 +114,7 @@ This repository includes:
 packaging/debian/build-deb.sh
 ```
 
-### 1. Build release binaries
-
-```bash
-cargo build --release
-```
-
-### 2. Ensure `dpkg-deb` is available
+### 1. Ensure `dpkg-deb` is available
 
 On Debian/Ubuntu:
 
@@ -135,11 +129,27 @@ On Arch, install the Debian packaging toolchain:
 sudo pacman -S dpkg
 ```
 
-### 3. Build the package
+You also need a working Rust toolchain with `cargo`.
+
+### 2. Build the package
 
 ```bash
 ./packaging/debian/build-deb.sh 0.1.0 amd64
 ```
+
+That script now:
+
+- runs `cargo build --release`
+- assembles the package payload
+- emits the final `.deb`
+
+Optional third argument:
+
+```bash
+./packaging/debian/build-deb.sh 0.1.0 amd64 x86_64-unknown-linux-gnu
+```
+
+Use that if you want to package from a specific Cargo target directory.
 
 That emits:
 
@@ -147,7 +157,7 @@ That emits:
 target/debian/rmail_0.1.0_amd64.deb
 ```
 
-### 4. Install on Ubuntu
+### 3. Install on Ubuntu
 
 ```bash
 sudo apt install ./target/debian/rmail_0.1.0_amd64.deb
