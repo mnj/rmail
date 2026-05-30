@@ -14,6 +14,11 @@ The daemons are:
 - `rmail_web`: admin/status web UI
 - `rmail_outbound`: outbound queue worker
 
+Administrative tools:
+
+- `rmail_ctl`: mailbox/password/cert management CLI
+- `rmail_queuectl`: queue and alias management CLI
+
 The runtime model is:
 
 - configuration lives in `/etc/rmail/config.toml`
@@ -46,6 +51,8 @@ sudo install -m 0755 target/release/rmail_smtpd /usr/bin/rmail_smtpd
 sudo install -m 0755 target/release/rmail_imapd /usr/bin/rmail_imapd
 sudo install -m 0755 target/release/rmail_web /usr/bin/rmail_web
 sudo install -m 0755 target/release/rmail_outbound /usr/bin/rmail_outbound
+sudo install -m 0755 target/release/rmail_ctl /usr/bin/rmail_ctl
+sudo install -m 0755 target/release/rmail_queuectl /usr/bin/rmail_queuectl
 ```
 
 ### 4. Install config and environment files
@@ -163,6 +170,8 @@ target/debian/rmail_0.1.0_amd64.deb
 sudo apt install ./target/debian/rmail_0.1.0_amd64.deb
 ```
 
+Avoid installing a local `.deb` from `/root/...` with `apt install` if possible. Put it in a world-readable path like your normal home directory or `/tmp`, otherwise `apt` may warn that download/acquire ran unsandboxed because the `_apt` user cannot read the file.
+
 Then edit:
 
 - `/etc/rmail/config.toml`
@@ -193,6 +202,19 @@ sudo dpkg -i ./target/debian/rmail_0.2.0_amd64.deb
 
 `apt install ./...deb` is preferred on Ubuntu.
 
+If you see:
+
+```text
+Download is performed unsandboxed as root as file '/root/...' couldn't be accessed by user '_apt'
+```
+
+that is not a package bug. It means the `.deb` file is stored somewhere `_apt` cannot read, typically `/root`. Move it to a readable path before installing, for example:
+
+```bash
+cp target/debian/rmail_0.2.0_amd64.deb /tmp/
+sudo apt install /tmp/rmail_0.2.0_amd64.deb
+```
+
 The package now marks these as Debian conffiles:
 
 - `/etc/rmail/config.toml`
@@ -202,6 +224,5 @@ That means your local edits are preserved across upgrades unless you explicitly 
 
 ## Current Limits
 
-- The package script assumes you already built the Rust binaries locally.
 - The generated `.deb` is simple and does not yet declare library/runtime dependencies beyond `systemd`.
 - The package installs a sample config; you still need to provision real TLS certs, mailbox config, and any DNS/MX records yourself.

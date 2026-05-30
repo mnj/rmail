@@ -41,6 +41,8 @@ install -m 0755 "${RELEASE_DIR}/rmail_smtpd" "${PKG_ROOT}/usr/bin/rmail_smtpd"
 install -m 0755 "${RELEASE_DIR}/rmail_imapd" "${PKG_ROOT}/usr/bin/rmail_imapd"
 install -m 0755 "${RELEASE_DIR}/rmail_web" "${PKG_ROOT}/usr/bin/rmail_web"
 install -m 0755 "${RELEASE_DIR}/rmail_outbound" "${PKG_ROOT}/usr/bin/rmail_outbound"
+install -m 0755 "${RELEASE_DIR}/rmail_ctl" "${PKG_ROOT}/usr/bin/rmail_ctl"
+install -m 0755 "${RELEASE_DIR}/rmail_queuectl" "${PKG_ROOT}/usr/bin/rmail_queuectl"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_smtpd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_smtpd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_imapd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_imapd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_web.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_web.service"
@@ -56,8 +58,9 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: rMail Maintainers <noreply@example.invalid>
 Depends: systemd
-Description: rMail SMTP, IMAP, web, and outbound daemons
- Minimal Rust mail stack packaged for systemd-based Linux distributions.
+Description: rMail daemons and admin tools
+ Minimal Rust mail stack packaged with SMTP, IMAP, web, outbound,
+ and administrative CLI binaries for systemd-based Linux distributions.
 EOF
 
 cat > "${PKG_ROOT}/DEBIAN/conffiles" <<'EOF'
