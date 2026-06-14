@@ -34,8 +34,8 @@ mkdir -p \
   "${PKG_ROOT}/usr/lib/systemd/system" \
   "${PKG_ROOT}/etc/rmail" \
   "${PKG_ROOT}/etc/default" \
-  "${PKG_ROOT}/var/lib/rmail" \
-  "${PKG_ROOT}/var/log/rmail"
+  "${PKG_ROOT}/opt/rmail/mail" \
+  "${PKG_ROOT}/opt/rmail/config"
 
 install -m 0755 "${RELEASE_DIR}/rmail_smtpd" "${PKG_ROOT}/usr/bin/rmail_smtpd"
 install -m 0755 "${RELEASE_DIR}/rmail_imapd" "${PKG_ROOT}/usr/bin/rmail_imapd"
@@ -75,10 +75,10 @@ if ! getent group rmail >/dev/null 2>&1; then
   addgroup --system rmail
 fi
 if ! id -u rmail >/dev/null 2>&1; then
-  adduser --system --ingroup rmail --home /var/lib/rmail --no-create-home --disabled-login rmail
+  adduser --system --ingroup rmail --home /opt/rmail --no-create-home --disabled-login rmail
 fi
-mkdir -p /var/lib/rmail /var/log/rmail /etc/rmail
-chown -R rmail:rmail /var/lib/rmail /var/log/rmail
+mkdir -p /opt/rmail/mail /opt/rmail/config /etc/rmail
+chown -R rmail:rmail /opt/rmail
 systemctl daemon-reload || true
 if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
   systemctl enable \
@@ -105,5 +105,5 @@ EOF
 chmod 0755 "${PKG_ROOT}/DEBIAN/postrm"
 
 OUT_DEB="${ROOT_DIR}/target/debian/rmail_${VERSION}_${ARCH}.deb"
-dpkg-deb --build "${PKG_ROOT}" "${OUT_DEB}"
+dpkg-deb --root-owner-group --build "${PKG_ROOT}" "${OUT_DEB}"
 echo "Built ${OUT_DEB}"

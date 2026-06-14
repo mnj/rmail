@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/rmail
-Environment=RMAIL_MAIL_ROOT=/var/lib/rmail
-WorkingDirectory=/var/lib/rmail
+Environment=RMAIL_MAIL_ROOT=/opt/rmail/mail
+WorkingDirectory=/opt/rmail
 ExecStart=/usr/bin/rmail_outbound
 User=rmail
 Group=rmail
@@ -15,7 +15,7 @@ StateDirectory=rmail
 LogsDirectory=rmail
 RuntimeDirectory=rmail
 ConfigurationDirectory=rmail
-ReadWritePaths=/var/lib/rmail /var/log/rmail /tmp
+ReadWritePaths=/opt/rmail /tmp
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true

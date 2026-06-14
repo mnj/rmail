@@ -1,6 +1,6 @@
 // rmail_web: minimal tokio-based HTTP UI for stats and logs (no hyper/axum)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use rmail_common::auth;
 use rmail_common::config::Config;
@@ -511,11 +511,13 @@ async fn handle_connection(
                     match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mr_clone)).await {
                         Ok(Ok(mut stats)) => {
                             // attempt to read delivered count from metrics file (fallback)
-                            let delivered = tokio::fs::read_to_string("/tmp/rmail_delivered.count")
-                                .await
-                                .ok()
-                                .and_then(|s| s.trim().parse::<u64>().ok())
-                                .unwrap_or(0);
+                            let delivered = tokio::fs::read_to_string(
+                                rmail_common::runtime::delivered_count_path(&mail_root),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(0);
                             stats.delivered_count = delivered;
                             content_type = "application/json".to_string();
                             body = match serde_json::to_string(&stats) {
@@ -547,7 +549,14 @@ async fn handle_connection(
                     extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
                 } else {
                     // Expose Prometheus-style metrics
-                    let mut metrics_text = rmail_common::metrics::gather_prometheus();
+                    let mut metrics_text = match tokio::fs::read_to_string(
+                        rmail_common::runtime::prometheus_snapshot_path(&mail_root, "smtpd"),
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(_) => rmail_common::metrics::gather_prometheus(),
+                    };
                     match count_queue_entries_sync(&mail_root) {
                         Ok(n) => {
                             metrics_text.push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
@@ -647,25 +656,23 @@ async fn handle_connection(
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(200);
                     lines = std::cmp::min(lines, 2000);
-                    let path = match component {
-                        "smtpd" => "/tmp/rmail_smtpd.log",
-                        "imapd" => "/tmp/rmail_imapd.log",
+                    match component {
+                        "smtpd" | "imapd" | "web" | "outbound" => {
+                            let path = rmail_common::runtime::log_path(&mail_root, component);
+                            match tokio::fs::read_to_string(&path).await {
+                                Ok(s) => {
+                                    content_type = "text/plain".to_string();
+                                    body = tail_lines(&s, lines);
+                                }
+                                Err(e) => {
+                                    status = 500;
+                                    body = format!("read error from {}: {}", path.display(), e);
+                                }
+                            }
+                        }
                         _ => {
                             status = 400;
                             body = "invalid component".to_string();
-                            ""
-                        }
-                    };
-                    if !path.is_empty() {
-                        match tokio::fs::read_to_string(path).await {
-                            Ok(s) => {
-                                content_type = "text/plain".to_string();
-                                body = tail_lines(&s, lines);
-                            }
-                            Err(e) => {
-                                status = 500;
-                                body = format!("read error: {}", e);
-                            }
                         }
                     }
                 }
@@ -1116,6 +1123,7 @@ async fn main() -> Result<()> {
         }
     });
     let mail_root = PathBuf::from(cfg.global.mail_root);
+    rmail_common::runtime::redirect_stdio_to_log(&mail_root, "web").context("redirecting logs")?;
     let admin_user = cfg.global.web_admin_user.clone();
     let admin_hash = cfg.global.web_admin_password_hash.clone();
     let db_path = cfg.global.db_path.clone();

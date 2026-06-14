@@ -1,11 +1,11 @@
 use anyhow::Result;
-use std::net::IpAddr;
-use sha2::{Sha256, Digest};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ipnet::IpNet;
+use sha2::{Digest, Sha256};
+use std::net::IpAddr;
 use trust_dns_resolver::Resolver;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
-use ipnet::IpNet;
 
 /// Analyze an email message and produce simple DKIM/SPF/DMARC status strings.
 ///
@@ -17,7 +17,16 @@ use ipnet::IpNet;
 /// - DMARC: performs a TXT lookup for _dmarc.<from-domain> and applies simple alignment rules:
 ///   DKIM relaxed (d==From) or SPF aligned (envelope-from domain == From domain). Returns pass/fail/none.
 
-pub fn analyze_message(data: &[u8], peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>)> {
+pub fn analyze_message(
+    data: &[u8],
+    peer_ip: Option<IpAddr>,
+    mail_from: Option<&str>,
+) -> Result<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
     let (headers, header_bytes, body) = parse_headers_body(data);
     let dkim = verify_dkim(&headers, header_bytes, body)?;
     let spf = verify_spf(peer_ip, mail_from)?;
@@ -38,7 +47,11 @@ fn parse_headers_body<'a>(data: &'a [u8]) -> (Vec<(String, String)>, &'a [u8], &
         split_at = Some(pos);
         sep_len = 2;
     }
-    let (hdr_bytes, body) = if let Some(idx) = split_at { (&data[..idx+sep_len], &data[idx+sep_len..]) } else { (&data[..0], &data[..0]) };
+    let (hdr_bytes, body) = if let Some(idx) = split_at {
+        (&data[..idx + sep_len], &data[idx + sep_len..])
+    } else {
+        (&data[..0], &data[..0])
+    };
 
     // convert headers region to string for simple parsing; invalid UTF-8 is tolerated via lossy conversion
     let hdr_str = String::from_utf8_lossy(hdr_bytes);
@@ -53,7 +66,7 @@ fn parse_headers_body<'a>(data: &'a [u8]) -> (Vec<(String, String)>, &'a [u8], &
         } else {
             if let Some(colon) = line.find(':') {
                 let name = line[..colon].trim().to_string();
-                let val = line[colon+1..].trim().to_string();
+                let val = line[colon + 1..].trim().to_string();
                 headers.push((name, val));
             }
         }
@@ -61,7 +74,7 @@ fn parse_headers_body<'a>(data: &'a [u8]) -> (Vec<(String, String)>, &'a [u8], &
     (headers, hdr_bytes, body)
 }
 
-fn get_header_value<'a>(headers: &'a [(String,String)], name: &str) -> Option<String> {
+fn get_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<String> {
     for (k, v) in headers.iter() {
         if k.eq_ignore_ascii_case(name) {
             return Some(v.clone());
@@ -70,11 +83,15 @@ fn get_header_value<'a>(headers: &'a [(String,String)], name: &str) -> Option<St
     None
 }
 
-fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) -> Result<Option<String>> {
+fn verify_dkim(
+    headers: &[(String, String)],
+    header_bytes: &[u8],
+    body: &[u8],
+) -> Result<Option<String>> {
     // Improved DKIM verification: support simple/relaxed header+body canonicalization
+    use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::sign::Verifier;
-    use openssl::hash::MessageDigest;
 
     let mut found_any = false;
     let mut tried_any = false;
@@ -90,7 +107,10 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             if slice.starts_with(b" ") || slice.starts_with(b"\t") {
                 cur.extend_from_slice(slice);
             } else {
-                if !cur.is_empty() { records.push(cur); cur = Vec::new(); }
+                if !cur.is_empty() {
+                    records.push(cur);
+                    cur = Vec::new();
+                }
                 cur.extend_from_slice(slice);
             }
             i = end;
@@ -98,7 +118,9 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             break;
         }
     }
-    if !cur.is_empty() { records.push(cur); }
+    if !cur.is_empty() {
+        records.push(cur);
+    }
 
     // Helper to find a DKIM-Signature record matching selector+domain (or first DKIM header if not found)
     let find_dkim_rec = |selector: &str, domain: &str| -> Option<Vec<u8>> {
@@ -106,28 +128,38 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             // check header name
             if let Some(pos) = rec.iter().position(|&b| b == b':') {
                 let name = String::from_utf8_lossy(&rec[..pos]).to_string();
-                if !name.eq_ignore_ascii_case("DKIM-Signature") { continue; }
+                if !name.eq_ignore_ascii_case("DKIM-Signature") {
+                    continue;
+                }
                 // parse tags in the header value to find s= and d=
-                let val = String::from_utf8_lossy(&rec[pos+1..]).to_string();
+                let val = String::from_utf8_lossy(&rec[pos + 1..]).to_string();
                 let mut has_s = false;
                 let mut has_d = false;
                 for part in val.split(';') {
                     let p = part.trim();
                     if p.to_ascii_lowercase().starts_with("s=") {
-                        if p[2..].trim() == selector { has_s = true; }
+                        if p[2..].trim() == selector {
+                            has_s = true;
+                        }
                     }
                     if p.to_ascii_lowercase().starts_with("d=") {
-                        if p[2..].trim() == domain { has_d = true; }
+                        if p[2..].trim() == domain {
+                            has_d = true;
+                        }
                     }
                 }
-                if has_s && has_d { return Some(rec.clone()); }
+                if has_s && has_d {
+                    return Some(rec.clone());
+                }
             }
         }
         // fallback: return first DKIM-Signature header if specific match not found
         for rec in records.iter() {
             if let Some(pos) = rec.iter().position(|&b| b == b':') {
                 let name = String::from_utf8_lossy(&rec[..pos]).to_string();
-                if name.eq_ignore_ascii_case("DKIM-Signature") { return Some(rec.clone()); }
+                if name.eq_ignore_ascii_case("DKIM-Signature") {
+                    return Some(rec.clone());
+                }
             }
         }
         None
@@ -135,7 +167,9 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
 
     // iterate over structured headers to find DKIM-Signature occurrences and attempt verification
     for (k, v) in headers.iter() {
-        if !k.eq_ignore_ascii_case("DKIM-Signature") { continue; }
+        if !k.eq_ignore_ascii_case("DKIM-Signature") {
+            continue;
+        }
         found_any = true;
 
         // parse semicolon-separated tag=value pairs into a small map
@@ -148,15 +182,25 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
         let mut canon: Option<String> = None;
         for part in v.split(';') {
             let p = part.trim();
-            if p.len() == 0 { continue; }
+            if p.len() == 0 {
+                continue;
+            }
             let lower = p.to_ascii_lowercase();
-            if lower.starts_with("bh=") { bh = Some(p[3..].trim().to_string()); }
-            else if lower.starts_with("d=") { d = Some(p[2..].trim().to_string()); }
-            else if lower.starts_with("s=") { s = Some(p[2..].trim().to_string()); }
-            else if lower.starts_with("b=") { b_sig = Some(p[2..].trim().to_string()); }
-            else if lower.starts_with("a=") { a_alg = Some(p[2..].trim().to_string()); }
-            else if lower.starts_with("h=") { h_list = Some(p[2..].trim().to_string()); }
-            else if lower.starts_with("c=") { canon = Some(p[2..].trim().to_string()); }
+            if lower.starts_with("bh=") {
+                bh = Some(p[3..].trim().to_string());
+            } else if lower.starts_with("d=") {
+                d = Some(p[2..].trim().to_string());
+            } else if lower.starts_with("s=") {
+                s = Some(p[2..].trim().to_string());
+            } else if lower.starts_with("b=") {
+                b_sig = Some(p[2..].trim().to_string());
+            } else if lower.starts_with("a=") {
+                a_alg = Some(p[2..].trim().to_string());
+            } else if lower.starts_with("h=") {
+                h_list = Some(p[2..].trim().to_string());
+            } else if lower.starts_with("c=") {
+                canon = Some(p[2..].trim().to_string());
+            }
         }
 
         // determine canonicalization pair
@@ -165,11 +209,17 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             let h = sp.next().unwrap_or("simple").trim().to_ascii_lowercase();
             let b = sp.next().unwrap_or("simple").trim().to_ascii_lowercase();
             (h, b)
-        } else { ("simple".to_string(), "simple".to_string()) };
+        } else {
+            ("simple".to_string(), "simple".to_string())
+        };
 
         // If bh present, verify body hash first
         if let Some(bh_val) = bh.clone() {
-            let body_to_hash = if body_canon.starts_with("relaxed") { canonicalize_body_relaxed(body) } else { canonicalize_body_simple(body) };
+            let body_to_hash = if body_canon.starts_with("relaxed") {
+                canonicalize_body_relaxed(body)
+            } else {
+                canonicalize_body_simple(body)
+            };
             let mut hasher = Sha256::new();
             hasher.update(&body_to_hash);
             let digest = hasher.finalize();
@@ -182,7 +232,8 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
         }
 
         // If signature is present and algorithm is supported, attempt verification
-        if let (Some(sig_b64), Some(selector), Some(domain)) = (b_sig.clone(), s.clone(), d.clone()) {
+        if let (Some(sig_b64), Some(selector), Some(domain)) = (b_sig.clone(), s.clone(), d.clone())
+        {
             if let Some(a) = a_alg.clone() {
                 if !a.to_ascii_lowercase().contains("rsa-sha256") {
                     // unsupported algorithm -> treat as tried but skip
@@ -198,7 +249,9 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
                 let fields: Vec<String> = hs.split(':').map(|s| s.trim().to_string()).collect();
                 for fname in fields.iter().rev() {
                     for idx in (0..records.len()).rev() {
-                        if used[idx] { continue; }
+                        if used[idx] {
+                            continue;
+                        }
                         if let Some(pos) = records[idx].iter().position(|&b| b == b':') {
                             let name_slice = &records[idx][..pos];
                             let name = String::from_utf8_lossy(name_slice).to_string();
@@ -236,9 +289,21 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
             }
 
             // fetch public key via DNS TXT at selector._domainkey.domain
-            let resolver = match resolver() { Ok(r) => r, Err(_) => { tried_any = true; continue; } };
+            let resolver = match resolver() {
+                Ok(r) => r,
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
+            };
             let lookup_name = format!("{}._domainkey.{}", selector, domain);
-            let txt_lookup = match resolver.txt_lookup(lookup_name.as_str()) { Ok(t) => t, Err(_) => { tried_any = true; continue; } };
+            let txt_lookup = match resolver.txt_lookup(lookup_name.as_str()) {
+                Ok(t) => t,
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
+            };
 
             let mut pubkey_b64: Option<String> = None;
             for txt in txt_lookup.iter() {
@@ -250,26 +315,65 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
                     }
                 }
             }
-            if pubkey_b64.is_none() { tried_any = true; continue; }
+            if pubkey_b64.is_none() {
+                tried_any = true;
+                continue;
+            }
             let pubkey_b64 = pubkey_b64.unwrap();
-            let pubkey_der = match BASE64.decode(pubkey_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
+            let pubkey_der = match BASE64.decode(pubkey_b64.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
+            };
 
             // try to build PKey from DER, falling back to PEM wrapper
             let pkey = PKey::public_key_from_der(&pubkey_der).or_else(|_| {
-                let pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", base64::engine::general_purpose::STANDARD.encode(&pubkey_der));
+                let pem = format!(
+                    "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+                    base64::engine::general_purpose::STANDARD.encode(&pubkey_der)
+                );
                 PKey::public_key_from_pem(pem.as_bytes())
             });
-            let pkey = match pkey { Ok(pk) => pk, Err(_) => { tried_any = true; continue; } };
+            let pkey = match pkey {
+                Ok(pk) => pk,
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
+            };
 
-            let sig_bytes = match BASE64.decode(sig_b64.as_bytes()) { Ok(b) => b, Err(_) => { tried_any = true; continue; } };
+            let sig_bytes = match BASE64.decode(sig_b64.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
+            };
 
             // verify signature (rsa-sha256)
-            let mut verifier = match Verifier::new(MessageDigest::sha256(), &pkey) { Ok(v) => v, Err(_) => { tried_any = true; continue; } };
-            if verifier.update(&header_data).is_err() { tried_any = true; continue; }
+            let mut verifier = match Verifier::new(MessageDigest::sha256(), &pkey) {
+                Ok(v) => v,
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
+            };
+            if verifier.update(&header_data).is_err() {
+                tried_any = true;
+                continue;
+            }
             match verifier.verify(&sig_bytes) {
                 Ok(true) => return Ok(Some(format!("pass; d={}", domain))),
-                Ok(false) => { tried_any = true; continue; }
-                Err(_) => { tried_any = true; continue; }
+                Ok(false) => {
+                    tried_any = true;
+                    continue;
+                }
+                Err(_) => {
+                    tried_any = true;
+                    continue;
+                }
             }
         } else {
             // no b/d/s tags found — mark that we observed a DKIM header but couldn't process it
@@ -290,9 +394,9 @@ fn verify_dkim(headers: &[(String,String)], header_bytes: &[u8], body: &[u8]) ->
 }
 
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
 use std::collections::HashMap;
-use std::time::{Instant, Duration};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 fn resolver() -> Result<Resolver> {
     // Use system-configured resolvers
@@ -301,8 +405,10 @@ fn resolver() -> Result<Resolver> {
 }
 
 // Simple DNS caches to avoid repeated lookups during message analysis
-static TXT_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<String>)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static A_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<std::net::IpAddr>)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static TXT_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<String>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static A_CACHE: Lazy<Mutex<HashMap<String, (Instant, Vec<std::net::IpAddr>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn cached_txt_lookup(name: &str) -> Option<Vec<String>> {
@@ -359,22 +465,35 @@ fn expand_spf_macros(s: &str, peer: IpAddr, mail_from: &str, current_domain: &st
                     '{' => {
                         let mut mac = String::new();
                         while let Some(n) = chars.next() {
-                            if n == '}' { break; }
+                            if n == '}' {
+                                break;
+                            }
                             mac.push(n);
                         }
                         let replacement = match mac.as_str() {
                             "i" => peer.to_string(),
                             "s" => mail_from.to_string(),
-                            "l" => mail_from.split('@').next().map(|s| s.to_string()).unwrap_or_else(|| "".to_string()),
+                            "l" => mail_from
+                                .split('@')
+                                .next()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "".to_string()),
                             "d" => current_domain.to_string(),
                             _ => "".to_string(),
                         };
                         out.push_str(&replacement);
                     }
-                    _ => { out.push('%'); out.push(next); }
+                    _ => {
+                        out.push('%');
+                        out.push(next);
+                    }
                 }
-            } else { out.push('%'); }
-        } else { out.push(ch); }
+            } else {
+                out.push('%');
+            }
+        } else {
+            out.push(ch);
+        }
     }
     out
 }
@@ -383,10 +502,15 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
     // Improved SPF: support ip4/ip6, a, mx, and include mechanisms (best-effort).
     use std::collections::HashSet;
 
-    let mf = match mail_from { Some(s) => s, None => return Ok(None) };
+    let mf = match mail_from {
+        Some(s) => s,
+        None => return Ok(None),
+    };
     let at = mf.rfind('@');
-    let domain = if let Some(i) = at { &mf[i+1..] } else { mf };
-    if peer_ip.is_none() { return Ok(None); }
+    let domain = if let Some(i) = at { &mf[i + 1..] } else { mf };
+    if peer_ip.is_none() {
+        return Ok(None);
+    }
     let peer = peer_ip.unwrap();
 
     fn map_qual(q: char) -> &'static str {
@@ -398,21 +522,36 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
         }
     }
 
-
-    fn eval_spf_for_domain(domain: &str, peer: IpAddr, depth: u8, visited: &mut HashSet<String>, mail_from: &str) -> Option<String> {
-        if depth > 10 { return None; }
-        if visited.contains(domain) { return None; }
+    fn eval_spf_for_domain(
+        domain: &str,
+        peer: IpAddr,
+        depth: u8,
+        visited: &mut HashSet<String>,
+        mail_from: &str,
+    ) -> Option<String> {
+        if depth > 10 {
+            return None;
+        }
+        if visited.contains(domain) {
+            return None;
+        }
         visited.insert(domain.to_string());
         // try cached TXT lookup first
         let txts = cached_txt_lookup(domain)?;
         for txt in txts.iter() {
             let txt_str = txt.to_string();
-            if !txt_str.to_ascii_lowercase().starts_with("v=spf1") { continue; }
+            if !txt_str.to_ascii_lowercase().starts_with("v=spf1") {
+                continue;
+            }
             let mut seen_all: Option<char> = None;
             for tok in txt_str.split_whitespace().skip(1) {
                 let mut chars = tok.chars();
                 let first = chars.next().unwrap_or('\0');
-                let (qual, mech) = if matches!(first, '+'|'-'|'~'|'?') { (first, chars.as_str()) } else { ('+', tok) };
+                let (qual, mech) = if matches!(first, '+' | '-' | '~' | '?') {
+                    (first, chars.as_str())
+                } else {
+                    ('+', tok)
+                };
                 // ip4/ip6
                 if mech.starts_with("ip4:") || mech.starts_with("ip6:") {
                     let cid = &mech[4..];
@@ -423,22 +562,38 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
                     }
                 } else if mech.starts_with("a") {
                     // a or a:domain
-                    let target = if mech == "a" { domain.to_string() } else if mech.starts_with("a:") { expand_spf_macros(&mech[2..], peer, mail_from, domain) } else { domain.to_string() };
+                    let target = if mech == "a" {
+                        domain.to_string()
+                    } else if mech.starts_with("a:") {
+                        expand_spf_macros(&mech[2..], peer, mail_from, domain)
+                    } else {
+                        domain.to_string()
+                    };
                     if let Some(ips) = cached_lookup_ip(target.as_str()) {
                         for ip in ips.iter() {
-                            if *ip == peer { return Some(map_qual(qual).to_string()); }
+                            if *ip == peer {
+                                return Some(map_qual(qual).to_string());
+                            }
                         }
                     }
                 } else if mech.starts_with("mx") {
                     // mx or mx:domain
-                    let target = if mech == "mx" { domain.to_string() } else if mech.starts_with("mx:") { mech[3..].to_string() } else { domain.to_string() };
+                    let target = if mech == "mx" {
+                        domain.to_string()
+                    } else if mech.starts_with("mx:") {
+                        mech[3..].to_string()
+                    } else {
+                        domain.to_string()
+                    };
                     if let Ok(resolver) = resolver() {
                         if let Ok(mxlookup) = resolver.mx_lookup(target.as_str()) {
                             for mx in mxlookup.iter() {
                                 let host = mx.exchange().to_utf8();
                                 if let Some(ips) = cached_lookup_ip(host.as_str()) {
                                     for ip in ips.iter() {
-                                        if *ip == peer { return Some(map_qual(qual).to_string()); }
+                                        if *ip == peer {
+                                            return Some(map_qual(qual).to_string());
+                                        }
                                     }
                                 }
                             }
@@ -448,8 +603,12 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
                     let inc_raw = &mech[8..];
                     let inc = expand_spf_macros(inc_raw, peer, mail_from, domain);
                     let mut v2 = visited.clone();
-                    if let Some(res) = eval_spf_for_domain(&inc, peer, depth.saturating_add(1), &mut v2, mail_from) {
-                        if res == "pass" { return Some("pass".to_string()); }
+                    if let Some(res) =
+                        eval_spf_for_domain(&inc, peer, depth.saturating_add(1), &mut v2, mail_from)
+                    {
+                        if res == "pass" {
+                            return Some("pass".to_string());
+                        }
                         // otherwise continue
                     }
                 } else if mech.ends_with("all") {
@@ -458,7 +617,9 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
                     seen_all = Some(q);
                 }
             }
-            if let Some(q) = seen_all { return Some(map_qual(q).to_string()); }
+            if let Some(q) = seen_all {
+                return Some(map_qual(q).to_string());
+            }
             return Some("neutral".to_string());
         }
         None
@@ -471,19 +632,36 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
     Ok(None)
 }
 
-fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&str>, mail_from: Option<&str>) -> Result<Option<String>> {
+fn verify_dmarc(
+    headers: &[(String, String)],
+    dkim: Option<&str>,
+    spf: Option<&str>,
+    mail_from: Option<&str>,
+) -> Result<Option<String>> {
     // Parse From header to obtain the header-from domain
-    let from_hdr = match get_header_value(headers, "From") { Some(s) => s, None => return Ok(None) };
+    let from_hdr = match get_header_value(headers, "From") {
+        Some(s) => s,
+        None => return Ok(None),
+    };
     let from_addr = extract_addr_from_header(&from_hdr);
-    let from_domain = match from_addr.as_deref().and_then(|s| s.rfind('@').map(|i| s[i+1..].to_string())) {
+    let from_domain = match from_addr
+        .as_deref()
+        .and_then(|s| s.rfind('@').map(|i| s[i + 1..].to_string()))
+    {
         Some(d) => d,
         None => return Ok(None),
     };
 
     // lookup _dmarc.<from_domain>
     let name = format!("_dmarc.{}", from_domain);
-    let resolver = match resolver() { Ok(r) => r, Err(_) => return Ok(None) };
-    let lookup = match resolver.txt_lookup(name.as_str()) { Ok(r) => r, Err(_) => return Ok(None) };
+    let resolver = match resolver() {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let lookup = match resolver.txt_lookup(name.as_str()) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
     let mut policy: Option<String> = None;
     for txt in lookup.iter() {
         let txt_str = txt.to_string();
@@ -493,7 +671,7 @@ fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&st
                 let p = part.trim();
                 if p.starts_with('p') && p.contains('=') {
                     if let Some(eq) = p.find('=') {
-                        policy = Some(p[eq+1..].trim().to_string());
+                        policy = Some(p[eq + 1..].trim().to_string());
                     }
                 }
             }
@@ -506,7 +684,7 @@ fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&st
         if dkim_s.starts_with("pass") {
             // attempt to extract d= from DKIM result or headers
             if let Some(pos) = dkim_s.find("d=") {
-                let rem = &dkim_s[pos+2..];
+                let rem = &dkim_s[pos + 2..];
                 let dval = rem.split_whitespace().next().unwrap_or("");
                 if dval == from_domain || dval.ends_with(&format!(".{}", from_domain)) {
                     return Ok(Some("pass".to_string()));
@@ -534,8 +712,9 @@ fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&st
             // envelope-from domain alignment
             if let Some(mf) = mail_from {
                 if let Some(idx) = mf.rfind('@') {
-                    let ef_domain = &mf[idx+1..];
-                    if ef_domain == from_domain || ef_domain.ends_with(&format!(".{}", from_domain)) {
+                    let ef_domain = &mf[idx + 1..];
+                    if ef_domain == from_domain || ef_domain.ends_with(&format!(".{}", from_domain))
+                    {
                         return Ok(Some("pass".to_string()));
                     }
                 }
@@ -544,8 +723,12 @@ fn verify_dmarc(headers: &[(String,String)], dkim: Option<&str>, spf: Option<&st
     }
 
     // If alignment failed, return policy decision (reject/quarantine/none)
-    if policy == "reject" { return Ok(Some("reject".to_string())); }
-    if policy == "quarantine" { return Ok(Some("quarantine".to_string())); }
+    if policy == "reject" {
+        return Ok(Some("reject".to_string()));
+    }
+    if policy == "quarantine" {
+        return Ok(Some("quarantine".to_string()));
+    }
     Ok(Some("none".to_string()))
 }
 
@@ -554,10 +737,20 @@ fn extract_addr_from_header(s: &str) -> Option<String> {
     if let Some(at) = s.find('@') {
         // find start
         let before = &s[..at];
-        let start = before.rfind('<').map(|i| i+1).unwrap_or_else(|| before.rfind(' ').map(|i| i+1).unwrap_or(0));
+        let start = before
+            .rfind('<')
+            .map(|i| i + 1)
+            .unwrap_or_else(|| before.rfind(' ').map(|i| i + 1).unwrap_or(0));
         let after = &s[at..];
-        let end = after.find('>').map(|i| at + i).unwrap_or_else(|| after.find(' ').map(|i| at + i).unwrap_or(s.len()));
-        let addr = s[start..end].trim().trim_matches('<').trim_matches('>').to_string();
+        let end = after
+            .find('>')
+            .map(|i| at + i)
+            .unwrap_or_else(|| after.find(' ').map(|i| at + i).unwrap_or(s.len()));
+        let addr = s[start..end]
+            .trim()
+            .trim_matches('<')
+            .trim_matches('>')
+            .to_string();
         return Some(addr);
     }
     None
@@ -608,8 +801,11 @@ fn canonicalize_body_simple(body: &[u8]) -> Vec<u8> {
     // Remove trailing CRLFs and ensure a single CRLF at the end
     let mut v = body.to_vec();
     while v.ends_with(b"\r\n") || v.ends_with(b"\n") {
-        if v.ends_with(b"\r\n") { v.truncate(v.len()-2); }
-        else { v.truncate(v.len()-1); }
+        if v.ends_with(b"\r\n") {
+            v.truncate(v.len() - 2);
+        } else {
+            v.truncate(v.len() - 1);
+        }
     }
     v.extend_from_slice(b"\r\n");
     v
@@ -620,23 +816,33 @@ fn canonicalize_body_relaxed(body: &[u8]) -> Vec<u8> {
     let s = String::from_utf8_lossy(body).to_string();
     // normalize line endings
     let s = s.replace("\r\n", "\n");
-    let mut lines: Vec<String> = s.split('\n').map(|ln| {
-        // collapse WSP sequences to a single space and trim
-        let mut out = String::new();
-        let mut last_ws = false;
-        for ch in ln.chars() {
-            if ch == ' ' || ch == '\t' {
-                if !last_ws { out.push(' '); last_ws = true; }
-            } else {
-                out.push(ch);
-                last_ws = false;
+    let mut lines: Vec<String> = s
+        .split('\n')
+        .map(|ln| {
+            // collapse WSP sequences to a single space and trim
+            let mut out = String::new();
+            let mut last_ws = false;
+            for ch in ln.chars() {
+                if ch == ' ' || ch == '\t' {
+                    if !last_ws {
+                        out.push(' ');
+                        last_ws = true;
+                    }
+                } else {
+                    out.push(ch);
+                    last_ws = false;
+                }
             }
-        }
-        out.trim().to_string()
-    }).collect();
+            out.trim().to_string()
+        })
+        .collect();
     // remove trailing empty lines
     while let Some(last) = lines.last() {
-        if last.is_empty() { lines.pop(); } else { break; }
+        if last.is_empty() {
+            lines.pop();
+        } else {
+            break;
+        }
     }
     let mut out = lines.join("\r\n");
     out.push_str("\r\n");
@@ -651,7 +857,7 @@ fn canonicalize_header_relaxed(rec: &[u8]) -> Vec<u8> {
     // find first colon
     if let Some(colon) = s.find(':') {
         let name = s[..colon].trim().to_ascii_lowercase();
-        let mut value = s[colon+1..].to_string();
+        let mut value = s[colon + 1..].to_string();
         // unfold: replace CRLF + WSP with single SP and replace any LF with space
         value = value.replace("\r\n", "\n").replace('\n', " ");
         // collapse WSP sequences
@@ -659,7 +865,10 @@ fn canonicalize_header_relaxed(rec: &[u8]) -> Vec<u8> {
         let mut last_ws = false;
         for ch in value.chars() {
             if ch == ' ' || ch == '\t' {
-                if !last_ws { out.push(' '); last_ws = true; }
+                if !last_ws {
+                    out.push(' ');
+                    last_ws = true;
+                }
             } else {
                 out.push(ch);
                 last_ws = false;
@@ -679,7 +888,7 @@ fn remove_b_from_dkim_header(rec: &[u8]) -> Vec<u8> {
     // semicolon or the end-of-line (preserving CRLF).
     let s = String::from_utf8_lossy(rec).to_string();
     if let Some(colon_pos) = s.find(':') {
-        let rest = &s[colon_pos+1..];
+        let rest = &s[colon_pos + 1..];
         let rest_lower = rest.to_ascii_lowercase();
         if let Some(rel) = rest_lower.find("b=") {
             // absolute start index of the 'b=' value in the original string
@@ -728,7 +937,10 @@ mod tests {
     fn test_canonicalize_header_relaxed() {
         let input = b"From:   Alice <alice@example.com>\r\n";
         let out = canonicalize_header_relaxed(input);
-        assert_eq!(String::from_utf8_lossy(&out), "from:Alice <alice@example.com>\r\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "from:Alice <alice@example.com>\r\n"
+        );
     }
 
     #[test]
@@ -745,7 +957,7 @@ mod tests {
         let out = remove_b_from_dkim_header(hdr.as_bytes());
         let out_s = String::from_utf8_lossy(&out).to_string();
         // should contain an empty b= tag and should not contain the original long b= value
-        assert!(out_s.contains("b=") );
+        assert!(out_s.contains("b="));
         assert!(!out_s.contains("b=AbCdEfGhIjKlMnOpQrStUvWxY1234567890+/=="));
     }
 }

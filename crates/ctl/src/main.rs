@@ -1,12 +1,15 @@
-use clap::{Parser, Subcommand};
 use anyhow::Result;
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString},
+};
+use clap::{Parser, Subcommand};
+use rand::rngs::OsRng;
+use rmail_common::{config::Config, maildir};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use rmail_common::{config::Config, maildir};
-use argon2::{Argon2, password_hash::{SaltString, PasswordHasher}};
-use rand::rngs::OsRng;
 
 /// rmail_ctl: minimal control CLI for managing mailboxes and generating password hashes.
 #[derive(Parser)]
@@ -93,20 +96,38 @@ fn main() -> Result<()> {
             let mut rng = OsRng;
             let salt = SaltString::generate(&mut rng);
             let argon2 = Argon2::default();
-            let ph = argon2.hash_password(password.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string();
+            let ph = argon2
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .to_string();
             println!("{}", ph);
-        },
+        }
         Commands::InitDb { db_path, config } => {
-            let dbp = if let Some(p) = db_path { p } else {
-                let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let dbp = if let Some(p) = db_path {
+                p
+            } else {
+                let cfg_path = config.unwrap_or_else(|| {
+                    std::env::var("RMAIL_CONFIG")
+                        .unwrap_or_else(|_| "config/example.toml".to_string())
+                });
                 let cfg = Config::from_file(&cfg_path)?;
-                cfg.global.db_path.ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
+                cfg.global
+                    .db_path
+                    .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
             };
             rmail_common::db::init_db(&dbp)?;
             println!("Initialized DB at {}", dbp);
         }
-        Commands::AddMailbox { address, password, password_hash, maildir: maildir_opt, config } => {
-            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+        Commands::AddMailbox {
+            address,
+            password,
+            password_hash,
+            maildir: maildir_opt,
+            config,
+        } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
             let cfg = Config::from_file(&cfg_path)?;
             // determine password_hash: either provided precomputed, or hash the plaintext password
             // Also generate a SCRAM verifier if a plaintext password was provided so SCRAM-SHA-256 can be used.
@@ -115,7 +136,10 @@ fn main() -> Result<()> {
             } else if let Some(p) = password {
                 let mut rng = OsRng;
                 let salt = SaltString::generate(&mut rng);
-                let phs = Argon2::default().hash_password(p.as_bytes(), &salt).map_err(|e| anyhow::anyhow!(e.to_string()))?.to_string();
+                let phs = Argon2::default()
+                    .hash_password(p.as_bytes(), &salt)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    .to_string();
                 // create SCRAM verifier JSON with a reasonable iteration count
                 let scram = rmail_common::auth::create_scram_verifier(&p, 4096)?;
                 (phs, Some(scram))
@@ -125,7 +149,7 @@ fn main() -> Result<()> {
 
             if let Some(at) = address.find('@') {
                 let local = &address[..at];
-                let domain = &address[at+1..];
+                let domain = &address[at + 1..];
                 let mail_root = cfg.global.mail_root.clone();
                 let maildir_path = if let Some(md) = maildir_opt {
                     md
@@ -139,7 +163,13 @@ fn main() -> Result<()> {
                 if let Some(dbp) = cfg.global.db_path.as_ref() {
                     // ensure DB initialized
                     rmail_common::db::init_db(dbp)?;
-                    rmail_common::db::add_mailbox(dbp, &address.to_ascii_lowercase(), if ph.is_empty() { None } else { Some(&ph) }, Some(&maildir_path), scram_json.as_deref())?;
+                    rmail_common::db::add_mailbox(
+                        dbp,
+                        &address.to_ascii_lowercase(),
+                        if ph.is_empty() { None } else { Some(&ph) },
+                        Some(&maildir_path),
+                        scram_json.as_deref(),
+                    )?;
                     println!("Added mailbox {} into DB at {}", address, dbp);
                 } else {
                     eprintln!("No db_path configured; SQLite DB is required");
@@ -150,7 +180,9 @@ fn main() -> Result<()> {
             }
         }
         Commands::List { config } => {
-            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
             let cfg = Config::from_file(&cfg_path)?;
             if let Some(dbp) = cfg.global.db_path.as_ref() {
                 // list from DB
@@ -163,16 +195,26 @@ fn main() -> Result<()> {
             }
         }
         Commands::SendDmarcReports { config } => {
-            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
             let cfg = Config::from_file(&cfg_path)?;
-            let dbp = cfg.global.db_path.as_ref().ok_or_else(|| anyhow::anyhow!("No db_path configured"))?.to_string();
+            let dbp = cfg
+                .global
+                .db_path
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
+                .to_string();
             let domains = rmail_common::db::get_unreported_dmarc_domains(&dbp)?;
             if domains.is_empty() {
                 println!("No unreported DMARC events");
             } else {
                 for domain in domains {
-                    let events = rmail_common::db::fetch_unreported_dmarc_events_for_domain(&dbp, &domain)?;
-                    if events.is_empty() { continue; }
+                    let events =
+                        rmail_common::db::fetch_unreported_dmarc_events_for_domain(&dbp, &domain)?;
+                    if events.is_empty() {
+                        continue;
+                    }
                     // Build a simple aggregate XML report
                     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
                     let begin = events.first().map(|e| e.7).unwrap_or(now - 86400);
@@ -180,7 +222,9 @@ fn main() -> Result<()> {
                     let report_id = format!("rmail-{}-{}", domain, now);
                     let org_name = "rMail";
                     let org_email = "dmarc-reports@localhost";
-                    let policy = rmail_common::mail_auth::get_dmarc_policy(&domain).unwrap_or(None).unwrap_or_else(|| "none".to_string());
+                    let policy = rmail_common::mail_auth::get_dmarc_policy(&domain)
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| "none".to_string());
 
                     let mut records = String::new();
                     for ev in events.iter() {
@@ -190,7 +234,8 @@ fn main() -> Result<()> {
                         let dkim_res = ev.4.clone().unwrap_or_else(|| "none".to_string());
                         let spf_res = ev.5.clone().unwrap_or_else(|| "none".to_string());
                         let disposition = ev.6.clone().unwrap_or_else(|| "none".to_string());
-                        records.push_str(&format!(r#"  <record>
+                        records.push_str(&format!(
+                            r#"  <record>
     <row>
       <source_ip>{}</source_ip>
       <count>1</count>
@@ -204,10 +249,13 @@ fn main() -> Result<()> {
       <header_from>{}</header_from>
     </identifiers>
   </record>
-"#, source_ip, disposition, dkim_res, spf_res, header_from));
+"#,
+                            source_ip, disposition, dkim_res, spf_res, header_from
+                        ));
                     }
 
-                    let xml = format!(r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+                    let xml = format!(
+                        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <feedback>
   <report_metadata>
     <org_name>{}</org_name>
@@ -228,7 +276,9 @@ fn main() -> Result<()> {
   </policy_published>
 {}
 </feedback>
-"#, org_name, org_email, report_id, begin, end, domain, policy, policy, records);
+"#,
+                        org_name, org_email, report_id, begin, end, domain, policy, policy, records
+                    );
 
                     // enqueue to each rua recipient
                     let ruas = rmail_common::mail_auth::get_dmarc_rua(&domain)?;
@@ -238,78 +288,187 @@ fn main() -> Result<()> {
                     }
                     for rua in ruas.iter() {
                         // Build a simple email with XML body
-                        let email = format!("From: {}\r\nTo: {}\r\nSubject: DMARC aggregate report for {}\r\nMIME-Version: 1.0\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n{}", org_email, rua, domain, xml);
+                        let email = format!(
+                            "From: {}\r\nTo: {}\r\nSubject: DMARC aggregate report for {}\r\nMIME-Version: 1.0\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n{}",
+                            org_email, rua, domain, xml
+                        );
                         // enqueue via on-disk queue (avoid SQLite for queues)
                         let mail_root = cfg.global.mail_root.clone();
-                        let _ = rmail_common::outbound::queue_outbound(std::path::Path::new(&mail_root), rua, email.as_bytes(), Some(org_email))?;
+                        let _ = rmail_common::outbound::queue_outbound(
+                            std::path::Path::new(&mail_root),
+                            rua,
+                            email.as_bytes(),
+                            Some(org_email),
+                        )?;
                     }
 
                     // mark events reported
                     let ids: Vec<i64> = events.iter().map(|e| e.0).collect();
                     rmail_common::db::mark_dmarc_events_reported(&dbp, &ids)?;
-                    println!("Enqueued DMARC report for {} -> {} recipients", domain, ruas.len());
+                    println!(
+                        "Enqueued DMARC report for {} -> {} recipients",
+                        domain,
+                        ruas.len()
+                    );
                 }
             }
-        },
-        Commands::ObtainCert { domains, email, staging, config } => {
-            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+        }
+        Commands::ObtainCert {
+            domains,
+            email,
+            staging,
+            config,
+        } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
             let cfg = Config::from_file(&cfg_path)?;
-            let acme_dir = cfg.global.acme_challenge_dir.clone().ok_or_else(|| anyhow::anyhow!("No acme_challenge_dir configured in global config"))?;
+            let acme_dir = cfg.global.acme_challenge_dir.clone().ok_or_else(|| {
+                anyhow::anyhow!("No acme_challenge_dir configured in global config")
+            })?;
             // ensure webroot exists
             if !Path::new(&acme_dir).exists() {
                 fs::create_dir_all(&acme_dir)?;
             }
             // Build certbot command
             let mut cmd = Command::new("certbot");
-            cmd.arg("certonly").arg("--non-interactive").arg("--agree-tos").arg("--webroot").arg("-w").arg(&acme_dir).arg("--rsa-key-size").arg("2048");
-            if staging { cmd.arg("--staging"); }
-            if let Some(e) = email.as_ref() { cmd.arg("--email").arg(e); } else { cmd.arg("--register-unsafely-without-email"); }
-            for d in domains.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) { cmd.arg("-d").arg(d); }
+            cmd.arg("certonly")
+                .arg("--non-interactive")
+                .arg("--agree-tos")
+                .arg("--webroot")
+                .arg("-w")
+                .arg(&acme_dir)
+                .arg("--rsa-key-size")
+                .arg("2048");
+            if staging {
+                cmd.arg("--staging");
+            }
+            if let Some(e) = email.as_ref() {
+                cmd.arg("--email").arg(e);
+            } else {
+                cmd.arg("--register-unsafely-without-email");
+            }
+            for d in domains
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                cmd.arg("-d").arg(d);
+            }
             println!("Running certbot to obtain certificate for {}", domains);
-            let status = cmd.status().map_err(|e| anyhow::anyhow!(format!("failed to run certbot: {}", e)))?;
-            if !status.success() { return Err(anyhow::anyhow!(format!("certbot exited with status {}", status))); }
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!(format!("failed to run certbot: {}", e)))?;
+            if !status.success() {
+                return Err(anyhow::anyhow!(format!(
+                    "certbot exited with status {}",
+                    status
+                )));
+            }
             // Copy certs for primary domain
             let primary_domain = domains.split(',').next().unwrap().trim();
             let live_dir = Path::new("/etc/letsencrypt/live").join(primary_domain);
             let fullchain = live_dir.join("fullchain.pem");
             let privkey = live_dir.join("privkey.pem");
-            if !fullchain.exists() || !privkey.exists() { return Err(anyhow::anyhow!(format!("expected cert files not found in {}", live_dir.display()))); }
-            let out_cert = cfg.global.tls_cert.clone().unwrap_or(format!("config/certs/{}.crt", primary_domain));
-            let out_key = cfg.global.tls_key.clone().unwrap_or(format!("config/certs/{}.key", primary_domain));
-            if let Some(parent) = Path::new(&out_cert).parent() { fs::create_dir_all(parent)?; }
-            if let Some(parent) = Path::new(&out_key).parent() { fs::create_dir_all(parent)?; }
+            if !fullchain.exists() || !privkey.exists() {
+                return Err(anyhow::anyhow!(format!(
+                    "expected cert files not found in {}",
+                    live_dir.display()
+                )));
+            }
+            let out_cert = cfg
+                .global
+                .tls_cert
+                .clone()
+                .unwrap_or(format!("config/certs/{}.crt", primary_domain));
+            let out_key = cfg
+                .global
+                .tls_key
+                .clone()
+                .unwrap_or(format!("config/certs/{}.key", primary_domain));
+            if let Some(parent) = Path::new(&out_cert).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Some(parent) = Path::new(&out_key).parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(&fullchain, &out_cert)?;
             fs::copy(&privkey, &out_key)?;
-            println!("Obtained cert for {} -> {} / {}", primary_domain, out_cert, out_key);
+            println!(
+                "Obtained cert for {} -> {} / {}",
+                primary_domain, out_cert, out_key
+            );
         }
         Commands::Renew { staging, config } => {
-            let cfg_path = config.unwrap_or_else(|| std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string()));
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
             let cfg = Config::from_file(&cfg_path)?;
             println!("Running certbot renew...");
             let mut cmd = Command::new("certbot");
             cmd.arg("renew").arg("--non-interactive");
-            if staging { cmd.arg("--staging"); }
-            let status = cmd.status().map_err(|e| anyhow::anyhow!(format!("failed to run certbot renew: {}", e)))?;
-            if !status.success() { return Err(anyhow::anyhow!(format!("certbot renew exited with status {}", status))); }
+            if staging {
+                cmd.arg("--staging");
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!(format!("failed to run certbot renew: {}", e)))?;
+            if !status.success() {
+                return Err(anyhow::anyhow!(format!(
+                    "certbot renew exited with status {}",
+                    status
+                )));
+            }
             // Determine primary domain to copy (prefer tls_cert filename stem)
-            let primary_domain_opt = cfg.global.tls_cert.as_ref().and_then(|p| std::path::Path::new(p).file_stem().and_then(|os| os.to_str()).map(|s| s.to_string()));
-            let primary_domain = if let Some(d) = primary_domain_opt { d } else {
+            let primary_domain_opt = cfg.global.tls_cert.as_ref().and_then(|p| {
+                std::path::Path::new(p)
+                    .file_stem()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_string())
+            });
+            let primary_domain = if let Some(d) = primary_domain_opt {
+                d
+            } else {
                 // fallback: pick first dir under /etc/letsencrypt/live
                 let live_root = Path::new("/etc/letsencrypt/live");
-                let first = std::fs::read_dir(live_root)?.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).next().ok_or_else(|| anyhow::anyhow!("no live certs found to copy"))?;
+                let first = std::fs::read_dir(live_root)?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no live certs found to copy"))?;
                 first
             };
             let live_dir = Path::new("/etc/letsencrypt/live").join(&primary_domain);
             let fullchain = live_dir.join("fullchain.pem");
             let privkey = live_dir.join("privkey.pem");
-            if !fullchain.exists() || !privkey.exists() { return Err(anyhow::anyhow!(format!("expected cert files not found in {}", live_dir.display()))); }
-            let out_cert = cfg.global.tls_cert.clone().unwrap_or(format!("config/certs/{}.crt", primary_domain));
-            let out_key = cfg.global.tls_key.clone().unwrap_or(format!("config/certs/{}.key", primary_domain));
-            if let Some(parent) = Path::new(&out_cert).parent() { fs::create_dir_all(parent)?; }
-            if let Some(parent) = Path::new(&out_key).parent() { fs::create_dir_all(parent)?; }
+            if !fullchain.exists() || !privkey.exists() {
+                return Err(anyhow::anyhow!(format!(
+                    "expected cert files not found in {}",
+                    live_dir.display()
+                )));
+            }
+            let out_cert = cfg
+                .global
+                .tls_cert
+                .clone()
+                .unwrap_or(format!("config/certs/{}.crt", primary_domain));
+            let out_key = cfg
+                .global
+                .tls_key
+                .clone()
+                .unwrap_or(format!("config/certs/{}.key", primary_domain));
+            if let Some(parent) = Path::new(&out_cert).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Some(parent) = Path::new(&out_key).parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(&fullchain, &out_cert)?;
             fs::copy(&privkey, &out_key)?;
-            println!("Renewed cert for {} -> {} / {}", primary_domain, out_cert, out_key);
+            println!(
+                "Renewed cert for {} -> {} / {}",
+                primary_domain, out_cert, out_key
+            );
             // reload services (try graceful reload then restart if reload fails)
             let services = vec!["rmail-smtpd", "rmail-imapd", "rmail-web"];
             for svc in services {

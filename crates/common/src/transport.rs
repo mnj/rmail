@@ -19,7 +19,9 @@ struct RawTransportConfig {
 /// [transport]
 /// example.com = "smtp:mail.example.net"
 /// bad.example = "error:550 No such domain"
-pub fn load_transport_map<P: AsRef<Path>>(mail_root: P) -> anyhow::Result<HashMap<String, Transport>> {
+pub fn load_transport_map<P: AsRef<Path>>(
+    mail_root: P,
+) -> anyhow::Result<HashMap<String, Transport>> {
     let path = mail_root.as_ref().join("transport.toml");
     if !path.exists() {
         return Ok(HashMap::new());

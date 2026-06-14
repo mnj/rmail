@@ -37,16 +37,19 @@ static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
 /// Increment an on-disk counter for delivered messages. Uses an atomic write via a temporary file
 /// so that concurrent processes won't corrupt the counter file. This is intentionally simple and
 /// avoids pulling in heavier metrics crates — it's a lightweight local metric for the Web UI.
-async fn increment_delivery_counter() -> Result<()> {
-    let path = std::path::Path::new("/tmp/rmail_delivered.count");
+async fn increment_delivery_counter(mail_root: &std::path::Path) -> Result<()> {
+    let path = rmail_common::runtime::delivered_count_path(mail_root);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let mut count: u64 = 0;
-    if let Ok(s) = tokio::fs::read_to_string(path).await {
+    if let Ok(s) = tokio::fs::read_to_string(&path).await {
         count = s.trim().parse::<u64>().unwrap_or(0);
     }
     count = count.saturating_add(1);
     let tmp = path.with_extension("tmp");
     tokio::fs::write(&tmp, count.to_string()).await?;
-    tokio::fs::rename(&tmp, path).await?;
+    tokio::fs::rename(&tmp, &path).await?;
     Ok(())
 }
 
@@ -98,6 +101,10 @@ async fn main() -> Result<()> {
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
 
     let mail_root = cfg.global.mail_root.clone();
+    rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "smtpd")
+        .context("redirecting logs")?;
+    rmail_common::metrics::persist_prometheus_snapshot(std::path::Path::new(&mail_root), "smtpd")
+        .context("initializing metrics snapshot")?;
     // SQLite DB is the authoritative source for mailboxes and catchalls
     let db_path = cfg.global.db_path.clone();
     if db_path.is_none() {
@@ -195,6 +202,12 @@ async fn run_plain_listener(
     println!("rMail SMTPD listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
+        println!(
+            "Accepted SMTP plaintext connection on {} from {} (starttls_available={})",
+            addr,
+            peer,
+            tls_ctx.is_some()
+        );
         let mail_root = mail_root.clone();
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
@@ -208,6 +221,7 @@ async fn run_plain_listener(
                 Some(peer),
                 false,
                 enforce,
+                true,
             )
             .await
             {
@@ -228,6 +242,7 @@ async fn run_smtps_listener(
     println!("rMail SMTPS listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
+        println!("Accepted SMTPS TCP connection on {} from {}", addr, peer);
         let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
@@ -235,6 +250,7 @@ async fn run_smtps_listener(
         tokio::spawn(async move {
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
+                    println!("SMTPS TLS handshake success peer={}", peer);
                     if let Err(e) = process_stream(
                         Box::new(tls_stream),
                         mail_root,
@@ -243,13 +259,14 @@ async fn run_smtps_listener(
                         Some(peer),
                         true,
                         enforce,
+                        true,
                     )
                     .await
                     {
                         eprintln!("tls client error: {}", e);
                     }
                 }
-                Err(e) => eprintln!("TLS accept error: {}", e),
+                Err(e) => eprintln!("SMTPS TLS accept error from {}: {}", peer, e),
             }
         });
     }
@@ -286,6 +303,7 @@ async fn process_stream(
     peer: Option<SocketAddr>,
     session_encrypted: bool,
     enforce_dmarc: bool,
+    send_greeting: bool,
 ) -> Result<()> {
     // Limits to protect against malformed or malicious clients
     // - MAX_LINE_LEN: per-line limit (RFC 5321 recommends 1000 octets including CRLF)
@@ -294,8 +312,15 @@ async fn process_stream(
     const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
     let mut reader = BufReader::new(stream);
+    println!(
+        "Starting SMTP session peer={:?} encrypted={} tls_configured={} enforce_dmarc={}",
+        peer,
+        session_encrypted,
+        tls_ctx.is_some(),
+        enforce_dmarc
+    );
     let mut line = String::new();
-    {
+    if send_greeting {
         let w = reader.get_mut();
         w.write_all(b"220 rMail SMTPD ready\r\n").await?;
         w.flush().await?;
@@ -331,9 +356,27 @@ async fn process_stream(
             continue;
         }
         let up = cmd.to_ascii_uppercase();
+        println!(
+            "SMTP peer={:?} encrypted={} cmd={:?} authed={:?} mail_from={:?} rcpt_count={}",
+            peer,
+            session_encrypted,
+            cmd,
+            authenticated_user,
+            mail_from,
+            rcpts.len()
+        );
 
         // Simple command parsing; robust parsers can be added later.
         if up.starts_with("HELO") || up.starts_with("EHLO") {
+            println!(
+                "SMTP greeting peer={:?} verb={}",
+                peer,
+                if up.starts_with("EHLO") {
+                    "EHLO"
+                } else {
+                    "HELO"
+                }
+            );
             // Respond with basic capability. If TLS is available advertise STARTTLS.
             let mut resp = String::from("250-Hello\r\n");
             if !session_encrypted && tls_ctx.is_some() {
@@ -352,6 +395,7 @@ async fn process_stream(
             mail_from_seen = false;
             rcpts.clear();
         } else if cmd.trim_start().to_ascii_uppercase().starts_with("AUTH") {
+            println!("SMTP AUTH attempt peer={:?} line={:?}", peer, cmd);
             // Simple AUTH implementation supporting PLAIN and LOGIN (only allowed over TLS in production)
             let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
             let mech = parts
@@ -405,6 +449,7 @@ async fn process_stream(
                             if let Some(dbp) = db_path.as_ref() {
                                 let dbp2 = dbp.clone();
                                 let user_lower = authcid.to_ascii_lowercase();
+                                let user_for_log = user_lower.clone();
                                 match tokio::task::spawn_blocking(move || {
                                     rmail_common::db::get_mailbox(&dbp2, &user_lower)
                                 })
@@ -418,6 +463,10 @@ async fn process_stream(
                                                 Ok(true) => {
                                                     authenticated_user =
                                                         Some(mb.address.to_ascii_lowercase());
+                                                    println!(
+                                                        "SMTP AUTH success peer={:?} user={}",
+                                                        peer, mb.address
+                                                    );
                                                     let w = reader.get_mut();
                                                     w.write_all(
                                                         b"235 Authentication succeeded\r\n",
@@ -429,6 +478,10 @@ async fn process_stream(
                                                     }
                                                 }
                                                 Ok(false) => {
+                                                    println!(
+                                                        "SMTP AUTH bad password peer={:?} user={}",
+                                                        peer, mb.address
+                                                    );
                                                     if let Some(peer_addr) = peer {
                                                         record_auth_failure(peer_addr.ip());
                                                     }
@@ -457,6 +510,10 @@ async fn process_stream(
                                         }
                                     }
                                     Ok(Ok(None)) => {
+                                        println!(
+                                            "SMTP AUTH unknown user peer={:?} authcid={}",
+                                            peer, user_for_log
+                                        );
                                         if let Some(peer_addr) = peer {
                                             record_auth_failure(peer_addr.ip());
                                         }
@@ -516,6 +573,7 @@ async fn process_stream(
                             if let Some(dbp) = db_path.as_ref() {
                                 let dbp2 = dbp.clone();
                                 let user_lower = authcid.to_ascii_lowercase();
+                                let user_for_log = user_lower.clone();
                                 match tokio::task::spawn_blocking(move || {
                                     rmail_common::db::get_mailbox(&dbp2, &user_lower)
                                 })
@@ -529,6 +587,10 @@ async fn process_stream(
                                                 Ok(true) => {
                                                     authenticated_user =
                                                         Some(mb.address.to_ascii_lowercase());
+                                                    println!(
+                                                        "SMTP AUTH success peer={:?} user={}",
+                                                        peer, mb.address
+                                                    );
                                                     let w = reader.get_mut();
                                                     w.write_all(
                                                         b"235 Authentication succeeded\r\n",
@@ -540,6 +602,10 @@ async fn process_stream(
                                                     }
                                                 }
                                                 Ok(false) => {
+                                                    println!(
+                                                        "SMTP AUTH bad password peer={:?} user={}",
+                                                        peer, mb.address
+                                                    );
                                                     if let Some(peer_addr) = peer {
                                                         record_auth_failure(peer_addr.ip());
                                                     }
@@ -568,6 +634,10 @@ async fn process_stream(
                                         }
                                     }
                                     Ok(Ok(None)) => {
+                                        println!(
+                                            "SMTP AUTH unknown user peer={:?} authcid={}",
+                                            peer, user_for_log
+                                        );
                                         if let Some(peer_addr) = peer {
                                             record_auth_failure(peer_addr.ip());
                                         }
@@ -1117,10 +1187,12 @@ async fn process_stream(
                 Some(sender) => {
                     mail_from = sender;
                     mail_from_seen = true;
+                    println!("SMTP MAIL FROM peer={:?} parsed={:?}", peer, mail_from);
                 }
                 None => {
                     mail_from = None;
                     mail_from_seen = false;
+                    println!("SMTP MAIL FROM peer={:?} parse failed", peer);
                 }
             }
             if !mail_from_seen {
@@ -1144,6 +1216,7 @@ async fn process_stream(
             }
             let raw = cmd.get(8..).unwrap_or("");
             if let Some(addr) = extract_addr(raw) {
+                println!("SMTP RCPT TO peer={:?} parsed={}", peer, addr);
                 // DB is authoritative — must be configured at startup
                 if let Some(dbp) = db_path.as_ref() {
                     let dbp2 = dbp.clone();
@@ -1160,6 +1233,12 @@ async fn process_stream(
                                 w.flush().await?;
                             } else {
                                 rcpts.push(addr.clone());
+                                println!(
+                                    "SMTP RCPT accepted peer={:?} rcpt_count={} current_rcpts={:?}",
+                                    peer,
+                                    rcpts.len(),
+                                    rcpts
+                                );
                                 let w = reader.get_mut();
                                 w.write_all(b"250 OK\r\n").await?;
                                 w.flush().await?;
@@ -1177,6 +1256,10 @@ async fn process_stream(
                                 .await
                                 {
                                     Ok(Ok(Some(targets))) => {
+                                        println!(
+                                            "SMTP RCPT alias match peer={:?} rcpt={} targets={:?}",
+                                            peer, addr, targets
+                                        );
                                         // Expand alias targets (allow forwarding even when unauthenticated)
                                         for t in targets {
                                             if rcpts.len() >= MAX_RCPT {
@@ -1201,6 +1284,10 @@ async fn process_stream(
                                         .await
                                         {
                                             Ok(Ok(Some(target))) => {
+                                                println!(
+                                                    "SMTP RCPT catchall match peer={:?} rcpt={} target={}",
+                                                    peer, addr, target
+                                                );
                                                 if rcpts.len() >= MAX_RCPT {
                                                     let w = reader.get_mut();
                                                     w.write_all(b"452 Too many recipients\r\n")
@@ -1298,6 +1385,10 @@ async fn process_stream(
                 w.flush().await?;
                 continue;
             }
+            println!(
+                "SMTP DATA begin peer={:?} mail_from={:?} rcpts={:?}",
+                peer, mail_from, rcpts
+            );
             let w = reader.get_mut();
             w.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
                 .await?;
@@ -1352,6 +1443,12 @@ async fn process_stream(
             if !data_failed {
                 // account bytes received
                 metrics::add_bytes_received(data.len() as u64);
+                println!(
+                    "SMTP DATA received peer={:?} bytes={} rcpts={:?}",
+                    peer,
+                    data.len(),
+                    rcpts
+                );
                 let mut any_accepted = false;
                 let mut any_rejected = false;
                 for rcpt in &rcpts {
@@ -1458,9 +1555,16 @@ async fn process_stream(
                                             elapsed_us,
                                         );
 
-                                        println!("Quarantined to {} -> {:?}", rcpt, path);
+                                        println!(
+                                            "SMTP local quarantine peer={:?} rcpt={} path={:?} bytes={} dmarc={:?}",
+                                            peer,
+                                            rcpt,
+                                            path,
+                                            data.len(),
+                                            dmarc_res
+                                        );
                                         // update simple on-disk metric; failures are non-fatal
-                                        if let Err(e) = increment_delivery_counter().await {
+                                        if let Err(e) = increment_delivery_counter(&mr).await {
                                             eprintln!("metrics update failed: {}", e);
                                         }
                                     }
@@ -1487,9 +1591,16 @@ async fn process_stream(
                                             elapsed_us,
                                         );
 
-                                        println!("Delivered to {} -> {:?}", rcpt, path);
+                                        println!(
+                                            "SMTP local delivery peer={:?} rcpt={} path={:?} bytes={} dmarc={:?}",
+                                            peer,
+                                            rcpt,
+                                            path,
+                                            data.len(),
+                                            dmarc_res
+                                        );
                                         // update simple on-disk metric; failures are non-fatal
-                                        if let Err(e) = increment_delivery_counter().await {
+                                        if let Err(e) = increment_delivery_counter(&mr).await {
                                             eprintln!("metrics update failed: {}", e);
                                         }
                                     }
@@ -1523,7 +1634,13 @@ async fn process_stream(
                                 {
                                     Ok(Ok(path)) => {
                                         any_accepted = true;
-                                        println!("Queued outbound to {} -> {:?}", rcpt, path);
+                                        println!(
+                                            "SMTP outbound queued peer={:?} rcpt={} path={:?} bytes={}",
+                                            peer,
+                                            rcpt,
+                                            path,
+                                            data.len()
+                                        );
                                     }
                                     Ok(Err(e)) => {
                                         any_rejected = true;
@@ -1554,14 +1671,32 @@ async fn process_stream(
                 // Finalize DATA response based on per-recipient outcomes
                 let w = reader.get_mut();
                 if any_accepted {
+                    println!(
+                        "SMTP DATA completed peer={:?} accepted=true rejected={}",
+                        peer, any_rejected
+                    );
                     w.write_all(b"250 OK\r\n").await?;
                 } else if any_rejected {
+                    println!(
+                        "SMTP DATA completed peer={:?} accepted=false rejected=true",
+                        peer
+                    );
                     w.write_all(b"554 5.7.1 Message rejected by policy\r\n")
                         .await?;
                 } else {
+                    println!(
+                        "SMTP DATA completed peer={:?} accepted=false rejected=false",
+                        peer
+                    );
                     w.write_all(b"250 OK\r\n").await?;
                 }
                 w.flush().await?;
+                if let Err(e) = rmail_common::metrics::persist_prometheus_snapshot(
+                    std::path::Path::new(&mail_root),
+                    "smtpd",
+                ) {
+                    eprintln!("metrics snapshot update failed: {}", e);
+                }
             }
 
             // reset transaction state after DATA
@@ -1569,11 +1704,13 @@ async fn process_stream(
             mail_from = None;
             mail_from_seen = false;
         } else if up.starts_with("QUIT") {
+            println!("SMTP QUIT peer={:?}", peer);
             let w = reader.get_mut();
             w.write_all(b"221 Bye\r\n").await?;
             w.flush().await?;
             break;
         } else if up.starts_with("STARTTLS") {
+            println!("SMTP STARTTLS peer={:?}", peer);
             // if we have an acceptor available, perform TLS handshake and continue inside TLS
             if let Some(acceptor_ctx) = tls_ctx {
                 // Signal readiness and pause plain-text protocol processing while the TLS handshake occurs.
@@ -1587,6 +1724,7 @@ async fn process_stream(
                 let inner = reader.into_inner();
                 match acceptor_ctx.acceptor.accept(inner).await {
                     Ok(tls_stream) => {
+                        println!("SMTP STARTTLS handshake success peer={:?}", peer);
                         // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
                         let fut = Box::pin(process_stream(
                             Box::new(tls_stream),
@@ -1596,11 +1734,12 @@ async fn process_stream(
                             peer,
                             true,
                             enforce_dmarc,
+                            false,
                         ));
                         return fut.await;
                     }
                     Err(e) => {
-                        eprintln!("TLS accept error: {}", e);
+                        eprintln!("SMTP STARTTLS handshake failed peer={:?}: {}", peer, e);
                         // We can't continue; return error to close connection
                         return Err(anyhow::anyhow!("TLS accept error: {}", e));
                     }
@@ -1611,11 +1750,19 @@ async fn process_stream(
                 w.flush().await?;
             }
         } else {
+            eprintln!(
+                "SMTP unknown or unsupported command peer={:?} encrypted={} cmd={:?}",
+                peer, session_encrypted, cmd
+            );
             let w = reader.get_mut();
             w.write_all(b"502 Command not implemented\r\n").await?;
             w.flush().await?;
         }
     }
+    println!(
+        "SMTP session peer={:?} encrypted={} closed",
+        peer, session_encrypted
+    );
     Ok(())
 }
 
@@ -1664,6 +1811,7 @@ mod tests {
                 None,
                 false,
                 false,
+                true,
             )
             .await
         });

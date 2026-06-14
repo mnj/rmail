@@ -7,16 +7,16 @@
 //! - For testing only: supports a "plain:..." prefix to store plaintext passwords (DO NOT USE IN PRODUCTION)
 
 use argon2::{Argon2, PasswordVerifier};
-use password_hash::PasswordHash;
 use base64::Engine;
+use password_hash::PasswordHash;
 
-use pbkdf2::pbkdf2;
 use hmac::Hmac;
 use hmac::Mac;
 use hmac::digest::KeyInit;
-use sha2::{Sha256, Digest};
-use rand::rngs::OsRng;
+use pbkdf2::pbkdf2;
 use rand::RngCore;
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 /// Verify a password against a stored password hash.
@@ -55,7 +55,8 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
     pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted_password);
 
     // client_key = HMAC(salted_password, "Client Key")
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac.update(b"Client Key");
     let client_key = mac.finalize().into_bytes();
 
@@ -63,7 +64,8 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
     let stored_key = Sha256::digest(&client_key);
 
     // server_key = HMAC(salted_password, "Server Key")
-    let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&salted_password)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac2.update(b"Server Key");
     let server_key = mac2.finalize().into_bytes();
 
@@ -78,34 +80,64 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
 
 /// Parse a stored SCRAM verifier JSON and return (salt_base64, iterations)
 pub fn parse_scram_verifier(stored_verifier_json: &str) -> anyhow::Result<(String, u32)> {
-    let v: serde_json::Value = serde_json::from_str(stored_verifier_json).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let salt = v.get("salt").and_then(|s| s.as_str()).ok_or_else(|| anyhow::anyhow!("missing salt"))?.to_string();
-    let iter = v.get("iter").and_then(|i| i.as_u64()).ok_or_else(|| anyhow::anyhow!("missing iter"))? as u32;
+    let v: serde_json::Value =
+        serde_json::from_str(stored_verifier_json).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let salt = v
+        .get("salt")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing salt"))?
+        .to_string();
+    let iter = v
+        .get("iter")
+        .and_then(|i| i.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("missing iter"))? as u32;
     Ok((salt, iter))
 }
 
 /// Verify a SCRAM client proof using a stored verifier JSON and the computed auth message.
 /// Returns server_signature bytes on success.
-pub fn verify_scram_proof(stored_verifier_json: &str, auth_message: &str, client_proof_b64: &str) -> anyhow::Result<Vec<u8>> {
-    let v: serde_json::Value = serde_json::from_str(stored_verifier_json).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let stored_key_b64 = v.get("stored_key").and_then(|s| s.as_str()).ok_or_else(|| anyhow::anyhow!("missing stored_key in verifier"))?;
-    let server_key_b64 = v.get("server_key").and_then(|s| s.as_str()).ok_or_else(|| anyhow::anyhow!("missing server_key in verifier"))?;
+pub fn verify_scram_proof(
+    stored_verifier_json: &str,
+    auth_message: &str,
+    client_proof_b64: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let v: serde_json::Value =
+        serde_json::from_str(stored_verifier_json).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let stored_key_b64 = v
+        .get("stored_key")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing stored_key in verifier"))?;
+    let server_key_b64 = v
+        .get("server_key")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing server_key in verifier"))?;
 
-    let stored_key = base64::engine::general_purpose::STANDARD.decode(stored_key_b64).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let server_key = base64::engine::general_purpose::STANDARD.decode(server_key_b64).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let stored_key = base64::engine::general_purpose::STANDARD
+        .decode(stored_key_b64)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let server_key = base64::engine::general_purpose::STANDARD
+        .decode(server_key_b64)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     // client_signature = HMAC(stored_key, auth_message)
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac.update(auth_message.as_bytes());
     let client_signature = mac.finalize().into_bytes();
 
-    let client_proof = base64::engine::general_purpose::STANDARD.decode(client_proof_b64).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let client_proof = base64::engine::general_purpose::STANDARD
+        .decode(client_proof_b64)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     if client_proof.len() != client_signature.len() {
         return Err(anyhow::anyhow!("invalid client proof length"));
     }
 
     // client_key = client_proof XOR client_signature
-    let client_key: Vec<u8> = client_proof.iter().zip(client_signature.iter()).map(|(a,b)| a ^ b).collect();
+    let client_key: Vec<u8> = client_proof
+        .iter()
+        .zip(client_signature.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
 
     // stored_key_check = H(client_key)
     let stored_key_check = Sha256::digest(&client_key);
@@ -115,7 +147,8 @@ pub fn verify_scram_proof(stored_verifier_json: &str, auth_message: &str, client
     }
 
     // server_signature = HMAC(server_key, auth_message)
-    let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&server_key).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&server_key)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     mac2.update(auth_message.as_bytes());
     let server_signature = mac2.finalize().into_bytes();
     Ok(server_signature.to_vec())
@@ -134,8 +167,14 @@ pub fn saslprep(input: &str) -> String {
 /// The client sends base64(gs2_header || channel_binding_data). For tls-server-end-point
 /// channel binding data is the certificate fingerprint (SHA-256 of the DER bytes). This
 /// function returns Ok(()) if the provided c_b64 matches the expected value.
-pub fn verify_tls_server_end_point_binding(gs2_header: &str, server_end_point: &[u8], c_b64: &str) -> anyhow::Result<()> {
-    let decoded = base64::engine::general_purpose::STANDARD.decode(c_b64).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+pub fn verify_tls_server_end_point_binding(
+    gs2_header: &str,
+    server_end_point: &[u8],
+    c_b64: &str,
+) -> anyhow::Result<()> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(c_b64)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let gh = gs2_header.as_bytes();
     if decoded.len() != gh.len() + server_end_point.len() {
         return Err(anyhow::anyhow!("channel-binding length mismatch"));
@@ -144,7 +183,9 @@ pub fn verify_tls_server_end_point_binding(gs2_header: &str, server_end_point: &
         return Err(anyhow::anyhow!("gs2 header mismatch in channel binding"));
     }
     if &decoded[gh.len()..] != server_end_point {
-        return Err(anyhow::anyhow!("server_end_point mismatch in channel binding"));
+        return Err(anyhow::anyhow!(
+            "server_end_point mismatch in channel binding"
+        ));
     }
     Ok(())
 }
@@ -153,8 +194,8 @@ pub fn verify_tls_server_end_point_binding(gs2_header: &str, server_end_point: &
 mod tests {
     use super::*;
     use base64;
-    use pbkdf2::pbkdf2;
     use hmac::Hmac;
+    use pbkdf2::pbkdf2;
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
@@ -171,7 +212,9 @@ mod tests {
         let verifier_json = create_scram_verifier(password, iterations).expect("create verifier");
         let (salt_b64, iter) = parse_scram_verifier(&verifier_json).expect("parse verifier");
         assert_eq!(iter, iterations);
-        let salt = base64::engine::general_purpose::STANDARD.decode(&salt_b64).expect("decode salt");
+        let salt = base64::engine::general_purpose::STANDARD
+            .decode(&salt_b64)
+            .expect("decode salt");
 
         // derive salted_password using PBKDF2-HMAC-SHA256 (must match create_scram_verifier)
         let mut salted_password = [0u8; 32];
@@ -199,11 +242,16 @@ mod tests {
         let client_signature = mac3.finalize().into_bytes();
 
         // client_proof = client_key XOR client_signature
-        let client_proof: Vec<u8> = client_key.iter().zip(client_signature.iter()).map(|(a,b)| a ^ b).collect();
+        let client_proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
         let client_proof_b64 = base64::engine::general_purpose::STANDARD.encode(&client_proof);
 
         // Verify using the library call
-        let server_sig = verify_scram_proof(&verifier_json, auth_message, &client_proof_b64).expect("verify");
+        let server_sig =
+            verify_scram_proof(&verifier_json, auth_message, &client_proof_b64).expect("verify");
 
         // Expected server_signature = HMAC(server_key, auth_message)
         let mut mac4 = <HmacSha256 as KeyInit>::new_from_slice(&server_key).unwrap();
@@ -215,7 +263,7 @@ mod tests {
     #[test]
     fn test_verify_tls_server_end_point_binding_ok() {
         let gs2 = "p=tls-server-end-point,,";
-        let server_ep = vec![1u8,2u8,3u8,4u8,5u8];
+        let server_ep = vec![1u8, 2u8, 3u8, 4u8, 5u8];
         let mut combined = gs2.as_bytes().to_vec();
         combined.extend_from_slice(&server_ep);
         let c_b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
@@ -225,9 +273,9 @@ mod tests {
     #[test]
     fn test_verify_tls_server_end_point_binding_fail() {
         let gs2 = "p=tls-server-end-point,,";
-        let server_ep = vec![1u8,2u8,3u8,4u8,5u8];
+        let server_ep = vec![1u8, 2u8, 3u8, 4u8, 5u8];
         let mut combined = gs2.as_bytes().to_vec();
-        combined.extend_from_slice(&[9u8,9u8,9u8]);
+        combined.extend_from_slice(&[9u8, 9u8, 9u8]);
         let c_b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
         assert!(verify_tls_server_end_point_binding(gs2, &server_ep, &c_b64).is_err());
     }

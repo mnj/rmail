@@ -28,7 +28,9 @@ pub fn match_tlsa_records(recs: &[TlsaRecord], cert_der: &[u8], spki_der: &[u8])
             }
             _ => false,
         };
-        if ok { return true; }
+        if ok {
+            return true;
+        }
     }
     false
 }
@@ -53,7 +55,9 @@ pub fn match_tlsa_usages(recs: &[TlsaRecord], cert_der: &[u8], spki_der: &[u8]) 
             }
             _ => false,
         };
-        if ok { out.push(r.usage); }
+        if ok {
+            out.push(r.usage);
+        }
     }
     out
 }
@@ -67,7 +71,12 @@ mod tests {
         let cert = b"certdata";
         let spki = b"spkibytes";
         let dg = sha256(cert);
-        let rec = TlsaRecord { usage: 3, selector: 0, mtype: 1, data: dg.to_vec() };
+        let rec = TlsaRecord {
+            usage: 3,
+            selector: 0,
+            mtype: 1,
+            data: dg.to_vec(),
+        };
         assert!(match_tlsa_records(&[rec], cert, spki));
     }
 
@@ -75,7 +84,12 @@ mod tests {
     fn test_match_tlsa_direct() {
         let cert = b"mycert";
         let spki = b"spk";
-        let rec = TlsaRecord { usage: 3, selector: 0, mtype: 0, data: cert.to_vec() };
+        let rec = TlsaRecord {
+            usage: 3,
+            selector: 0,
+            mtype: 0,
+            data: cert.to_vec(),
+        };
         assert!(match_tlsa_records(&[rec], cert, spki));
     }
 }

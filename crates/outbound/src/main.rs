@@ -21,6 +21,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStre
 async fn main() -> anyhow::Result<()> {
     let mail_root = std::env::var("RMAIL_MAIL_ROOT").unwrap_or_else(|_| "./mail".to_string());
     let base = PathBuf::from(mail_root);
+    rmail_common::runtime::redirect_stdio_to_log(&base, "outbound").context("redirecting logs")?;
     let maildrop_dir = base.join("outbound").join("maildrop");
     let queue_dir = maildrop_dir.join("queue");
     let inflight_dir = maildrop_dir.join("inflight");
