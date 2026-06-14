@@ -16,6 +16,10 @@ imap_port = 143
 # Web UI defaults to localhost unless explicitly set; dual-stack localhost is supported
 web_listen_addrs = ["127.0.0.1:8080", "[::1]:8080"]
 web_port = 8080
+webmail_listen_addrs = ["127.0.0.1:8081", "[::1]:8081"]
+webmail_port = 8081
+# Set this to a long random value in production.
+# webmail_session_secret = "replace-with-at-least-32-random-bytes"
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "info"

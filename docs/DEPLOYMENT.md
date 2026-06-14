@@ -12,6 +12,7 @@ The daemons are:
 - `rmail_smtpd`: inbound SMTP
 - `rmail_imapd`: IMAP
 - `rmail_web`: admin/status web UI
+- `rmail_webmail`: user-facing mailbox webmail UI
 - `rmail_outbound`: outbound queue worker
 
 Administrative tools:
@@ -50,6 +51,7 @@ sudo install -d -o rmail -g rmail /var/lib/rmail /var/log/rmail /etc/rmail
 sudo install -m 0755 target/release/rmail_smtpd /usr/bin/rmail_smtpd
 sudo install -m 0755 target/release/rmail_imapd /usr/bin/rmail_imapd
 sudo install -m 0755 target/release/rmail_web /usr/bin/rmail_web
+sudo install -m 0755 target/release/rmail_webmail /usr/bin/rmail_webmail
 sudo install -m 0755 target/release/rmail_outbound /usr/bin/rmail_outbound
 sudo install -m 0755 target/release/rmail_ctl /usr/bin/rmail_ctl
 sudo install -m 0755 target/release/rmail_queuectl /usr/bin/rmail_queuectl
@@ -79,6 +81,7 @@ Important:
 sudo install -m 0644 packaging/systemd/rmail_smtpd.service /usr/lib/systemd/system/rmail_smtpd.service
 sudo install -m 0644 packaging/systemd/rmail_imapd.service /usr/lib/systemd/system/rmail_imapd.service
 sudo install -m 0644 packaging/systemd/rmail_web.service /usr/lib/systemd/system/rmail_web.service
+sudo install -m 0644 packaging/systemd/rmail_webmail.service /usr/lib/systemd/system/rmail_webmail.service
 sudo install -m 0644 packaging/systemd/rmail_outbound.service /usr/lib/systemd/system/rmail_outbound.service
 sudo systemctl daemon-reload
 ```
@@ -89,14 +92,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rmail_smtpd.service
 sudo systemctl enable --now rmail_imapd.service
 sudo systemctl enable --now rmail_web.service
+sudo systemctl enable --now rmail_webmail.service
 sudo systemctl enable --now rmail_outbound.service
 ```
 
 ### 7. Verify
 
 ```bash
-sudo systemctl status rmail_smtpd.service rmail_imapd.service rmail_web.service rmail_outbound.service
-journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_outbound.service -n 200 --no-pager
+sudo systemctl status rmail_smtpd.service rmail_imapd.service rmail_web.service rmail_webmail.service rmail_outbound.service
+journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_webmail.service -u rmail_outbound.service -n 200 --no-pager
 ```
 
 ## Notes On Privileged Ports

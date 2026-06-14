@@ -6,6 +6,7 @@ members = [
   "crates/imapd",
   "crates/ctl",
   "crates/webui",
+  "crates/webmail",
   "crates/outbound",
   "crates/queuectl",
   "crates/queue-manager",

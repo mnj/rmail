@@ -40,12 +40,14 @@ mkdir -p \
 install -m 0755 "${RELEASE_DIR}/rmail_smtpd" "${PKG_ROOT}/usr/bin/rmail_smtpd"
 install -m 0755 "${RELEASE_DIR}/rmail_imapd" "${PKG_ROOT}/usr/bin/rmail_imapd"
 install -m 0755 "${RELEASE_DIR}/rmail_web" "${PKG_ROOT}/usr/bin/rmail_web"
+install -m 0755 "${RELEASE_DIR}/rmail_webmail" "${PKG_ROOT}/usr/bin/rmail_webmail"
 install -m 0755 "${RELEASE_DIR}/rmail_outbound" "${PKG_ROOT}/usr/bin/rmail_outbound"
 install -m 0755 "${RELEASE_DIR}/rmail_ctl" "${PKG_ROOT}/usr/bin/rmail_ctl"
 install -m 0755 "${RELEASE_DIR}/rmail_queuectl" "${PKG_ROOT}/usr/bin/rmail_queuectl"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_smtpd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_smtpd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_imapd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_imapd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_web.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_web.service"
+install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_webmail.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_webmail.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_outbound.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_outbound.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail.env" "${PKG_ROOT}/etc/default/rmail"
 install -m 0644 "${ROOT_DIR}/config/example.toml" "${PKG_ROOT}/etc/rmail/config.toml"
@@ -60,7 +62,7 @@ Maintainer: rMail Maintainers <noreply@example.invalid>
 Depends: systemd
 Description: rMail daemons and admin tools
  Minimal Rust mail stack packaged with SMTP, IMAP, web, outbound,
- and administrative CLI binaries for systemd-based Linux distributions.
+ webmail, and administrative CLI binaries for systemd-based Linux distributions.
 EOF
 
 cat > "${PKG_ROOT}/DEBIAN/conffiles" <<'EOF'
@@ -85,6 +87,7 @@ if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
     rmail_smtpd.service \
     rmail_imapd.service \
     rmail_web.service \
+    rmail_webmail.service \
     rmail_outbound.service >/dev/null 2>&1 || true
 fi
 EOF
@@ -93,7 +96,7 @@ chmod 0755 "${PKG_ROOT}/DEBIAN/postinst"
 cat > "${PKG_ROOT}/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
-systemctl stop rmail_outbound.service rmail_web.service rmail_imapd.service rmail_smtpd.service >/dev/null 2>&1 || true
+systemctl stop rmail_outbound.service rmail_webmail.service rmail_web.service rmail_imapd.service rmail_smtpd.service >/dev/null 2>&1 || true
 EOF
 chmod 0755 "${PKG_ROOT}/DEBIAN/prerm"
 

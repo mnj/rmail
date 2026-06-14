@@ -1,0 +1,26 @@
+[Unit]
+Description=rMail webmail UI
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rmail
+Environment=RMAIL_CONFIG=/etc/rmail/config.toml
+WorkingDirectory=/opt/rmail
+ExecStart=/usr/bin/rmail_webmail
+User=rmail
+Group=rmail
+StateDirectory=rmail
+LogsDirectory=rmail
+RuntimeDirectory=rmail
+ConfigurationDirectory=rmail
+ReadWritePaths=/opt/rmail /tmp
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

@@ -319,3 +319,31 @@ pub fn delete_message_by_uid_for_mailbox(
 ) -> anyhow::Result<()> {
     crate::imap_state::delete_message_by_uid(maildir_root, domain, localpart, mailbox, uid)
 }
+
+pub fn move_message_by_uid_for_mailbox(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    source_mailbox: &str,
+    uid: u64,
+    destination_mailbox: &str,
+) -> anyhow::Result<Option<u64>> {
+    crate::imap_state::move_message_by_uid(
+        maildir_root,
+        domain,
+        localpart,
+        source_mailbox,
+        uid,
+        destination_mailbox,
+    )
+}
+
+pub fn delete_or_trash_message_by_uid_for_mailbox(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    uid: u64,
+) -> anyhow::Result<()> {
+    crate::imap_state::delete_or_trash_message_by_uid(maildir_root, domain, localpart, mailbox, uid)
+}

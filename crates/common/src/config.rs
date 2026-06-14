@@ -20,6 +20,11 @@ pub struct Global {
     /// Web UI bind addresses; if unset, web_port binds 127.0.0.1 only
     pub web_listen_addrs: Option<Vec<String>>,
     pub web_port: Option<u16>,
+    /// User webmail bind addresses; if unset, webmail_port binds 127.0.0.1 only
+    pub webmail_listen_addrs: Option<Vec<String>>,
+    pub webmail_port: Option<u16>,
+    /// Secret used to sign webmail session cookies.
+    pub webmail_session_secret: Option<String>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub log_level: Option<String>,
