@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
             acme_challenge_dir: None,
             enforce_dmarc: None,
         },
+        security: rmail_common::config::SecurityConfig::default(),
     });
     let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "webmail")

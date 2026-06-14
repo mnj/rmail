@@ -7,7 +7,12 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
-use rmail_common::{auth, config::Config, maildir, metrics};
+use rmail_common::{
+    auth,
+    config::{Config, ScannerFailureAction, SecurityConfig},
+    maildir, metrics,
+    scanner::{ScanAction, ScanEnvelope},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -149,6 +154,7 @@ async fn main() -> Result<()> {
 
     // DMARC enforcement flag
     let enforce_dmarc = cfg.global.enforce_dmarc.unwrap_or(false);
+    let security = Arc::new(cfg.security.clone());
 
     // spawn plain SMTP listeners
     for addr in listen_addrs.iter() {
@@ -157,9 +163,17 @@ async fn main() -> Result<()> {
         let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
+        let security = security.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone, enforce).await
+            if let Err(e) = run_plain_listener(
+                &addr,
+                mail_root_clone,
+                acceptor_clone,
+                db_clone,
+                enforce,
+                security,
+            )
+            .await
             {
                 eprintln!("Listener {} failed: {}", addr, e);
             }
@@ -180,10 +194,17 @@ async fn main() -> Result<()> {
                 let ctx_clone = s_ctx.clone();
                 let db_clone = db_path.clone();
                 let enforce = enforce_dmarc;
+                let security = security.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        run_smtps_listener(&addr, ctx_clone, mail_root_clone, db_clone, enforce)
-                            .await
+                    if let Err(e) = run_smtps_listener(
+                        &addr,
+                        ctx_clone,
+                        mail_root_clone,
+                        db_clone,
+                        enforce,
+                        security,
+                    )
+                    .await
                     {
                         eprintln!("SMTPS {} failed: {}", addr, e);
                     }
@@ -206,6 +227,7 @@ async fn run_plain_listener(
     tls_ctx: Option<Arc<tls::TlsContext>>,
     db_path: Option<String>,
     enforce_dmarc: bool,
+    security: Arc<SecurityConfig>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPD listening on {}", addr);
@@ -221,6 +243,7 @@ async fn run_plain_listener(
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
+        let security = security.clone();
         tokio::spawn(async move {
             if let Err(e) = process_stream(
                 Box::new(stream),
@@ -231,6 +254,7 @@ async fn run_plain_listener(
                 false,
                 enforce,
                 true,
+                security,
             )
             .await
             {
@@ -246,6 +270,7 @@ async fn run_smtps_listener(
     mail_root: String,
     db_path: Option<String>,
     enforce_dmarc: bool,
+    security: Arc<SecurityConfig>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("rMail SMTPS listening on {}", addr);
@@ -256,6 +281,7 @@ async fn run_smtps_listener(
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
+        let security = security.clone();
         tokio::spawn(async move {
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
@@ -269,6 +295,7 @@ async fn run_smtps_listener(
                         true,
                         enforce,
                         true,
+                        security,
                     )
                     .await
                     {
@@ -522,6 +549,7 @@ async fn process_stream(
     session_encrypted: bool,
     enforce_dmarc: bool,
     send_greeting: bool,
+    security: Arc<SecurityConfig>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     println!(
@@ -1726,7 +1754,7 @@ async fn process_stream(
                     .await?;
                 w.flush().await?;
 
-                let data = match read_smtp_data(&mut reader).await? {
+                let mut data = match read_smtp_data(&mut reader).await? {
                     DataReadResult::Complete(mut data) => {
                         let mut traced =
                             received_header(peer, helo_name.as_deref(), session_encrypted);
@@ -1760,6 +1788,78 @@ async fn process_stream(
                     }
                     DataReadResult::Eof => break,
                 };
+
+                let mut scanner_quarantine = false;
+                if security.scanners_enabled() {
+                    let envelope = ScanEnvelope {
+                        mail_from: mail_from.clone(),
+                        rcpts: rcpts.clone(),
+                        peer_ip: peer.map(|p| p.ip()),
+                        helo: helo_name.clone(),
+                        hostname: helo_name.clone(),
+                        user: authenticated_user.clone(),
+                    };
+                    match rmail_common::scanner::scan_message(&security, &data, &envelope).await {
+                        Ok(verdict) => match verdict.action {
+                            ScanAction::Clean => {
+                                if !verdict.headers.is_empty() {
+                                    data = rmail_common::scanner::prepend_scan_headers(
+                                        &data,
+                                        &verdict.headers,
+                                    );
+                                }
+                            }
+                            ScanAction::Quarantine => {
+                                scanner_quarantine = true;
+                                data = rmail_common::scanner::prepend_scan_headers(
+                                    &data,
+                                    &verdict.headers,
+                                );
+                            }
+                            ScanAction::Reject => {
+                                println!(
+                                    "SMTP scanner rejected peer={:?} reason={:?}",
+                                    peer, verdict.reason
+                                );
+                                let w = reader.get_mut();
+                                w.write_all(b"554 5.7.1 Message rejected: malware detected\r\n")
+                                    .await?;
+                                w.flush().await?;
+                                rcpts.clear();
+                                mail_from = None;
+                                mail_from_seen = false;
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("SMTP scanner error peer={:?}: {}", peer, e);
+                            let w = reader.get_mut();
+                            match security.scanner_failure_action {
+                                ScannerFailureAction::Accept => {}
+                                ScannerFailureAction::Reject => {
+                                    w.write_all(
+                                        b"554 5.7.1 Message rejected: scanner unavailable\r\n",
+                                    )
+                                    .await?;
+                                    w.flush().await?;
+                                    rcpts.clear();
+                                    mail_from = None;
+                                    mail_from_seen = false;
+                                    continue;
+                                }
+                                ScannerFailureAction::Tempfail => {
+                                    w.write_all(b"451 4.7.1 Message scanner unavailable\r\n")
+                                        .await?;
+                                    w.flush().await?;
+                                    rcpts.clear();
+                                    mail_from = None;
+                                    mail_from_seen = false;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Attempt delivery to each recipient; errors are logged and yield temporary failure response
                 {
@@ -1865,7 +1965,8 @@ async fn process_stream(
                                 // measure per-recipient delivery latency
                                 let start = std::time::Instant::now();
                                 // If DMARC recommends quarantine, deliver to quarantine Maildir
-                                if dmarc_res.as_deref() == Some("quarantine") {
+                                if scanner_quarantine || dmarc_res.as_deref() == Some("quarantine")
+                                {
                                     match maildir::deliver_quarantine(&mr, &domain, &local, &data) {
                                         Ok(path) => {
                                             any_accepted = true;
@@ -2088,6 +2189,7 @@ async fn process_stream(
                                 true,
                                 enforce_dmarc,
                                 false,
+                                security.clone(),
                             ));
                             return fut.await;
                         }
@@ -2134,8 +2236,11 @@ async fn process_stream(
 #[cfg(test)]
 mod tests {
     use super::{MAX_MESSAGE_BYTES, parse_mail_from_arg, process_stream};
+    use rmail_common::config::{ScannerFailureAction, SecurityConfig};
     use std::path::Path;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, duplex};
+    use tokio::net::UnixListener;
 
     fn setup_mailbox() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let td = tempfile::tempdir().expect("tempdir");
@@ -2154,6 +2259,14 @@ mod tests {
     }
 
     async fn run_session(input: Vec<u8>, capacity: usize) -> (Vec<String>, tempfile::TempDir) {
+        run_session_with_security(input, capacity, SecurityConfig::default()).await
+    }
+
+    async fn run_session_with_security(
+        input: Vec<u8>,
+        capacity: usize,
+        security: SecurityConfig,
+    ) -> (Vec<String>, tempfile::TempDir) {
         let (td, mail_root, db_path) = setup_mailbox();
         let (client, server) = duplex(capacity);
         let server_task = tokio::spawn(async move {
@@ -2166,6 +2279,7 @@ mod tests {
                 false,
                 false,
                 true,
+                Arc::new(security),
             )
             .await
         });
@@ -2192,6 +2306,25 @@ mod tests {
         }
         server_task.await.expect("join").expect("server");
         (responses, td)
+    }
+
+    async fn read_clamav_stream<S: AsyncReadExt + Unpin>(stream: &mut S) -> Vec<u8> {
+        let mut command = vec![0u8; b"zINSTREAM\0".len()];
+        stream.read_exact(&mut command).await.expect("command");
+        assert_eq!(command, b"zINSTREAM\0");
+        let mut body = Vec::new();
+        loop {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.expect("chunk len");
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len == 0 {
+                break;
+            }
+            let start = body.len();
+            body.resize(start + len, 0);
+            stream.read_exact(&mut body[start..]).await.expect("chunk");
+        }
+        body
     }
 
     #[test]
@@ -2229,6 +2362,102 @@ mod tests {
         );
         assert!(body.windows(8).any(|w| w == b"binary:\xff"));
         assert!(Path::new(&entries[0]).exists());
+    }
+
+    #[tokio::test]
+    async fn disabled_scanners_preserve_delivery() {
+        let (responses, td) = run_session_with_security(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbody\r\n.\r\nQUIT\r\n".to_vec(),
+            16 * 1024,
+            SecurityConfig {
+                clamav_enabled: false,
+                rspamd_enabled: false,
+                ..SecurityConfig::default()
+            },
+        )
+        .await;
+        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
+        let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
+        assert_eq!(
+            std::fs::read_dir(delivered_dir).expect("maildir").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_size_limit_tempfails_by_default() {
+        let (responses, td) = run_session_with_security(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbody\r\n.\r\nQUIT\r\n".to_vec(),
+            16 * 1024,
+            SecurityConfig {
+                rspamd_enabled: true,
+                scanner_max_message_bytes: 1,
+                ..SecurityConfig::default()
+            },
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|r| r.starts_with("451 4.7.1 Message scanner unavailable"))
+        );
+        let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
+        assert!(!delivered_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn scanner_size_limit_accept_policy_delivers() {
+        let (responses, td) = run_session_with_security(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbody\r\n.\r\nQUIT\r\n".to_vec(),
+            16 * 1024,
+            SecurityConfig {
+                rspamd_enabled: true,
+                scanner_max_message_bytes: 1,
+                scanner_failure_action: ScannerFailureAction::Accept,
+                ..SecurityConfig::default()
+            },
+        )
+        .await;
+        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
+        let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
+        assert_eq!(
+            std::fs::read_dir(delivered_dir).expect("maildir").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn clamav_infected_rejects_data_and_does_not_deliver() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let sock = td.path().join("clamd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let body = read_clamav_stream(&mut stream).await;
+            assert!(body.starts_with(b"Received:"));
+            stream
+                .write_all(b"stream: Eicar-Test-Signature FOUND\0")
+                .await
+                .expect("write");
+        });
+        let (responses, mail_td) = run_session_with_security(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbody\r\n.\r\nQUIT\r\n".to_vec(),
+            16 * 1024,
+            SecurityConfig {
+                clamav_enabled: true,
+                clamav_endpoint: format!("unix:{}", sock.display()),
+                ..SecurityConfig::default()
+            },
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|r| r.starts_with("554 5.7.1 Message rejected: malware detected"))
+        );
+        let delivered_dir = mail_td.path().join("mail/example.test/user/Maildir/new");
+        assert!(!delivered_dir.exists());
+        server.await.expect("server");
     }
 
     #[tokio::test]

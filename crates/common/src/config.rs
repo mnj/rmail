@@ -43,6 +43,88 @@ pub struct Global {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub global: Global,
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScannerFailureAction {
+    Tempfail,
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SecurityConfig {
+    #[serde(default = "default_scanner_failure_action")]
+    pub scanner_failure_action: ScannerFailureAction,
+    #[serde(default = "default_scanner_timeout_ms")]
+    pub scanner_timeout_ms: u64,
+    #[serde(default = "default_scanner_max_message_bytes")]
+    pub scanner_max_message_bytes: usize,
+    #[serde(default)]
+    pub clamav_enabled: bool,
+    #[serde(default = "default_clamav_endpoint")]
+    pub clamav_endpoint: String,
+    #[serde(default)]
+    pub rspamd_enabled: bool,
+    #[serde(default = "default_rspamd_url")]
+    pub rspamd_url: String,
+    #[serde(default = "default_rspamd_quarantine_actions")]
+    pub rspamd_quarantine_actions: Vec<String>,
+    #[serde(default)]
+    pub rspamd_reject_actions: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            scanner_failure_action: default_scanner_failure_action(),
+            scanner_timeout_ms: default_scanner_timeout_ms(),
+            scanner_max_message_bytes: default_scanner_max_message_bytes(),
+            clamav_enabled: false,
+            clamav_endpoint: default_clamav_endpoint(),
+            rspamd_enabled: false,
+            rspamd_url: default_rspamd_url(),
+            rspamd_quarantine_actions: default_rspamd_quarantine_actions(),
+            rspamd_reject_actions: Vec::new(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    pub fn scanners_enabled(&self) -> bool {
+        self.clamav_enabled || self.rspamd_enabled
+    }
+}
+
+fn default_scanner_failure_action() -> ScannerFailureAction {
+    ScannerFailureAction::Tempfail
+}
+
+fn default_scanner_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_scanner_max_message_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+fn default_clamav_endpoint() -> String {
+    "unix:/run/clamav/clamd.ctl".to_string()
+}
+
+fn default_rspamd_url() -> String {
+    "http://127.0.0.1:11333/checkv2".to_string()
+}
+
+fn default_rspamd_quarantine_actions() -> Vec<String> {
+    vec![
+        "add header".to_string(),
+        "rewrite subject".to_string(),
+        "reject".to_string(),
+    ]
 }
 
 impl Config {
@@ -50,5 +132,53 @@ impl Config {
         let s = fs::read_to_string(path)?;
         let cfg: Config = toml::from_str(&s)?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, ScannerFailureAction};
+
+    #[test]
+    fn security_defaults_when_absent() {
+        let cfg: Config = toml::from_str("[global]\nmail_root = \"mail\"\n").expect("config");
+        assert_eq!(
+            cfg.security.scanner_failure_action,
+            ScannerFailureAction::Tempfail
+        );
+        assert_eq!(cfg.security.scanner_timeout_ms, 5000);
+        assert_eq!(cfg.security.scanner_max_message_bytes, 10 * 1024 * 1024);
+        assert!(!cfg.security.clamav_enabled);
+        assert!(!cfg.security.rspamd_enabled);
+        assert!(!cfg.security.scanners_enabled());
+    }
+
+    #[test]
+    fn security_parses_enums_and_values() {
+        let cfg: Config = toml::from_str(
+            r#"
+[global]
+mail_root = "mail"
+
+[security]
+scanner_failure_action = "reject"
+scanner_timeout_ms = 42
+scanner_max_message_bytes = 99
+clamav_enabled = true
+clamav_endpoint = "tcp:127.0.0.1:3310"
+rspamd_enabled = true
+rspamd_url = "http://localhost:11333/checkv2"
+rspamd_quarantine_actions = ["add header"]
+rspamd_reject_actions = ["reject"]
+"#,
+        )
+        .expect("config");
+        assert_eq!(
+            cfg.security.scanner_failure_action,
+            ScannerFailureAction::Reject
+        );
+        assert_eq!(cfg.security.scanner_timeout_ms, 42);
+        assert_eq!(cfg.security.scanner_max_message_bytes, 99);
+        assert!(cfg.security.scanners_enabled());
     }
 }

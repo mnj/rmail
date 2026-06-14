@@ -9,6 +9,7 @@ pub mod maildir;
 pub mod metrics;
 pub mod outbound;
 pub mod runtime;
+pub mod scanner;
 pub mod transport;
 
 pub fn hello() -> &'static str {

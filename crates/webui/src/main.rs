@@ -1123,6 +1123,7 @@ async fn main() -> Result<()> {
                 db_path: None,
                 enforce_dmarc: None,
             },
+            security: rmail_common::config::SecurityConfig::default(),
         }
     });
     let mail_root = PathBuf::from(cfg.global.mail_root);

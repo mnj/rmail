@@ -32,5 +32,16 @@ db_path = "config/rmail.db"
 # directory used to serve ACME http-01 challenges (used by automated cert managers)
 acme_challenge_dir = "config/acme-challenges"
 
+[security]
+scanner_failure_action = "tempfail" # tempfail | accept | reject
+scanner_timeout_ms = 5000
+scanner_max_message_bytes = 10485760
+clamav_enabled = false
+clamav_endpoint = "unix:/run/clamav/clamd.ctl" # or tcp:127.0.0.1:3310
+rspamd_enabled = false
+rspamd_url = "http://127.0.0.1:11333/checkv2"
+rspamd_quarantine_actions = ["add header", "rewrite subject", "reject"]
+rspamd_reject_actions = []
+
 # Experimental: enable DANE/TLSA verification for outbound deliveries via environment variable
 # RMAIL_ENABLE_DANE=1  (set to 0 or false to disable)
