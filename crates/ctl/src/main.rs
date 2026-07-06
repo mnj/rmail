@@ -11,6 +11,14 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const RMAIL_SYSTEMD_UNITS: &[&str] = &[
+    "rmail_smtpd.service",
+    "rmail_imapd.service",
+    "rmail_web.service",
+    "rmail_webmail.service",
+    "rmail_outbound.service",
+];
+
 /// rmail_ctl: minimal control CLI for managing mailboxes and generating password hashes.
 #[derive(Parser)]
 #[command(name = "rmail_ctl")]
@@ -87,6 +95,35 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Control rMail systemd services
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Start rMail services
+    Start(ServiceCommandOptions),
+    /// Stop rMail services
+    Stop(ServiceCommandOptions),
+    /// Restart rMail services
+    Restart(ServiceCommandOptions),
+    /// Reload rMail services, falling back to restart when reload is unsupported
+    Reload(ServiceCommandOptions),
+    /// Show rMail service status
+    Status(ServiceCommandOptions),
+}
+
+#[derive(clap::Args, Clone)]
+struct ServiceCommandOptions {
+    /// Restrict operation to one or more unit names or short names, e.g. smtpd or rmail_smtpd.service
+    #[arg(long = "unit", value_name = "UNIT")]
+    units: Vec<String>,
+    /// Print systemctl commands without running them
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn main() -> Result<()> {
@@ -313,6 +350,13 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Service { action } => match action {
+            ServiceAction::Start(opts) => run_service_action("start", opts)?,
+            ServiceAction::Stop(opts) => run_service_action("stop", opts)?,
+            ServiceAction::Restart(opts) => run_service_action("restart", opts)?,
+            ServiceAction::Reload(opts) => reload_services(opts)?,
+            ServiceAction::Status(opts) => run_service_action("status", opts)?,
+        },
         Commands::ObtainCert {
             domains,
             email,
@@ -469,23 +513,126 @@ fn main() -> Result<()> {
                 "Renewed cert for {} -> {} / {}",
                 primary_domain, out_cert, out_key
             );
-            // reload services (try graceful reload then restart if reload fails)
-            let services = vec!["rmail-smtpd", "rmail-imapd", "rmail-web"];
-            for svc in services {
-                let r = Command::new("systemctl").arg("reload").arg(svc).status();
-                match r {
-                    Ok(s) if s.success() => println!("reloaded {}", svc),
-                    _ => {
-                        let r2 = Command::new("systemctl").arg("restart").arg(svc).status();
-                        match r2 {
-                            Ok(s2) if s2.success() => println!("restarted {}", svc),
-                            Ok(s2) => eprintln!("failed to reload/restart {}: exit {}", svc, s2),
-                            Err(e) => eprintln!("failed to run systemctl for {}: {}", svc, e),
-                        }
-                    }
-                }
+            reload_services(ServiceCommandOptions {
+                units: vec![
+                    "smtpd".to_string(),
+                    "imapd".to_string(),
+                    "web".to_string(),
+                    "webmail".to_string(),
+                ],
+                dry_run: false,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn selected_units(opts: &ServiceCommandOptions, reverse: bool) -> Result<Vec<&'static str>> {
+    let mut units = if opts.units.is_empty() {
+        RMAIL_SYSTEMD_UNITS.to_vec()
+    } else {
+        opts.units
+            .iter()
+            .map(|u| normalize_unit_name(u))
+            .collect::<Result<Vec<_>>>()?
+    };
+    if reverse {
+        units.reverse();
+    }
+    Ok(units)
+}
+
+fn normalize_unit_name(name: &str) -> Result<&'static str> {
+    let trimmed = name.trim();
+    for unit in RMAIL_SYSTEMD_UNITS {
+        if trimmed == *unit {
+            return Ok(unit);
+        }
+        if let Some(short) = unit
+            .strip_prefix("rmail_")
+            .and_then(|s| s.strip_suffix(".service"))
+        {
+            if trimmed == short {
+                return Ok(unit);
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "unknown rMail service {trimmed:?}; expected one of: {}",
+        RMAIL_SYSTEMD_UNITS.join(", ")
+    ))
+}
+
+fn run_service_action(action: &str, opts: ServiceCommandOptions) -> Result<()> {
+    let units = selected_units(&opts, action == "stop")?;
+    for unit in units {
+        run_systemctl(action, unit, opts.dry_run)?;
+    }
+    Ok(())
+}
+
+fn reload_services(opts: ServiceCommandOptions) -> Result<()> {
+    let units = selected_units(&opts, false)?;
+    for unit in units {
+        if opts.dry_run {
+            println!("systemctl reload {unit}");
+            println!("systemctl restart {unit} # fallback if reload fails");
+            continue;
+        }
+        let status = Command::new("systemctl").arg("reload").arg(unit).status();
+        match status {
+            Ok(s) if s.success() => println!("reloaded {unit}"),
+            Ok(_) | Err(_) => {
+                eprintln!("reload unsupported or failed for {unit}; restarting");
+                run_systemctl("restart", unit, false)?;
             }
         }
     }
     Ok(())
+}
+
+fn run_systemctl(action: &str, unit: &str, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("systemctl {action} {unit}");
+        return Ok(());
+    }
+    let status = Command::new("systemctl")
+        .arg(action)
+        .arg(unit)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run systemctl {action} {unit}: {e}"))?;
+    if status.success() {
+        println!("{action} {unit}: ok");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "systemctl {action} {unit} exited with {status}"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServiceCommandOptions, normalize_unit_name, selected_units};
+
+    #[test]
+    fn normalizes_service_short_names() {
+        assert_eq!(normalize_unit_name("smtpd").unwrap(), "rmail_smtpd.service");
+        assert_eq!(
+            normalize_unit_name("rmail_webmail.service").unwrap(),
+            "rmail_webmail.service"
+        );
+        assert!(normalize_unit_name("unknown").is_err());
+    }
+
+    #[test]
+    fn stop_order_is_reversed() {
+        let opts = ServiceCommandOptions {
+            units: Vec::new(),
+            dry_run: false,
+        };
+        let units = selected_units(&opts, true).unwrap();
+        assert_eq!(units.first().copied(), Some("rmail_outbound.service"));
+        assert_eq!(units.last().copied(), Some("rmail_smtpd.service"));
+    }
 }

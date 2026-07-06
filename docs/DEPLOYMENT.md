@@ -17,7 +17,7 @@ The daemons are:
 
 Administrative tools:
 
-- `rmail_ctl`: mailbox/password/cert management CLI
+- `rmail_ctl`: mailbox/password/cert/service management CLI
 - `rmail_queuectl`: queue and alias management CLI
 
 The runtime model is:
@@ -96,10 +96,27 @@ sudo systemctl enable --now rmail_webmail.service
 sudo systemctl enable --now rmail_outbound.service
 ```
 
+After the units are enabled, `rmail_ctl` can control the whole service set:
+
+```bash
+sudo rmail_ctl service start
+sudo rmail_ctl service stop
+sudo rmail_ctl service restart
+sudo rmail_ctl service reload
+sudo rmail_ctl service status
+```
+
+To operate on a subset, pass short names or full unit names:
+
+```bash
+sudo rmail_ctl service restart --unit smtpd --unit imapd
+sudo rmail_ctl service stop --unit rmail_web.service
+```
+
 ### 7. Verify
 
 ```bash
-sudo systemctl status rmail_smtpd.service rmail_imapd.service rmail_web.service rmail_webmail.service rmail_outbound.service
+sudo rmail_ctl service status
 journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_webmail.service -u rmail_outbound.service -n 200 --no-pager
 ```
 
