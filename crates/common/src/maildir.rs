@@ -232,6 +232,22 @@ pub fn delete_mailbox(
     crate::imap_state::delete_folder(maildir_root, domain, localpart, mailbox)
 }
 
+pub fn rename_mailbox(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    source_mailbox: &str,
+    destination_mailbox: &str,
+) -> anyhow::Result<()> {
+    crate::imap_state::rename_folder(
+        maildir_root,
+        domain,
+        localpart,
+        source_mailbox,
+        destination_mailbox,
+    )
+}
+
 pub fn set_mailbox_subscription(
     maildir_root: &Path,
     domain: &str,

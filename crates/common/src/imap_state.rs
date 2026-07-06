@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -214,6 +215,51 @@ pub fn delete_folder(
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
+    Ok(())
+}
+
+pub fn rename_folder(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    source_mailbox: &str,
+    destination_mailbox: &str,
+) -> Result<()> {
+    let source = normalize_mailbox_name(source_mailbox)?;
+    let destination = normalize_mailbox_name(destination_mailbox)?;
+    if source.eq_ignore_ascii_case("INBOX") {
+        anyhow::bail!("cannot rename INBOX");
+    }
+    if source.eq_ignore_ascii_case(&destination) {
+        return Ok(());
+    }
+
+    let conn = open_account(maildir_root, domain, localpart)?;
+    let Some(source_id) = folder_id(&conn, &source)? else {
+        anyhow::bail!("source mailbox does not exist");
+    };
+    if folder_id(&conn, &destination)?.is_some() {
+        anyhow::bail!("destination mailbox already exists");
+    }
+
+    let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
+    let destination_dir = mailbox_dir(maildir_root, domain, localpart, &destination)?;
+    if !source_dir.is_dir() {
+        anyhow::bail!("source mailbox directory does not exist");
+    }
+    if destination_dir.exists() {
+        anyhow::bail!("destination mailbox directory already exists");
+    }
+    fs::rename(&source_dir, &destination_dir).with_context(|| {
+        format!(
+            "renaming mailbox {} to {}",
+            source_mailbox, destination_mailbox
+        )
+    })?;
+    conn.execute(
+        "UPDATE folders SET name = ?1, path = ?2 WHERE id = ?3",
+        params![destination, folder_path(&destination)?, source_id],
+    )?;
     Ok(())
 }
 
@@ -593,6 +639,61 @@ pub fn list_message_metadata(
     Ok(load_folder(maildir_root, domain, localpart, mailbox)?.1)
 }
 
+pub fn append_message(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    data: &[u8],
+    flags: Vec<String>,
+) -> Result<(u64, u64)> {
+    let name = normalize_mailbox_name(mailbox)?;
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    if folder_id(&conn, &name)?.is_none() {
+        anyhow::bail!("destination mailbox does not exist");
+    }
+    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+
+    let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
+    ensure_maildir(&dir)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let filename = format!(
+        "{}.{}.{}.append",
+        now.as_nanos(),
+        std::process::id(),
+        rand::random::<u64>()
+    );
+    let tmp_path = dir.join("tmp").join(&filename);
+    let new_path = dir.join("new").join(&filename);
+    let mut file = fs::File::create(&tmp_path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    fs::rename(&tmp_path, &new_path)?;
+
+    let tx = conn.transaction()?;
+    let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
+    let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
+    let uid = folder.uidnext;
+    tx.execute(
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
+         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6)",
+        params![
+            folder_id,
+            filename,
+            uid as i64,
+            flags_to_text(&flags)?,
+            data.len() as i64,
+            now.as_secs() as i64
+        ],
+    )?;
+    tx.execute(
+        "UPDATE folders SET uidnext = ?1 WHERE id = ?2",
+        params![uid.saturating_add(1) as i64, folder_id],
+    )?;
+    tx.commit()?;
+    Ok((folder.uidvalidity, uid))
+}
+
 fn ensure_folder(
     conn: &Connection,
     maildir_root: &Path,
@@ -914,6 +1015,40 @@ mod tests {
     }
 
     #[test]
+    fn append_message_preserves_bytes_flags_and_requires_existing_folder() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let raw = b"Subject: appended\r\nX-Raw: \xff\r\n\r\nbody\x00bytes\r\n";
+        let (uidvalidity, uid) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "Drafts",
+            raw,
+            vec!["\\Seen".to_string(), "\\Draft".to_string()],
+        )
+        .unwrap();
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "Drafts").unwrap();
+        assert_eq!(folder.uidvalidity, uidvalidity);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].uid, uid);
+        assert_eq!(messages[0].flags, vec!["\\Seen", "\\Draft"]);
+        assert_eq!(fs::read(&messages[0].path).unwrap(), raw);
+
+        assert!(
+            append_message(
+                td.path(),
+                "example.test",
+                "user",
+                "Missing",
+                raw,
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn delete_moves_to_trash_then_removes_from_trash() {
         let td = tempfile::tempdir().unwrap();
         let inbox = account_maildir(td.path(), "example.test", "user");
@@ -951,5 +1086,39 @@ mod tests {
         assert!(!subscribed.iter().any(|f| f.name == "Projects"));
         delete_folder(td.path(), "example.test", "user", "Projects").unwrap();
         assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+    }
+
+    #[test]
+    fn rename_folder_preserves_messages_flags_and_subscription() {
+        let td = tempfile::tempdir().unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        let projects = mailbox_dir(td.path(), "example.test", "user", "Projects").unwrap();
+        write_msg(&projects, "a", b"Subject: a\r\n\r\nbody");
+        let (_, messages) = load_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        set_uid_flags(
+            td.path(),
+            "example.test",
+            "user",
+            "Projects",
+            messages[0].uid,
+            vec!["\\Seen".to_string()],
+        )
+        .unwrap();
+        set_subscription(td.path(), "example.test", "user", "Projects", false).unwrap();
+
+        rename_folder(td.path(), "example.test", "user", "Projects", "Renamed").unwrap();
+        assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+        assert!(folder_exists(td.path(), "example.test", "user", "Renamed").unwrap());
+        let (folder, renamed) = load_folder(td.path(), "example.test", "user", "Renamed").unwrap();
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].uid, messages[0].uid);
+        assert_eq!(renamed[0].flags, vec!["\\Seen"]);
+        assert!(!folder.subscribed);
+        assert_eq!(
+            fs::read(&renamed[0].path).unwrap(),
+            b"Subject: a\r\n\r\nbody"
+        );
+
+        assert!(rename_folder(td.path(), "example.test", "user", "INBOX", "Nope").is_err());
     }
 }

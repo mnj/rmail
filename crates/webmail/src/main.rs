@@ -1232,7 +1232,7 @@ const EMBEDDED_SPA: &str = r#"<!doctype html>
       .folders button{width:100%;display:flex;justify-content:space-between;border:0;background:transparent;color:inherit;border-radius:6px;padding:9px 10px}.folders .active,.folders button:hover{background:#38505c}
       .list{display:grid;grid-template-rows:58px minmax(0,1fr);border-right:1px solid #d8dee2;min-width:0;min-height:0;background:#fff}.bar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid #d8dee2}.bar input{flex:1;min-width:0;background:#f3f6f7}
       .list>div{min-height:0;overflow:auto}.msg{display:grid;grid-template-columns:140px 1fr;gap:4px 12px;width:100%;border:0;border-bottom:1px solid #e3e8eb;background:#fff;text-align:left;padding:12px}.msg.unread{font-weight:700}.msg small{grid-column:2;color:#667780;font-weight:400;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-      .reader{min-height:0;background:#fff;padding:24px;overflow:auto}.reader-actions{display:flex;gap:8px;margin-bottom:18px}.reader pre{white-space:pre-wrap;font-family:inherit;line-height:1.5}.html-message{display:block;width:100%;min-height:480px;border:0;background:#fff}.muted{color:#667780}
+      .reader{min-height:0;background:#fff;padding:24px;overflow:hidden;display:flex;flex-direction:column}.reader-actions{display:flex;gap:8px;margin-bottom:18px}.reader pre{flex:1 1 auto;min-height:0;overflow:auto;white-space:pre-wrap;font-family:inherit;line-height:1.5}.html-message{flex:1 1 auto;min-height:0;width:100%;height:100%;border:0;background:#fff}.muted{color:#667780}
       @media(max-width:820px){.app{display:block}.folders,.list,.reader{height:auto;min-height:33vh}.msg{grid-template-columns:1fr}.msg small{grid-column:1}}
     </style>
   </head>

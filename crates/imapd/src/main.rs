@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use once_cell::sync::Lazy;
+use rand::RngCore;
 use rmail_common::db::Mailbox;
 use rmail_common::{auth, config::Config, maildir, net::bind_tcp_listener};
 use std::path::Path;
@@ -9,7 +12,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 mod tls;
 use tls::load_tls_context;
@@ -166,6 +169,7 @@ async fn expunge_deleted(mail_root: &str, selected: &SelectedMailbox) -> Result<
 mod tests {
     use super::process_stream;
     use crate::capability_tokens;
+    use base64::Engine;
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
 
@@ -186,6 +190,31 @@ mod tests {
             }
         }
         out
+    }
+
+    async fn run_scripted_fixture(reader: &mut BufReader<tokio::io::DuplexStream>, fixture: &str) {
+        for raw_line in fixture.lines() {
+            let line = raw_line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(command) = line.strip_prefix("C: ") {
+                reader
+                    .get_mut()
+                    .write_all(format!("{}\r\n", command).as_bytes())
+                    .await
+                    .expect("write fixture command");
+                reader.get_mut().flush().await.expect("flush fixture");
+            } else if let Some(expected) = line.strip_prefix("S: ") {
+                let lines = read_until_contains(reader, expected).await;
+                assert!(
+                    lines.iter().any(|line| line.contains(expected)),
+                    "expected fixture response containing {expected:?}, got {lines:?}"
+                );
+            } else {
+                panic!("invalid fixture line: {line}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -270,11 +299,266 @@ mod tests {
     fn capability_advertises_starttls_and_login_policy() {
         let plain_caps = capability_tokens(false, None);
         assert!(plain_caps.contains("LOGINDISABLED"));
+        assert!(!plain_caps.contains("AUTH=PLAIN"));
+        assert!(!plain_caps.contains("AUTH=SCRAM-SHA-256"));
         assert!(!plain_caps.contains("STARTTLS"));
+        assert!(!plain_caps.contains("CONDSTORE"));
+        assert!(!plain_caps.contains("QRESYNC"));
+        assert!(!plain_caps.contains("COMPRESS=DEFLATE"));
 
         let tls_caps = capability_tokens(true, None);
         assert!(!tls_caps.contains("LOGINDISABLED"));
+        assert!(tls_caps.contains("AUTH=PLAIN"));
+        assert!(tls_caps.contains("AUTH=SCRAM-SHA-256"));
         assert!(!tls_caps.contains("STARTTLS"));
+        assert!(!tls_caps.contains("CONDSTORE"));
+        assert!(!tls_caps.contains("QRESYNC"));
+        assert!(!tls_caps.contains("COMPRESS=DEFLATE"));
+    }
+
+    #[test]
+    fn unsupported_log_selected_mailbox_placeholder_is_stable() {
+        assert_eq!(super::selected_mailbox_for_log(&None), "-");
+    }
+
+    #[tokio::test]
+    async fn authenticate_plain_is_tls_only_and_logs_in() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let payload = crate::BASE64_ENGINE.encode(b"\0user@example.test\0password");
+        let (client, server) = duplex(32 * 1024);
+        let encrypted_mail_root = mail_root.clone();
+        let encrypted_db_path = db_path.clone();
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                encrypted_mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(encrypted_db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        assert!(capability.contains("AUTH=PLAIN"));
+        reader
+            .get_mut()
+            .write_all(
+                format!(
+                    "A001 AUTHENTICATE PLAIN {}\r\nA002 SELECT INBOX\r\nA003 LOGOUT\r\n",
+                    payload
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write encrypted auth commands");
+        reader.get_mut().flush().await.expect("flush");
+        let auth_lines = read_until_contains(&mut reader, "A001 OK").await;
+        assert!(
+            auth_lines
+                .iter()
+                .any(|l| l.contains("AUTHENTICATE completed"))
+        );
+        let select_lines = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(select_lines.iter().any(|l| l.contains("SELECT completed")));
+        let _logout = read_until_contains(&mut reader, "A003 OK").await;
+        server_task.await.expect("join").expect("server");
+
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                false,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader
+            .read_line(&mut greeting)
+            .await
+            .expect("plain greeting");
+        let mut capability = String::new();
+        reader
+            .read_line(&mut capability)
+            .await
+            .expect("plain capability");
+        assert!(!capability.contains("AUTH=PLAIN"));
+        reader
+            .get_mut()
+            .write_all(format!("A001 AUTHENTICATE PLAIN {}\r\nA002 LOGOUT\r\n", payload).as_bytes())
+            .await
+            .expect("write plain auth commands");
+        reader.get_mut().flush().await.expect("flush");
+        let auth_lines = read_until_contains(&mut reader, "A001 NO").await;
+        assert!(auth_lines.iter().any(|l| l.contains("Encryption required")));
+        let _logout = read_until_contains(&mut reader, "A002 OK").await;
+        server_task.await.expect("join").expect("plain server");
+    }
+
+    fn scram_client_final(password: &str, client_first_bare: &str, server_first: &str) -> String {
+        use hmac::Mac;
+        use hmac::digest::KeyInit;
+        use pbkdf2::pbkdf2;
+        use sha2::{Digest, Sha256};
+
+        type HmacSha256 = hmac::Hmac<Sha256>;
+
+        let salt_b64 = super::parse_scram_attr(server_first, "s=").expect("salt");
+        let iterations = super::parse_scram_attr(server_first, "i=")
+            .expect("iterations")
+            .parse::<u32>()
+            .expect("parse iterations");
+        let nonce = super::parse_scram_attr(server_first, "r=").expect("nonce");
+        let salt = crate::BASE64_ENGINE.decode(salt_b64).expect("decode salt");
+        let gs2_header_b64 = crate::BASE64_ENGINE.encode(b"n,,");
+        let client_final_without_proof = format!("c={},r={}", gs2_header_b64, nonce);
+        let auth_message = format!(
+            "{},{},{}",
+            client_first_bare, server_first, client_final_without_proof
+        );
+
+        let mut salted_password = [0u8; 32];
+        pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted_password)
+            .expect("derive salted password");
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();
+        mac.update(b"Client Key");
+        let client_key = mac.finalize().into_bytes();
+        let stored_key = Sha256::digest(&client_key);
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).unwrap();
+        mac.update(auth_message.as_bytes());
+        let client_signature = mac.finalize().into_bytes();
+        let proof = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect::<Vec<_>>();
+        format!(
+            "{},p={}",
+            client_final_without_proof,
+            crate::BASE64_ENGINE.encode(proof)
+        )
+    }
+
+    #[tokio::test]
+    async fn authenticate_scram_sha256_logs_in_with_real_proof() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        let scram = rmail_common::auth::create_scram_verifier("password", 4096)
+            .expect("create scram verifier");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            Some(&scram),
+        )
+        .expect("add mailbox");
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        assert!(capability.contains("AUTH=SCRAM-SHA-256"));
+
+        let client_first_bare = "n=user@example.test,r=clientnonce";
+        let client_first = format!("n,,{}", client_first_bare);
+        let client_first_b64 = crate::BASE64_ENGINE.encode(client_first.as_bytes());
+        reader
+            .get_mut()
+            .write_all(
+                format!("A001 AUTHENTICATE SCRAM-SHA-256 {}\r\n", client_first_b64).as_bytes(),
+            )
+            .await
+            .expect("write client first");
+        reader.get_mut().flush().await.expect("flush");
+
+        let server_first_lines = read_until_contains(&mut reader, "+ ").await;
+        let server_first_line = server_first_lines
+            .iter()
+            .find(|line| line.starts_with("+ "))
+            .expect("server first")
+            .trim();
+        let server_first_b64 = server_first_line.trim_start_matches("+ ").trim();
+        let server_first = String::from_utf8(
+            crate::BASE64_ENGINE
+                .decode(server_first_b64)
+                .expect("decode server first"),
+        )
+        .expect("server first utf8");
+        let client_final = scram_client_final("password", client_first_bare, &server_first);
+        reader
+            .get_mut()
+            .write_all(format!("{}\r\n", crate::BASE64_ENGINE.encode(client_final)).as_bytes())
+            .await
+            .expect("write client final");
+        reader.get_mut().flush().await.expect("flush");
+
+        let server_final_lines = read_until_contains(&mut reader, "+ ").await;
+        assert!(
+            server_final_lines
+                .iter()
+                .any(|line| line.starts_with("+ ") && line.contains('='))
+        );
+        reader
+            .get_mut()
+            .write_all(b"\r\nA002 SELECT INBOX\r\nA003 LOGOUT\r\n")
+            .await
+            .expect("finish scram and write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let auth_lines = read_until_contains(&mut reader, "A001 OK").await;
+        assert!(
+            auth_lines
+                .iter()
+                .any(|line| line.contains("AUTHENTICATE completed"))
+        );
+        let select_lines = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(
+            select_lines
+                .iter()
+                .any(|line| line.contains("SELECT completed"))
+        );
+        let _logout = read_until_contains(&mut reader, "A003 OK").await;
+
+        server_task.await.expect("join").expect("server");
     }
 
     #[tokio::test]
@@ -903,6 +1187,286 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_preserves_literal_bytes_returns_appenduid_and_requires_existing_mailbox() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let server_mail_root = mail_root.clone();
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                server_mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        assert!(capability.contains("UIDPLUS"));
+
+        let raw = b"Subject: appended\r\nX-Raw: \xff\r\n\r\nbody\x00bytes\r\n";
+        let mut commands = Vec::new();
+        commands.extend_from_slice(b"A001 LOGIN \"user@example.test\" \"password\"\r\n");
+        commands.extend_from_slice(
+            format!("A002 APPEND Sent (\\Seen) {{{}}}\r\n", raw.len()).as_bytes(),
+        );
+        commands.extend_from_slice(raw);
+        commands.extend_from_slice(b"\r\n");
+        commands.extend_from_slice(format!("A003 APPEND Missing {{{}}}\r\n", raw.len()).as_bytes());
+        commands.extend_from_slice(raw);
+        commands.extend_from_slice(b"\r\nA004 LOGOUT\r\n");
+        reader
+            .get_mut()
+            .write_all(&commands)
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _login = read_until_contains(&mut reader, "A001 OK").await;
+        let append_lines = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(append_lines.iter().any(|l| l.starts_with("+ ")));
+        assert!(append_lines.iter().any(|l| l.contains("APPENDUID")));
+
+        let missing_lines = read_until_contains(&mut reader, "A003 NO").await;
+        assert!(missing_lines.iter().any(|l| l.contains("APPEND failed")));
+
+        let _logout = read_until_contains(&mut reader, "A004 OK").await;
+        server_task.await.expect("join").expect("server");
+
+        let (_, sent) =
+            rmail_common::imap_state::load_folder(&mail_root, "example.test", "user", "Sent")
+                .expect("load sent");
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0]
+                .flags
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case("\\Seen"))
+        );
+        assert_eq!(std::fs::read(&sent[0].path).expect("read appended"), raw);
+        assert!(
+            !rmail_common::imap_state::folder_exists(&mail_root, "example.test", "user", "Missing")
+                .expect("missing folder check")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_commands_return_bad_after_logging_context() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 UID SORT RETURN (ALL)\r\nA004 XLIST \"\" \"*\"\r\nA005 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _login = read_until_contains(&mut reader, "A001 OK").await;
+        let _select = read_until_contains(&mut reader, "A002 OK").await;
+
+        let uid_sort = read_until_contains(&mut reader, "A003 BAD").await;
+        assert!(
+            uid_sort
+                .iter()
+                .any(|l| l.contains("Unsupported UID subcommand"))
+        );
+
+        let xlist = read_until_contains(&mut reader, "A004 BAD").await;
+        assert!(
+            xlist
+                .iter()
+                .any(|l| l.contains("Unknown or unimplemented command"))
+        );
+
+        let _logout = read_until_contains(&mut reader, "A005 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn scripted_thunderbird_compatibility_fixture_completes() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Date: Sun, 14 Jun 2026 12:00:00 +0000\r\nFrom: alice@example.test\r\nTo: user@example.test\r\nSubject: one\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nfirst body\r\n",
+        )
+        .expect("deliver first");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Date: Mon, 15 Jun 2026 12:00:00 +0000\r\nFrom: bob@example.test\r\nTo: user@example.test\r\nSubject: two\r\nContent-Type: multipart/alternative; boundary=\"alt\"\r\n\r\n--alt\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nsecond plain\r\n--alt\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<p>second html</p>\r\n--alt--\r\n",
+        )
+        .expect("deliver second");
+
+        let (client, server) = duplex(128 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        run_scripted_fixture(
+            &mut reader,
+            include_str!("../fixtures/thunderbird_compat.imap"),
+        )
+        .await;
+
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn rename_mailbox_updates_list_and_preserves_messages() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::imap_state::create_folder(&mail_root, "example.test", "user", "Projects")
+            .expect("create folder");
+        rmail_common::imap_state::append_message(
+            &mail_root,
+            "example.test",
+            "user",
+            "Projects",
+            b"Subject: project\r\n\r\nbody\r\n",
+            Vec::new(),
+        )
+        .expect("append project");
+
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 RENAME Projects \"Renamed\"\r\nA003 LIST \"\" \"*\"\r\nA004 SELECT Renamed\r\nA005 RENAME INBOX Nope\r\nA006 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _login = read_until_contains(&mut reader, "A001 OK").await;
+        let rename = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(rename.iter().any(|l| l.contains("RENAME completed")));
+
+        let list = read_until_contains(&mut reader, "A003 OK").await;
+        let joined = list.join("");
+        assert!(joined.contains("\"Renamed\""));
+        assert!(!joined.contains("\"Projects\""));
+
+        let select = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(select.iter().any(|l| l.contains("* 1 EXISTS")));
+
+        let inbox_rename = read_until_contains(&mut reader, "A005 NO").await;
+        assert!(
+            inbox_rename
+                .iter()
+                .any(|l| l.contains("cannot rename INBOX"))
+        );
+
+        let _logout = read_until_contains(&mut reader, "A006 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
     async fn list_exposes_standard_special_use_folders() {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
@@ -983,6 +1547,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_and_lsub_honor_reference_and_patterns() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::imap_state::create_folder(&mail_root, "example.test", "user", "Projects")
+            .expect("create projects");
+        rmail_common::imap_state::set_subscription(
+            &mail_root,
+            "example.test",
+            "user",
+            "Projects",
+            false,
+        )
+        .expect("unsubscribe projects");
+
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 LIST \"\" \"Pro*\"\r\nA003 LIST \"\" \"INBOX\"\r\nA004 LIST \"Projects\" \"\"\r\nA005 LSUB \"\" \"Pro*\"\r\nA006 LSUB \"\" \"*\"\r\nA007 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _login = read_until_contains(&mut reader, "A001 OK").await;
+
+        let pro_star = read_until_contains(&mut reader, "A002 OK").await;
+        let joined = pro_star.join("");
+        assert!(joined.contains("\"Projects\""));
+        assert!(!joined.contains("\"INBOX\""));
+
+        let inbox = read_until_contains(&mut reader, "A003 OK").await;
+        let joined = inbox.join("");
+        assert!(joined.contains("\"INBOX\""));
+        assert!(!joined.contains("\"Projects\""));
+
+        let reference = read_until_contains(&mut reader, "A004 OK").await;
+        let joined = reference.join("");
+        assert!(joined.contains("\"Projects\""));
+        assert!(!joined.contains("\"INBOX\""));
+
+        let unsubscribed = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(!unsubscribed.join("").contains("\"Projects\""));
+
+        let subscribed = read_until_contains(&mut reader, "A006 OK").await;
+        let joined = subscribed.join("");
+        assert!(joined.contains("\"INBOX\""));
+        assert!(!joined.contains("\"Projects\""));
+
+        let _logout = read_until_contains(&mut reader, "A007 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn subscribe_and_unsubscribe_update_lsub_state() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::imap_state::create_folder(&mail_root, "example.test", "user", "Projects")
+            .expect("create projects");
+        rmail_common::imap_state::set_subscription(
+            &mail_root,
+            "example.test",
+            "user",
+            "Projects",
+            false,
+        )
+        .expect("initial unsubscribe");
+
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 LSUB \"\" \"Projects\"\r\nA003 SUBSCRIBE Projects\r\nA004 LSUB \"\" \"Projects\"\r\nA005 UNSUBSCRIBE Projects\r\nA006 LSUB \"\" \"Projects\"\r\nA007 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _login = read_until_contains(&mut reader, "A001 OK").await;
+
+        let initial = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(!initial.join("").contains("\"Projects\""));
+
+        let subscribe = read_until_contains(&mut reader, "A003 OK").await;
+        assert!(subscribe.iter().any(|l| l.contains("SUBSCRIBE completed")));
+
+        let subscribed = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(subscribed.join("").contains("\"Projects\""));
+
+        let unsubscribe = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(
+            unsubscribe
+                .iter()
+                .any(|l| l.contains("UNSUBSCRIBE completed"))
+        );
+
+        let final_lsub = read_until_contains(&mut reader, "A006 OK").await;
+        assert!(!final_lsub.join("").contains("\"Projects\""));
+
+        let _logout = read_until_contains(&mut reader, "A007 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
     async fn fetch_macros_envelope_and_bodystructure_are_parseable() {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
@@ -1052,6 +1776,73 @@ mod tests {
         assert!(joined_uid.contains("\"<m1@example.test>\""));
 
         let _logout = read_until_contains(&mut reader, "A005 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn bodystructure_describes_multipart_html_inline_and_attachment_parts() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"From: a@example.test\r\nSubject: multipart\r\nContent-Type: multipart/mixed; boundary=\"mix\"\r\n\r\n--mix\r\nContent-Type: multipart/alternative; boundary=\"alt\"\r\n\r\n--alt\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nPlain body\r\n--alt\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<p>HTML body</p>\r\n--alt--\r\n--mix\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <logo@example.test>\r\nContent-Disposition: inline; filename=\"logo.png\"\r\n\r\naGVsbG8=\r\n--mix\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"file.pdf\"\r\n\r\n%PDF\r\n--mix--\r\n",
+        )
+        .expect("deliver");
+
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 UID FETCH 1:* (UID BODYSTRUCTURE)\r\nA004 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _select = read_until_contains(&mut reader, "A002 OK").await;
+        let fetch_lines = read_until_contains(&mut reader, "A003 OK").await;
+        let joined = fetch_lines.join("");
+        assert!(joined.contains("BODYSTRUCTURE"));
+        assert!(joined.contains("\"MIXED\""));
+        assert!(joined.contains("\"ALTERNATIVE\""));
+        assert!(joined.contains("\"TEXT\" \"HTML\""));
+        assert!(joined.contains("\"IMAGE\" \"PNG\""));
+        assert!(joined.contains("\"APPLICATION\" \"PDF\""));
+        assert!(joined.contains("\"INLINE\" (\"FILENAME\" \"logo.png\")"));
+        assert!(joined.contains("\"ATTACHMENT\" (\"FILENAME\" \"file.pdf\")"));
+        assert!(joined.contains("logo@example.test"));
+
+        let _logout = read_until_contains(&mut reader, "A004 OK").await;
         server_task.await.expect("join").expect("server");
     }
 }
@@ -1230,6 +2021,9 @@ fn capability_tokens(session_encrypted: bool, tls_ctx: Option<&Arc<tls::TlsConte
         if tls_ctx.is_some() {
             caps.push("STARTTLS");
         }
+    } else {
+        caps.push("AUTH=PLAIN");
+        caps.push("AUTH=SCRAM-SHA-256");
     }
     caps.join(" ")
 }
@@ -1246,6 +2040,27 @@ fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
         .as_ref()
         .map(|s| s.mailbox.as_str())
         .unwrap_or("INBOX")
+}
+
+fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &str {
+    selected.as_ref().map(|s| s.mailbox.as_str()).unwrap_or("-")
+}
+
+fn log_unsupported_imap(
+    peer: Option<SocketAddr>,
+    selected: &Option<SelectedMailbox>,
+    tag: &str,
+    command: &str,
+    raw_args: &str,
+) {
+    eprintln!(
+        "imap_unsupported peer={:?} selected_mailbox={} tag={} command={} raw_args={:?}",
+        peer,
+        selected_mailbox_for_log(selected),
+        tag,
+        command,
+        raw_args
+    );
 }
 
 fn next_uid(sel: &SelectedMailbox) -> u64 {
@@ -1868,8 +2683,320 @@ fn envelope_response(data: &[u8]) -> String {
     )
 }
 
+fn parse_header_params(value: &str) -> (String, Vec<(String, String)>) {
+    let mut parts = value.split(';');
+    let main = parts
+        .next()
+        .unwrap_or("text/plain")
+        .trim()
+        .to_ascii_lowercase();
+    let params = parts
+        .filter_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            let value = value.trim().trim_matches('"').to_string();
+            Some((name.trim().to_ascii_uppercase(), value))
+        })
+        .collect();
+    (main, params)
+}
+
+fn imap_param_list(params: &[(String, String)]) -> String {
+    if params.is_empty() {
+        "NIL".to_string()
+    } else {
+        let values = params
+            .iter()
+            .map(|(name, value)| format!("\"{}\" {}", name, nstring(Some(value))))
+            .collect::<Vec<_>>();
+        format!("({})", values.join(" "))
+    }
+}
+
+fn content_type_parts(data: &[u8]) -> (String, String, Vec<(String, String)>) {
+    let raw = header_value(data, "Content-Type").unwrap_or_else(|| "text/plain".to_string());
+    let (main, params) = parse_header_params(&raw);
+    let (typ, subtype) = main
+        .split_once('/')
+        .map(|(typ, subtype)| (typ.to_ascii_uppercase(), subtype.to_ascii_uppercase()))
+        .unwrap_or_else(|| ("TEXT".to_string(), "PLAIN".to_string()));
+    (typ, subtype, params)
+}
+
+fn content_disposition(data: &[u8]) -> String {
+    let Some(raw) = header_value(data, "Content-Disposition") else {
+        return "NIL".to_string();
+    };
+    let (disposition, params) = parse_header_params(&raw);
+    format!(
+        "({} {})",
+        nstring(Some(&disposition.to_ascii_uppercase())),
+        imap_param_list(&params)
+    )
+}
+
+fn body_line_count(body: &[u8]) -> usize {
+    if body.is_empty() {
+        0
+    } else {
+        bytecount_newlines(body).max(1)
+    }
+}
+
+fn bytecount_newlines(data: &[u8]) -> usize {
+    data.iter().filter(|b| **b == b'\n').count()
+}
+
+fn multipart_boundary(params: &[(String, String)]) -> Option<String> {
+    params
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("BOUNDARY"))
+        .map(|(_, value)| value.clone())
+}
+
+fn split_multipart_parts(body: &[u8], boundary: &str) -> Vec<Vec<u8>> {
+    let text = String::from_utf8_lossy(body);
+    let marker = format!("--{}", boundary);
+    let closing = format!("--{}--", boundary);
+    let mut parts = Vec::new();
+    let mut current = Vec::new();
+    let mut in_part = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == marker {
+            if in_part && !current.is_empty() {
+                parts.push(current.join("").into_bytes());
+                current.clear();
+            }
+            in_part = true;
+        } else if trimmed == closing {
+            if in_part && !current.is_empty() {
+                parts.push(current.join("").into_bytes());
+            }
+            break;
+        } else if in_part {
+            current.push(line);
+        }
+    }
+    parts
+}
+
+fn bodystructure_response(data: &[u8]) -> String {
+    let (typ, subtype, params) = content_type_parts(data);
+    let body = body_after_header(data);
+    if typ == "MULTIPART" {
+        let boundary = multipart_boundary(&params);
+        let parts = boundary
+            .as_ref()
+            .map(|boundary| split_multipart_parts(body, boundary))
+            .unwrap_or_default();
+        if parts.is_empty() {
+            return format!("(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" {} 0)", body.len());
+        }
+        let children = parts
+            .iter()
+            .map(|part| bodystructure_response(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!(
+            "({} \"{}\" {} NIL NIL)",
+            children,
+            subtype,
+            imap_param_list(&params)
+        );
+    }
+
+    let encoding = header_value(data, "Content-Transfer-Encoding")
+        .unwrap_or_else(|| "7BIT".to_string())
+        .to_ascii_uppercase();
+    let content_id = header_value(data, "Content-ID");
+    let description = header_value(data, "Content-Description");
+    let disposition = content_disposition(data);
+    if typ == "TEXT" {
+        format!(
+            "(\"TEXT\" \"{}\" {} {} {} {} {} {} NIL {} NIL)",
+            subtype,
+            imap_param_list(&params),
+            nstring(content_id.as_deref()),
+            nstring(description.as_deref()),
+            nstring(Some(&encoding)),
+            body.len(),
+            body_line_count(body),
+            disposition
+        )
+    } else {
+        format!(
+            "(\"{}\" \"{}\" {} {} {} {} {} NIL {} NIL)",
+            typ,
+            subtype,
+            imap_param_list(&params),
+            nstring(content_id.as_deref()),
+            nstring(description.as_deref()),
+            nstring(Some(&encoding)),
+            body.len(),
+            disposition
+        )
+    }
+}
+
 fn parse_store_items(spec: &str) -> Vec<String> {
     normalize_fetch_items(spec)
+}
+
+fn split_first_imap_astring(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return None;
+    }
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut value = String::new();
+        let mut escaped = false;
+        for (idx, ch) in rest.char_indices() {
+            if escaped {
+                value.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                return Some((value, &rest[idx + 1..]));
+            } else {
+                value.push(ch);
+            }
+        }
+        None
+    } else {
+        let end = input.find(char::is_whitespace).unwrap_or(input.len());
+        Some((input[..end].to_string(), &input[end..]))
+    }
+}
+
+fn parse_append_args(args: &str) -> Option<(String, Vec<String>, usize)> {
+    let trimmed = args.trim();
+    let literal_start = trimmed.rfind('{')?;
+    let literal_end = trimmed[literal_start + 1..].find('}')? + literal_start + 1;
+    if literal_end != trimmed.len() - 1 {
+        return None;
+    }
+    let literal_len = trimmed[literal_start + 1..literal_end]
+        .parse::<usize>()
+        .ok()?;
+    let before_literal = trimmed[..literal_start].trim_end();
+    let (mailbox, rest) = split_first_imap_astring(before_literal)?;
+    let rest = rest.trim();
+    let flags = if let Some(start) = rest.find('(') {
+        let end = rest[start + 1..].find(')')? + start + 1;
+        parse_store_items(&rest[start..=end])
+    } else {
+        Vec::new()
+    };
+    Some((mailbox, flags, literal_len))
+}
+
+fn parse_list_args(args: &str) -> Option<(String, String)> {
+    let (reference, rest) = split_first_imap_astring(args)?;
+    let (pattern, _) = split_first_imap_astring(rest)?;
+    Some((reference, pattern))
+}
+
+fn list_effective_pattern(reference: &str, pattern: &str) -> String {
+    if pattern.is_empty() {
+        reference.to_string()
+    } else if reference.is_empty() || pattern.starts_with('/') {
+        pattern.to_string()
+    } else {
+        format!("{}/{}", reference.trim_end_matches('/'), pattern)
+    }
+}
+
+fn mailbox_pattern_matches(name: &str, reference: &str, pattern: &str) -> bool {
+    let effective = list_effective_pattern(reference, pattern);
+    if effective.is_empty() {
+        return name.is_empty();
+    }
+    mailbox_pattern_match_bytes(name.as_bytes(), effective.as_bytes())
+}
+
+fn mailbox_pattern_match_bytes(name: &[u8], pattern: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return name.is_empty();
+    }
+    match pattern[0] {
+        b'*' => {
+            mailbox_pattern_match_bytes(name, &pattern[1..])
+                || (!name.is_empty() && mailbox_pattern_match_bytes(&name[1..], pattern))
+        }
+        b'%' => {
+            mailbox_pattern_match_bytes(name, &pattern[1..])
+                || (!name.is_empty()
+                    && name[0] != b'/'
+                    && mailbox_pattern_match_bytes(&name[1..], pattern))
+        }
+        ch => {
+            !name.is_empty()
+                && name[0].eq_ignore_ascii_case(&ch)
+                && mailbox_pattern_match_bytes(&name[1..], &pattern[1..])
+        }
+    }
+}
+
+fn decode_authenticate_plain(response: &str) -> Option<(String, String)> {
+    let decoded = BASE64_ENGINE.decode(response.trim()).ok()?;
+    let mut parts = decoded.split(|b| *b == 0);
+    let _authzid = parts.next()?;
+    let authcid = parts.next()?;
+    let password = parts.next()?;
+    if parts.next().is_some() || authcid.is_empty() {
+        return None;
+    }
+    Some((
+        String::from_utf8_lossy(authcid).to_string(),
+        String::from_utf8_lossy(password).to_string(),
+    ))
+}
+
+fn decode_sasl_message(response: &str) -> Option<String> {
+    let decoded = BASE64_ENGINE.decode(response.trim()).ok()?;
+    Some(String::from_utf8_lossy(&decoded).to_string())
+}
+
+fn parse_scram_attr<'a>(message: &'a str, key: &str) -> Option<&'a str> {
+    message.split(',').find_map(|part| part.strip_prefix(key))
+}
+
+fn parse_scram_client_first(message: &str) -> Option<(String, String, String)> {
+    let (gs2_header, client_first_bare) = if let Some(idx) = message.find(",,") {
+        (&message[..idx + 2], &message[idx + 2..])
+    } else {
+        ("", message)
+    };
+    if !gs2_header.is_empty() && gs2_header != "n,," {
+        return None;
+    }
+    let username = parse_scram_attr(client_first_bare, "n=")?;
+    let nonce = parse_scram_attr(client_first_bare, "r=")?;
+    if username.is_empty() || nonce.is_empty() {
+        return None;
+    }
+    Some((
+        username.to_string(),
+        nonce.to_string(),
+        client_first_bare.to_string(),
+    ))
+}
+
+fn parse_scram_client_final(message: &str) -> Option<(String, String)> {
+    let proof_pos = message.find(",p=")?;
+    let without_proof = message[..proof_pos].to_string();
+    let proof = message[proof_pos + 3..].to_string();
+    if proof.is_empty() {
+        return None;
+    }
+    Some((without_proof, proof))
+}
+
+fn generate_scram_nonce() -> String {
+    let mut bytes = [0u8; 18];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    BASE64_ENGINE.encode(bytes)
 }
 
 fn apply_flag_operation(existing: &[String], op: &str, flags: &[String]) -> Vec<String> {
@@ -1950,7 +3077,7 @@ async fn write_fetch_response(
     } else {
         None
     };
-    let data = if include_rfc822 || include_body {
+    let data = if include_rfc822 || include_body || include_bodystructure {
         Some(tokio::task::spawn_blocking(move || std::fs::read(path)).await??)
     } else if include_headers || include_envelope {
         Some(tokio::task::spawn_blocking(move || read_message_header(&path)).await??)
@@ -1986,12 +3113,9 @@ async fn write_fetch_response(
         ));
     }
     if include_bodystructure {
-        let size = metadata_len
-            .or_else(|| data.as_ref().map(|d| d.len()))
-            .unwrap_or(0);
         attrs.push(format!(
-            "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" {} 0)",
-            size
+            "BODYSTRUCTURE {}",
+            bodystructure_response(data.as_deref().unwrap_or_default())
         ));
     }
 
@@ -2279,6 +3403,341 @@ async fn process_stream(
                     w.flush().await?;
                 }
             }
+            "AUTHENTICATE" => {
+                let mut auth_parts = args.trim().splitn(2, ' ');
+                let mechanism = auth_parts.next().unwrap_or("").to_uppercase();
+                let initial_response = auth_parts.next().map(str::trim).filter(|s| !s.is_empty());
+                if mechanism != "PLAIN" && mechanism != "SCRAM-SHA-256" {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} NO Unsupported authentication mechanism\r\n", tag).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                if let Some(peer_addr) = peer {
+                    if let Some(rem) = auth_block_remaining(peer_addr.ip()) {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!(
+                                "{} NO Too many failed auth attempts; try again in {}s\r\n",
+                                tag,
+                                rem.as_secs()
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                }
+                if !session_encrypted {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} NO Encryption required for authentication\r\n", tag).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let response = if let Some(initial_response) = initial_response {
+                    initial_response.to_string()
+                } else {
+                    {
+                        let w = reader.get_mut();
+                        w.write_all(b"+ \r\n").await?;
+                        w.flush().await?;
+                    }
+                    let mut auth_line = String::new();
+                    let n = reader.read_line(&mut auth_line).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    auth_line.trim_end_matches("\r\n").to_string()
+                };
+                if mechanism == "SCRAM-SHA-256" {
+                    let Some(client_first_msg) = decode_sasl_message(&response) else {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid SCRAM client-first response\r\n", tag)
+                                .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    let Some((username, client_nonce, client_first_bare)) =
+                        parse_scram_client_first(&client_first_msg)
+                    else {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid SCRAM client-first message\r\n", tag)
+                                .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    let user_lookup = auth::saslprep(&username).to_ascii_lowercase();
+                    let mut mb: Option<Mailbox> = None;
+                    if let Some(dbp) = db_path.as_ref() {
+                        let dbp2 = dbp.clone();
+                        if user_lookup.contains('@') {
+                            match tokio::task::spawn_blocking(move || {
+                                rmail_common::db::get_mailbox(dbp2, &user_lookup)
+                            })
+                            .await
+                            {
+                                Ok(Ok(Some(m))) => mb = Some(m),
+                                Ok(Ok(None)) => {}
+                                Ok(Err(e)) => eprintln!("db get_mailbox error: {}", e),
+                                Err(e) => eprintln!("db task join error: {}", e),
+                            }
+                        } else {
+                            match tokio::task::spawn_blocking(move || {
+                                rmail_common::db::find_mailbox_by_localpart(dbp2, &user_lookup)
+                            })
+                            .await
+                            {
+                                Ok(Ok(Some(m))) => mb = Some(m),
+                                Ok(Ok(None)) => {}
+                                Ok(Err(e)) => eprintln!("db query error: {}", e),
+                                Err(e) => eprintln!("db task join error: {}", e),
+                            }
+                        }
+                    }
+                    let Some(mailbox) = mb else {
+                        if let Some(peer_addr) = peer {
+                            record_auth_failure(peer_addr.ip());
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    let Some(scram_json) = mailbox.scram.as_ref() else {
+                        if let Some(peer_addr) = peer {
+                            record_auth_failure(peer_addr.ip());
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    let (salt_b64, iterations) = match auth::parse_scram_verifier(scram_json) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "IMAP SCRAM verifier parse error peer={:?} mailbox={} err={}",
+                                peer, mailbox.address, e
+                            );
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes())
+                                .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                    };
+                    let combined_nonce = format!("{}{}", client_nonce, generate_scram_nonce());
+                    let server_first =
+                        format!("r={},s={},i={}", combined_nonce, salt_b64, iterations);
+                    let server_first_b64 = BASE64_ENGINE.encode(server_first.as_bytes());
+                    {
+                        let w = reader.get_mut();
+                        w.write_all(format!("+ {}\r\n", server_first_b64).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                    let mut final_line = String::new();
+                    let n = reader.read_line(&mut final_line).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    let Some(client_final_msg) =
+                        decode_sasl_message(final_line.trim_end_matches("\r\n"))
+                    else {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid SCRAM client-final response\r\n", tag)
+                                .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    let Some((client_final_without_proof, proof_b64)) =
+                        parse_scram_client_final(&client_final_msg)
+                    else {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid SCRAM client-final message\r\n", tag)
+                                .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    if !client_final_without_proof
+                        .split(',')
+                        .any(|part| part == format!("r={}", combined_nonce))
+                    {
+                        if let Some(peer_addr) = peer {
+                            record_auth_failure(peer_addr.ip());
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                    let auth_message = format!(
+                        "{},{},{}",
+                        client_first_bare, server_first, client_final_without_proof
+                    );
+                    match auth::verify_scram_proof(scram_json, &auth_message, &proof_b64) {
+                        Ok(server_signature) => {
+                            let server_final =
+                                format!("v={}", BASE64_ENGINE.encode(server_signature));
+                            let server_final_b64 = BASE64_ENGINE.encode(server_final.as_bytes());
+                            {
+                                let w = reader.get_mut();
+                                w.write_all(format!("+ {}\r\n", server_final_b64).as_bytes())
+                                    .await?;
+                                w.flush().await?;
+                            }
+                            let mut empty_line = String::new();
+                            let n = reader.read_line(&mut empty_line).await?;
+                            if n == 0 {
+                                return Ok(());
+                            }
+                            authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
+                            if let Some(peer_addr) = peer {
+                                reset_auth_failures(peer_addr.ip());
+                            }
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} OK AUTHENTICATE completed\r\n", tag).as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                        }
+                        Err(e) => {
+                            if let Some(peer_addr) = peer {
+                                record_auth_failure(peer_addr.ip());
+                            }
+                            eprintln!(
+                                "IMAP SCRAM verify error peer={:?} mailbox={} err={}",
+                                peer, mailbox.address, e
+                            );
+                            let w = reader.get_mut();
+                            w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
+                                .await?;
+                            w.flush().await?;
+                        }
+                    }
+                    continue;
+                }
+                let Some((user, pass)) = decode_authenticate_plain(&response) else {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} BAD Invalid AUTHENTICATE PLAIN response\r\n", tag).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                println!(
+                    "IMAP AUTHENTICATE PLAIN attempt peer={:?} encrypted={} user={:?} password_len={}",
+                    peer,
+                    session_encrypted,
+                    user,
+                    pass.len()
+                );
+                let mut mb: Option<Mailbox> = None;
+                if let Some(dbp) = db_path.as_ref() {
+                    let user_lookup = user.to_ascii_lowercase();
+                    if user_lookup.contains('@') {
+                        let dbp2 = dbp.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            rmail_common::db::get_mailbox(dbp2, &user_lookup)
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some(m))) => mb = Some(m),
+                            Ok(Ok(None)) => {}
+                            Ok(Err(e)) => eprintln!("db get_mailbox error: {}", e),
+                            Err(e) => eprintln!("db task join error: {}", e),
+                        }
+                    } else {
+                        let dbp2 = dbp.clone();
+                        let user_local = user.to_string();
+                        match tokio::task::spawn_blocking(move || {
+                            rmail_common::db::find_mailbox_by_localpart(dbp2, &user_local)
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some(m))) => mb = Some(m),
+                            Ok(Ok(None)) => {}
+                            Ok(Err(e)) => eprintln!("db query error: {}", e),
+                            Err(e) => eprintln!("db task join error: {}", e),
+                        }
+                    }
+                }
+                let Some(mailbox) = mb else {
+                    if let Some(peer_addr) = peer {
+                        record_auth_failure(peer_addr.ip());
+                    }
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                let Some(hash) = mailbox.password_hash.as_ref() else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO No password set for account\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                match auth::verify_password(&pass, hash) {
+                    Ok(true) => {
+                        authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
+                        if let Some(peer_addr) = peer {
+                            reset_auth_failures(peer_addr.ip());
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} OK AUTHENTICATE completed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                    Ok(false) => {
+                        if let Some(peer_addr) = peer {
+                            record_auth_failure(peer_addr.ip());
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                    Err(e) => {
+                        if let Some(peer_addr) = peer {
+                            record_auth_failure(peer_addr.ip());
+                        }
+                        eprintln!(
+                            "IMAP AUTHENTICATE PLAIN verify error peer={:?} mailbox={} err={}",
+                            peer, mailbox.address, e
+                        );
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                }
+            }
             "NOOP" => {
                 let w = reader.get_mut();
                 w.write_all(format!("{} OK NOOP completed\r\n", tag).as_bytes())
@@ -2312,6 +3771,82 @@ async fn process_stream(
                     .await?;
                 w.flush().await?;
             }
+            "APPEND" => {
+                if authed_mailbox.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let Some((mailbox_name, flags, literal_len)) = parse_append_args(args) else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Invalid APPEND arguments\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                {
+                    let w = reader.get_mut();
+                    w.write_all(b"+ Ready for literal data\r\n").await?;
+                    w.flush().await?;
+                }
+                let mut literal = vec![0u8; literal_len];
+                if let Err(e) = reader.read_exact(&mut literal).await {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Error reading literal\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    eprintln!("IMAP APPEND literal read error peer={:?}: {}", peer, e);
+                    continue;
+                }
+                let addr = authed_mailbox.as_ref().unwrap();
+                let (local, domain) = address_parts(addr)?;
+                let mail_root_clone = mail_root.clone();
+                let mailbox_for_task = mailbox_name.clone();
+                let append_result = tokio::task::spawn_blocking(move || {
+                    rmail_common::imap_state::append_message(
+                        Path::new(&mail_root_clone),
+                        &domain,
+                        &local,
+                        &mailbox_for_task,
+                        &literal,
+                        flags,
+                    )
+                })
+                .await?;
+                match append_result {
+                    Ok((uidvalidity, uid)) => {
+                        if let Some(addr) = authed_mailbox.as_ref() {
+                            if selected
+                                .as_ref()
+                                .map(|sel| sel.mailbox.eq_ignore_ascii_case(&mailbox_name))
+                                .unwrap_or(false)
+                            {
+                                selected = Some(
+                                    load_selected_mailbox(&mail_root, addr, &mailbox_name).await?,
+                                );
+                            }
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!(
+                                "{} OK [APPENDUID {} {}] APPEND completed\r\n",
+                                tag, uidvalidity, uid
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                    }
+                    Err(e) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO APPEND failed: {}\r\n", tag, e).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                }
+            }
             "LIST" => {
                 // Require authentication to list user's mailboxes in this simple implementation
                 if authed_mailbox.is_none() {
@@ -2321,6 +3856,13 @@ async fn process_stream(
                     w.flush().await?;
                     continue;
                 }
+                let Some((reference, pattern)) = parse_list_args(args) else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Invalid LIST arguments\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
                 let addr = authed_mailbox.as_ref().unwrap();
                 let (local, domain) = address_parts(addr)?;
                 let mail_root_clone = mail_root.clone();
@@ -2335,6 +3877,9 @@ async fn process_stream(
                 );
                 let w = reader.get_mut();
                 for (name, special) in boxes {
+                    if !mailbox_pattern_matches(&name, &reference, &pattern) {
+                        continue;
+                    }
                     let mut attrs = vec!["\\HasNoChildren".to_string()];
                     if let Some(special) = special {
                         attrs.push(special);
@@ -2356,6 +3901,13 @@ async fn process_stream(
                     w.flush().await?;
                     continue;
                 }
+                let Some((reference, pattern)) = parse_list_args(args) else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Invalid LSUB arguments\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
                 let addr = authed_mailbox.as_ref().unwrap();
                 let (local, domain) = address_parts(addr)?;
                 let mail_root_clone = mail_root.clone();
@@ -2366,6 +3918,9 @@ async fn process_stream(
                 println!("IMAP LSUB peer={:?} returning subscriptions", peer);
                 let w = reader.get_mut();
                 for (name, special) in boxes {
+                    if !mailbox_pattern_matches(&name, &reference, &pattern) {
+                        continue;
+                    }
                     let mut attrs = vec!["\\HasNoChildren".to_string()];
                     if let Some(special) = special {
                         attrs.push(special);
@@ -2451,16 +4006,68 @@ async fn process_stream(
                 }
             }
             "RENAME" => {
-                let w = reader.get_mut();
-                w.write_all(
-                    format!(
-                        "{} NO RENAME is not supported for this mailbox layout\r\n",
-                        tag
+                if authed_mailbox.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let Some((source_mailbox, rest)) = split_first_imap_astring(args) else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Invalid RENAME arguments\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                let Some((destination_mailbox, _)) = split_first_imap_astring(rest) else {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Invalid RENAME arguments\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                let addr = authed_mailbox.as_ref().unwrap();
+                let (local, domain) = address_parts(addr)?;
+                let mail_root_clone = mail_root.clone();
+                let source_for_task = source_mailbox.clone();
+                let destination_for_task = destination_mailbox.clone();
+                match tokio::task::spawn_blocking(move || {
+                    maildir::rename_mailbox(
+                        Path::new(&mail_root_clone),
+                        &domain,
+                        &local,
+                        &source_for_task,
+                        &destination_for_task,
                     )
-                    .as_bytes(),
-                )
-                .await?;
-                w.flush().await?;
+                })
+                .await?
+                {
+                    Ok(()) => {
+                        if let Some(addr) = authed_mailbox.as_ref() {
+                            if selected
+                                .as_ref()
+                                .map(|sel| sel.mailbox.eq_ignore_ascii_case(&source_mailbox))
+                                .unwrap_or(false)
+                            {
+                                selected = Some(
+                                    load_selected_mailbox(&mail_root, addr, &destination_mailbox)
+                                        .await?,
+                                );
+                            }
+                        }
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} OK RENAME completed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                    Err(e) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO RENAME failed: {}\r\n", tag, e).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                }
             }
             "SUBSCRIBE" | "UNSUBSCRIBE" => {
                 if authed_mailbox.is_none() {
@@ -3167,6 +4774,7 @@ async fn process_stream(
                     .await?;
                     w.flush().await?;
                 } else {
+                    log_unsupported_imap(peer, &selected, tag, &format!("UID {}", subcmd), subargs);
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes())
                         .await?;
@@ -3350,10 +4958,7 @@ async fn process_stream(
                 break;
             }
             _ => {
-                eprintln!(
-                    "IMAP unknown command peer={:?} encrypted={} tag={} cmd={} args={:?}",
-                    peer, session_encrypted, tag, cmd, args
-                );
+                log_unsupported_imap(peer, &selected, tag, &cmd, args);
                 let w = reader.get_mut();
                 w.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes())
                     .await?;
