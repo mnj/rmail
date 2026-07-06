@@ -25,6 +25,8 @@ RELEASE_DIR="${ROOT_DIR}/target/release"
 
 cd "${ROOT_DIR}"
 
+"${ROOT_DIR}/scripts/set-rust-version.sh" "${VERSION}"
+
 (
   cd "${ROOT_DIR}/crates/webmail/frontend"
   bun install --frozen-lockfile
