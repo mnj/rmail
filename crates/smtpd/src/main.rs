@@ -11,10 +11,10 @@ use rmail_common::{
     auth,
     config::{Config, ScannerFailureAction, SecurityConfig},
     maildir, metrics,
+    net::bind_tcp_listener,
     scanner::{ScanAction, ScanEnvelope},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 mod tls;
@@ -229,7 +229,7 @@ async fn run_plain_listener(
     enforce_dmarc: bool,
     security: Arc<SecurityConfig>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_tcp_listener(addr)?;
     println!("rMail SMTPD listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -272,7 +272,7 @@ async fn run_smtps_listener(
     enforce_dmarc: bool,
     security: Arc<SecurityConfig>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_tcp_listener(addr)?;
     println!("rMail SMTPS listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;

@@ -4,13 +4,13 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use rmail_common::auth;
 use rmail_common::config::Config;
+use rmail_common::net::bind_tcp_listener;
 use rmail_common::outbound::QueueControl;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 
 #[derive(Serialize)]
 struct Stats {
@@ -435,7 +435,7 @@ async fn handle_connection(
     // prepare response
     let mut status = 200;
     let mut content_type = "text/plain".to_string();
-    let mut body = String::new();
+    let body: String;
 
     // read body for POST requests
     let mut body_bytes: Vec<u8> = Vec::new();
@@ -1139,7 +1139,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| vec![format!("127.0.0.1:{}", port)]);
     for addr in bind_addrs {
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = bind_tcp_listener(&addr)?;
         println!("rMail web UI listening on {}", addr);
         let mr = mail_root.clone();
         let admin_user = admin_user.clone();

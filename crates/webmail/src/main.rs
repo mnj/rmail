@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
-use rmail_common::{auth, config::Config, db, imap_state};
+use rmail_common::{auth, config::Config, db, imap_state, net::bind_tcp_listener};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| vec![format!("127.0.0.1:{}", port)]);
     for addr in bind_addrs {
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = bind_tcp_listener(&addr)?;
         println!("rMail webmail listening on {}", addr);
         let state = state.clone();
         tokio::spawn(async move {

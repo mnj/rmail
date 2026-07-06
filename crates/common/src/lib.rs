@@ -7,6 +7,7 @@ pub mod imap_state;
 pub mod mail_auth;
 pub mod maildir;
 pub mod metrics;
+pub mod net;
 pub mod outbound;
 pub mod runtime;
 pub mod scanner;

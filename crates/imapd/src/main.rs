@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use rmail_common::db::Mailbox;
-use rmail_common::{auth, config::Config, maildir};
+use rmail_common::{auth, config::Config, maildir, net::bind_tcp_listener};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{
@@ -10,7 +10,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 
 mod tls;
 use tls::load_tls_context;
@@ -776,7 +775,7 @@ async fn run_plain_listener(
     tls_ctx: Option<Arc<tls::TlsContext>>,
     db_path: Option<String>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_tcp_listener(addr)?;
     println!("rMail IMAPD listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -812,7 +811,7 @@ async fn run_imaps_listener(
     mail_root: String,
     db_path: Option<String>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_tcp_listener(addr)?;
     println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
