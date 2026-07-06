@@ -11,6 +11,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v bun >/dev/null 2>&1; then
+  echo "bun is required to build the webmail frontend" >&2
+  exit 1
+fi
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION="${1:-0.1.0}"
 ARCH="${2:-amd64}"
@@ -19,6 +24,12 @@ PKG_ROOT="${ROOT_DIR}/target/debian/rmail_${VERSION}_${ARCH}"
 RELEASE_DIR="${ROOT_DIR}/target/release"
 
 cd "${ROOT_DIR}"
+
+(
+  cd "${ROOT_DIR}/crates/webmail/frontend"
+  bun install --frozen-lockfile
+  bun run build
+)
 
 if [[ -n "${TARGET_TRIPLE}" ]]; then
   cargo build --release --target "${TARGET_TRIPLE}"
@@ -32,6 +43,7 @@ mkdir -p \
   "${PKG_ROOT}/DEBIAN" \
   "${PKG_ROOT}/usr/bin" \
   "${PKG_ROOT}/usr/lib/systemd/system" \
+  "${PKG_ROOT}/usr/share/rmail/webmail" \
   "${PKG_ROOT}/etc/rmail" \
   "${PKG_ROOT}/etc/default" \
   "${PKG_ROOT}/opt/rmail/mail" \
@@ -44,6 +56,7 @@ install -m 0755 "${RELEASE_DIR}/rmail_webmail" "${PKG_ROOT}/usr/bin/rmail_webmai
 install -m 0755 "${RELEASE_DIR}/rmail_outbound" "${PKG_ROOT}/usr/bin/rmail_outbound"
 install -m 0755 "${RELEASE_DIR}/rmail_ctl" "${PKG_ROOT}/usr/bin/rmail_ctl"
 install -m 0755 "${RELEASE_DIR}/rmail_queuectl" "${PKG_ROOT}/usr/bin/rmail_queuectl"
+cp -a "${ROOT_DIR}/crates/webmail/frontend/dist/." "${PKG_ROOT}/usr/share/rmail/webmail/"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_smtpd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_smtpd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_imapd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_imapd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_web.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_web.service"

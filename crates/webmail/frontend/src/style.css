@@ -1,6 +1,7 @@
 :root { color: #222831; background: #f5f7f8; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 * { box-sizing: border-box; }
-body { margin: 0; }
+html, body, #root { height: 100%; }
+body { margin: 0; overflow: hidden; }
 button, input { font: inherit; }
 .login-shell { min-height: 100vh; display: grid; place-items: center; background: #edf3f2; }
 .login-panel { width: min(360px, calc(100vw - 32px)); display: grid; gap: 12px; padding: 24px; background: #fff; border: 1px solid #d8dee2; border-radius: 8px; }
@@ -8,29 +9,33 @@ button, input { font: inherit; }
 .login-panel input, .search input { border: 1px solid #cfd7dc; border-radius: 6px; padding: 10px 12px; min-width: 0; }
 .login-panel button { border: 0; border-radius: 6px; padding: 10px 14px; background: #276ef1; color: white; cursor: pointer; }
 .error { color: #a0192b; margin: 0; }
-.app { height: 100vh; display: grid; grid-template-columns: 220px minmax(360px, 0.95fr) minmax(420px, 1.15fr); overflow: hidden; }
+.app { height: 100vh; min-height: 0; display: grid; grid-template-columns: 220px minmax(360px, 0.95fr) minmax(420px, 1.15fr); overflow: hidden; }
 .folders { background: #24313a; color: #eef5f6; padding: 14px 10px; overflow: auto; }
 .account { font-size: 13px; color: #aec2c8; padding: 8px 10px 18px; overflow: hidden; text-overflow: ellipsis; }
 .folders button { width: 100%; display: flex; justify-content: space-between; align-items: center; border: 0; color: inherit; background: transparent; border-radius: 6px; padding: 9px 10px; cursor: pointer; }
 .folders button.active, .folders button:hover { background: #38505c; }
 .folders small { color: #c7d7dc; }
-.mailbox { display: grid; grid-template-rows: 58px 48px 1fr; border-right: 1px solid #d8dee2; min-width: 0; }
+.mailbox { display: grid; grid-template-rows: 58px 48px minmax(0, 1fr); border-right: 1px solid #d8dee2; min-width: 0; min-height: 0; }
 .topbar, .toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #d8dee2; background: #fff; min-width: 0; }
 .search { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .search input { width: 100%; background: #f3f6f7; }
 .icon { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid #cfd7dc; border-radius: 6px; background: #fff; cursor: pointer; flex: 0 0 auto; }
 .toolbar strong { margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.message-list { overflow: auto; background: #fff; }
+.toolbar span { color: #667780; font-size: 13px; }
+.message-list { min-height: 0; overflow-y: auto; overflow-x: hidden; background: #fff; }
 .row { display: grid; grid-template-columns: 34px 1fr; min-height: 70px; border-bottom: 1px solid #e3e8eb; }
 .row input { margin: 22px 10px; }
 .row button { min-width: 0; text-align: left; border: 0; background: transparent; cursor: pointer; display: grid; grid-template-columns: 140px 1fr; gap: 3px 10px; padding: 10px 12px 10px 0; }
 .row.unread .from, .row.unread .subject { font-weight: 700; }
 .from, .subject, .snippet { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .snippet { grid-column: 2; color: #667780; font-size: 13px; }
-.reader { background: #fff; padding: 24px; overflow: auto; }
+.reader { min-height: 0; background: #fff; padding: 24px; overflow: auto; }
+.reader-actions { display: flex; gap: 8px; align-items: center; margin-bottom: 18px; }
+.reader-actions .back { margin: 0 auto 0 0; }
 .reader h2 { margin: 0 0 10px; font-size: 24px; line-height: 1.25; }
 .meta { color: #667780; margin-bottom: 24px; }
 .reader pre { white-space: pre-wrap; word-wrap: break-word; font-family: inherit; line-height: 1.5; }
+.html-message { display: block; width: 100%; min-height: 320px; border: 0; background: #fff; }
 .empty { height: 100%; display: grid; place-items: center; color: #7b8a91; }
 .mobile-only { display: none; }
 .back { margin-bottom: 12px; border: 1px solid #cfd7dc; border-radius: 6px; background: #fff; padding: 8px 10px; }

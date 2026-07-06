@@ -25,6 +25,7 @@ const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 struct AppState {
     mail_root: PathBuf,
     db_path: PathBuf,
+    static_dir: PathBuf,
     session_secret: Vec<u8>,
 }
 
@@ -156,9 +157,13 @@ async fn main() -> Result<()> {
             format!("ephemeral-{}", randish())
         })
         .into_bytes();
+    let static_dir = env::var("RMAIL_WEBMAIL_STATIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/usr/share/rmail/webmail"));
     let state = Arc::new(AppState {
         mail_root,
         db_path,
+        static_dir,
         session_secret,
     });
     let port = cfg.global.webmail_port.unwrap_or(8081);
@@ -305,7 +310,7 @@ async fn route(request: Request, state: &AppState) -> Response {
             Err(response) => response,
         },
         _ if request.path.starts_with("/api/folders/") => mailbox_api(request, state),
-        _ if request.method == "GET" => spa(),
+        _ if request.method == "GET" => static_spa(&request.path, state),
         _ => Response::empty(405),
     }
 }
@@ -470,7 +475,7 @@ fn message_detail(state: &AppState, session: &Session, folder: &str, uid: u64) -
             subject: parsed.subject,
             date: parsed.date,
             text_body: parsed.text_body,
-            html_body: parsed.html_body.map(|html| sanitize_html(&html)),
+            html_body: parsed.html_body.map(|html| sanitize_email_html(&html)),
         },
     )
 }
@@ -637,50 +642,455 @@ struct ParsedMessage {
     date: String,
     text_body: String,
     html_body: Option<String>,
+    inline_images: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct MultipartParsed {
+    text_body: Option<String>,
+    html_body: Option<String>,
+    inline_images: HashMap<String, String>,
 }
 
 fn parse_message(bytes: &[u8]) -> ParsedMessage {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
     let (headers, body) = text.split_once("\n\n").unwrap_or(("", &text));
+    parse_message_parts(headers, body)
+}
+
+fn parse_message_parts(headers: &str, body: &str) -> ParsedMessage {
     let mut parsed = ParsedMessage::default();
+    let header_map = parse_headers(headers);
+    parsed.from = header_map.get("from").cloned().unwrap_or_default();
+    parsed.to = header_map.get("to").cloned().unwrap_or_default();
+    parsed.subject = header_map.get("subject").cloned().unwrap_or_default();
+    parsed.date = header_map.get("date").cloned().unwrap_or_default();
+
+    let content_type_raw = header_map
+        .get("content-type")
+        .cloned()
+        .unwrap_or_else(|| "text/plain".to_string());
+    let content_type = content_type_raw.to_ascii_lowercase();
+    let transfer_encoding = header_map
+        .get("content-transfer-encoding")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let (text_body, html_body, inline_images) = if content_type.starts_with("multipart/") {
+        if let Some(boundary) = header_param(&content_type_raw, "boundary") {
+            let multipart = parse_multipart_body(body, &boundary);
+            (
+                multipart.text_body.unwrap_or_else(|| {
+                    multipart
+                        .html_body
+                        .as_deref()
+                        .map(strip_html)
+                        .unwrap_or_default()
+                }),
+                multipart.html_body,
+                multipart.inline_images,
+            )
+        } else {
+            (
+                decode_transfer_text(body, &transfer_encoding),
+                None,
+                HashMap::new(),
+            )
+        }
+    } else {
+        let decoded = decode_transfer_text(body, &transfer_encoding);
+        if content_type.contains("text/html") {
+            (strip_html(decoded.trim()), Some(decoded), HashMap::new())
+        } else {
+            (decoded, None, HashMap::new())
+        }
+    };
+
+    parsed.text_body = text_body.trim().to_string();
+    parsed.inline_images = inline_images;
+    parsed.html_body =
+        html_body.map(|html| apply_inline_images(html.trim(), &parsed.inline_images));
+    parsed
+}
+
+fn parse_headers(headers: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut current_name: Option<String> = None;
+    let mut current_value = String::new();
     for line in headers.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
+            if !current_value.is_empty() {
+                current_value.push(' ');
+            }
+            current_value.push_str(line.trim());
             continue;
+        }
+        if let Some(name) = current_name.take() {
+            out.insert(name, decode_rfc2047_words(current_value.trim()));
+            current_value.clear();
         }
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        match name.to_ascii_lowercase().as_str() {
-            "from" => parsed.from = value.trim().to_string(),
-            "to" => parsed.to = value.trim().to_string(),
-            "subject" => parsed.subject = value.trim().to_string(),
-            "date" => parsed.date = value.trim().to_string(),
-            "content-type" if value.to_ascii_lowercase().contains("text/html") => {
-                parsed.html_body = Some(body.trim().to_string());
+        current_name = Some(name.trim().to_ascii_lowercase());
+        current_value.push_str(value.trim());
+    }
+    if let Some(name) = current_name {
+        out.insert(name, decode_rfc2047_words(current_value.trim()));
+    }
+    out
+}
+
+fn header_param(content_type: &str, name: &str) -> Option<String> {
+    for part in content_type.split(';').skip(1) {
+        let (k, v) = part.trim().split_once('=')?;
+        if k.trim().eq_ignore_ascii_case(name) {
+            return Some(v.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn parse_multipart_body(body: &str, boundary: &str) -> MultipartParsed {
+    let marker = format!("--{boundary}");
+    let mut parsed = MultipartParsed::default();
+    for raw_part in body.split(&marker).skip(1) {
+        let part = raw_part.trim_start_matches('\n').trim_end();
+        if part.starts_with("--") {
+            break;
+        }
+        let Some((part_headers, part_body)) = part.split_once("\n\n") else {
+            continue;
+        };
+        let headers = parse_headers(part_headers);
+        let content_type_raw = headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "text/plain".to_string());
+        let content_type = content_type_raw.to_ascii_lowercase();
+        let transfer_encoding = headers
+            .get("content-transfer-encoding")
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if content_type.starts_with("multipart/") {
+            if let Some(boundary) = header_param(&content_type_raw, "boundary") {
+                let nested = parse_multipart_body(part_body, &boundary);
+                if parsed.text_body.is_none() {
+                    parsed.text_body = nested.text_body;
+                }
+                if parsed.html_body.is_none() {
+                    parsed.html_body = nested.html_body;
+                }
+                parsed.inline_images.extend(nested.inline_images);
+            }
+            continue;
+        }
+
+        let decoded = decode_transfer_text(part_body, &transfer_encoding);
+        if content_type.starts_with("image/") {
+            if let Some(cid) = headers
+                .get("content-id")
+                .map(|v| v.trim().trim_matches('<').trim_matches('>').to_string())
+            {
+                let bytes = decode_transfer_bytes(part_body, &transfer_encoding);
+                parsed.inline_images.insert(
+                    cid,
+                    format!(
+                        "data:{};base64,{}",
+                        content_type_raw
+                            .split(';')
+                            .next()
+                            .unwrap_or("application/octet-stream"),
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ),
+                );
+            }
+        } else if content_type.contains("text/plain") && parsed.text_body.is_none() {
+            parsed.text_body = Some(decoded);
+        } else if content_type.contains("text/html") && parsed.html_body.is_none() {
+            parsed.html_body = Some(decoded);
+        }
+    }
+    parsed
+}
+
+fn decode_transfer_text(input: &str, encoding: &str) -> String {
+    String::from_utf8_lossy(&decode_transfer_bytes(input, encoding)).to_string()
+}
+
+fn decode_transfer_bytes(input: &str, encoding: &str) -> Vec<u8> {
+    if encoding.contains("quoted-printable") {
+        decode_quoted_printable(input.as_bytes())
+    } else if encoding.contains("base64") {
+        let compact = input.split_whitespace().collect::<String>();
+        base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .unwrap_or_else(|_| input.as_bytes().to_vec())
+    } else {
+        input.as_bytes().to_vec()
+    }
+}
+
+fn apply_inline_images(html: &str, inline_images: &HashMap<String, String>) -> String {
+    let mut out = html.to_string();
+    for (cid, data_url) in inline_images {
+        out = out.replace(&format!("cid:{cid}"), data_url);
+        out = out.replace(&format!("cid:<{cid}>"), data_url);
+    }
+    out
+}
+
+fn decode_quoted_printable(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'=' {
+            if input.get(i + 1) == Some(&b'\r') && input.get(i + 2) == Some(&b'\n') {
+                i += 3;
+                continue;
+            }
+            if input.get(i + 1) == Some(&b'\n') {
+                i += 2;
+                continue;
+            }
+            if i + 2 < input.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_rfc2047_words(input: &str) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("=?") {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(charset_end) = after_start.find('?') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let charset = &after_start[..charset_end];
+        let after_charset = &after_start[charset_end + 1..];
+        let Some(enc_end) = after_charset.find('?') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let encoding = &after_charset[..enc_end];
+        let after_encoding = &after_charset[enc_end + 1..];
+        let Some(data_end) = after_encoding.find("?=") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let data = &after_encoding[..data_end];
+        if charset.eq_ignore_ascii_case("utf-8") || charset.eq_ignore_ascii_case("us-ascii") {
+            if encoding.eq_ignore_ascii_case("q") {
+                let qp = data.replace('_', " ");
+                out.push_str(&String::from_utf8_lossy(&decode_quoted_printable(
+                    qp.as_bytes(),
+                )));
+            } else if encoding.eq_ignore_ascii_case("b") {
+                match base64::engine::general_purpose::STANDARD.decode(data) {
+                    Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    Err(_) => out.push_str(data),
+                }
+            } else {
+                out.push_str(data);
+            }
+        } else {
+            out.push_str(data);
+        }
+        rest = &after_encoding[data_end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_html(input: &str) -> String {
+    let input = remove_html_block(input, "head");
+    let input = remove_html_block(&input, "style");
+    let input = remove_html_block(&input, "script");
+    let input = remove_html_block(&input, "noscript");
+    let input = remove_html_comments(&input);
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut last_was_space = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+            }
+            _ if !in_tag => {
+                if ch.is_whitespace() {
+                    if !last_was_space {
+                        out.push(' ');
+                        last_was_space = true;
+                    }
+                } else {
+                    out.push(ch);
+                    last_was_space = false;
+                }
             }
             _ => {}
         }
     }
-    parsed.text_body = strip_html(body.trim());
-    parsed
+    html_unescape(&out).trim().to_string()
 }
 
-fn strip_html(input: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for ch in input.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+fn remove_html_block(input: &str, tag: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(start) = lower.find(&open) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        let lower_after = &lower[start..];
+        if let Some(end) = lower_after.find(&close) {
+            rest = &after_open[end + close.len()..];
+        } else {
+            break;
         }
     }
-    html_unescape(&out)
+    out
 }
 
-fn sanitize_html(input: &str) -> String {
-    html_escape(&strip_html(input)).replace('\n', "<br>")
+fn remove_html_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let Some(start) = rest.find("<!--") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        if let Some(end) = after.find("-->") {
+            rest = &after[end + 3..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn sanitize_email_html(input: &str) -> String {
+    let input = remove_html_block(input, "script");
+    let input = remove_html_block(&input, "iframe");
+    let input = remove_html_block(&input, "object");
+    let input = remove_html_block(&input, "embed");
+    let input = remove_html_comments(&input);
+    let mut out = String::with_capacity(input.len() + 128);
+    let mut rest = input.as_str();
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let Some(end) = after.find('>') else {
+            break;
+        };
+        let tag = &after[..=end];
+        out.push_str(&sanitize_html_tag(tag));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    format!(
+        r#"<!doctype html><html><head><base target="_blank"><style>html,body{{margin:0;padding:0;background:#fff;color:#222831;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}}img{{max-width:100%;height:auto}}table{{max-width:100%;border-collapse:collapse}}a{{color:#276ef1}}</style></head><body>{}</body></html>"#,
+        out
+    )
+}
+
+fn sanitize_html_tag(tag: &str) -> String {
+    let lower = tag.to_ascii_lowercase();
+    if lower.starts_with("<script")
+        || lower.starts_with("</script")
+        || lower.starts_with("<iframe")
+        || lower.starts_with("</iframe")
+        || lower.starts_with("<object")
+        || lower.starts_with("</object")
+        || lower.starts_with("<embed")
+        || lower.starts_with("</embed")
+        || lower.starts_with("<meta")
+        || lower.starts_with("<link")
+    {
+        return String::new();
+    }
+
+    let mut cleaned = String::with_capacity(tag.len());
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            let attr_start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let name_start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b':')
+            {
+                i += 1;
+            }
+            let name = tag[name_start..i].to_ascii_lowercase();
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'=' {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                } else {
+                    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                        i += 1;
+                    }
+                }
+            }
+            if name.starts_with("on") || name == "srcdoc" {
+                continue;
+            }
+            cleaned.push_str(&tag[attr_start..i]);
+        } else {
+            cleaned.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    cleaned
 }
 
 fn snippet(input: &str) -> String {
@@ -724,14 +1134,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn html_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn html_unescape(input: &str) -> String {
     input
         .replace("&lt;", "<")
@@ -755,11 +1157,62 @@ fn randish() -> u64 {
         ^ u64::from(std::process::id())
 }
 
-fn spa() -> Response {
+fn static_spa(path: &str, state: &AppState) -> Response {
+    if state.static_dir.is_dir() {
+        let relative = if path == "/" {
+            "index.html"
+        } else {
+            path.trim_start_matches('/')
+        };
+        if !relative
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            let file_path = state.static_dir.join(relative);
+            if file_path.is_file() {
+                if let Ok(body) = fs::read(&file_path) {
+                    return Response {
+                        status: 200,
+                        content_type: static_content_type(&file_path),
+                        headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
+                        body,
+                    };
+                }
+            }
+        }
+        let index = state.static_dir.join("index.html");
+        if index.is_file() {
+            if let Ok(body) = fs::read(index) {
+                return Response {
+                    status: 200,
+                    content_type: "text/html; charset=utf-8",
+                    headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
+                    body,
+                };
+            }
+        }
+    }
+    embedded_spa()
+}
+
+fn static_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "ico" => "image/x-icon",
+        "html" => "text/html; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn embedded_spa() -> Response {
     Response {
         status: 200,
         content_type: "text/html; charset=utf-8",
-        headers: Vec::new(),
+        headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
         body: EMBEDDED_SPA.as_bytes().to_vec(),
     }
 }
@@ -771,15 +1224,15 @@ const EMBEDDED_SPA: &str = r#"<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>rMail Webmail</title>
     <style>
-      body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f7f8;color:#222831}
+      html,body,#root{height:100%}body{margin:0;overflow:hidden;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f7f8;color:#222831}
       button,input{font:inherit}button{cursor:pointer}.login{min-height:100vh;display:grid;place-items:center;background:#edf3f2}
       form{width:min(360px,calc(100vw - 32px));display:grid;gap:12px;padding:24px;background:#fff;border:1px solid #d8dee2;border-radius:8px}
       input{border:1px solid #cfd7dc;border-radius:6px;padding:10px 12px}form button,.bar button{border:0;border-radius:6px;padding:10px 14px;background:#276ef1;color:#fff}
-      .app{height:100vh;display:grid;grid-template-columns:220px minmax(340px,.95fr) minmax(380px,1.15fr);overflow:hidden}.folders{background:#24313a;color:#eef5f6;padding:14px 10px;overflow:auto}
+      .app{height:100vh;min-height:0;display:grid;grid-template-columns:220px minmax(340px,.95fr) minmax(380px,1.15fr);overflow:hidden}.folders{background:#24313a;color:#eef5f6;padding:14px 10px;overflow:auto}
       .folders button{width:100%;display:flex;justify-content:space-between;border:0;background:transparent;color:inherit;border-radius:6px;padding:9px 10px}.folders .active,.folders button:hover{background:#38505c}
-      .list{display:grid;grid-template-rows:58px 1fr;border-right:1px solid #d8dee2;min-width:0;background:#fff}.bar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid #d8dee2}.bar input{flex:1;min-width:0;background:#f3f6f7}
-      .msg{display:grid;grid-template-columns:140px 1fr;gap:4px 12px;width:100%;border:0;border-bottom:1px solid #e3e8eb;background:#fff;text-align:left;padding:12px}.msg.unread{font-weight:700}.msg small{grid-column:2;color:#667780;font-weight:400;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-      .reader{background:#fff;padding:24px;overflow:auto}.reader pre{white-space:pre-wrap;font-family:inherit;line-height:1.5}.muted{color:#667780}
+      .list{display:grid;grid-template-rows:58px minmax(0,1fr);border-right:1px solid #d8dee2;min-width:0;min-height:0;background:#fff}.bar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid #d8dee2}.bar input{flex:1;min-width:0;background:#f3f6f7}
+      .list>div{min-height:0;overflow:auto}.msg{display:grid;grid-template-columns:140px 1fr;gap:4px 12px;width:100%;border:0;border-bottom:1px solid #e3e8eb;background:#fff;text-align:left;padding:12px}.msg.unread{font-weight:700}.msg small{grid-column:2;color:#667780;font-weight:400;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+      .reader{min-height:0;background:#fff;padding:24px;overflow:auto}.reader-actions{display:flex;gap:8px;margin-bottom:18px}.reader pre{white-space:pre-wrap;font-family:inherit;line-height:1.5}.html-message{display:block;width:100%;min-height:480px;border:0;background:#fff}.muted{color:#667780}
       @media(max-width:820px){.app{display:block}.folders,.list,.reader{height:auto;min-height:33vh}.msg{grid-template-columns:1fr}.msg small{grid-column:1}}
     </style>
   </head>
@@ -787,7 +1240,7 @@ const EMBEDDED_SPA: &str = r#"<!doctype html>
     const root=document.getElementById('root');let folder='INBOX',q='';
     async function api(url,options={}){const r=await fetch(url,{credentials:'same-origin',headers:{'Content-Type':'application/json'},...options});if(!r.ok)throw new Error(await r.text()||r.statusText);return r.status===204?null:r.json()}
     function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-    async function load(){try{const s=await api('/api/session'),folders=await api('/api/folders'),msgs=await api('/api/folders/'+encodeURIComponent(folder)+'/messages?limit=100&q='+encodeURIComponent(q));root.className='app';root.innerHTML='<aside class="folders"><p class="muted">'+esc(s.address)+'</p>'+folders.map(f=>'<button class="'+(f.name===folder?'active':'')+'" data-folder="'+esc(f.name)+'"><span>'+esc(f.name)+'</span><small>'+(f.unread||f.messages)+'</small></button>').join('')+'</aside><main class="list"><div class="bar"><input id="q" placeholder="Search mail" value="'+esc(q)+'"><button id="refresh">Refresh</button><button id="archive">Archive</button><button id="delete">Delete</button></div><div>'+msgs.map(m=>'<button class="msg '+(m.flags.some(f=>f.toLowerCase()==='\\\\seen')?'':'unread')+'" data-uid="'+m.uid+'"><span>'+esc(m.from||'(unknown)')+'</span><span>'+esc(m.subject||'(no subject)')+'</span><small>'+esc(m.snippet)+'</small></button>').join('')+'</div></main><article class="reader" id="reader">Select a message</article>';document.querySelector('.folders').onclick=e=>{const b=e.target.closest('button[data-folder]');if(b){folder=b.dataset.folder;load()}};document.getElementById('refresh').onclick=()=>{q=document.getElementById('q').value;load()};document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'){q=e.target.value;load()}};document.querySelector('.list').onclick=async e=>{const b=e.target.closest('button[data-uid]');if(!b)return;const m=await api('/api/folders/'+encodeURIComponent(folder)+'/messages/'+b.dataset.uid);document.getElementById('reader').innerHTML='<h2>'+esc(m.subject||'(no subject)')+'</h2><p class="muted">From '+esc(m.from||'(unknown)')+' to '+esc(m.to||s.address)+'</p><pre>'+esc(m.text_body)+'</pre>';window.currentUid=Number(b.dataset.uid)};document.getElementById('archive').onclick=()=>bulk('archive');document.getElementById('delete').onclick=()=>bulk('delete')}catch{login()}}
+    async function load(){try{const s=await api('/api/session'),folders=await api('/api/folders'),msgs=await api('/api/folders/'+encodeURIComponent(folder)+'/messages?limit=100&q='+encodeURIComponent(q));root.className='app';root.innerHTML='<aside class="folders"><p class="muted">'+esc(s.address)+'</p>'+folders.map(f=>'<button class="'+(f.name===folder?'active':'')+'" data-folder="'+esc(f.name)+'"><span>'+esc(f.name)+'</span><small>'+(f.unread||f.messages)+'</small></button>').join('')+'</aside><main class="list"><div class="bar"><input id="q" placeholder="Search mail" value="'+esc(q)+'"><button id="refresh">Refresh</button></div><div>'+msgs.map(m=>'<button class="msg '+(m.flags.some(f=>f.toLowerCase()==='\\\\seen')?'':'unread')+'" data-uid="'+m.uid+'"><span>'+esc(m.from||'(unknown)')+'</span><span>'+esc(m.subject||'(no subject)')+'</span><small>'+esc(m.snippet)+'</small></button>').join('')+'</div></main><article class="reader" id="reader">Select a message</article>';document.querySelector('.folders').onclick=e=>{const b=e.target.closest('button[data-folder]');if(b){folder=b.dataset.folder;load()}};document.getElementById('refresh').onclick=()=>{q=document.getElementById('q').value;load()};document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'){q=e.target.value;load()}};document.querySelector('.list').onclick=async e=>{const b=e.target.closest('button[data-uid]');if(!b)return;const m=await api('/api/folders/'+encodeURIComponent(folder)+'/messages/'+b.dataset.uid);const body=m.html_body?'<iframe class="html-message" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>':'<pre>'+esc(m.text_body)+'</pre>';document.getElementById('reader').innerHTML='<div class="reader-actions"><button id="archive">Archive</button><button id="delete">Delete</button></div><h2>'+esc(m.subject||'(no subject)')+'</h2><p class="muted">From '+esc(m.from||'(unknown)')+' to '+esc(m.to||s.address)+'</p>'+body;if(m.html_body){document.querySelector('.html-message').srcdoc=m.html_body}window.currentUid=Number(b.dataset.uid);document.getElementById('archive').onclick=()=>bulk('archive');document.getElementById('delete').onclick=()=>bulk('delete')}}catch{login()}}
     async function bulk(action){if(!window.currentUid)return;await api('/api/folders/'+encodeURIComponent(folder)+'/messages/bulk',{method:'POST',body:JSON.stringify({action,uids:[window.currentUid]})});window.currentUid=null;load()}
     function login(){root.className='login';root.innerHTML='<form id="login"><h1>rMail</h1><input name="address" placeholder="Mailbox" autocomplete="username"><input name="password" placeholder="Password" type="password" autocomplete="current-password"><button>Sign in</button><p id="err"></p></form>';document.getElementById('login').onsubmit=async e=>{e.preventDefault();const fd=new FormData(e.target);try{await api('/api/login',{method:'POST',body:JSON.stringify({address:fd.get('address'),password:fd.get('password')})});load()}catch{document.getElementById('err').textContent='Invalid mailbox or password'}}}
     load();
@@ -847,6 +1300,7 @@ mod tests {
         AppState {
             mail_root: td.path().join("mail"),
             db_path,
+            static_dir: td.path().join("static"),
             session_secret: b"test secret".to_vec(),
         }
     }
@@ -988,5 +1442,76 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn serves_static_webmail_assets_when_present() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        fs::create_dir_all(&state.static_dir).unwrap();
+        fs::write(
+            state.static_dir.join("index.html"),
+            "<!doctype html><p>built ui</p>",
+        )
+        .unwrap();
+        fs::create_dir_all(state.static_dir.join("assets")).unwrap();
+        fs::write(
+            state.static_dir.join("assets/app.js"),
+            "console.log('built')",
+        )
+        .unwrap();
+
+        let index = route(req("GET", "/", b"", None), &state).await;
+        assert_eq!(index.status, 200);
+        assert_eq!(index.content_type, "text/html; charset=utf-8");
+        assert!(String::from_utf8(index.body).unwrap().contains("built ui"));
+
+        let asset = route(req("GET", "/assets/app.js", b"", None), &state).await;
+        assert_eq!(asset.status, 200);
+        assert_eq!(asset.content_type, "application/javascript; charset=utf-8");
+        assert_eq!(asset.body, b"console.log('built')");
+    }
+
+    #[test]
+    fn parse_message_decodes_quoted_printable_html() {
+        let parsed = parse_message(
+            b"From: =?UTF-8?Q?Glassdoor_Jobs?= <noreply@example.test>\r\nSubject: =?UTF-8?Q?Apply_Now_=E2=80=93_Aarhus?=\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<p>Vestas Wind Systems =E2=80=93 apply now.</p>",
+        );
+
+        assert_eq!(parsed.from, "Glassdoor Jobs <noreply@example.test>");
+        assert_eq!(parsed.subject, "Apply Now – Aarhus");
+        assert_eq!(parsed.text_body, "Vestas Wind Systems – apply now.");
+    }
+
+    #[test]
+    fn parse_message_drops_html_styles_from_visible_text() {
+        let parsed = parse_message(
+            b"From: jobs@example.test\r\nSubject: styled\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<html><head><style>@font-face { font-family: 'Glassdoor Sans'; src: url(font.woff2); } body { color: red; }</style></head><body><h1>Apply Now</h1><p>Vestas Wind Systems =E2=80=93 Aarhus</p></body></html>",
+        );
+
+        assert_eq!(parsed.text_body, "Apply Now Vestas Wind Systems – Aarhus");
+        assert!(!parsed.text_body.contains("@font-face"));
+        assert!(!parsed.text_body.contains("font-family"));
+    }
+
+    #[test]
+    fn parse_message_prefers_plain_part_from_multipart() {
+        let parsed = parse_message(
+            b"From: a@example.test\r\nSubject: multipart\r\nContent-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n--b1\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nPlain =E2=80=93 text\r\n--b1\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<p>HTML =E2=80=93 text</p>\r\n--b1--\r\n",
+        );
+
+        assert_eq!(parsed.text_body, "Plain – text");
+        assert_eq!(parsed.html_body.as_deref(), Some("<p>HTML – text</p>"));
+    }
+
+    #[test]
+    fn parse_message_rewrites_inline_cid_images() {
+        let parsed = parse_message(
+            b"From: a@example.test\r\nSubject: image\r\nContent-Type: multipart/related; boundary=\"rel\"\r\n\r\n--rel\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<p>Logo <img src=\"cid:logo@example.test\"></p>\r\n--rel\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <logo@example.test>\r\n\r\naGVsbG8=\r\n--rel--\r\n",
+        );
+
+        let html = parsed.html_body.unwrap();
+        assert!(html.contains("Logo"));
+        assert!(html.contains("src=\"data:image/png;base64,aGVsbG8=\""));
     }
 }

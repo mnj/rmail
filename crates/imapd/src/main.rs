@@ -466,6 +466,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uid_fetch_header_fields_not_excludes_requested_headers() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"From: a@example.test\r\nTo: user@example.test\r\nSubject: one\r\nX-Spam: no\r\n\r\nfirst\r\n",
+        )
+        .expect("deliver");
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 UID FETCH 1:* (UID BODY.PEEK[HEADER.FIELDS.NOT (SUBJECT)])\r\nA004 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _select_lines = read_until_contains(&mut reader, "A002 OK").await;
+        let fetch_lines = read_until_contains(&mut reader, "A003 OK").await;
+        let joined = fetch_lines.join("");
+        assert!(joined.contains("BODY[HEADER.FIELDS.NOT (SUBJECT)] {"));
+        assert!(joined.contains("From: a@example.test"));
+        assert!(joined.contains("X-Spam: no"));
+        assert!(!joined.contains("Subject: one"));
+
+        let _logout_lines = read_until_contains(&mut reader, "A004 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn uid_fetch_supports_body_text_and_partial_literals() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"From: a@example.test\r\nSubject: body ranges\r\n\r\n0123456789abcdef\r\n",
+        )
+        .expect("deliver");
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 UID FETCH 1:* (UID BODY[TEXT]<2.5>)\r\nA004 UID FETCH 1:* (UID BODY.PEEK[]<0.12>)\r\nA005 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _select_lines = read_until_contains(&mut reader, "A002 OK").await;
+        let text_lines = read_until_contains(&mut reader, "A003 OK").await;
+        let joined_text = text_lines.join("");
+        assert!(joined_text.contains("BODY[TEXT]<2> {5}"));
+        assert!(joined_text.contains("23456"));
+        assert!(!joined_text.contains("Subject: body ranges"));
+
+        let partial_lines = read_until_contains(&mut reader, "A004 OK").await;
+        let joined_partial = partial_lines.join("");
+        assert!(joined_partial.contains("BODY[]<0> {12}"));
+        assert!(joined_partial.contains("From: a@exam"));
+        assert!(!joined_partial.contains("0123456789abcdef"));
+
+        let _logout_lines = read_until_contains(&mut reader, "A005 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn idle_completes_after_done() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        assert!(capability.contains("IDLE"));
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 IDLE\r\nDONE\r\nA003 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _login_lines = read_until_contains(&mut reader, "A001 OK").await;
+        let idle_start = read_until_contains(&mut reader, "+ idling").await;
+        assert!(idle_start.iter().any(|line| line.contains("+ idling")));
+        let idle_done = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(idle_done.iter().any(|line| line.contains("IDLE completed")));
+        let _logout_lines = read_until_contains(&mut reader, "A003 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
     async fn store_deleted_and_expunge_removes_message() {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
@@ -537,6 +719,186 @@ mod tests {
         assert!(select2.iter().any(|l| l.contains("* 1 EXISTS")));
 
         let _logout = read_until_contains(&mut reader, "A006 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn search_supports_headers_text_dates_ranges_or_and_not() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Date: Sun, 14 Jun 2026 12:00:00 +0000\r\nFrom: alice@example.test\r\nTo: user@example.test\r\nCc: team@example.test\r\nSubject: Alpha Project\r\n\r\nbody has rocket text\r\n",
+        )
+        .expect("deliver one");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Date: Mon, 15 Jun 2026 12:00:00 +0000\r\nFrom: bob@example.test\r\nTo: user@example.test\r\nSubject: Beta Report\r\n\r\nbody has invoice text\r\n",
+        )
+        .expect("deliver two");
+
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 UID STORE 1 +FLAGS (\\Seen)\r\nA004 SEARCH UNSEEN\r\nA005 SEARCH FROM alice\r\nA006 SEARCH BODY invoice\r\nA007 SEARCH TEXT rocket\r\nA008 UID SEARCH UID 2:*\r\nA009 SEARCH OR SUBJECT Alpha SUBJECT Beta\r\nA010 SEARCH NOT FROM alice\r\nA011 SEARCH 2\r\nA012 UID SEARCH SENTSINCE 15-Jun-2026 SENTBEFORE 16-Jun-2026\r\nA013 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _select = read_until_contains(&mut reader, "A002 OK").await;
+        let _store = read_until_contains(&mut reader, "A003 OK").await;
+
+        let unseen = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(unseen.iter().any(|l| l.trim_end() == "* SEARCH 2"));
+
+        let from = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(from.iter().any(|l| l.trim_end() == "* SEARCH 1"));
+
+        let body = read_until_contains(&mut reader, "A006 OK").await;
+        assert!(body.iter().any(|l| l.trim_end() == "* SEARCH 2"));
+
+        let text = read_until_contains(&mut reader, "A007 OK").await;
+        assert!(text.iter().any(|l| l.trim_end() == "* SEARCH 1"));
+
+        let uid_range = read_until_contains(&mut reader, "A008 OK").await;
+        assert!(uid_range.iter().any(|l| l.trim_end() == "* SEARCH 2"));
+
+        let or_lines = read_until_contains(&mut reader, "A009 OK").await;
+        assert!(or_lines.iter().any(|l| l.trim_end() == "* SEARCH 1 2"));
+
+        let not_lines = read_until_contains(&mut reader, "A010 OK").await;
+        assert!(not_lines.iter().any(|l| l.trim_end() == "* SEARCH 2"));
+
+        let seq_range = read_until_contains(&mut reader, "A011 OK").await;
+        assert!(seq_range.iter().any(|l| l.trim_end() == "* SEARCH 2"));
+
+        let sent_date = read_until_contains(&mut reader, "A012 OK").await;
+        assert!(sent_date.iter().any(|l| l.trim_end() == "* SEARCH 2"));
+
+        let _logout = read_until_contains(&mut reader, "A013 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn check_unselect_uid_copy_and_uid_move_work() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Subject: one\r\n\r\nfirst\r\n",
+        )
+        .expect("deliver one");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Subject: two\r\n\r\nsecond\r\n",
+        )
+        .expect("deliver two");
+
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        assert!(capability.contains("MOVE"));
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 CHECK\r\nA004 UID COPY 1 Archive\r\nA005 UID MOVE 2 Archive\r\nA006 UNSELECT\r\nA007 SELECT INBOX\r\nA008 STATUS Archive (MESSAGES)\r\nA009 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _select1 = read_until_contains(&mut reader, "A002 OK").await;
+        let check_lines = read_until_contains(&mut reader, "A003 OK").await;
+        assert!(check_lines.iter().any(|l| l.contains("CHECK completed")));
+
+        let copy_lines = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(copy_lines.iter().any(|l| l.contains("COPYUID")));
+
+        let move_lines = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(move_lines.iter().any(|l| l.contains("COPYUID")));
+
+        let unselect_lines = read_until_contains(&mut reader, "A006 OK").await;
+        assert!(
+            unselect_lines
+                .iter()
+                .any(|l| l.contains("UNSELECT completed"))
+        );
+
+        let select2 = read_until_contains(&mut reader, "A007 OK").await;
+        assert!(select2.iter().any(|l| l.contains("* 1 EXISTS")));
+
+        let status = read_until_contains(&mut reader, "A008 OK").await;
+        assert!(
+            status
+                .iter()
+                .any(|l| l.contains("* STATUS \"Archive\" (MESSAGES 2)"))
+        );
+
+        let _logout = read_until_contains(&mut reader, "A009 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -638,7 +1000,7 @@ mod tests {
             &mail_root,
             "example.test",
             "user",
-            b"Date: Sun, 14 Jun 2026 12:00:00 +0000\r\nSubject: macro\r\n\r\nbody\r\n",
+            b"Date: Sun, 14 Jun 2026 12:00:00 +0000\r\nFrom: Sender Name <sender@example.test>\r\nTo: User <user@example.test>\r\nCc: copy@example.test\r\nMessage-ID: <m1@example.test>\r\nSubject: macro\r\n\r\nbody\r\n",
         )
         .expect("deliver");
 
@@ -684,6 +1046,10 @@ mod tests {
         assert!(joined_uid.contains("UID "));
         assert!(joined_uid.contains("BODYSTRUCTURE"));
         assert!(joined_uid.contains("ENVELOPE"));
+        assert!(joined_uid.contains("(\"Sender Name\" NIL \"sender\" \"example.test\")"));
+        assert!(joined_uid.contains("(\"User\" NIL \"user\" \"example.test\")"));
+        assert!(joined_uid.contains("(NIL NIL \"copy\" \"example.test\")"));
+        assert!(joined_uid.contains("\"<m1@example.test>\""));
 
         let _logout = read_until_contains(&mut reader, "A005 OK").await;
         server_task.await.expect("join").expect("server");
@@ -851,7 +1217,14 @@ fn unquote(s: &str) -> &str {
 }
 
 fn capability_tokens(session_encrypted: bool, tls_ctx: Option<&Arc<tls::TlsContext>>) -> String {
-    let mut caps = vec!["IMAP4rev1", "UIDPLUS", "NAMESPACE", "SPECIAL-USE"];
+    let mut caps = vec![
+        "IMAP4rev1",
+        "UIDPLUS",
+        "NAMESPACE",
+        "SPECIAL-USE",
+        "IDLE",
+        "MOVE",
+    ];
     if !session_encrypted {
         caps.push("LOGINDISABLED");
         if tls_ctx.is_some() {
@@ -940,6 +1313,280 @@ fn uids_from_set(uid_set: &str, msgs: &[(u64, std::path::PathBuf, Vec<String>)])
     }
 }
 
+fn ids_from_set(id_set: &str, max: u64) -> Vec<u64> {
+    if id_set == "*" {
+        return (1..=max).collect();
+    }
+    let mut out = Vec::new();
+    for part in id_set.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once(':') {
+            let start = if start == "*" {
+                max
+            } else {
+                start.parse::<u64>().unwrap_or(1)
+            };
+            let end = if end == "*" {
+                max
+            } else {
+                end.parse::<u64>().unwrap_or(max)
+            };
+            let (lo, hi) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            out.extend(lo..=hi);
+        } else if let Ok(id) = part.parse::<u64>() {
+            out.push(id);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[derive(Debug, Clone)]
+enum SearchCriterion {
+    All,
+    Seen,
+    Unseen,
+    SeqSet(String),
+    UidSet(String),
+    Since(chrono::NaiveDate),
+    Before(chrono::NaiveDate),
+    SentSince(chrono::NaiveDate),
+    SentBefore(chrono::NaiveDate),
+    Header(String, String),
+    Body(String),
+    Text(String),
+    Not(Box<SearchCriterion>),
+    Or(Box<SearchCriterion>, Box<SearchCriterion>),
+    And(Vec<SearchCriterion>),
+}
+
+#[derive(Debug)]
+struct SearchMessage<'a> {
+    seq: usize,
+    uid: u64,
+    flags: &'a [String],
+    path: &'a Path,
+    data: &'a [u8],
+}
+
+fn tokenize_search(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ' ' | '\t' | '\r' | '\n' => {}
+            '(' | ')' => tokens.push(ch.to_string()),
+            '"' => {
+                let mut token = String::new();
+                let mut escaped = false;
+                for next in chars.by_ref() {
+                    if escaped {
+                        token.push(next);
+                        escaped = false;
+                    } else if next == '\\' {
+                        escaped = true;
+                    } else if next == '"' {
+                        break;
+                    } else {
+                        token.push(next);
+                    }
+                }
+                tokens.push(token);
+            }
+            _ => {
+                let mut token = String::new();
+                token.push(ch);
+                while let Some(next) = chars.peek().copied() {
+                    if next.is_whitespace() || next == '(' || next == ')' {
+                        break;
+                    }
+                    token.push(next);
+                    chars.next();
+                }
+                tokens.push(token);
+            }
+        }
+    }
+    tokens
+}
+
+fn parse_imap_date(token: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(token, "%d-%b-%Y").ok()
+}
+
+fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCriterion> {
+    let token = tokens.get(*pos)?.clone();
+    *pos += 1;
+    if token == "(" {
+        let mut items = Vec::new();
+        while tokens.get(*pos).map(|s| s.as_str()) != Some(")") {
+            items.push(parse_search_criterion(tokens, pos)?);
+        }
+        *pos += 1;
+        return Some(SearchCriterion::And(items));
+    }
+    if token == ")" {
+        return None;
+    }
+    let upper = token.to_uppercase();
+    match upper.as_str() {
+        "ALL" => Some(SearchCriterion::All),
+        "SEEN" => Some(SearchCriterion::Seen),
+        "UNSEEN" => Some(SearchCriterion::Unseen),
+        "UID" => {
+            let set = tokens.get(*pos)?.clone();
+            *pos += 1;
+            Some(SearchCriterion::UidSet(set))
+        }
+        "SINCE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::Since(date))
+        }
+        "BEFORE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::Before(date))
+        }
+        "SENTSINCE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SentSince(date))
+        }
+        "SENTBEFORE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SentBefore(date))
+        }
+        "FROM" | "TO" | "CC" | "BCC" | "SUBJECT" => {
+            let value = tokens.get(*pos)?.clone();
+            *pos += 1;
+            Some(SearchCriterion::Header(upper, value))
+        }
+        "BODY" => {
+            let value = tokens.get(*pos)?.clone();
+            *pos += 1;
+            Some(SearchCriterion::Body(value))
+        }
+        "TEXT" => {
+            let value = tokens.get(*pos)?.clone();
+            *pos += 1;
+            Some(SearchCriterion::Text(value))
+        }
+        "NOT" => Some(SearchCriterion::Not(Box::new(parse_search_criterion(
+            tokens, pos,
+        )?))),
+        "OR" => {
+            let left = parse_search_criterion(tokens, pos)?;
+            let right = parse_search_criterion(tokens, pos)?;
+            Some(SearchCriterion::Or(Box::new(left), Box::new(right)))
+        }
+        _ if token
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ':' || c == '*' || c == ',') =>
+        {
+            Some(SearchCriterion::SeqSet(token))
+        }
+        _ => None,
+    }
+}
+
+fn parse_search(input: &str) -> Option<SearchCriterion> {
+    let tokens = tokenize_search(input);
+    if tokens.is_empty() {
+        return Some(SearchCriterion::All);
+    }
+    let mut pos = 0;
+    let mut criteria = Vec::new();
+    while pos < tokens.len() {
+        criteria.push(parse_search_criterion(&tokens, &mut pos)?);
+    }
+    Some(SearchCriterion::And(criteria))
+}
+
+fn message_internal_date(path: &Path) -> Option<chrono::NaiveDate> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let dt: chrono::DateTime<chrono::Utc> = modified.into();
+    Some(dt.date_naive())
+}
+
+fn message_sent_date(data: &[u8]) -> Option<chrono::NaiveDate> {
+    let raw = header_value(data, "Date")?;
+    chrono::DateTime::parse_from_rfc2822(&raw)
+        .ok()
+        .map(|dt| dt.date_naive())
+}
+
+fn contains_ascii_casefold(haystack: &[u8], needle: &str) -> bool {
+    String::from_utf8_lossy(haystack)
+        .to_lowercase()
+        .contains(&needle.to_lowercase())
+}
+
+fn search_matches(criterion: &SearchCriterion, msg: &SearchMessage<'_>, total: usize) -> bool {
+    match criterion {
+        SearchCriterion::All => true,
+        SearchCriterion::Seen => msg.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen")),
+        SearchCriterion::Unseen => !msg.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen")),
+        SearchCriterion::SeqSet(set) => ids_from_set(set, total as u64).contains(&(msg.seq as u64)),
+        SearchCriterion::UidSet(set) => {
+            ids_from_set(set, msg.uid.max(total as u64)).contains(&msg.uid)
+        }
+        SearchCriterion::Since(date) => message_internal_date(msg.path)
+            .map(|msg_date| msg_date >= *date)
+            .unwrap_or(false),
+        SearchCriterion::Before(date) => message_internal_date(msg.path)
+            .map(|msg_date| msg_date < *date)
+            .unwrap_or(false),
+        SearchCriterion::SentSince(date) => message_sent_date(msg.data)
+            .map(|msg_date| msg_date >= *date)
+            .unwrap_or(false),
+        SearchCriterion::SentBefore(date) => message_sent_date(msg.data)
+            .map(|msg_date| msg_date < *date)
+            .unwrap_or(false),
+        SearchCriterion::Header(name, value) => header_value(msg.data, name)
+            .map(|header| header.to_lowercase().contains(&value.to_lowercase()))
+            .unwrap_or(false),
+        SearchCriterion::Body(value) => contains_ascii_casefold(body_after_header(msg.data), value),
+        SearchCriterion::Text(value) => contains_ascii_casefold(msg.data, value),
+        SearchCriterion::Not(inner) => !search_matches(inner, msg, total),
+        SearchCriterion::Or(left, right) => {
+            search_matches(left, msg, total) || search_matches(right, msg, total)
+        }
+        SearchCriterion::And(items) => items.iter().all(|item| search_matches(item, msg, total)),
+    }
+}
+
+fn copy_uid_pairs(
+    source_set: &[u64],
+    destination_uids: &[u64],
+    uidvalidity: u64,
+) -> Option<String> {
+    if source_set.is_empty() || destination_uids.is_empty() {
+        None
+    } else {
+        let source = source_set
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let dest = destination_uids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!("[COPYUID {} {} {}] ", uidvalidity, source, dest))
+    }
+}
+
 fn normalize_fetch_items(spec: &str) -> Vec<String> {
     let trimmed = spec.trim();
     let inner = trimmed
@@ -987,9 +1634,66 @@ fn header_section_response_name(spec: &str) -> Option<String> {
     Some(section)
 }
 
-fn requested_header_fields(spec: &str) -> Option<Vec<String>> {
+fn body_section_response_name(spec: &str) -> Option<String> {
+    let inner = fetch_inner_spec(spec);
+    let upper = inner.to_uppercase();
+    let start = upper.find("BODY.PEEK[").or_else(|| upper.find("BODY["))?;
+    if upper[start..].starts_with("BODY.PEEK[HEADER") || upper[start..].starts_with("BODY[HEADER") {
+        return None;
+    }
+    let candidate = inner[start..].trim();
+    let end = candidate.find(']')?;
+    let section = &candidate[..=end];
+    let mut name = if section.to_uppercase().starts_with("BODY.PEEK[") {
+        format!("BODY[{}", &section["BODY.PEEK[".len()..])
+    } else {
+        section.to_string()
+    };
+    if let Some((offset, _count)) = partial_fetch_range(candidate) {
+        name.push_str(&format!("<{}>", offset));
+    }
+    Some(name)
+}
+
+fn partial_fetch_range(section: &str) -> Option<(usize, usize)> {
+    let start = section.find('<')?;
+    let end = section[start + 1..].find('>')? + start + 1;
+    let mut parts = section[start + 1..end].splitn(2, '.');
+    let offset = parts.next()?.parse::<usize>().ok()?;
+    let count = parts.next()?.parse::<usize>().ok()?;
+    Some((offset, count))
+}
+
+fn body_after_header(data: &[u8]) -> &[u8] {
+    data.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| &data[pos + 4..])
+        .or_else(|| {
+            data.windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|pos| &data[pos + 2..])
+        })
+        .unwrap_or(data)
+}
+
+fn apply_partial_range(data: &[u8], range: Option<(usize, usize)>) -> Vec<u8> {
+    let Some((offset, count)) = range else {
+        return data.to_vec();
+    };
+    if offset >= data.len() {
+        return Vec::new();
+    }
+    let end = offset.saturating_add(count).min(data.len());
+    data[offset..end].to_vec()
+}
+
+fn requested_header_fields(spec: &str) -> Option<(Vec<String>, bool)> {
     let upper = spec.to_uppercase();
-    let marker = "HEADER.FIELDS (";
+    let (marker, exclude) = if upper.contains("HEADER.FIELDS.NOT (") {
+        ("HEADER.FIELDS.NOT (", true)
+    } else {
+        ("HEADER.FIELDS (", false)
+    };
     let start = upper.find(marker)?;
     let after = &spec[start + marker.len()..];
     let end = after.find(')')?;
@@ -998,17 +1702,17 @@ fn requested_header_fields(spec: &str) -> Option<Vec<String>> {
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
-    Some(fields)
+    Some((fields, exclude))
 }
 
-fn extract_header_literal(data: &[u8], requested_fields: Option<&[String]>) -> Vec<u8> {
+fn extract_header_literal(data: &[u8], requested_fields: Option<(&[String], bool)>) -> Vec<u8> {
     let header_end = data
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|pos| pos + 4)
         .unwrap_or(data.len());
     let header = &data[..header_end];
-    let Some(fields) = requested_fields else {
+    let Some((fields, exclude)) = requested_fields else {
         return header.to_vec();
     };
     if fields.is_empty() {
@@ -1030,7 +1734,8 @@ fn extract_header_literal(data: &[u8], requested_fields: Option<&[String]>) -> V
             continue;
         }
         if let Some((name, _)) = line.split_once(':') {
-            include_current = fields.iter().any(|f| f.eq_ignore_ascii_case(name.trim()));
+            let matched = fields.iter().any(|f| f.eq_ignore_ascii_case(name.trim()));
+            include_current = if exclude { !matched } else { matched };
             if include_current {
                 out.push_str(line);
             }
@@ -1040,6 +1745,29 @@ fn extract_header_literal(data: &[u8], requested_fields: Option<&[String]>) -> V
     }
     out.push_str("\r\n");
     out.into_bytes()
+}
+
+fn read_message_header(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        if let Some(pos) = out.windows(4).position(|w| w == b"\r\n\r\n") {
+            out.truncate(pos + 4);
+            break;
+        }
+        if out.len() > 256 * 1024 {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn header_value(data: &[u8], field: &str) -> Option<String> {
@@ -1059,12 +1787,84 @@ fn header_value(data: &[u8], field: &str) -> Option<String> {
     None
 }
 
+fn nstring(value: Option<&str>) -> String {
+    match value {
+        Some(value) if !value.is_empty() => {
+            format!("\"{}\"", value.replace(['\\', '"'], ""))
+        }
+        _ => "NIL".to_string(),
+    }
+}
+
+fn parse_address(value: &str) -> Option<(Option<String>, String, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (name, addr) = if let Some(start) = trimmed.rfind('<') {
+        let end = trimmed[start + 1..]
+            .find('>')
+            .map(|pos| start + 1 + pos)
+            .unwrap_or(trimmed.len());
+        let display = trimmed[..start].trim().trim_matches('"').trim();
+        let name = (!display.is_empty()).then(|| display.to_string());
+        (name, trimmed[start + 1..end].trim())
+    } else {
+        (None, trimmed.trim_matches('"'))
+    };
+    let (mailbox, host) = addr.rsplit_once('@')?;
+    if mailbox.is_empty() || host.is_empty() {
+        return None;
+    }
+    Some((name, mailbox.to_string(), host.to_string()))
+}
+
+fn envelope_address_list(value: Option<String>) -> String {
+    let Some(value) = value else {
+        return "NIL".to_string();
+    };
+    let addresses = value
+        .split(',')
+        .filter_map(parse_address)
+        .map(|(name, mailbox, host)| {
+            format!(
+                "({} NIL \"{}\" \"{}\")",
+                nstring(name.as_deref()),
+                mailbox.replace(['\\', '"'], ""),
+                host.replace(['\\', '"'], "")
+            )
+        })
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        "NIL".to_string()
+    } else {
+        format!("({})", addresses.join(" "))
+    }
+}
+
 fn envelope_response(data: &[u8]) -> String {
     let date = header_value(data, "Date").unwrap_or_default();
     let subject = header_value(data, "Subject").unwrap_or_default();
+    let from = header_value(data, "From");
+    let sender = header_value(data, "Sender").or_else(|| from.clone());
+    let reply_to = header_value(data, "Reply-To").or_else(|| from.clone());
+    let to = header_value(data, "To");
+    let cc = header_value(data, "Cc");
+    let bcc = header_value(data, "Bcc");
+    let in_reply_to = header_value(data, "In-Reply-To");
+    let message_id = header_value(data, "Message-ID");
     format!(
-        "(\"{}\" \"{}\" NIL NIL NIL NIL NIL NIL NIL NIL)",
-        date, subject
+        "({} {} {} {} {} {} {} {} {} {})",
+        nstring(Some(&date)),
+        nstring(Some(&subject)),
+        envelope_address_list(from),
+        envelope_address_list(sender),
+        envelope_address_list(reply_to),
+        envelope_address_list(to),
+        envelope_address_list(cc),
+        envelope_address_list(bcc),
+        nstring(in_reply_to.as_deref()),
+        nstring(message_id.as_deref())
     )
 }
 
@@ -1114,9 +1914,21 @@ async fn write_fetch_response(
         .iter()
         .any(|i| i == "BODYSTRUCTURE" || i == "BODY");
     let include_body = requested.iter().any(|i| {
-        i == "BODY[]" || i == "BODY.PEEK[]" || i.starts_with("BODY.PEEK[") || i == "RFC822.TEXT"
+        i == "BODY[]"
+            || i == "BODY.PEEK[]"
+            || i == "BODY[TEXT]"
+            || i.starts_with("BODY[TEXT]<")
+            || i.starts_with("BODY.PEEK[TEXT]<")
+            || i == "RFC822.TEXT"
+            || ((i.starts_with("BODY.PEEK[") || i.starts_with("BODY["))
+                && !i.starts_with("BODY.PEEK[HEADER")
+                && !i.starts_with("BODY[HEADER"))
     });
     let header_section_name = header_section_response_name(raw_spec);
+    let body_section_name = body_section_response_name(raw_spec);
+    let body_partial = body_section_name
+        .as_ref()
+        .and_then(|_| partial_fetch_range(fetch_inner_spec(raw_spec)));
     let requested_headers = requested_header_fields(raw_spec);
     let include_headers = header_section_name.is_some();
 
@@ -1127,8 +1939,23 @@ async fn write_fetch_response(
         || include_envelope
         || include_bodystructure;
     let internal_date = include_internaldate.then(|| format_internal_date(&path));
-    let data = if need_data {
+    let metadata_len = if include_size || include_bodystructure {
+        Some(
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || std::fs::metadata(path).map(|m| m.len() as usize)
+            })
+            .await??,
+        )
+    } else {
+        None
+    };
+    let data = if include_rfc822 || include_body {
         Some(tokio::task::spawn_blocking(move || std::fs::read(path)).await??)
+    } else if include_headers || include_envelope {
+        Some(tokio::task::spawn_blocking(move || read_message_header(&path)).await??)
+    } else if need_data {
+        Some(Vec::new())
     } else {
         None
     };
@@ -1141,7 +1968,9 @@ async fn write_fetch_response(
         attrs.push(format!("UID {}", uid));
     }
     if include_size {
-        let len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let len = metadata_len
+            .or_else(|| data.as_ref().map(|d| d.len()))
+            .unwrap_or(0);
         attrs.push(format!("RFC822.SIZE {}", len));
     }
     if include_internaldate {
@@ -1157,7 +1986,9 @@ async fn write_fetch_response(
         ));
     }
     if include_bodystructure {
-        let size = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let size = metadata_len
+            .or_else(|| data.as_ref().map(|d| d.len()))
+            .unwrap_or(0);
         attrs.push(format!(
             "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" {} 0)",
             size
@@ -1180,13 +2011,24 @@ async fn write_fetch_response(
     let literal_name = if include_headers {
         header_section_name.as_deref().unwrap_or("BODY[HEADER]")
     } else if include_body {
-        "BODY[]"
+        body_section_name.as_deref().unwrap_or("BODY[]")
     } else {
         "RFC822"
     };
     let data = data.unwrap_or_default();
     let literal = if include_headers {
-        extract_header_literal(&data, requested_headers.as_deref())
+        extract_header_literal(
+            &data,
+            requested_headers
+                .as_ref()
+                .map(|(fields, exclude)| (fields.as_slice(), *exclude)),
+        )
+    } else if include_body && literal_name.starts_with("BODY[TEXT]") {
+        apply_partial_range(body_after_header(&data), body_partial)
+    } else if include_body && literal_name.starts_with("BODY[") {
+        apply_partial_range(&data, body_partial)
+    } else if include_body && raw_spec.to_uppercase().contains("RFC822.TEXT") {
+        body_after_header(&data).to_vec()
     } else {
         data
     };
@@ -1440,6 +2282,33 @@ async fn process_stream(
             "NOOP" => {
                 let w = reader.get_mut();
                 w.write_all(format!("{} OK NOOP completed\r\n", tag).as_bytes())
+                    .await?;
+                w.flush().await?;
+            }
+            "CHECK" => {
+                if selected.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK CHECK completed\r\n", tag).as_bytes())
+                    .await?;
+                w.flush().await?;
+            }
+            "UNSELECT" => {
+                if selected.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                selected = None;
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK UNSELECT completed\r\n", tag).as_bytes())
                     .await?;
                 w.flush().await?;
             }
@@ -1897,6 +2766,104 @@ async fn process_stream(
                 w.flush().await?;
             }
 
+            "COPY" | "MOVE" => {
+                if selected.is_none() {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let mut parts = args.trim().splitn(2, ' ');
+                let seq_set = parts.next().unwrap_or("");
+                let destination = unquote(parts.next().unwrap_or("").trim()).to_string();
+                let sel = selected.as_ref().unwrap();
+                let seqs = seqs_from_set(seq_set, sel.msgs.len());
+                let source_uids = seqs
+                    .iter()
+                    .filter_map(|seq| {
+                        (*seq > 0 && *seq <= sel.msgs.len()).then_some(sel.msgs[*seq - 1].0)
+                    })
+                    .collect::<Vec<_>>();
+                let mut destination_uids = Vec::new();
+                let mut command_error = None;
+                for uid in &source_uids {
+                    let mail_root = mail_root.clone();
+                    let domain = sel.domain.clone();
+                    let local = sel.local.clone();
+                    let mailbox = sel.mailbox.clone();
+                    let destination = destination.clone();
+                    let uid = *uid;
+                    let copied = if cmd == "COPY" {
+                        tokio::task::spawn_blocking(move || {
+                            rmail_common::imap_state::copy_message_by_uid(
+                                Path::new(&mail_root),
+                                &domain,
+                                &local,
+                                &mailbox,
+                                uid,
+                                &destination,
+                            )
+                        })
+                        .await?
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            maildir::move_message_by_uid_for_mailbox(
+                                Path::new(&mail_root),
+                                &domain,
+                                &local,
+                                &mailbox,
+                                uid,
+                                &destination,
+                            )
+                        })
+                        .await?
+                    };
+                    match copied {
+                        Ok(Some(dest_uid)) => destination_uids.push(dest_uid),
+                        Ok(None) => {}
+                        Err(e) => {
+                            command_error = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = command_error {
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, e).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                let destination_sel = match load_selected_mailbox(
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    &destination,
+                )
+                .await
+                {
+                    Ok(sel) => sel,
+                    Err(e) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, e).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
+                if let Some(addr) = authed_mailbox.as_ref() {
+                    let mailbox = selected_mailbox_name(&selected).to_string();
+                    selected = Some(load_selected_mailbox(&mail_root, addr, &mailbox).await?);
+                }
+                let copyuid =
+                    copy_uid_pairs(&source_uids, &destination_uids, destination_sel.uidvalidity)
+                        .unwrap_or_default();
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK {}{} completed\r\n", tag, copyuid, cmd).as_bytes())
+                    .await?;
+                w.flush().await?;
+            }
+
             "UID" => {
                 let mut a = args.trim().splitn(2, ' ');
                 let subcmd = a.next().unwrap_or("").to_uppercase();
@@ -1968,15 +2935,23 @@ async fn process_stream(
                         continue;
                     }
                     let sel = selected.as_ref().unwrap();
-                    let criteria = subargs.to_uppercase();
+                    let criteria = parse_search(subargs).unwrap_or(SearchCriterion::All);
                     println!("IMAP UID SEARCH peer={:?} criteria={:?}", peer, criteria);
                     let mut matches = Vec::new();
-                    for (uid, _, flags) in &sel.msgs {
-                        let seen = flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
-                        if criteria.contains("ALL")
-                            || (criteria.contains("UNSEEN") && !seen)
-                            || (criteria.contains("SEEN") && seen)
-                        {
+                    for (idx, (uid, path, flags)) in sel.msgs.iter().enumerate() {
+                        let data = tokio::task::spawn_blocking({
+                            let path = path.clone();
+                            move || std::fs::read(path)
+                        })
+                        .await??;
+                        let msg = SearchMessage {
+                            seq: idx + 1,
+                            uid: *uid,
+                            flags,
+                            path,
+                            data: &data,
+                        };
+                        if search_matches(&criteria, &msg, sel.msgs.len()) {
                             matches.push(uid.to_string());
                         }
                     }
@@ -2092,6 +3067,105 @@ async fn process_stream(
                     w.write_all(format!("{} OK UID EXPUNGE completed\r\n", tag).as_bytes())
                         .await?;
                     w.flush().await?;
+                } else if subcmd.as_str() == "COPY" || subcmd.as_str() == "MOVE" {
+                    if selected.is_none() {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                    let mut parts = subargs.trim().splitn(2, ' ');
+                    let uid_set = parts.next().unwrap_or("");
+                    let destination = unquote(parts.next().unwrap_or("").trim()).to_string();
+                    let sel = selected.as_ref().unwrap();
+                    let source_uids = uids_from_set(uid_set, &sel.msgs);
+                    let mut destination_uids = Vec::new();
+                    let mut command_error = None;
+                    for uid in &source_uids {
+                        let mail_root = mail_root.clone();
+                        let domain = sel.domain.clone();
+                        let local = sel.local.clone();
+                        let mailbox = sel.mailbox.clone();
+                        let destination = destination.clone();
+                        let uid = *uid;
+                        let copied = if subcmd == "COPY" {
+                            tokio::task::spawn_blocking(move || {
+                                rmail_common::imap_state::copy_message_by_uid(
+                                    Path::new(&mail_root),
+                                    &domain,
+                                    &local,
+                                    &mailbox,
+                                    uid,
+                                    &destination,
+                                )
+                            })
+                            .await?
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                maildir::move_message_by_uid_for_mailbox(
+                                    Path::new(&mail_root),
+                                    &domain,
+                                    &local,
+                                    &mailbox,
+                                    uid,
+                                    &destination,
+                                )
+                            })
+                            .await?
+                        };
+                        match copied {
+                            Ok(Some(dest_uid)) => destination_uids.push(dest_uid),
+                            Ok(None) => {}
+                            Err(e) => {
+                                command_error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = command_error {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} NO UID {} failed: {}\r\n", tag, subcmd, e).as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                    let destination_sel = match load_selected_mailbox(
+                        &mail_root,
+                        authed_mailbox.as_ref().unwrap(),
+                        &destination,
+                    )
+                    .await
+                    {
+                        Ok(sel) => sel,
+                        Err(e) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} NO UID {} failed: {}\r\n", tag, subcmd, e).as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                    };
+                    if let Some(addr) = authed_mailbox.as_ref() {
+                        let mailbox = selected_mailbox_name(&selected).to_string();
+                        selected = Some(load_selected_mailbox(&mail_root, addr, &mailbox).await?);
+                    }
+                    let copyuid = copy_uid_pairs(
+                        &source_uids,
+                        &destination_uids,
+                        destination_sel.uidvalidity,
+                    )
+                    .unwrap_or_default();
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} OK {}UID {} completed\r\n", tag, copyuid, subcmd).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
                 } else {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes())
@@ -2108,15 +3182,23 @@ async fn process_stream(
                     continue;
                 }
                 let sel = selected.as_ref().unwrap();
-                let criteria = args.to_uppercase();
+                let criteria = parse_search(args).unwrap_or(SearchCriterion::All);
                 println!("IMAP SEARCH peer={:?} criteria={:?}", peer, criteria);
                 let mut matches = Vec::new();
-                for (idx, (_, _, flags)) in sel.msgs.iter().enumerate() {
-                    let seen = flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
-                    if criteria.contains("ALL")
-                        || (criteria.contains("UNSEEN") && !seen)
-                        || (criteria.contains("SEEN") && seen)
-                    {
+                for (idx, (uid, path, flags)) in sel.msgs.iter().enumerate() {
+                    let data = tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || std::fs::read(path)
+                    })
+                    .await??;
+                    let msg = SearchMessage {
+                        seq: idx + 1,
+                        uid: *uid,
+                        flags,
+                        path,
+                        data: &data,
+                    };
+                    if search_matches(&criteria, &msg, sel.msgs.len()) {
                         matches.push((idx + 1).to_string());
                     }
                 }
@@ -2230,6 +3312,30 @@ async fn process_stream(
                 selected = None;
                 let w = reader.get_mut();
                 w.write_all(format!("{} OK CLOSE completed\r\n", tag).as_bytes())
+                    .await?;
+                w.flush().await?;
+            }
+            "IDLE" => {
+                let idle_tag = tag.to_string();
+                let w = reader.get_mut();
+                w.write_all(b"+ idling\r\n").await?;
+                w.flush().await?;
+                let mut idle_line = String::new();
+                loop {
+                    idle_line.clear();
+                    let n = reader.read_line(&mut idle_line).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    if idle_line
+                        .trim_end_matches("\r\n")
+                        .eq_ignore_ascii_case("DONE")
+                    {
+                        break;
+                    }
+                }
+                let w = reader.get_mut();
+                w.write_all(format!("{} OK IDLE completed\r\n", idle_tag).as_bytes())
                     .await?;
                 w.flush().await?;
             }

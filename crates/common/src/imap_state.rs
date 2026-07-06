@@ -340,7 +340,9 @@ pub fn move_message_by_uid(
 
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &source)?;
-    ensure_folder(&conn, maildir_root, domain, localpart, &destination)?;
+    if folder_id(&conn, &destination)?.is_none() {
+        anyhow::bail!("destination mailbox does not exist");
+    }
     reconcile_folder(&conn, maildir_root, domain, localpart, &source)?;
     reconcile_folder(&conn, maildir_root, domain, localpart, &destination)?;
 
@@ -398,6 +400,92 @@ pub fn move_message_by_uid(
         params![destination_id],
         |row| row.get(0),
     )?;
+    tx.execute(
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            destination_id,
+            destination_filename,
+            subdir,
+            uidnext,
+            flags,
+            size,
+            internaldate
+        ],
+    )?;
+    tx.execute(
+        "UPDATE folders SET uidnext = ?1 WHERE id = ?2",
+        params![uidnext.saturating_add(1), destination_id],
+    )?;
+    tx.commit()?;
+    Ok(Some(uidnext as u64))
+}
+
+pub fn copy_message_by_uid(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    source_mailbox: &str,
+    uid: u64,
+    destination_mailbox: &str,
+) -> Result<Option<u64>> {
+    let source = normalize_mailbox_name(source_mailbox)?;
+    let destination = normalize_mailbox_name(destination_mailbox)?;
+
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    ensure_folder(&conn, maildir_root, domain, localpart, &source)?;
+    if folder_id(&conn, &destination)?.is_none() {
+        anyhow::bail!("destination mailbox does not exist");
+    }
+    reconcile_folder(&conn, maildir_root, domain, localpart, &source)?;
+    reconcile_folder(&conn, maildir_root, domain, localpart, &destination)?;
+
+    let tx = conn.transaction()?;
+    let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
+    let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
+    let Some((filename, subdir, flags, size, internaldate)) = tx
+        .query_row(
+            "SELECT filename, subdir, flags, size, internaldate
+             FROM messages WHERE folder_id = ?1 AND uid = ?2",
+            params![source_id, uid as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
+    let destination_dir = mailbox_dir(maildir_root, domain, localpart, &destination)?;
+    ensure_maildir(&destination_dir)?;
+    let source_path = source_dir.join(&subdir).join(&filename);
+    let uidnext: i64 = tx.query_row(
+        "SELECT uidnext FROM folders WHERE id = ?1",
+        params![destination_id],
+        |row| row.get(0),
+    )?;
+    let destination_filename = format!(
+        "{}.copy.{}.{}",
+        filename,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        rand::random::<u64>()
+    );
+    let destination_path = destination_dir.join(&subdir).join(&destination_filename);
+    fs::copy(&source_path, &destination_path).with_context(|| {
+        format!(
+            "copying message {} from {} to {}",
+            uid, source_mailbox, destination_mailbox
+        )
+    })?;
+
     tx.execute(
         "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -783,6 +871,38 @@ mod tests {
                 .unwrap()
                 .1
                 .is_empty()
+        );
+        let (_, archived) = load_folder(td.path(), "example.test", "user", "Archive").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].uid, dest_uid);
+        assert_eq!(
+            fs::read(&archived[0].path).unwrap(),
+            b"Subject: a\r\n\r\nbody"
+        );
+    }
+
+    #[test]
+    fn copy_message_assigns_destination_uid_and_keeps_source() {
+        let td = tempfile::tempdir().unwrap();
+        let inbox = account_maildir(td.path(), "example.test", "user");
+        write_msg(&inbox, "a", b"Subject: a\r\n\r\nbody");
+        let (_, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        let dest_uid = copy_message_by_uid(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            messages[0].uid,
+            "Archive",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            load_folder(td.path(), "example.test", "user", "INBOX")
+                .unwrap()
+                .1
+                .len(),
+            1
         );
         let (_, archived) = load_folder(td.path(), "example.test", "user", "Archive").unwrap();
         assert_eq!(archived.len(), 1);
