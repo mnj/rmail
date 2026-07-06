@@ -11,3 +11,6 @@ serde_json = "1.0"
 anyhow = "1.0"
 rmail_common = { path = "../common" }
 base64 = "0.21"
+
+[dev-dependencies]
+tempfile = "3.5"

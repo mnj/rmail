@@ -1170,3 +1170,93 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmail_common::outbound::{QueueControl, control_path_for_eml};
+    use std::fs;
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn send_request(mail_root: PathBuf, request: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, mail_root, None, None, None, None).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        client.shutdown().await.expect("shutdown");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        server.await.expect("server");
+        response
+    }
+
+    #[tokio::test]
+    async fn queue_action_post_requeues_failed_message_with_sidecar() {
+        let td = tempdir().expect("tempdir");
+        let mail_root = td.path().to_path_buf();
+        let failed = mail_root.join("outbound").join("failed");
+        fs::create_dir_all(&failed).expect("failed dir");
+
+        let eml = failed.join("msg.eml");
+        fs::write(&eml, b"X-RMail-Envelope-To: user@example.com\r\n\r\nbody").expect("write eml");
+        let mut control = QueueControl::new(5, 0);
+        control.attempts = 3;
+        control.next_try = Some(123);
+        let sidecar = control_path_for_eml(&eml);
+        fs::write(
+            &sidecar,
+            serde_json::to_string(&control).expect("control json"),
+        )
+        .expect("write sidecar");
+
+        let body = r#"{"action":"requeue","name":"msg.eml"}"#;
+        let request = format!(
+            "POST /api/queue/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request(mail_root.clone(), request).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        let queued = mail_root
+            .join("outbound")
+            .join("maildrop")
+            .join("queue")
+            .join("msg.eml");
+        let queued_sidecar = control_path_for_eml(&queued);
+        assert!(queued.exists());
+        assert!(queued_sidecar.exists());
+        assert!(!eml.exists());
+        assert!(!sidecar.exists());
+
+        let updated: QueueControl =
+            serde_json::from_str(&fs::read_to_string(queued_sidecar).expect("read sidecar"))
+                .expect("parse sidecar");
+        assert_eq!(updated.attempts, 0);
+        assert_eq!(updated.next_try, None);
+    }
+
+    #[tokio::test]
+    async fn queue_action_get_is_method_not_allowed() {
+        let td = tempdir().expect("tempdir");
+        let request = "GET /api/queue/action HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string();
+
+        let response = send_request(td.path().to_path_buf(), request).await;
+        assert!(response.starts_with("HTTP/1.1 405 ERR"), "{response}");
+    }
+}
