@@ -155,12 +155,14 @@ async fn main() -> anyhow::Result<()> {
                 let queue_eml = queue_dir.join(&fname);
                 let queue_json = rmail_common::outbound::control_path_for_eml(&queue_eml);
                 if let Err(e) =
-                    tokio::fs::write(&queue_json, serde_json::to_string(&control)?).await
+                    tokio::fs::write(&inflight_json, serde_json::to_string(&control)?).await
                 {
                     eprintln!("failed to write control json for retry {}: {}", fname, e);
                 }
                 if let Err(e) = tokio::fs::rename(&inflight_eml, &queue_eml).await {
                     eprintln!("failed to move back to queue {}: {}", fname, e);
+                } else if let Err(e) = tokio::fs::rename(&inflight_json, &queue_json).await {
+                    eprintln!("failed to move control json back to queue {}: {}", fname, e);
                 }
             }
         }

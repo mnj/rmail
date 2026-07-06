@@ -402,14 +402,19 @@ mod tests {
             writeln!(f, "X-RMail-Envelope-To: user@example.com\r\n\r\nBody {}", i)?;
             f.sync_all()?;
             let ctl = QueueControl::new(5, 0);
-            let json_path = queue.join(format!("{}.json", &filename));
+            let json_path = rmail_common::outbound::control_path_for_eml(&eml_path);
             fs::write(&json_path, serde_json::to_string(&ctl)?)?;
         }
 
         // claim with limit 1 - first call should return Some, second should return None because inflight has one
         let claimed = claim_one_with_limit(&maildrop, 1)?;
         assert!(claimed.is_some());
-        let _ = claimed.unwrap();
+        let (inflight_eml, inflight_json) = claimed.unwrap();
+        assert_eq!(
+            inflight_json,
+            rmail_common::outbound::control_path_for_eml(&inflight_eml)
+        );
+        assert!(inflight_json.exists());
         let claimed2 = claim_one_with_limit(&maildrop, 1)?;
         assert!(claimed2.is_none());
         Ok(())
@@ -434,7 +439,7 @@ mod tests {
             .unwrap()
             .as_secs() as i64)
             - (60 * 60 * 24 * 40);
-        let json_path = failed.join(format!("{}.json", filename));
+        let json_path = rmail_common::outbound::control_path_for_eml(&eml_path);
         fs::write(&json_path, serde_json::to_string(&ctl)?)?;
 
         let maildrop = outbound.join("maildrop");
@@ -442,6 +447,7 @@ mod tests {
         assert_eq!(moved, 1);
         let dead_dir = outbound.join("dead");
         assert!(dead_dir.join(filename).exists());
+        assert!(rmail_common::outbound::control_path_for_eml(&dead_dir.join(filename)).exists());
         Ok(())
     }
 }
