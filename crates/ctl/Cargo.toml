@@ -1,6 +1,6 @@
 [package]
 name = "rmail_ctl"
-version = "0.8.4"
+version = "0.8.7"
 edition = "2024"
 
 [dependencies]

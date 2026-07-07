@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use once_cell::sync::Lazy;
@@ -749,6 +749,23 @@ mod tests {
         server_task.await.expect("join").expect("server");
     }
 
+    #[test]
+    fn normalize_fetch_items_keeps_nested_header_fields_together() {
+        let items = super::normalize_fetch_items(
+            "(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To Received)])",
+        );
+
+        assert_eq!(
+            items,
+            vec![
+                "BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE MESSAGE-ID PRIORITY X-PRIORITY REFERENCES NEWSGROUPS IN-REPLY-TO CONTENT-TYPE REPLY-TO RECEIVED)]",
+                "FLAGS",
+                "RFC822.SIZE",
+                "UID",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn uid_fetch_header_fields_not_excludes_requested_headers() {
         let td = tempfile::tempdir().expect("tempdir");
@@ -1149,7 +1166,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 CHECK\r\nA004 UID COPY 1 Archive\r\nA005 UID MOVE 2 Archive\r\nA006 UNSELECT\r\nA007 SELECT INBOX\r\nA008 STATUS Archive (MESSAGES)\r\nA009 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 CHECK\r\nA004 UID COPY 1 Archive\r\nA005 UID MOVE 2 Archive\r\nA006 UNSELECT\r\nA007 SELECT INBOX\r\nA008 STATUS Archive (UIDNEXT MESSAGES UNSEEN RECENT)\r\nA009 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
@@ -1177,9 +1194,9 @@ mod tests {
 
         let status = read_until_contains(&mut reader, "A008 OK").await;
         assert!(
-            status
-                .iter()
-                .any(|l| l.contains("* STATUS \"Archive\" (MESSAGES 2)"))
+            status.iter().any(
+                |l| l.contains("* STATUS \"Archive\" (MESSAGES 2 UIDNEXT 3 UNSEEN 2 RECENT 0)")
+            )
         );
 
         let _logout = read_until_contains(&mut reader, "A009 OK").await;
@@ -1884,15 +1901,20 @@ async fn main() -> Result<()> {
         .imap_listen_addrs
         .clone()
         .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imap_port)]);
+    let mut listener_count = 0usize;
     for addr in imap_addrs {
+        let listener = bind_tcp_listener(&addr)
+            .with_context(|| format!("starting IMAP plain listener on {addr}"))?;
+        println!("rMail IMAPD listening on {}", addr);
+        listener_count += 1;
         let mail_root_clone = mail_root.clone();
         let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_plain_listener(&addr, mail_root_clone, acceptor_clone, db_clone).await
+                run_plain_listener(addr, listener, mail_root_clone, acceptor_clone, db_clone).await
             {
-                eprintln!("IMAP plain listener {} failed: {}", addr, e);
+                eprintln!("IMAP plain listener failed: {}", e);
             }
         });
     }
@@ -1906,18 +1928,29 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imaps_port)]);
             for addr in imaps_addrs {
+                let listener = bind_tcp_listener(&addr)
+                    .with_context(|| format!("starting IMAPS listener on {addr}"))?;
+                println!("rMail IMAPD (IMAPS) listening on {}", addr);
+                listener_count += 1;
                 let mail_root_clone = mail_root.clone();
                 let ctx_clone = ctx.clone();
                 let db_clone = db_path.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        run_imaps_listener(&addr, ctx_clone, mail_root_clone, db_clone).await
+                        run_imaps_listener(addr, listener, ctx_clone, mail_root_clone, db_clone)
+                            .await
                     {
-                        eprintln!("IMAPS listener {} failed: {}", addr, e);
+                        eprintln!("IMAPS listener failed: {}", e);
                     }
                 });
             }
         }
+    } else if cfg.global.imaps_port.is_some() || cfg.global.imaps_listen_addrs.is_some() {
+        eprintln!("IMAPS listener not started because TLS certificate/key could not be loaded");
+    }
+
+    if listener_count == 0 {
+        return Err(anyhow!("no IMAP listeners were started"));
     }
 
     // keep running
@@ -1927,13 +1960,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run_plain_listener(
-    addr: &str,
+    addr: String,
+    listener: tokio::net::TcpListener,
     mail_root: String,
     tls_ctx: Option<Arc<tls::TlsContext>>,
     db_path: Option<String>,
 ) -> Result<()> {
-    let listener = bind_tcp_listener(addr)?;
-    println!("rMail IMAPD listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
         println!(
@@ -1963,13 +1995,12 @@ async fn run_plain_listener(
 }
 
 async fn run_imaps_listener(
-    addr: &str,
+    addr: String,
+    listener: tokio::net::TcpListener,
     ctx: Arc<tls::TlsContext>,
     mail_root: String,
     db_path: Option<String>,
 ) -> Result<()> {
-    let listener = bind_tcp_listener(addr)?;
-    println!("rMail IMAPD (IMAPS) listening on {}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
         println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
@@ -2074,6 +2105,13 @@ fn first_unseen(sel: &SelectedMailbox) -> u64 {
         .find(|(_, (_, _, flags))| !flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen")))
         .map(|(idx, _)| idx as u64 + 1)
         .unwrap_or(0)
+}
+
+fn unseen_count(sel: &SelectedMailbox) -> usize {
+    sel.msgs
+        .iter()
+        .filter(|(_, _, flags)| !flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen")))
+        .count()
 }
 
 fn format_internal_date(path: &Path) -> String {
@@ -2409,7 +2447,10 @@ fn normalize_fetch_items(spec: &str) -> Vec<String> {
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or(trimmed);
     let mut out = Vec::new();
-    for item in inner.split_whitespace().map(|s| s.to_uppercase()) {
+    for item in split_fetch_items(inner)
+        .into_iter()
+        .map(|s| s.to_uppercase())
+    {
         match item.as_str() {
             "ALL" => {
                 out.extend(["FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE"].map(str::to_string))
@@ -2424,6 +2465,58 @@ fn normalize_fetch_items(spec: &str) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+fn split_fetch_items(spec: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = None;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for (idx, ch) in spec.char_indices() {
+        if start.is_none() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            start = Some(idx);
+        }
+
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quote = true,
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 => paren_depth += 1,
+            ')' if bracket_depth == 0 => paren_depth = paren_depth.saturating_sub(1),
+            c if c.is_whitespace() && paren_depth == 0 && bracket_depth == 0 => {
+                if let Some(item_start) = start.take() {
+                    items.push(spec[item_start..idx].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(item_start) = start {
+        let item = spec[item_start..].trim();
+        if !item.is_empty() {
+            items.push(item);
+        }
+    }
+
+    items
 }
 
 fn fetch_inner_spec(spec: &str) -> &str {
@@ -4233,7 +4326,10 @@ async fn process_stream(
                     values.push(format!("UIDVALIDITY {}", sel.uidvalidity));
                 }
                 if items_upper.iter().any(|i| i == "UNSEEN") {
-                    values.push(format!("UNSEEN {}", first_unseen(&sel)));
+                    values.push(format!("UNSEEN {}", unseen_count(&sel)));
+                }
+                if items_upper.iter().any(|i| i == "RECENT") {
+                    values.push("RECENT 0".to_string());
                 }
                 let w = reader.get_mut();
                 println!(
