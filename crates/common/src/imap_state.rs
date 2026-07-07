@@ -130,6 +130,10 @@ fn insert_folder(
             uidvalidity as i64
         ],
     )?;
+    conn.execute(
+        "UPDATE folders SET path = ?2, special_use = ?3 WHERE name = ?1",
+        params![name, path, special_use],
+    )?;
     Ok(())
 }
 

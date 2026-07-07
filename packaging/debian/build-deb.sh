@@ -33,6 +33,12 @@ cd "${ROOT_DIR}"
   bun run build
 )
 
+(
+  cd "${ROOT_DIR}/crates/webui/frontend"
+  bun install --frozen-lockfile
+  bun run build
+)
+
 if [[ -n "${TARGET_TRIPLE}" ]]; then
   cargo build --release --target "${TARGET_TRIPLE}"
   RELEASE_DIR="${ROOT_DIR}/target/${TARGET_TRIPLE}/release"
@@ -45,6 +51,7 @@ mkdir -p \
   "${PKG_ROOT}/DEBIAN" \
   "${PKG_ROOT}/usr/bin" \
   "${PKG_ROOT}/usr/lib/systemd/system" \
+  "${PKG_ROOT}/usr/share/rmail/admin" \
   "${PKG_ROOT}/usr/share/rmail/webmail" \
   "${PKG_ROOT}/etc/rmail" \
   "${PKG_ROOT}/etc/default" \
@@ -59,6 +66,7 @@ install -m 0755 "${RELEASE_DIR}/rmail_outbound" "${PKG_ROOT}/usr/bin/rmail_outbo
 install -m 0755 "${RELEASE_DIR}/rmail_ctl" "${PKG_ROOT}/usr/bin/rmail_ctl"
 install -m 0755 "${RELEASE_DIR}/rmail_queuectl" "${PKG_ROOT}/usr/bin/rmail_queuectl"
 cp -a "${ROOT_DIR}/crates/webmail/frontend/dist/." "${PKG_ROOT}/usr/share/rmail/webmail/"
+cp -a "${ROOT_DIR}/crates/webui/frontend/dist/." "${PKG_ROOT}/usr/share/rmail/admin/"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_smtpd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_smtpd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_imapd.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_imapd.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_web.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_web.service"

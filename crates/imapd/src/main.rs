@@ -1338,11 +1338,11 @@ mod tests {
                 .any(|l| l.contains("Unsupported UID subcommand"))
         );
 
-        let xlist = read_until_contains(&mut reader, "A004 BAD").await;
+        let xlist = read_until_contains(&mut reader, "A004 OK").await;
         assert!(
             xlist
                 .iter()
-                .any(|l| l.contains("Unknown or unimplemented command"))
+                .any(|l| l.contains("\\Inbox") && l.contains("\"INBOX\""))
         );
 
         let _logout = read_until_contains(&mut reader, "A005 OK").await;
@@ -1530,6 +1530,7 @@ mod tests {
         let _login = read_until_contains(&mut reader, "A001 OK").await;
         let list_lines = read_until_contains(&mut reader, "A002 OK").await;
         assert!(list_lines.iter().any(|l| l.contains("\"INBOX\"")));
+        assert!(!list_lines.iter().any(|l| l.contains("\\Inbox")));
         assert!(
             list_lines
                 .iter()
@@ -1560,6 +1561,67 @@ mod tests {
         assert!(select_lines.iter().any(|l| l.contains("* 0 EXISTS")));
 
         let _logout = read_until_contains(&mut reader, "A004 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn geary_account_probe_gets_inbox_special_use_and_namespace() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 CAPABILITY\r\nA002 LOGIN user@example.test password\r\nA003 CAPABILITY\r\nA004 LIST \"\" INBOX\r\nA005 NAMESPACE\r\nA006 LOGOUT\r\n",
+            )
+            .await
+            .expect("write commands");
+        reader.get_mut().flush().await.expect("flush");
+
+        let _initial_capability = read_until_contains(&mut reader, "A001 OK").await;
+        let _login = read_until_contains(&mut reader, "A002 OK").await;
+        let _authed_capability = read_until_contains(&mut reader, "A003 OK").await;
+        let inbox = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(inbox.iter().any(|l| l.contains("\"INBOX\"")));
+        assert!(!inbox.iter().any(|l| l.contains("\\Inbox")));
+
+        let namespace = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(
+            namespace
+                .iter()
+                .any(|l| l == "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n")
+        );
+
+        let _logout = read_until_contains(&mut reader, "A006 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -2045,6 +2107,7 @@ fn capability_tokens(session_encrypted: bool, tls_ctx: Option<&Arc<tls::TlsConte
         "NAMESPACE",
         "SPECIAL-USE",
         "IDLE",
+        "ID",
         "MOVE",
     ];
     if !session_encrypted {
@@ -3940,7 +4003,7 @@ async fn process_stream(
                     }
                 }
             }
-            "LIST" => {
+            "LIST" | "XLIST" => {
                 // Require authentication to list user's mailboxes in this simple implementation
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
@@ -3951,7 +4014,7 @@ async fn process_stream(
                 }
                 let Some((reference, pattern)) = parse_list_args(args) else {
                     let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid LIST arguments\r\n", tag).as_bytes())
+                    w.write_all(format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes())
                         .await?;
                     w.flush().await?;
                     continue;
@@ -3964,7 +4027,8 @@ async fn process_stream(
                 })
                 .await??;
                 println!(
-                    "IMAP LIST peer={:?} returning {} mailboxes",
+                    "IMAP {} peer={:?} returning {} mailboxes",
+                    cmd,
                     peer,
                     boxes.len()
                 );
@@ -3974,15 +4038,19 @@ async fn process_stream(
                         continue;
                     }
                     let mut attrs = vec!["\\HasNoChildren".to_string()];
+                    if cmd == "XLIST" && name.eq_ignore_ascii_case("INBOX") {
+                        attrs.push("\\Inbox".to_string());
+                    }
                     if let Some(special) = special {
                         attrs.push(special);
                     }
                     w.write_all(
-                        format!("* LIST ({}) \"/\" \"{}\"\r\n", attrs.join(" "), name).as_bytes(),
+                        format!("* {} ({}) \"/\" \"{}\"\r\n", cmd, attrs.join(" "), name)
+                            .as_bytes(),
                     )
                     .await?;
                 }
-                w.write_all(format!("{} OK LIST completed\r\n", tag).as_bytes())
+                w.write_all(format!("{} OK {} completed\r\n", tag, cmd).as_bytes())
                     .await?;
                 w.flush().await?;
             }

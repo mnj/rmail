@@ -114,6 +114,13 @@ pub fn add_mailbox<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Remove a mailbox from the account database.
+pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute("DELETE FROM mailboxes WHERE address = ?1", params![address])?;
+    Ok(())
+}
+
 /// Get mailbox by exact address
 pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mailbox>> {
     let conn = Connection::open(path)?;
@@ -212,6 +219,25 @@ pub fn set_catchall<P: AsRef<Path>>(path: P, domain: &str, target: &str) -> Resu
         params![domain, target],
     )?;
     Ok(())
+}
+
+/// Remove a catchall mapping.
+pub fn remove_catchall<P: AsRef<Path>>(path: P, domain: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute("DELETE FROM catchalls WHERE domain = ?1", params![domain])?;
+    Ok(())
+}
+
+/// List catchall mappings.
+pub fn list_catchalls<P: AsRef<Path>>(path: P) -> Result<Vec<(String, String)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT domain, target FROM catchalls ORDER BY domain")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push((row.get(0)?, row.get(1)?));
+    }
+    Ok(out)
 }
 
 /// Add or update an alias mapping. Targets is a JSON array of address strings (may include remote addresses).
