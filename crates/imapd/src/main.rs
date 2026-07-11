@@ -593,6 +593,18 @@ mod tests {
             authenticated,
             capability_tokens(CapabilityPhase::Selected, false)
         );
+
+        let scram_only = super::auth::AuthPolicy::from_names(&["SCRAM-SHA-256".to_string()])
+            .expect("SCRAM-only policy");
+        let configured = super::response::capability_tokens_with_policy(
+            CapabilityPhase::NotAuthenticatedTls,
+            true,
+            &scram_only,
+        );
+        assert!(configured.contains("AUTH=SCRAM-SHA-256"));
+        assert!(!configured.contains("AUTH=PLAIN"));
+        assert!(!configured.contains("AUTH=LOGIN"));
+        assert!(!configured.contains("AUTH=SCRAM-SHA-256-PLUS"));
     }
 
     #[tokio::test]
@@ -736,6 +748,7 @@ mod tests {
             None,
             true,
             false,
+            Arc::new(super::auth::AuthPolicy::default()),
         ));
         let mut reader = BufReader::new(client);
         reader
@@ -4834,6 +4847,10 @@ async fn main() -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
+    let auth_policy = Arc::new(
+        auth::AuthPolicy::from_names(&cfg.security.imap_sasl_mechanisms)
+            .context("validating security.imap_sasl_mechanisms")?,
+    );
     let mail_root = cfg.global.mail_root.clone();
     rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "imapd")
         .context("redirecting logs")?;
@@ -4875,9 +4892,17 @@ async fn main() -> Result<()> {
         let mail_root_clone = mail_root.clone();
         let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
+        let auth_policy = auth_policy.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_plain_listener(addr, listener, mail_root_clone, acceptor_clone, db_clone).await
+            if let Err(e) = run_plain_listener(
+                addr,
+                listener,
+                mail_root_clone,
+                acceptor_clone,
+                db_clone,
+                auth_policy,
+            )
+            .await
             {
                 eprintln!("IMAP plain listener failed: {}", e);
             }
@@ -4900,10 +4925,17 @@ async fn main() -> Result<()> {
                 let mail_root_clone = mail_root.clone();
                 let ctx_clone = ctx.clone();
                 let db_clone = db_path.clone();
+                let auth_policy = auth_policy.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        run_imaps_listener(addr, listener, ctx_clone, mail_root_clone, db_clone)
-                            .await
+                    if let Err(e) = run_imaps_listener(
+                        addr,
+                        listener,
+                        ctx_clone,
+                        mail_root_clone,
+                        db_clone,
+                        auth_policy,
+                    )
+                    .await
                     {
                         eprintln!("IMAPS listener failed: {}", e);
                     }
@@ -4930,6 +4962,7 @@ async fn run_plain_listener(
     mail_root: String,
     tls_ctx: Option<Arc<tls::TlsContext>>,
     db_path: Option<String>,
+    auth_policy: Arc<auth::AuthPolicy>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -4942,14 +4975,16 @@ async fn run_plain_listener(
         let mail_root = mail_root.clone();
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
+        let auth_policy = auth_policy.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(
+            if let Err(e) = process_stream_with_policy(
                 Box::new(stream),
                 mail_root,
                 acceptor,
                 db_clone,
                 Some(peer),
                 false,
+                auth_policy,
             )
             .await
             {
@@ -4965,6 +5000,7 @@ async fn run_imaps_listener(
     ctx: Arc<tls::TlsContext>,
     mail_root: String,
     db_path: Option<String>,
+    auth_policy: Arc<auth::AuthPolicy>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -4972,16 +5008,18 @@ async fn run_imaps_listener(
         let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
+        let auth_policy = auth_policy.clone();
         tokio::spawn(async move {
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = process_stream(
+                    if let Err(e) = process_stream_with_policy(
                         Box::new(tls_stream),
                         mail_root,
                         Some(ctx.clone()),
                         db_clone,
                         Some(peer),
                         true,
+                        auth_policy,
                     )
                     .await
                     {
@@ -5699,6 +5737,7 @@ fn command_preflight_response(
 // session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
 // and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
 // for per-IP rate-limiting of authentication attempts.
+#[cfg(test)]
 async fn process_stream(
     stream: Box<dyn RawStream + Send + 'static>,
     mail_root: String,
@@ -5706,6 +5745,27 @@ async fn process_stream(
     db_path: Option<String>,
     peer: Option<SocketAddr>,
     session_encrypted: bool,
+) -> Result<()> {
+    process_stream_with_policy(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        Arc::new(auth::AuthPolicy::default()),
+    )
+    .await
+}
+
+async fn process_stream_with_policy(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    auth_policy: Arc<auth::AuthPolicy>,
 ) -> Result<()> {
     process_stream_inner(
         stream,
@@ -5715,6 +5775,7 @@ async fn process_stream(
         peer,
         session_encrypted,
         true,
+        auth_policy,
     )
     .await
 }
@@ -5727,6 +5788,7 @@ async fn process_stream_inner(
     peer: Option<SocketAddr>,
     session_encrypted: bool,
     send_greeting: bool,
+    auth_policy: Arc<auth::AuthPolicy>,
 ) -> Result<()> {
     let stream: Box<dyn AsyncStream + Send + 'static> = Box::new(SwitchableStream::new(stream));
     let mut reader = BufReader::new(stream);
@@ -5743,7 +5805,8 @@ async fn process_stream_inner(
         } else {
             response::CapabilityPhase::NotAuthenticatedPlain
         };
-        let caps = response::capability_tokens(phase, tls_ctx.is_some());
+        let caps =
+            response::capability_tokens_with_policy(phase, tls_ctx.is_some(), auth_policy.as_ref());
         println!(
             "Greeting peer={:?} encrypted={} capabilities={}",
             peer, session_encrypted, caps
@@ -5916,7 +5979,11 @@ async fn process_stream_inner(
                 } else {
                     response::CapabilityPhase::NotAuthenticatedPlain
                 };
-                let caps = response::capability_tokens(phase, tls_ctx.is_some());
+                let caps = response::capability_tokens_with_policy(
+                    phase,
+                    tls_ctx.is_some(),
+                    auth_policy.as_ref(),
+                );
                 let response = response::capability_response(tag, &caps);
                 log_imap_response(peer, tag, &cmd, &response);
                 w.write_all(response.as_bytes()).await?;
@@ -6121,7 +6188,7 @@ async fn process_stream_inner(
                         continue;
                     }
                 };
-                let Some(mechanism_metadata) = auth::sasl_mechanism(&mechanism) else {
+                let Some(mechanism_metadata) = auth_policy.mechanism(&mechanism) else {
                     let w = reader.get_mut();
                     w.write_all(
                         format!("{} NO Unsupported authentication mechanism\r\n", tag).as_bytes(),
@@ -7732,6 +7799,7 @@ async fn process_stream_inner(
                             peer,
                             true,
                             false,
+                            auth_policy.clone(),
                         ));
                         return fut.await;
                     }

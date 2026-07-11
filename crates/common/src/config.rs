@@ -57,6 +57,8 @@ pub enum ScannerFailureAction {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SecurityConfig {
+    #[serde(default = "default_imap_sasl_mechanisms")]
+    pub imap_sasl_mechanisms: Vec<String>,
     #[serde(default = "default_scanner_failure_action")]
     pub scanner_failure_action: ScannerFailureAction,
     #[serde(default = "default_scanner_timeout_ms")]
@@ -80,6 +82,7 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             scanner_failure_action: default_scanner_failure_action(),
             scanner_timeout_ms: default_scanner_timeout_ms(),
             scanner_max_message_bytes: default_scanner_max_message_bytes(),
@@ -91,6 +94,15 @@ impl Default for SecurityConfig {
             rspamd_reject_actions: Vec::new(),
         }
     }
+}
+
+fn default_imap_sasl_mechanisms() -> Vec<String> {
+    vec![
+        "PLAIN".to_string(),
+        "LOGIN".to_string(),
+        "SCRAM-SHA-256".to_string(),
+        "SCRAM-SHA-256-PLUS".to_string(),
+    ]
 }
 
 impl SecurityConfig {
@@ -149,6 +161,10 @@ mod tests {
         assert_eq!(cfg.security.scanner_timeout_ms, 5000);
         assert_eq!(cfg.security.scanner_max_message_bytes, 10 * 1024 * 1024);
         assert!(!cfg.security.clamav_enabled);
+        assert_eq!(
+            cfg.security.imap_sasl_mechanisms,
+            ["PLAIN", "LOGIN", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+        );
         assert!(!cfg.security.rspamd_enabled);
         assert!(!cfg.security.scanners_enabled());
     }
@@ -161,6 +177,7 @@ mod tests {
 mail_root = "mail"
 
 [security]
+imap_sasl_mechanisms = ["SCRAM-SHA-256"]
 scanner_failure_action = "reject"
 scanner_timeout_ms = 42
 scanner_max_message_bytes = 99
@@ -178,6 +195,7 @@ rspamd_reject_actions = ["reject"]
             ScannerFailureAction::Reject
         );
         assert_eq!(cfg.security.scanner_timeout_ms, 42);
+        assert_eq!(cfg.security.imap_sasl_mechanisms, ["SCRAM-SHA-256"]);
         assert_eq!(cfg.security.scanner_max_message_bytes, 99);
         assert!(cfg.security.scanners_enabled());
     }

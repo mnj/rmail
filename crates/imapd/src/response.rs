@@ -22,7 +22,16 @@ pub(crate) enum CapabilityPhase {
     Selected,
 }
 
+#[cfg(test)]
 pub(crate) fn capability_tokens(phase: CapabilityPhase, starttls_available: bool) -> String {
+    capability_tokens_with_policy(phase, starttls_available, &auth::AuthPolicy::default())
+}
+
+pub(crate) fn capability_tokens_with_policy(
+    phase: CapabilityPhase,
+    starttls_available: bool,
+    auth_policy: &auth::AuthPolicy,
+) -> String {
     let mut caps = vec![
         "IMAP4rev1",
         "ID",
@@ -39,13 +48,15 @@ pub(crate) fn capability_tokens(phase: CapabilityPhase, starttls_available: bool
                 caps.push("STARTTLS");
             }
             caps.extend(
-                auth::advertised_sasl_mechanisms(false, false)
+                auth_policy
+                    .advertised_mechanisms(false, false)
                     .map(|mechanism| mechanism.capability),
             );
         }
         CapabilityPhase::NotAuthenticatedTls => {
             caps.extend(
-                auth::advertised_sasl_mechanisms(true, starttls_available)
+                auth_policy
+                    .advertised_mechanisms(true, starttls_available)
                     .map(|mechanism| mechanism.capability),
             );
         }

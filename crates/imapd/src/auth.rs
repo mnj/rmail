@@ -50,22 +50,64 @@ const SASL_MECHANISMS: &[SaslMechanism] = &[
     },
 ];
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuthPolicy {
+    mechanisms: Vec<SaslMechanism>,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self {
+            mechanisms: SASL_MECHANISMS.to_vec(),
+        }
+    }
+}
+
+impl AuthPolicy {
+    pub(crate) fn from_names(names: &[String]) -> anyhow::Result<Self> {
+        if names.is_empty() {
+            anyhow::bail!("security.imap_sasl_mechanisms must not be empty");
+        }
+        let mut mechanisms = Vec::with_capacity(names.len());
+        for name in names {
+            let mechanism = sasl_mechanism(name)
+                .ok_or_else(|| anyhow::anyhow!("unsupported IMAP SASL mechanism {name:?}"))?;
+            if mechanisms
+                .iter()
+                .any(|configured: &SaslMechanism| configured.name == mechanism.name)
+            {
+                anyhow::bail!("duplicate IMAP SASL mechanism {:?}", mechanism.name);
+            }
+            mechanisms.push(mechanism);
+        }
+        Ok(Self { mechanisms })
+    }
+
+    pub(crate) fn mechanism(&self, name: &str) -> Option<SaslMechanism> {
+        self.mechanisms
+            .iter()
+            .copied()
+            .find(|mechanism| mechanism.name.eq_ignore_ascii_case(name))
+    }
+
+    pub(crate) fn advertised_mechanisms(
+        &self,
+        encrypted: bool,
+        channel_binding_available: bool,
+    ) -> impl Iterator<Item = SaslMechanism> + '_ {
+        self.mechanisms.iter().filter_map(move |mechanism| {
+            ((encrypted || mechanism.security != SaslSecurity::PlaintextPassword)
+                && (!mechanism.channel_binding_required || channel_binding_available))
+                .then_some(*mechanism)
+        })
+    }
+}
+
 pub(crate) fn sasl_mechanism(name: &str) -> Option<SaslMechanism> {
     SASL_MECHANISMS
         .iter()
         .copied()
         .find(|mechanism| mechanism.name.eq_ignore_ascii_case(name))
-}
-
-pub(crate) fn advertised_sasl_mechanisms(
-    encrypted: bool,
-    channel_binding_available: bool,
-) -> impl Iterator<Item = SaslMechanism> {
-    SASL_MECHANISMS.iter().filter_map(move |mechanism| {
-        ((encrypted || mechanism.security != SaslSecurity::PlaintextPassword)
-            && (!mechanism.channel_binding_required || channel_binding_available))
-            .then_some(*mechanism)
-    })
 }
 
 #[derive(Clone)]
@@ -577,5 +619,31 @@ mod tests {
             Ok(SaslProgress::ScramClientFirst(_))
         ));
         assert!(plus.expect_final_acknowledgment().is_err());
+    }
+
+    #[test]
+    fn auth_policy_validates_and_filters_configured_mechanisms() {
+        assert!(AuthPolicy::from_names(&[]).is_err());
+        assert!(AuthPolicy::from_names(&["UNKNOWN".to_string()]).is_err());
+        assert!(AuthPolicy::from_names(&["PLAIN".to_string(), "plain".to_string()]).is_err());
+
+        let policy =
+            AuthPolicy::from_names(&["LOGIN".to_string(), "SCRAM-SHA-256".to_string()]).unwrap();
+        assert!(policy.mechanism("PLAIN").is_none());
+        assert!(policy.mechanism("LOGIN").is_some());
+        assert_eq!(
+            policy
+                .advertised_mechanisms(false, false)
+                .map(|mechanism| mechanism.name)
+                .collect::<Vec<_>>(),
+            ["SCRAM-SHA-256"]
+        );
+        assert_eq!(
+            policy
+                .advertised_mechanisms(true, false)
+                .map(|mechanism| mechanism.name)
+                .collect::<Vec<_>>(),
+            ["LOGIN", "SCRAM-SHA-256"]
+        );
     }
 }
