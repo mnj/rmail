@@ -55,6 +55,7 @@ pub(crate) fn capability_tokens(phase: CapabilityPhase, starttls_available: bool
             "SORT",
             "THREAD=ORDEREDSUBJECT",
             "THREAD=REFERENCES",
+            "THREAD=REFS",
             "WITHIN",
             "STATUS=SIZE",
             "SAVEDATE",

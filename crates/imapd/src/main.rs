@@ -3169,7 +3169,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 SELECT INBOX\r\nA004 THREAD REFERENCES UTF-8 ALL\r\nA005 UID THREAD REFERENCES UTF-8 ALL\r\nA006 THREAD ORDEREDSUBJECT UTF-8 ALL\r\nA007 THREAD REFERENCES UTF-8 SEEN\r\nA008 THREAD UNKNOWN UTF-8 ALL\r\nA009 THREAD REFERENCES ISO-8859-1 ALL\r\nA010 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 SELECT INBOX\r\nA004 THREAD REFERENCES UTF-8 ALL\r\nA005 UID THREAD REFERENCES UTF-8 ALL\r\nA006 THREAD ORDEREDSUBJECT UTF-8 ALL\r\nA007 THREAD REFERENCES UTF-8 SEEN\r\nA008 THREAD REFS UTF-8 ALL\r\nA009 THREAD UNKNOWN UTF-8 ALL\r\nA010 THREAD REFERENCES ISO-8859-1 ALL\r\nA011 LOGOUT\r\n",
             )
             .await
             .expect("commands");
@@ -3178,6 +3178,7 @@ mod tests {
         let _login = read_until_contains(&mut reader, "A001 OK").await;
         let caps = read_until_contains(&mut reader, "A002 OK").await.join("");
         assert!(caps.contains("THREAD=REFERENCES"));
+        assert!(caps.contains("THREAD=REFS"));
         assert!(caps.contains("THREAD=ORDEREDSUBJECT"));
         let _select = read_until_contains(&mut reader, "A003 OK").await;
         let refs = read_until_contains(&mut reader, "A004 OK").await.join("");
@@ -3188,11 +3189,13 @@ mod tests {
         assert!(ordered.contains("* THREAD (1 (2)(3))(4)"));
         let filtered = read_until_contains(&mut reader, "A007 OK").await.join("");
         assert!(filtered.contains("* THREAD (2)"));
-        let unknown = read_until_contains(&mut reader, "A008 BAD").await.join("");
+        let refs2 = read_until_contains(&mut reader, "A008 OK").await.join("");
+        assert!(refs2.contains("* THREAD (1 2 3)(4)"));
+        let unknown = read_until_contains(&mut reader, "A009 BAD").await.join("");
         assert!(unknown.contains("Invalid THREAD arguments"));
-        let charset = read_until_contains(&mut reader, "A009 NO").await.join("");
+        let charset = read_until_contains(&mut reader, "A010 NO").await.join("");
         assert!(charset.contains("[BADCHARSET (US-ASCII UTF-8)]"));
-        let _logout = read_until_contains(&mut reader, "A010 OK").await;
+        let _logout = read_until_contains(&mut reader, "A011 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -7226,6 +7229,15 @@ async fn process_stream_inner(
                                 let mailbox = sel.mailbox.clone();
                                 let since = qresync.modseq;
                                 let known = qresync.known_uids.clone();
+                                let sample_endpoints = qresync
+                                    .sample
+                                    .as_ref()
+                                    .and_then(|(sequences, uids)| {
+                                        parser::SequenceSet::qresync_sample_endpoints(
+                                            sequences, uids,
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                 let mut changes = tokio::task::spawn_blocking(move || {
                                     rmail_common::imap_state::qresync_changes(
                                         Path::new(&mail_root),
@@ -7243,6 +7255,20 @@ async fn process_stream_inner(
                                         .changed_messages
                                         .retain(|message| known.contains(message.uid));
                                 }
+                                for (_, sampled_uid) in sample_endpoints {
+                                    let known_allows = qresync
+                                        .known_uids
+                                        .as_ref()
+                                        .is_none_or(|known| known.contains(sampled_uid));
+                                    if sampled_uid < uidnext
+                                        && known_allows
+                                        && !sel.msgs.iter().any(|message| message.0 == sampled_uid)
+                                    {
+                                        changes.vanished_uids.push(sampled_uid);
+                                    }
+                                }
+                                changes.vanished_uids.sort_unstable();
+                                changes.vanished_uids.dedup();
                                 Some(changes)
                             } else {
                                 None
@@ -7932,6 +7958,7 @@ async fn process_stream_inner(
                             thread::ordered_subject(&messages, true)
                         }
                         parser::ThreadAlgorithm::References => thread::references(&messages, true),
+                        parser::ThreadAlgorithm::Refs => thread::refs(&messages, true),
                     };
                     let w = reader.get_mut();
                     w.write_all(format!("* THREAD {}\r\n", body).as_bytes())
@@ -8435,6 +8462,7 @@ async fn process_stream_inner(
                         thread::ordered_subject(&messages, false)
                     }
                     parser::ThreadAlgorithm::References => thread::references(&messages, false),
+                    parser::ThreadAlgorithm::Refs => thread::refs(&messages, false),
                 };
                 let w = reader.get_mut();
                 w.write_all(format!("* THREAD {}\r\n", body).as_bytes())

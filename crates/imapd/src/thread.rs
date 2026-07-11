@@ -121,6 +121,18 @@ pub(crate) fn ordered_subject(messages: &[ThreadMessage], uid_mode: bool) -> Str
 }
 
 pub(crate) fn references(messages: &[ThreadMessage], uid_mode: bool) -> String {
+    references_with_subject_merging(messages, uid_mode, true)
+}
+
+pub(crate) fn refs(messages: &[ThreadMessage], uid_mode: bool) -> String {
+    references_with_subject_merging(messages, uid_mode, false)
+}
+
+fn references_with_subject_merging(
+    messages: &[ThreadMessage],
+    uid_mode: bool,
+    merge_subjects: bool,
+) -> String {
     let mut nodes = Vec::<Node>::new();
     let mut by_id = HashMap::<String, usize>::new();
     let mut used_message_ids = HashSet::new();
@@ -162,7 +174,9 @@ pub(crate) fn references(messages: &[ThreadMessage], uid_mode: bool) -> String {
         }
     }
 
-    merge_roots_by_subject(&mut nodes);
+    if merge_subjects {
+        merge_roots_by_subject(&mut nodes);
+    }
     let mut roots = (0..nodes.len())
         .filter(|index| nodes[*index].parent.is_none())
         .collect::<Vec<_>>();
@@ -371,5 +385,15 @@ mod tests {
             ),
         ];
         assert_eq!(ordered_subject(&messages, false), "(1 2)(3)");
+    }
+
+    #[test]
+    fn refs_preserves_same_subject_roots_that_references_merges() {
+        let messages = vec![
+            message(1, b"Message-ID: <first@x>\r\nSubject: Topic\r\n\r\n"),
+            message(2, b"Message-ID: <second@x>\r\nSubject: Re: Topic\r\n\r\n"),
+        ];
+        assert_eq!(references(&messages, false), "(1 2)");
+        assert_eq!(refs(&messages, false), "(1)(2)");
     }
 }

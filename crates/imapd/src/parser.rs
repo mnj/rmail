@@ -505,6 +505,38 @@ impl SequenceSet {
             count.checked_add(end.checked_sub(*start)?.checked_add(1)?)
         })
     }
+
+    fn nth(&self, mut index: u64) -> Option<u64> {
+        for (start, end) in &self.ranges {
+            let length = end.checked_sub(*start)?.checked_add(1)?;
+            if index < length {
+                return start.checked_add(index);
+            }
+            index = index.checked_sub(length)?;
+        }
+        None
+    }
+
+    pub(crate) fn qresync_sample_endpoints(
+        sequences: &Self,
+        uids: &Self,
+    ) -> Option<Vec<(u64, u64)>> {
+        if sequences.cardinality()? != uids.cardinality()? {
+            return None;
+        }
+        let mut samples = Vec::with_capacity(uids.ranges.len().saturating_mul(2));
+        let mut offset = 0_u64;
+        for (uid_start, uid_end) in &uids.ranges {
+            samples.push((sequences.nth(offset)?, *uid_start));
+            let width = uid_end.checked_sub(*uid_start)?;
+            if width > 0 {
+                offset = offset.checked_add(width)?;
+                samples.push((sequences.nth(offset)?, *uid_end));
+            }
+            offset = offset.checked_add(1)?;
+        }
+        Some(samples)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1078,6 +1110,7 @@ fn parse_sort_request_inner(input: &str) -> Option<SortRequest> {
 pub(crate) enum ThreadAlgorithm {
     OrderedSubject,
     References,
+    Refs,
 }
 
 #[derive(Debug)]
@@ -1092,6 +1125,7 @@ pub(crate) fn parse_thread_request(input: &str) -> Result<ThreadRequest, SortPar
     let algorithm = match tokens.first().map(|token| token.to_ascii_uppercase()) {
         Some(value) if value == "ORDEREDSUBJECT" => ThreadAlgorithm::OrderedSubject,
         Some(value) if value == "REFERENCES" => ThreadAlgorithm::References,
+        Some(value) if value == "REFS" => ThreadAlgorithm::Refs,
         _ => return Err(SortParseError::Syntax),
     };
     let charset = tokens
@@ -1945,6 +1979,13 @@ mod tests {
         assert!(parse_select_request("INBOX (QRESYNC (1 2 1:4 (1:2 1:3)))").is_err());
         assert!(parse_select_request("INBOX (UNKNOWN)").is_err());
         assert!(parse_select_request("INBOX (CONDSTORE CONDSTORE)").is_err());
+
+        let sequences = SequenceSet::parse_nostar("2:4,8:10").unwrap();
+        let uids = SequenceSet::parse_nostar("20:22,40:42").unwrap();
+        assert_eq!(
+            SequenceSet::qresync_sample_endpoints(&sequences, &uids),
+            Some(vec![(2, 20), (4, 22), (8, 40), (10, 42)])
+        );
     }
 
     #[test]
@@ -2058,10 +2099,10 @@ mod tests {
         assert!(matches!(references.search, SearchCriterion::Unseen));
         let ordered = parse_thread_request("ORDEREDSUBJECT US-ASCII ALL").unwrap();
         assert_eq!(ordered.algorithm, ThreadAlgorithm::OrderedSubject);
-        assert!(matches!(
-            parse_thread_request("REFS UTF-8 ALL"),
-            Err(SortParseError::Syntax)
-        ));
+        assert_eq!(
+            parse_thread_request("REFS UTF-8 ALL").unwrap().algorithm,
+            ThreadAlgorithm::Refs
+        );
         assert!(matches!(
             parse_thread_request("REFERENCES ISO-8859-1 ALL"),
             Err(SortParseError::UnsupportedCharset(_))
