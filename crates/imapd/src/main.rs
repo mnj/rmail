@@ -5594,13 +5594,12 @@ async fn reload_selected_mailbox_preserving_mode(
 }
 
 fn command_preflight_response(
-    command: &str,
-    args: &str,
+    spec: Option<commands::CommandSpec>,
     authenticated: bool,
     selected: bool,
     encrypted: bool,
 ) -> Option<&'static str> {
-    let spec = commands::command_spec(command, args)?;
+    let spec = spec?;
     match spec.auth {
         commands::CommandAuth::Any => {}
         commands::CommandAuth::NotAuthenticated if authenticated => {
@@ -5809,9 +5808,9 @@ async fn process_stream_inner(
             session_state.authenticated_mailbox.is_some(),
             session_state.selected_mailbox.is_some()
         );
+        let command_spec = commands::command_spec(&request.command);
         if let Some(reason) = command_preflight_response(
-            &cmd,
-            args,
+            command_spec,
             session_state.authenticated_mailbox.is_some(),
             session_state.selected_mailbox.is_some(),
             session_encrypted,
@@ -5821,6 +5820,18 @@ async fn process_stream_inner(
                 .await?;
             w.flush().await?;
             continue;
+        }
+        if command_spec
+            .is_some_and(|spec| spec.requires_sync || spec.uses_sequences || spec.breaks_sequences)
+            && selected.is_some()
+        {
+            sync_selected_mailbox(
+                &mut reader,
+                &mail_root,
+                &mut selected,
+                session_state.feature_enabled("QRESYNC"),
+            )
+            .await?;
         }
         match cmd.as_str() {
             "CAPABILITY" => {

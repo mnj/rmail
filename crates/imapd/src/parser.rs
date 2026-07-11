@@ -268,13 +268,40 @@ pub(crate) fn parse_id_args(
     Ok(Some(fields))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UidCommand {
+    Copy,
+    Expunge,
+    Fetch,
+    Move,
+    Search,
+    Sort,
+    Store,
+    Thread,
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     Capability,
+    Compress,
     Login,
     Authenticate,
     Noop,
     Check,
+    Close,
+    Copy,
+    Expunge,
+    Fetch,
+    Search,
+    Sort,
+    Store,
+    Thread,
+    Move,
+    Idle,
+    Logout,
+    StartTls,
+    Status,
     Unselect,
     Append,
     List { kind: &'static str },
@@ -287,7 +314,8 @@ pub(crate) enum Command {
     Subscribe { subscribe: bool },
     Id,
     Select { read_only: bool },
-    Raw { name: String },
+    Uid { command: UidCommand },
+    Unknown { name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -301,10 +329,24 @@ impl<'a> RequestLine<'a> {
     pub(crate) fn command_name(&self) -> &str {
         match &self.command {
             Command::Capability => "CAPABILITY",
+            Command::Compress => "COMPRESS",
             Command::Login => "LOGIN",
             Command::Authenticate => "AUTHENTICATE",
             Command::Noop => "NOOP",
             Command::Check => "CHECK",
+            Command::Close => "CLOSE",
+            Command::Copy => "COPY",
+            Command::Expunge => "EXPUNGE",
+            Command::Fetch => "FETCH",
+            Command::Search => "SEARCH",
+            Command::Sort => "SORT",
+            Command::Store => "STORE",
+            Command::Thread => "THREAD",
+            Command::Move => "MOVE",
+            Command::Idle => "IDLE",
+            Command::Logout => "LOGOUT",
+            Command::StartTls => "STARTTLS",
+            Command::Status => "STATUS",
             Command::Unselect => "UNSELECT",
             Command::Append => "APPEND",
             Command::List { kind } => kind,
@@ -329,7 +371,8 @@ impl<'a> RequestLine<'a> {
                     "SELECT"
                 }
             }
-            Command::Raw { name } => name.as_str(),
+            Command::Uid { .. } => "UID",
+            Command::Unknown { name } => name.as_str(),
         }
     }
 
@@ -379,10 +422,24 @@ pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseEr
     let name = raw_name.to_ascii_uppercase();
     let command = match name.as_str() {
         "CAPABILITY" => Command::Capability,
+        "COMPRESS" => Command::Compress,
         "LOGIN" => Command::Login,
         "AUTHENTICATE" => Command::Authenticate,
         "NOOP" => Command::Noop,
         "CHECK" => Command::Check,
+        "CLOSE" => Command::Close,
+        "COPY" => Command::Copy,
+        "EXPUNGE" => Command::Expunge,
+        "FETCH" => Command::Fetch,
+        "SEARCH" => Command::Search,
+        "SORT" => Command::Sort,
+        "STORE" => Command::Store,
+        "THREAD" => Command::Thread,
+        "MOVE" => Command::Move,
+        "IDLE" => Command::Idle,
+        "LOGOUT" => Command::Logout,
+        "STARTTLS" => Command::StartTls,
+        "STATUS" => Command::Status,
         "UNSELECT" => Command::Unselect,
         "APPEND" => Command::Append,
         "LIST" | "XLIST" => Command::List {
@@ -399,7 +456,26 @@ pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseEr
         "ID" => Command::Id,
         "SELECT" => Command::Select { read_only: false },
         "EXAMINE" => Command::Select { read_only: true },
-        _ => Command::Raw { name },
+        "UID" => {
+            let subcommand = args
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            let command = match subcommand.as_str() {
+                "COPY" => UidCommand::Copy,
+                "EXPUNGE" => UidCommand::Expunge,
+                "FETCH" => UidCommand::Fetch,
+                "MOVE" => UidCommand::Move,
+                "SEARCH" => UidCommand::Search,
+                "SORT" => UidCommand::Sort,
+                "STORE" => UidCommand::Store,
+                "THREAD" => UidCommand::Thread,
+                _ => UidCommand::Unknown(subcommand),
+            };
+            Command::Uid { command }
+        }
+        _ => Command::Unknown { name },
     };
     Ok(RequestLine {
         tag,

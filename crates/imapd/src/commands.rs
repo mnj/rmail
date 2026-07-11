@@ -71,59 +71,153 @@ const LOGIN: CommandSpec = CommandSpec {
     requires_sync: false,
 };
 
-pub(crate) fn command_spec(command: &str, args: &str) -> Option<CommandSpec> {
-    let upper = command.to_ascii_uppercase();
-    match upper.as_str() {
-        "CAPABILITY" | "NOOP" | "LOGOUT" | "ID" => Some(ANY),
-        "STARTTLS" => Some(NOT_AUTH),
-        "LOGIN" => Some(LOGIN),
-        "AUTHENTICATE" => Some(NOT_AUTH),
-        "APPEND" | "CREATE" | "DELETE" | "RENAME" | "LIST" | "XLIST" | "LSUB" | "NAMESPACE"
-        | "STATUS" | "SUBSCRIBE" | "UNSUBSCRIBE" | "ENABLE" | "COMPRESS" => Some(AUTH),
-        "SELECT" | "EXAMINE" => Some(AUTH),
-        "CHECK" | "CLOSE" | "EXPUNGE" | "FETCH" | "SEARCH" | "SORT" | "THREAD" | "STORE"
-        | "COPY" | "MOVE" | "UNSELECT" | "IDLE" => {
-            let mut spec = if matches!(
-                upper.as_str(),
-                "FETCH" | "SEARCH" | "SORT" | "THREAD" | "STORE" | "COPY" | "MOVE"
-            ) {
-                SELECTED_USES_SEQS
-            } else if matches!(upper.as_str(), "CLOSE" | "EXPUNGE" | "IDLE") {
-                SELECTED_BREAKS_SEQS
-            } else {
-                SELECTED
-            };
-            if upper == "IDLE" {
-                spec.requires_sync = true;
+pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
+    match command {
+        Command::Capability | Command::Noop | Command::Logout | Command::Id => Some(ANY),
+        Command::StartTls => Some(NOT_AUTH),
+        Command::Login => Some(LOGIN),
+        Command::Authenticate => Some(NOT_AUTH),
+        Command::Append
+        | Command::Create
+        | Command::Delete
+        | Command::Rename
+        | Command::List { .. }
+        | Command::Lsub
+        | Command::Namespace
+        | Command::Status
+        | Command::Subscribe { .. }
+        | Command::Enable
+        | Command::Compress
+        | Command::Select { .. } => Some(AUTH),
+        Command::Fetch
+        | Command::Search
+        | Command::Sort
+        | Command::Thread
+        | Command::Store
+        | Command::Copy
+        | Command::Move => Some(SELECTED_USES_SEQS),
+        Command::Close | Command::Expunge => Some(SELECTED_BREAKS_SEQS),
+        Command::Idle => Some(CommandSpec {
+            requires_sync: true,
+            ..SELECTED_BREAKS_SEQS
+        }),
+        Command::Check | Command::Unselect => Some(SELECTED),
+        Command::Uid { command } => match command {
+            UidCommand::Fetch
+            | UidCommand::Search
+            | UidCommand::Sort
+            | UidCommand::Thread
+            | UidCommand::Store
+            | UidCommand::Copy
+            | UidCommand::Move => Some(CommandSpec {
+                auth: CommandAuth::Selected,
+                tls_required: false,
+                uses_sequences: false,
+                breaks_sequences: true,
+                requires_sync: false,
+            }),
+            UidCommand::Expunge => Some(CommandSpec {
+                auth: CommandAuth::Selected,
+                tls_required: false,
+                uses_sequences: false,
+                breaks_sequences: true,
+                requires_sync: true,
+            }),
+            UidCommand::Unknown(name) => {
+                let _unsupported_subcommand = name;
+                Some(SELECTED)
             }
-            Some(spec)
-        }
-        "UID" => {
-            let subcommand = args
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_ascii_uppercase();
-            match subcommand.as_str() {
-                "FETCH" | "SEARCH" | "SORT" | "THREAD" | "STORE" | "COPY" | "MOVE" => {
-                    Some(CommandSpec {
-                        auth: CommandAuth::Selected,
-                        tls_required: false,
-                        uses_sequences: false,
-                        breaks_sequences: true,
-                        requires_sync: false,
-                    })
-                }
-                "EXPUNGE" => Some(CommandSpec {
-                    auth: CommandAuth::Selected,
-                    tls_required: false,
-                    uses_sequences: false,
-                    breaks_sequences: true,
-                    requires_sync: true,
-                }),
-                _ => Some(SELECTED),
-            }
-        }
-        _ => None,
+        },
+        Command::Unknown { .. } => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_request_line;
+
+    #[test]
+    fn every_implemented_command_has_typed_registry_metadata() {
+        let commands = [
+            "CAPABILITY",
+            "COMPRESS DEFLATE",
+            "LOGIN user password",
+            "AUTHENTICATE PLAIN",
+            "NOOP",
+            "CHECK",
+            "CLOSE",
+            "COPY 1 Archive",
+            "EXPUNGE",
+            "FETCH 1 FLAGS",
+            "SEARCH ALL",
+            "SORT (DATE) UTF-8 ALL",
+            "STORE 1 +FLAGS (\\Seen)",
+            "THREAD REFERENCES UTF-8 ALL",
+            "MOVE 1 Trash",
+            "IDLE",
+            "LOGOUT",
+            "STARTTLS",
+            "STATUS INBOX (MESSAGES)",
+            "UNSELECT",
+            "APPEND INBOX {1}",
+            "LIST \"\" \"*\"",
+            "XLIST \"\" \"*\"",
+            "LSUB \"\" \"*\"",
+            "NAMESPACE",
+            "ENABLE QRESYNC",
+            "CREATE Archive",
+            "DELETE Archive",
+            "RENAME Old New",
+            "SUBSCRIBE Archive",
+            "UNSUBSCRIBE Archive",
+            "ID NIL",
+            "SELECT INBOX",
+            "EXAMINE INBOX",
+        ];
+        for command in commands {
+            let line = format!("A1 {command}");
+            let request = parse_request_line(&line).unwrap();
+            assert!(
+                !matches!(request.command, Command::Unknown { .. }),
+                "{command} parsed as unknown"
+            );
+            assert!(
+                command_spec(&request.command).is_some(),
+                "{command} has no command metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn uid_subcommands_are_typed_and_never_use_sequence_numbers() {
+        for subcommand in [
+            "COPY 1 Archive",
+            "EXPUNGE 1",
+            "FETCH 1 FLAGS",
+            "MOVE 1 Trash",
+            "SEARCH ALL",
+            "SORT (DATE) UTF-8 ALL",
+            "STORE 1 +FLAGS (\\Seen)",
+            "THREAD REFERENCES UTF-8 ALL",
+        ] {
+            let line = format!("A1 UID {subcommand}");
+            let request = parse_request_line(&line).unwrap();
+            assert!(
+                matches!(&request.command, Command::Uid { command } if !matches!(command, UidCommand::Unknown(_))),
+                "UID {subcommand} was not typed"
+            );
+            let spec = command_spec(&request.command).unwrap();
+            assert_eq!(spec.auth, CommandAuth::Selected);
+            assert!(!spec.uses_sequences);
+        }
+    }
+
+    #[test]
+    fn unknown_top_level_commands_are_not_registered() {
+        let request = parse_request_line("A1 X-UNKNOWN arg").unwrap();
+        assert!(matches!(request.command, Command::Unknown { .. }));
+        assert!(command_spec(&request.command).is_none());
+    }
+}
+use crate::parser::{Command, UidCommand};
