@@ -438,52 +438,63 @@ pub fn delete_message_by_uid(
     mailbox: &str,
     uid: u64,
 ) -> Result<()> {
+    delete_messages_by_uid(maildir_root, domain, localpart, mailbox, &[uid]).map(|_| ())
+}
+
+pub fn delete_messages_by_uid(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    uids: &[u64],
+) -> Result<Vec<u64>> {
     let name = normalize_mailbox_name(mailbox)?;
+    let mut requested = uids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
     let tx = conn.transaction()?;
-    let Some((folder_id, filename, subdir)) = tx
-        .query_row(
-            "SELECT folder_id, filename, subdir
-             FROM messages
-             WHERE folder_id = (SELECT id FROM folders WHERE name = ?1) AND uid = ?2",
-            params![name, uid as i64],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?
-    else {
-        return Ok(());
-    };
-
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
-    let path = dir.join(&subdir).join(&filename);
-    let tombstone = dir.join("tmp").join(format!(
-        "{}.expunge.{}.{}",
-        filename,
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
-        rand::random::<u64>()
-    ));
-    let file_guard = if path.exists() {
-        fs::rename(&path, &tombstone)
-            .with_context(|| format!("staging message UID {uid} for expunge"))?;
-        Some(FileMutationGuard::moved(path, tombstone.clone()))
-    } else {
-        None
-    };
-    let modseq = next_modseq(&tx, folder_id)?;
-    record_expunge(&tx, folder_id, uid, modseq)?;
-    tx.execute(
-        "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
-        params![folder_id, uid as i64],
-    )?;
+    let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
+    let mut staged = Vec::new();
+    let mut deleted = Vec::new();
+    for uid in requested {
+        let Some((filename, subdir)) = tx
+            .query_row(
+                "SELECT filename, subdir FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![folder_id, uid as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        let path = dir.join(&subdir).join(&filename);
+        if path.exists() {
+            let tombstone = dir.join("tmp").join(format!(
+                "{}.expunge.{}.{}",
+                filename,
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+                rand::random::<u64>()
+            ));
+            fs::rename(&path, &tombstone)
+                .with_context(|| format!("staging message UID {uid} for expunge"))?;
+            staged.push((FileMutationGuard::moved(path, tombstone.clone()), tombstone));
+        }
+        let modseq = next_modseq(&tx, folder_id)?;
+        record_expunge(&tx, folder_id, uid, modseq)?;
+        tx.execute(
+            "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
+            params![folder_id, uid as i64],
+        )?;
+        deleted.push(uid);
+    }
     tx.commit()?;
-    if let Some(guard) = file_guard {
+    for (guard, tombstone) in staged {
         guard.commit();
         if let Err(error) = fs::remove_file(&tombstone) {
             eprintln!(
@@ -493,7 +504,7 @@ pub fn delete_message_by_uid(
             );
         }
     }
-    Ok(())
+    Ok(deleted)
 }
 
 enum FileMutationRollback {
@@ -1845,6 +1856,65 @@ mod tests {
             assert_eq!(message.flags, original.flags);
             assert_eq!(message.modseq, original.modseq);
         }
+    }
+
+    #[test]
+    fn expunge_batch_is_atomic_when_a_later_message_fails() {
+        let td = tempfile::tempdir().unwrap();
+        let (_, first) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: first\r\n\r\n",
+            Vec::new(),
+        )
+        .unwrap();
+        let (_, second) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: second\r\n\r\n",
+            Vec::new(),
+        )
+        .unwrap();
+        let (before, messages_before) =
+            load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        let paths = messages_before
+            .iter()
+            .map(|message| message.path.clone())
+            .collect::<Vec<_>>();
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second_expunge
+             BEFORE INSERT ON expunges
+             WHEN NEW.uid = 2
+             BEGIN SELECT RAISE(FAIL, 'injected second expunge failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            delete_messages_by_uid(td.path(), "example.test", "user", "INBOX", &[first, second],)
+                .is_err()
+        );
+        assert!(paths.iter().all(|path| path.is_file()));
+        let (after, messages_after) =
+            load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(after.highest_modseq, before.highest_modseq);
+        assert_eq!(messages_after.len(), 2);
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        let expunges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM expunges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(expunges, 0);
+        assert_eq!(
+            fs::read_dir(account_maildir(td.path(), "example.test", "user").join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]

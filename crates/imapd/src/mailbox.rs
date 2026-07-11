@@ -135,23 +135,21 @@ pub(crate) async fn expunge_deleted(
         })
         .collect();
     deleted.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, uid) in &deleted {
-        let mail_root = mail_root.to_string();
-        let domain = selected.domain.clone();
-        let local = selected.local.clone();
-        let mailbox = selected.mailbox.clone();
-        let uid = *uid;
-        tokio::task::spawn_blocking(move || {
-            rmail_common::maildir::delete_message_by_uid_for_mailbox(
-                Path::new(&mail_root),
-                &domain,
-                &local,
-                &mailbox,
-                uid,
-            )
-        })
-        .await??;
-    }
+    let uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
+    let mail_root = mail_root.to_string();
+    let domain = selected.domain.clone();
+    let local = selected.local.clone();
+    let mailbox = selected.mailbox.clone();
+    tokio::task::spawn_blocking(move || {
+        rmail_common::imap_state::delete_messages_by_uid(
+            Path::new(&mail_root),
+            &domain,
+            &local,
+            &mailbox,
+            &uids,
+        )
+    })
+    .await??;
     Ok(deleted)
 }
 

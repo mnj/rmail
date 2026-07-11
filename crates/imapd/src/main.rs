@@ -8235,15 +8235,14 @@ async fn process_stream_inner(
                         })
                         .collect();
                     deleted.sort_by(|a, b| b.0.cmp(&a.0));
-                    for (_, uid) in &deleted {
-                        maildir::delete_message_by_uid_for_mailbox(
-                            Path::new(&mail_root),
-                            &sel.domain,
-                            &sel.local,
-                            &sel.mailbox,
-                            *uid,
-                        )?;
-                    }
+                    let deleted_uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
+                    rmail_common::imap_state::delete_messages_by_uid(
+                        Path::new(&mail_root),
+                        &sel.domain,
+                        &sel.local,
+                        &sel.mailbox,
+                        &deleted_uids,
+                    )?;
                     let w = reader.get_mut();
                     if session_state.feature_enabled("QRESYNC") && !deleted.is_empty() {
                         let uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
