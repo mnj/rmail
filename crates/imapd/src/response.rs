@@ -23,7 +23,15 @@ pub(crate) enum CapabilityPhase {
 }
 
 pub(crate) fn capability_tokens(phase: CapabilityPhase, starttls_available: bool) -> String {
-    let mut caps = vec!["IMAP4rev1", "ID", "ENABLE", "IDLE", "SASL-IR", "LITERAL-"];
+    let mut caps = vec![
+        "IMAP4rev1",
+        "ID",
+        "ENABLE",
+        "IDLE",
+        "SASL-IR",
+        "LITERAL+",
+        "LITERAL-",
+    ];
     match phase {
         CapabilityPhase::NotAuthenticatedPlain => {
             caps.push("LOGINDISABLED");

@@ -25,7 +25,6 @@ use mailbox::SelectedMailbox;
 use tls::load_tls_context;
 
 const MAX_APPEND_LITERAL_BYTES: usize = 100 * 1024 * 1024;
-const MAX_LITERAL_MINUS_NON_SYNC_BYTES: usize = 4096;
 const MAX_PREAUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTHENTICATED_LINE_BYTES: usize = 64 * 1024;
 const MAX_SASL_RESPONSE_BYTES: usize = 64 * 1024;
@@ -293,7 +292,6 @@ fn trailing_literal_marker(line: &[u8]) -> Option<TrailingLiteralMarker> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandLiteralError {
     TooLarge,
-    NonSyncTooLarge,
     Literal8,
     NonSyncLiteral8,
     InvalidUtf8,
@@ -323,9 +321,6 @@ async fn read_textual_command_literals(
             .ok_or(CommandLiteralError::TooLarge)?;
         if total_literal_bytes > MAX_APPEND_LITERAL_BYTES {
             return Err(CommandLiteralError::TooLarge);
-        }
-        if marker.non_sync && marker.size > MAX_LITERAL_MINUS_NON_SYNC_BYTES {
-            return Err(CommandLiteralError::NonSyncTooLarge);
         }
         if !marker.non_sync {
             let w = reader.get_mut();
@@ -509,7 +504,7 @@ mod tests {
         assert!(plain_caps.contains("SASL-IR"));
         assert!(plain_caps.contains("ENABLE"));
         assert!(plain_caps.contains("LITERAL-"));
-        assert!(!plain_caps.contains("LITERAL+"));
+        assert!(plain_caps.contains("LITERAL+"));
         assert!(!plain_caps.contains("AUTH=PLAIN"));
         assert!(plain_caps.contains("AUTH=SCRAM-SHA-256"));
         assert!(!plain_caps.contains("STARTTLS"));
@@ -529,7 +524,7 @@ mod tests {
         assert!(tls_caps.contains("AUTH=SCRAM-SHA-256"));
         assert!(!tls_caps.contains("AUTH=SCRAM-SHA-256-PLUS"));
         assert!(tls_caps.contains("LITERAL-"));
-        assert!(!tls_caps.contains("LITERAL+"));
+        assert!(tls_caps.contains("LITERAL+"));
         assert!(!tls_caps.contains("STARTTLS"));
         assert!(!tls_caps.contains("CONDSTORE"));
         assert!(!tls_caps.contains("QRESYNC"));
@@ -3488,7 +3483,7 @@ mod tests {
         reader.read_line(&mut capability).await.expect("capability");
         assert!(!capability.contains("UIDPLUS"));
         assert!(capability.contains("LITERAL-"));
-        assert!(!capability.contains("LITERAL+"));
+        assert!(capability.contains("LITERAL+"));
 
         let raw = b"Subject: appended\r\nX-Raw: \xff\r\n\r\nbody\x00bytes\r\n";
         let raw_non_sync = b"Subject: non-sync\r\n\r\nliteral-minus\r\n";
@@ -3506,7 +3501,10 @@ mod tests {
         commands.extend_from_slice(b"\r\n");
         commands.extend_from_slice(b"A004 APPEND Sent ~{3+}\r\n");
         commands.extend_from_slice(b"x\0y\r\n");
+        let large_non_sync = vec![b'x'; 4097];
         commands.extend_from_slice(b"A005 APPEND Sent {4097+}\r\n");
+        commands.extend_from_slice(&large_non_sync);
+        commands.extend_from_slice(b"\r\n");
         commands.extend_from_slice(format!("A006 APPEND Missing {{{}}}\r\n", raw.len()).as_bytes());
         commands.extend_from_slice(raw);
         commands.extend_from_slice(b"\r\nA007 LOGOUT\r\n");
@@ -3533,12 +3531,9 @@ mod tests {
         let literal8_lines = read_until_contains(&mut reader, "A004 OK").await;
         assert!(literal8_lines.iter().any(|l| l.contains("APPENDUID")));
 
-        let oversized_non_sync = read_until_contains(&mut reader, "A005 BAD").await;
-        assert!(
-            oversized_non_sync
-                .iter()
-                .any(|l| l.contains("Non-synchronizing literal too large"))
-        );
+        let large_non_sync_lines = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(!large_non_sync_lines.iter().any(|l| l.starts_with("+ ")));
+        assert!(large_non_sync_lines.iter().any(|l| l.contains("APPENDUID")));
 
         let missing_lines = read_until_contains(&mut reader, "A006 NO").await;
         assert!(missing_lines.iter().any(|l| l.contains("APPEND failed")));
@@ -3549,7 +3544,10 @@ mod tests {
         let (_, sent) =
             rmail_common::imap_state::load_folder(&mail_root, "example.test", "user", "Sent")
                 .expect("load sent");
-        assert_eq!(sent.len(), 2);
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().any(|message| {
+            std::fs::read(&message.path).is_ok_and(|bytes| bytes == large_non_sync)
+        }));
         assert!(
             sent[0]
                 .flags
@@ -5668,15 +5666,6 @@ async fn process_stream_inner(
             line = match read_textual_command_literals(&mut reader, line, line_limit).await {
                 Ok(line) => line,
                 Err(CommandLiteralError::Eof) => break,
-                Err(CommandLiteralError::NonSyncTooLarge) => {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        b"* BYE Oversized non-synchronizing literal desynchronized command stream\r\n",
-                    )
-                    .await?;
-                    w.flush().await?;
-                    break;
-                }
                 Err(CommandLiteralError::NonSyncLiteral8) => {
                     let w = reader.get_mut();
                     w.write_all(
@@ -6603,21 +6592,6 @@ async fn process_stream_inner(
                     let w = reader.get_mut();
                     w.write_all(
                         format!("{} NO [TOOBIG] APPEND literal too large\r\n", tag).as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if append_request.non_sync
-                    && append_request.literal_len > MAX_LITERAL_MINUS_NON_SYNC_BYTES
-                {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} BAD [TOOBIG] Non-synchronizing literal too large\r\n",
-                            tag
-                        )
-                        .as_bytes(),
                     )
                     .await?;
                     w.flush().await?;
