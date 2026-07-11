@@ -1253,6 +1253,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authentication_failures_are_indistinguishable_and_share_lockout() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::db::add_mailbox(&db_path, "nopass@example.test", None, None, None)
+            .expect("add passwordless mailbox");
+        let peer = Some("192.0.2.123:4143".parse().expect("peer"));
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                peer,
+                true,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        let plain_bad =
+            base64::engine::general_purpose::STANDARD.encode(b"\0user@example.test\0wrong");
+        let commands = format!(
+            "A001 LOGIN missing@example.test wrong\r\n\
+             A002 LOGIN nopass@example.test wrong\r\n\
+             A003 LOGIN user@example.test wrong\r\n\
+             A004 LOGIN user@example.test wrong\r\n\
+             A005 AUTHENTICATE PLAIN {}\r\n\
+             A006 LOGIN user@example.test password\r\n\
+             A007 LOGOUT\r\n",
+            plain_bad
+        );
+        reader
+            .get_mut()
+            .write_all(commands.as_bytes())
+            .await
+            .expect("write auth failures");
+        reader.get_mut().flush().await.expect("flush");
+        for tag in ["A001", "A002", "A003", "A004", "A005"] {
+            let lines = read_until_contains(&mut reader, &format!("{tag} NO")).await;
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("[AUTHENTICATIONFAILED] Authentication failed")),
+                "failure leaked account state or lacked response code: {lines:?}"
+            );
+        }
+        let blocked = read_until_contains(&mut reader, "A006 NO").await;
+        assert!(
+            blocked
+                .iter()
+                .any(|line| line.contains("Too many failed auth attempts"))
+        );
+        let _logout = read_until_contains(&mut reader, "A007 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
     async fn authenticate_plain_is_tls_only_and_logs_in() {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
@@ -5617,7 +5688,7 @@ fn command_preflight_response(
         commands::CommandAuth::Selected => {}
     }
     if spec.tls_required && !encrypted {
-        return Some("NO Encryption required for authentication");
+        return Some("NO [PRIVACYREQUIRED] Encryption required for authentication");
     }
     None
 }
@@ -5917,7 +5988,11 @@ async fn process_stream_inner(
                 if !session_encrypted {
                     let w = reader.get_mut();
                     w.write_all(
-                        format!("{} NO Encryption required for authentication\r\n", tag).as_bytes(),
+                        format!(
+                            "{} NO [PRIVACYREQUIRED] Encryption required for authentication\r\n",
+                            tag
+                        )
+                        .as_bytes(),
                     )
                     .await?;
                     w.flush().await?;
@@ -5969,14 +6044,27 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO No such user\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                     PasswordAuthResult::NoPassword => {
+                        if let Some(peer_addr) = peer {
+                            auth::record_auth_failure(peer_addr.ip());
+                        }
                         let w = reader.get_mut();
                         w.write_all(
-                            format!("{} NO No password set for account\r\n", tag).as_bytes(),
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
                         )
                         .await?;
                         w.flush().await?;
@@ -5990,8 +6078,14 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                     PasswordAuthResult::Error { mailbox, message } => {
@@ -6005,8 +6099,10 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag).as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                 }
@@ -6055,7 +6151,11 @@ async fn process_stream_inner(
                 {
                     let w = reader.get_mut();
                     w.write_all(
-                        format!("{} NO Encryption required for authentication\r\n", tag).as_bytes(),
+                        format!(
+                            "{} NO [PRIVACYREQUIRED] Encryption required for authentication\r\n",
+                            tag
+                        )
+                        .as_bytes(),
                     )
                     .await?;
                     w.flush().await?;
@@ -6141,14 +6241,27 @@ async fn process_stream_inner(
                                 auth::record_auth_failure(peer_addr.ip());
                             }
                             let w = reader.get_mut();
-                            w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                                .await?;
+                            w.write_all(
+                                format!(
+                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                    tag
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
                             w.flush().await?;
                         }
                         PasswordAuthResult::NoPassword => {
+                            if let Some(peer_addr) = peer {
+                                auth::record_auth_failure(peer_addr.ip());
+                            }
                             let w = reader.get_mut();
                             w.write_all(
-                                format!("{} NO No password set for account\r\n", tag).as_bytes(),
+                                format!(
+                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                    tag
+                                )
+                                .as_bytes(),
                             )
                             .await?;
                             w.flush().await?;
@@ -6164,8 +6277,11 @@ async fn process_stream_inner(
                                 message
                             );
                             let w = reader.get_mut();
-                            w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes())
-                                .await?;
+                            w.write_all(
+                                format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag)
+                                    .as_bytes(),
+                            )
+                            .await?;
                             w.flush().await?;
                         }
                     }
@@ -6268,9 +6384,15 @@ async fn process_stream_inner(
                     if client_first.authzid.as_ref().is_some_and(|authzid| {
                         common_auth::saslprep(authzid).to_ascii_lowercase() != user_lookup
                     }) {
+                        if let Some(peer_addr) = peer {
+                            auth::record_auth_failure(peer_addr.ip());
+                        }
                         let w = reader.get_mut();
                         w.write_all(
-                            format!("{} NO Authorization identity is not permitted\r\n", tag)
+                            format!(
+                                "{} NO [AUTHORIZATIONFAILED] Authorization identity is not permitted\r\n",
+                                tag
+                            )
                                 .as_bytes(),
                         )
                         .await?;
@@ -6309,8 +6431,14 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                         continue;
                     };
@@ -6319,8 +6447,14 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                         continue;
                     };
@@ -6333,8 +6467,11 @@ async fn process_stream_inner(
                                 peer, mailbox.address, e
                             );
                             let w = reader.get_mut();
-                            w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes())
-                                .await?;
+                            w.write_all(
+                                format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag)
+                                    .as_bytes(),
+                            )
+                            .await?;
                             w.flush().await?;
                             continue;
                         }
@@ -6418,8 +6555,14 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                         continue;
                     }
@@ -6505,8 +6648,14 @@ async fn process_stream_inner(
                                 peer, mailbox.address, e
                             );
                             let w = reader.get_mut();
-                            w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                                .await?;
+                            w.write_all(
+                                format!(
+                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                    tag
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
                             w.flush().await?;
                         }
                     }
@@ -6518,9 +6667,15 @@ async fn process_stream_inner(
                     common_auth::saslprep(authzid).to_ascii_lowercase()
                         != common_auth::saslprep(&user).to_ascii_lowercase()
                 }) {
+                    if let Some(peer_addr) = peer {
+                        auth::record_auth_failure(peer_addr.ip());
+                    }
                     let w = reader.get_mut();
                     w.write_all(
-                        format!("{} NO Authorization identity is not permitted\r\n", tag)
+                        format!(
+                            "{} NO [AUTHORIZATIONFAILED] Authorization identity is not permitted\r\n",
+                            tag
+                        )
                             .as_bytes(),
                     )
                     .await?;
@@ -6552,14 +6707,27 @@ async fn process_stream_inner(
                             auth::record_auth_failure(peer_addr.ip());
                         }
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication failed\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                     PasswordAuthResult::NoPassword => {
+                        if let Some(peer_addr) = peer {
+                            auth::record_auth_failure(peer_addr.ip());
+                        }
                         let w = reader.get_mut();
                         w.write_all(
-                            format!("{} NO No password set for account\r\n", tag).as_bytes(),
+                            format!(
+                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                tag
+                            )
+                            .as_bytes(),
                         )
                         .await?;
                         w.flush().await?;
@@ -6575,8 +6743,10 @@ async fn process_stream_inner(
                             message
                         );
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO Authentication error\r\n", tag).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag).as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                 }
