@@ -453,6 +453,58 @@ pub fn delete_message_by_uid(
     Ok(())
 }
 
+enum FileMutationRollback {
+    Move {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+    Copy {
+        destination: PathBuf,
+    },
+}
+
+struct FileMutationGuard {
+    rollback: Option<FileMutationRollback>,
+}
+
+impl FileMutationGuard {
+    fn moved(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            rollback: Some(FileMutationRollback::Move {
+                source,
+                destination,
+            }),
+        }
+    }
+
+    fn copied(destination: PathBuf) -> Self {
+        Self {
+            rollback: Some(FileMutationRollback::Copy { destination }),
+        }
+    }
+
+    fn commit(mut self) {
+        self.rollback = None;
+    }
+}
+
+impl Drop for FileMutationGuard {
+    fn drop(&mut self) {
+        match self.rollback.take() {
+            Some(FileMutationRollback::Move {
+                source,
+                destination,
+            }) => {
+                let _ = fs::rename(destination, source);
+            }
+            Some(FileMutationRollback::Copy { destination }) => {
+                let _ = fs::remove_file(destination);
+            }
+            None => {}
+        }
+    }
+}
+
 pub fn move_message_by_uid(
     maildir_root: &Path,
     domain: &str,
@@ -520,6 +572,7 @@ pub fn move_message_by_uid(
             uid, source_mailbox, destination_mailbox
         )
     })?;
+    let file_guard = FileMutationGuard::moved(source_path, destination_path);
 
     let source_modseq = next_modseq(&tx, source_id)?;
     record_expunge(&tx, source_id, uid, source_modseq)?;
@@ -554,6 +607,7 @@ pub fn move_message_by_uid(
         params![uidnext.saturating_add(1), destination_id],
     )?;
     tx.commit()?;
+    file_guard.commit();
     Ok(Some(uidnext as u64))
 }
 
@@ -622,6 +676,7 @@ pub fn copy_message_by_uid(
             uid, source_mailbox, destination_mailbox
         )
     })?;
+    let file_guard = FileMutationGuard::copied(destination_path);
 
     let destination_modseq = next_modseq(&tx, destination_id)?;
     tx.execute(
@@ -645,6 +700,7 @@ pub fn copy_message_by_uid(
         params![uidnext.saturating_add(1), destination_id],
     )?;
     tx.commit()?;
+    file_guard.commit();
     Ok(Some(uidnext as u64))
 }
 
@@ -1355,6 +1411,55 @@ mod tests {
             fs::read(&archived[0].path).unwrap(),
             b"Subject: a\r\n\r\nbody"
         );
+    }
+
+    #[test]
+    fn copy_and_move_roll_back_maildir_when_database_commit_fails() {
+        for move_message in [false, true] {
+            let td = tempfile::tempdir().unwrap();
+            init_account(td.path(), "example.test", "user").unwrap();
+            let (_, uid) = append_message(
+                td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                b"Subject: rollback\r\n\r\nbody\r\n",
+                Vec::new(),
+            )
+            .unwrap();
+            let (_, source_before) =
+                load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+            let source_path = source_before[0].path.clone();
+            let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_archive_insert
+                 BEFORE INSERT ON messages
+                 WHEN NEW.folder_id = (SELECT id FROM folders WHERE name = 'Archive')
+                 BEGIN SELECT RAISE(FAIL, 'injected destination failure'); END;",
+            )
+            .unwrap();
+            drop(conn);
+
+            let result = if move_message {
+                move_message_by_uid(td.path(), "example.test", "user", "INBOX", uid, "Archive")
+            } else {
+                copy_message_by_uid(td.path(), "example.test", "user", "INBOX", uid, "Archive")
+            };
+            assert!(result.is_err());
+            assert!(
+                source_path.is_file(),
+                "source was not restored after failure"
+            );
+            let (_, source_after) =
+                load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+            let (_, destination_after) =
+                load_folder(td.path(), "example.test", "user", "Archive").unwrap();
+            assert_eq!(source_after.len(), 1);
+            assert!(destination_after.is_empty());
+            let archive_dir = mailbox_dir(td.path(), "example.test", "user", "Archive").unwrap();
+            assert_eq!(fs::read_dir(archive_dir.join("new")).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(archive_dir.join("cur")).unwrap().count(), 0);
+        }
     }
 
     #[test]
