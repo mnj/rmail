@@ -157,6 +157,27 @@ enum SaslProtocolError {
     Eof,
 }
 
+async fn read_sasl_wire_response(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+) -> std::result::Result<String, SaslProtocolError> {
+    let line = match read_bounded_line(reader, MAX_SASL_RESPONSE_BYTES)
+        .await
+        .map_err(|_| SaslProtocolError::Eof)?
+    {
+        BoundedLine::Eof => return Err(SaslProtocolError::Eof),
+        BoundedLine::TooLong => return Err(SaslProtocolError::ResponseTooLarge),
+        BoundedLine::Line(line) => line,
+    };
+    let line = std::str::from_utf8(&line)
+        .map_err(|_| SaslProtocolError::InvalidResponse)?
+        .trim_end_matches(['\r', '\n']);
+    if line == "*" {
+        Err(SaslProtocolError::Cancelled)
+    } else {
+        Ok(line.to_string())
+    }
+}
+
 async fn run_password_sasl_exchange(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     exchange: &mut dyn auth::SaslExchange,
@@ -174,22 +195,9 @@ async fn run_password_sasl_exchange(
                     .await
                     .map_err(|_| SaslProtocolError::Eof)?;
                 w.flush().await.map_err(|_| SaslProtocolError::Eof)?;
-                let line = match read_bounded_line(reader, MAX_SASL_RESPONSE_BYTES)
-                    .await
-                    .map_err(|_| SaslProtocolError::Eof)?
-                {
-                    BoundedLine::Eof => return Err(SaslProtocolError::Eof),
-                    BoundedLine::TooLong => return Err(SaslProtocolError::ResponseTooLarge),
-                    BoundedLine::Line(line) => line,
-                };
-                let line = std::str::from_utf8(&line)
-                    .map_err(|_| SaslProtocolError::InvalidResponse)?
-                    .trim_end_matches(['\r', '\n']);
-                if line == "*" {
-                    return Err(SaslProtocolError::Cancelled);
-                }
+                let line = read_sasl_wire_response(reader).await?;
                 progress = exchange
-                    .receive(line)
+                    .receive(&line)
                     .map_err(|_| SaslProtocolError::InvalidResponse)?;
             }
             auth::SaslProgress::ScramClientFirst(_)
@@ -4982,10 +4990,6 @@ fn append_list_response(
     }
 }
 
-fn decode_sasl_message(response: &str) -> Option<String> {
-    auth::decode_sasl_message(response)
-}
-
 #[cfg(test)]
 fn parse_scram_attr<'a>(message: &'a str, key: &str) -> Option<&'a str> {
     auth::parse_scram_attr(message, key)
@@ -5896,37 +5900,56 @@ async fn process_stream_inner(
                         w.write_all(b"+ \r\n").await?;
                         w.flush().await?;
                     }
-                    let mut auth_line = String::new();
-                    let n = reader.read_line(&mut auth_line).await?;
-                    if n == 0 {
-                        return Ok(());
+                    match read_sasl_wire_response(&mut reader).await {
+                        Ok(line) => line,
+                        Err(SaslProtocolError::Eof) => return Ok(()),
+                        Err(SaslProtocolError::Cancelled) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD AUTHENTICATE cancelled\r\n", tag).as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                        Err(SaslProtocolError::ResponseTooLarge) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD AUTHENTICATE response too large\r\n", tag)
+                                    .as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                        Err(SaslProtocolError::InvalidResponse) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD Invalid AUTHENTICATE response\r\n", tag).as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
                     }
-                    auth_line.trim_end_matches("\r\n").to_string()
                 };
                 if mechanism == "SCRAM-SHA-256" || mechanism == "SCRAM-SHA-256-PLUS" {
-                    let Some(client_first_msg) = auth::decode_sasl_message(&response) else {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid SCRAM client-first response\r\n", tag)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    };
-                    let Some(client_first) = auth::parse_scram_client_first(
-                        &client_first_msg,
-                        mechanism_metadata.channel_binding_required,
-                    ) else {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid SCRAM client-first message\r\n", tag)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    };
+                    let mut scram_exchange =
+                        auth::ScramExchange::new(mechanism_metadata.channel_binding_required);
+                    let client_first =
+                        match auth::SaslExchange::start(&mut scram_exchange, Some(&response)) {
+                            Ok(auth::SaslProgress::ScramClientFirst(first)) => first,
+                            _ => {
+                                let w = reader.get_mut();
+                                w.write_all(
+                                    format!("{} BAD Invalid SCRAM client-first message\r\n", tag)
+                                        .as_bytes(),
+                                )
+                                .await?;
+                                w.flush().await?;
+                                continue;
+                            }
+                        };
                     let user_lookup =
                         common_auth::saslprep(&client_first.username).to_ascii_lowercase();
                     if client_first.authzid.as_ref().is_some_and(|authzid| {
@@ -6014,41 +6037,55 @@ async fn process_stream_inner(
                             .await?;
                         w.flush().await?;
                     }
-                    let mut final_line = String::new();
-                    let n = reader.read_line(&mut final_line).await?;
-                    if n == 0 {
-                        return Ok(());
-                    }
-                    if final_line.trim_end_matches("\r\n") == "*" {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD AUTHENTICATE cancelled\r\n", tag).as_bytes())
+                    let final_line = match read_sasl_wire_response(&mut reader).await {
+                        Ok(line) => line,
+                        Err(SaslProtocolError::Eof) => return Ok(()),
+                        Err(SaslProtocolError::Cancelled) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD AUTHENTICATE cancelled\r\n", tag).as_bytes(),
+                            )
                             .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let Some(client_final_msg) =
-                        decode_sasl_message(final_line.trim_end_matches("\r\n"))
-                    else {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid SCRAM client-final response\r\n", tag)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
+                            w.flush().await?;
+                            continue;
+                        }
+                        Err(SaslProtocolError::ResponseTooLarge) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD AUTHENTICATE response too large\r\n", tag)
+                                    .as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                        Err(SaslProtocolError::InvalidResponse) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD Invalid SCRAM client-final response\r\n", tag)
+                                    .as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
                     };
-                    let Some(client_final) = auth::parse_scram_client_final(&client_final_msg)
-                    else {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid SCRAM client-final message\r\n", tag)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    };
+                    let client_final =
+                        match auth::SaslExchange::receive(&mut scram_exchange, &final_line) {
+                            Ok(auth::SaslProgress::ScramClientFinal(final_message)) => {
+                                final_message
+                            }
+                            _ => {
+                                let w = reader.get_mut();
+                                w.write_all(
+                                    format!("{} BAD Invalid SCRAM client-final message\r\n", tag)
+                                        .as_bytes(),
+                                )
+                                .await?;
+                                w.flush().await?;
+                                continue;
+                            }
+                        };
                     let channel_binding_valid = if mechanism_metadata.channel_binding_required {
                         common_auth::verify_tls_server_end_point_binding(
                             &client_first.gs2_header,
@@ -6092,10 +6129,47 @@ async fn process_stream_inner(
                                     .await?;
                                 w.flush().await?;
                             }
-                            let mut empty_line = String::new();
-                            let n = reader.read_line(&mut empty_line).await?;
-                            if n == 0 {
-                                return Ok(());
+                            auth::ScramExchange::expect_final_acknowledgment(&mut scram_exchange)
+                                .map_err(|_| anyhow!("invalid SCRAM exchange state"))?;
+                            let acknowledgment = match read_sasl_wire_response(&mut reader).await {
+                                Ok(line) => line,
+                                Err(SaslProtocolError::Eof) => return Ok(()),
+                                Err(SaslProtocolError::Cancelled) => {
+                                    let w = reader.get_mut();
+                                    w.write_all(
+                                        format!("{} BAD AUTHENTICATE cancelled\r\n", tag)
+                                            .as_bytes(),
+                                    )
+                                    .await?;
+                                    w.flush().await?;
+                                    continue;
+                                }
+                                Err(_) => {
+                                    let w = reader.get_mut();
+                                    w.write_all(
+                                        format!(
+                                            "{} BAD Invalid SCRAM final acknowledgment\r\n",
+                                            tag
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await?;
+                                    w.flush().await?;
+                                    continue;
+                                }
+                            };
+                            if !matches!(
+                                auth::SaslExchange::receive(&mut scram_exchange, &acknowledgment,),
+                                Ok(auth::SaslProgress::Complete)
+                            ) {
+                                let w = reader.get_mut();
+                                w.write_all(
+                                    format!("{} BAD Invalid SCRAM final acknowledgment\r\n", tag)
+                                        .as_bytes(),
+                                )
+                                .await?;
+                                w.flush().await?;
+                                continue;
                             }
                             authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
                             session_state.authenticated_mailbox = authed_mailbox.clone();

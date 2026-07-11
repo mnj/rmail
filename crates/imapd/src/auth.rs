@@ -143,6 +143,7 @@ pub(crate) trait SaslExchange: Send {
 enum ScramState {
     New,
     ClientFinal,
+    ClientFinalReceived,
     FinalAcknowledgment,
     Complete,
 }
@@ -161,7 +162,7 @@ impl ScramExchange {
     }
 
     pub(crate) fn expect_final_acknowledgment(&mut self) -> Result<(), SaslExchangeError> {
-        if !matches!(self.state, ScramState::ClientFinal) {
+        if !matches!(self.state, ScramState::ClientFinalReceived) {
             return Err(SaslExchangeError::UnexpectedResponse);
         }
         self.state = ScramState::FinalAcknowledgment;
@@ -199,8 +200,10 @@ impl SaslExchange for ScramExchange {
                     decode_sasl_message(response).ok_or(SaslExchangeError::InvalidResponse)?;
                 let final_message =
                     parse_scram_client_final(&message).ok_or(SaslExchangeError::InvalidResponse)?;
+                self.state = ScramState::ClientFinalReceived;
                 Ok(SaslProgress::ScramClientFinal(final_message))
             }
+            ScramState::ClientFinalReceived => Err(SaslExchangeError::UnexpectedResponse),
             ScramState::FinalAcknowledgment if response.is_empty() || response == "=" => {
                 self.state = ScramState::Complete;
                 Ok(SaslProgress::Complete)
@@ -539,5 +542,40 @@ mod tests {
             login.receive("cGFzcw=="),
             Err(SaslExchangeError::UnexpectedResponse)
         );
+    }
+
+    #[test]
+    fn scram_exchange_enforces_first_final_and_acknowledgment_order() {
+        let mut exchange = ScramExchange::new(false);
+        assert_eq!(exchange.start(None), Ok(SaslProgress::Challenge("")));
+        let first = BASE64_ENGINE.encode("n,,n=user,r=nonce");
+        assert!(matches!(
+            exchange.receive(&first),
+            Ok(SaslProgress::ScramClientFirst(_))
+        ));
+        let final_message = BASE64_ENGINE.encode("c=biws,r=nonce-server,p=cHJvb2Y=");
+        assert!(matches!(
+            exchange.receive(&final_message),
+            Ok(SaslProgress::ScramClientFinal(_))
+        ));
+        assert!(exchange.expect_final_acknowledgment().is_ok());
+        assert_eq!(exchange.receive(""), Ok(SaslProgress::Complete));
+        assert_eq!(
+            exchange.receive(""),
+            Err(SaslExchangeError::UnexpectedResponse)
+        );
+
+        let mut plus = ScramExchange::new(true);
+        assert!(
+            plus.start(Some(&BASE64_ENGINE.encode("n,,n=user,r=nonce")))
+                .is_err()
+        );
+        assert!(matches!(
+            plus.start(Some(
+                &BASE64_ENGINE.encode("p=tls-server-end-point,,n=user,r=nonce")
+            )),
+            Ok(SaslProgress::ScramClientFirst(_))
+        ));
+        assert!(plus.expect_final_acknowledgment().is_err());
     }
 }
