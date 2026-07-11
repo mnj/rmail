@@ -281,6 +281,22 @@ pub(crate) enum UidCommand {
     Unknown(String),
 }
 
+impl UidCommand {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Copy => "COPY",
+            Self::Expunge => "EXPUNGE",
+            Self::Fetch => "FETCH",
+            Self::Move => "MOVE",
+            Self::Search => "SEARCH",
+            Self::Sort => "SORT",
+            Self::Store => "STORE",
+            Self::Thread => "THREAD",
+            Self::Unknown(name) => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     Capability,

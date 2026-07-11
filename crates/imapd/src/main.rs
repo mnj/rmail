@@ -5833,8 +5833,8 @@ async fn process_stream_inner(
             )
             .await?;
         }
-        match cmd.as_str() {
-            "CAPABILITY" => {
+        match &request.command {
+            parser::Command::Capability => {
                 let w = reader.get_mut();
                 let phase = if session_state.selected_mailbox.is_some() {
                     response::CapabilityPhase::Selected
@@ -5851,7 +5851,7 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-            "COMPRESS" => {
+            parser::Command::Compress => {
                 if !args.eq_ignore_ascii_case("DEFLATE") {
                     let w = reader.get_mut();
                     w.write_all(
@@ -5895,7 +5895,7 @@ async fn process_stream_inner(
                     w.enable_deflate()?;
                 }
             }
-            "LOGIN" => {
+            parser::Command::Login => {
                 // Rate-limiting: block repeated failures per remote IP
                 if let Some(peer_addr) = peer {
                     if let Some(rem) = auth::auth_block_remaining(peer_addr.ip()) {
@@ -6011,7 +6011,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "AUTHENTICATE" => {
+            parser::Command::Authenticate => {
                 let (mechanism, initial_response) = match parser::parse_authenticate_args(args) {
                     Ok(parsed) => parsed,
                     Err(err) => {
@@ -6581,7 +6581,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "NOOP" => {
+            parser::Command::Noop => {
                 sync_selected_mailbox(
                     &mut reader,
                     &mail_root,
@@ -6594,7 +6594,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "CHECK" => {
+            parser::Command::Check => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -6614,7 +6614,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "UNSELECT" => {
+            parser::Command::Unselect => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -6629,7 +6629,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "APPEND" => {
+            parser::Command::Append => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -6769,7 +6769,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "LIST" | "XLIST" => {
+            parser::Command::List { .. } => {
                 // Require authentication to list user's mailboxes in this simple implementation
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
@@ -6847,7 +6847,7 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-            "LSUB" => {
+            parser::Command::Lsub => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -6908,7 +6908,7 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-            "NAMESPACE" => {
+            parser::Command::Namespace => {
                 println!("IMAP NAMESPACE peer={:?}", peer);
                 let w = reader.get_mut();
                 let response = response::namespace_response(tag);
@@ -6916,7 +6916,7 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-            "ENABLE" => {
+            parser::Command::Enable => {
                 let args = match parser::parse_imap_args(args) {
                     Ok(args) => args,
                     Err(err) => {
@@ -6968,7 +6968,7 @@ async fn process_stream_inner(
                 w.write_all(response_text.as_bytes()).await?;
                 w.flush().await?;
             }
-            "CREATE" => {
+            parser::Command::Create => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7006,7 +7006,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "DELETE" => {
+            parser::Command::Delete => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7054,7 +7054,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "RENAME" => {
+            parser::Command::Rename => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7136,7 +7136,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "SUBSCRIBE" | "UNSUBSCRIBE" => {
+            parser::Command::Subscribe { .. } => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7186,7 +7186,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "ID" => {
+            parser::Command::Id => {
                 let client_id = match parser::parse_id_args(args) {
                     Ok(fields) => fields,
                     Err(_) => {
@@ -7214,7 +7214,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "SELECT" | "EXAMINE" => {
+            parser::Command::Select { .. } => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7425,7 +7425,7 @@ async fn process_stream_inner(
                     }
                 }
             }
-            "STATUS" => {
+            parser::Command::Status => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7533,7 +7533,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "STARTTLS" => {
+            parser::Command::StartTls => {
                 if tls_ctx.is_none() {
                     println!("IMAP STARTTLS unavailable peer={:?}", peer);
                     let w = reader.get_mut();
@@ -7572,7 +7572,7 @@ async fn process_stream_inner(
                 }
             }
 
-            "FETCH" => {
+            parser::Command::Fetch => {
                 if authed_mailbox.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
@@ -7695,7 +7695,7 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
 
-            "COPY" | "MOVE" => {
+            parser::Command::Copy | parser::Command::Move => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -7804,11 +7804,16 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
 
-            "UID" => {
-                let mut a = args.trim().splitn(2, ' ');
-                let subcmd = a.next().unwrap_or("").to_uppercase();
-                let subargs = a.next().unwrap_or("");
-                if subcmd.as_str() == "FETCH" {
+            parser::Command::Uid {
+                command: uid_command,
+            } => {
+                let subcmd = uid_command.as_str();
+                let subargs = args
+                    .trim()
+                    .split_once(|character: char| character.is_ascii_whitespace())
+                    .map(|(_, subargs)| subargs.trim_start())
+                    .unwrap_or("");
+                if subcmd == "FETCH" {
                     if selected.is_none() {
                         let w = reader.get_mut();
                         w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -7965,7 +7970,7 @@ async fn process_stream_inner(
                     w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes())
                         .await?;
                     w.flush().await?;
-                } else if subcmd.as_str() == "THREAD" {
+                } else if subcmd == "THREAD" {
                     let request = match parser::parse_thread_request(subargs) {
                         Ok(request) => request,
                         Err(error) => {
@@ -8002,7 +8007,7 @@ async fn process_stream_inner(
                     w.write_all(format!("{} OK UID THREAD completed\r\n", tag).as_bytes())
                         .await?;
                     w.flush().await?;
-                } else if subcmd.as_str() == "SORT" {
+                } else if subcmd == "SORT" {
                     let request = match parser::parse_sort_request(subargs) {
                         Ok(request) => request,
                         Err(error) => {
@@ -8037,7 +8042,7 @@ async fn process_stream_inner(
                     w.write_all(format!("{} OK UID SORT completed\r\n", tag).as_bytes())
                         .await?;
                     w.flush().await?;
-                } else if subcmd.as_str() == "SEARCH" {
+                } else if subcmd == "SEARCH" {
                     if selected.is_none() {
                         let w = reader.get_mut();
                         w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8102,7 +8107,7 @@ async fn process_stream_inner(
                     w.write_all(format!("{} OK UID SEARCH completed\r\n", tag).as_bytes())
                         .await?;
                     w.flush().await?;
-                } else if subcmd.as_str() == "STORE" {
+                } else if subcmd == "STORE" {
                     if selected.is_none() {
                         let w = reader.get_mut();
                         w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8215,7 +8220,7 @@ async fn process_stream_inner(
                         .await?;
                     }
                     w.flush().await?;
-                } else if subcmd.as_str() == "EXPUNGE" {
+                } else if subcmd == "EXPUNGE" {
                     if selected.is_none() {
                         let w = reader.get_mut();
                         w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8279,7 +8284,7 @@ async fn process_stream_inner(
                     w.write_all(format!("{} OK UID EXPUNGE completed\r\n", tag).as_bytes())
                         .await?;
                     w.flush().await?;
-                } else if subcmd.as_str() == "COPY" || subcmd.as_str() == "MOVE" {
+                } else if subcmd == "COPY" || subcmd == "MOVE" {
                     if selected.is_none() {
                         let w = reader.get_mut();
                         w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8397,7 +8402,7 @@ async fn process_stream_inner(
                     w.flush().await?;
                 }
             }
-            "SEARCH" => {
+            parser::Command::Search => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8463,7 +8468,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "THREAD" => {
+            parser::Command::Thread => {
                 let request = match parser::parse_thread_request(args) {
                     Ok(request) => request,
                     Err(error) => {
@@ -8501,7 +8506,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "SORT" => {
+            parser::Command::Sort => {
                 let request = match parser::parse_sort_request(args) {
                     Ok(request) => request,
                     Err(error) => {
@@ -8537,7 +8542,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "STORE" => {
+            parser::Command::Store => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8649,7 +8654,7 @@ async fn process_stream_inner(
                 }
                 w.flush().await?;
             }
-            "EXPUNGE" => {
+            parser::Command::Expunge => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8696,7 +8701,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "CLOSE" => {
+            parser::Command::Close => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8723,7 +8728,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "IDLE" => {
+            parser::Command::Idle => {
                 if selected.is_none() {
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
@@ -8787,7 +8792,7 @@ async fn process_stream_inner(
                     .await?;
                 w.flush().await?;
             }
-            "LOGOUT" => {
+            parser::Command::Logout => {
                 let w = reader.get_mut();
                 w.write_all(b"* BYE Logging out\r\n").await?;
                 w.flush().await?;
@@ -8797,7 +8802,7 @@ async fn process_stream_inner(
                 w.flush().await?;
                 break;
             }
-            _ => {
+            parser::Command::Unknown { .. } => {
                 log_unsupported_imap(peer, &selected, tag, &cmd, args);
                 let w = reader.get_mut();
                 w.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes())
