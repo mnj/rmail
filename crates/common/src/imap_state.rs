@@ -505,6 +505,144 @@ impl Drop for FileMutationGuard {
     }
 }
 
+pub fn transfer_messages_by_uid(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    source_mailbox: &str,
+    uids: &[u64],
+    destination_mailbox: &str,
+    move_messages: bool,
+) -> Result<Vec<(u64, u64)>> {
+    let source = normalize_mailbox_name(source_mailbox)?;
+    let destination = normalize_mailbox_name(destination_mailbox)?;
+    let mut requested = uids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    ensure_folder(&conn, maildir_root, domain, localpart, &source)?;
+    if folder_id(&conn, &destination)?.is_none() {
+        anyhow::bail!("destination mailbox does not exist");
+    }
+    reconcile_folder(&conn, maildir_root, domain, localpart, &source)?;
+    if !source.eq_ignore_ascii_case(&destination) {
+        reconcile_folder(&conn, maildir_root, domain, localpart, &destination)?;
+    }
+    let tx = conn.transaction()?;
+    let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
+    let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
+    if move_messages && source_id == destination_id {
+        let mut existing = Vec::new();
+        for uid in requested {
+            if tx
+                .query_row(
+                    "SELECT 1 FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                    params![source_id, uid as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some()
+            {
+                existing.push((uid, uid));
+            }
+        }
+        tx.commit()?;
+        return Ok(existing);
+    }
+
+    let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
+    let destination_dir = mailbox_dir(maildir_root, domain, localpart, &destination)?;
+    ensure_maildir(&destination_dir)?;
+    let mut destination_uid: i64 = tx.query_row(
+        "SELECT uidnext FROM folders WHERE id = ?1",
+        params![destination_id],
+        |row| row.get(0),
+    )?;
+    let mut guards = Vec::new();
+    let mut mappings = Vec::new();
+    for uid in requested {
+        let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
+            .query_row(
+                "SELECT filename, subdir, flags, size, internaldate, internaldate_tz
+                 FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![source_id, uid as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i32>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        let source_path = source_dir.join(&subdir).join(&filename);
+        let operation = if move_messages { "moved" } else { "copy" };
+        let destination_filename = format!(
+            "{}.{}.{}.{}",
+            filename,
+            operation,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            rand::random::<u64>()
+        );
+        let destination_path = destination_dir.join(&subdir).join(&destination_filename);
+        if move_messages {
+            fs::rename(&source_path, &destination_path).with_context(|| {
+                format!("moving message {uid} from {source_mailbox} to {destination_mailbox}")
+            })?;
+            guards.push(FileMutationGuard::moved(source_path, destination_path));
+            let source_modseq = next_modseq(&tx, source_id)?;
+            record_expunge(&tx, source_id, uid, source_modseq)?;
+            tx.execute(
+                "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![source_id, uid as i64],
+            )?;
+        } else {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!("copying message {uid} from {source_mailbox} to {destination_mailbox}")
+            })?;
+            guards.push(FileMutationGuard::copied(destination_path));
+        }
+        let destination_modseq = next_modseq(&tx, destination_id)?;
+        tx.execute(
+            "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                destination_id,
+                destination_filename,
+                subdir,
+                destination_uid,
+                flags,
+                size,
+                internaldate,
+                internaldate_tz,
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+                destination_modseq as i64
+            ],
+        )?;
+        mappings.push((uid, destination_uid as u64));
+        destination_uid = destination_uid.saturating_add(1);
+    }
+    tx.execute(
+        "UPDATE folders SET uidnext = ?1 WHERE id = ?2",
+        params![destination_uid, destination_id],
+    )?;
+    tx.commit()?;
+    for guard in guards {
+        guard.commit();
+    }
+    Ok(mappings)
+}
+
 pub fn move_message_by_uid(
     maildir_root: &Path,
     domain: &str,
@@ -1459,6 +1597,71 @@ mod tests {
             let archive_dir = mailbox_dir(td.path(), "example.test", "user", "Archive").unwrap();
             assert_eq!(fs::read_dir(archive_dir.join("new")).unwrap().count(), 0);
             assert_eq!(fs::read_dir(archive_dir.join("cur")).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn batch_copy_and_move_are_atomic_when_a_later_message_fails() {
+        for move_messages in [false, true] {
+            let td = tempfile::tempdir().unwrap();
+            init_account(td.path(), "example.test", "user").unwrap();
+            let (_, first) = append_message(
+                td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                b"Subject: first\r\n\r\n",
+                Vec::new(),
+            )
+            .unwrap();
+            let (_, second) = append_message(
+                td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                b"Subject: second\r\n\r\n",
+                Vec::new(),
+            )
+            .unwrap();
+            let (_, source_before) =
+                load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+            let source_paths = source_before
+                .iter()
+                .map(|message| message.path.clone())
+                .collect::<Vec<_>>();
+            let (destination_before, _) =
+                load_folder(td.path(), "example.test", "user", "Archive").unwrap();
+            let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_second_archive_insert
+                 BEFORE INSERT ON messages
+                 WHEN NEW.folder_id = (SELECT id FROM folders WHERE name = 'Archive')
+                      AND NEW.uid = 2
+                 BEGIN SELECT RAISE(FAIL, 'injected second-message failure'); END;",
+            )
+            .unwrap();
+            drop(conn);
+
+            assert!(
+                transfer_messages_by_uid(
+                    td.path(),
+                    "example.test",
+                    "user",
+                    "INBOX",
+                    &[first, second],
+                    "Archive",
+                    move_messages,
+                )
+                .is_err()
+            );
+            assert!(source_paths.iter().all(|path| path.is_file()));
+            let (_, source_after) =
+                load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+            let (destination_after, messages_after) =
+                load_folder(td.path(), "example.test", "user", "Archive").unwrap();
+            assert_eq!(source_after.len(), 2);
+            assert!(messages_after.is_empty());
+            assert_eq!(destination_after.uidnext, destination_before.uidnext);
         }
     }
 

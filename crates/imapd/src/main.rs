@@ -7684,56 +7684,40 @@ async fn process_stream_inner(
                         (*seq > 0 && *seq <= sel.msgs.len()).then_some(sel.msgs[*seq - 1].0)
                     })
                     .collect::<Vec<_>>();
-                let mut destination_uids = Vec::new();
-                let mut command_error = None;
-                for uid in &source_uids {
+                let batch_result = tokio::task::spawn_blocking({
                     let mail_root = mail_root.clone();
                     let domain = sel.domain.clone();
                     let local = sel.local.clone();
                     let mailbox = sel.mailbox.clone();
                     let destination = destination.clone();
-                    let uid = *uid;
-                    let copied = if cmd == "COPY" {
-                        tokio::task::spawn_blocking(move || {
-                            rmail_common::imap_state::copy_message_by_uid(
-                                Path::new(&mail_root),
-                                &domain,
-                                &local,
-                                &mailbox,
-                                uid,
-                                &destination,
-                            )
-                        })
-                        .await?
-                    } else {
-                        tokio::task::spawn_blocking(move || {
-                            maildir::move_message_by_uid_for_mailbox(
-                                Path::new(&mail_root),
-                                &domain,
-                                &local,
-                                &mailbox,
-                                uid,
-                                &destination,
-                            )
-                        })
-                        .await?
-                    };
-                    match copied {
-                        Ok(Some(dest_uid)) => destination_uids.push(dest_uid),
-                        Ok(None) => {}
-                        Err(e) => {
-                            command_error = Some(e);
-                            break;
-                        }
+                    let source_uids = source_uids.clone();
+                    let move_messages = cmd == "MOVE";
+                    move || {
+                        rmail_common::imap_state::transfer_messages_by_uid(
+                            Path::new(&mail_root),
+                            &domain,
+                            &local,
+                            &mailbox,
+                            &source_uids,
+                            &destination,
+                            move_messages,
+                        )
                     }
-                }
-                if let Some(e) = command_error {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, e).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
+                })
+                .await?;
+                let mappings = match batch_result {
+                    Ok(mappings) => mappings,
+                    Err(error) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, error).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
+                let mapped_source_uids =
+                    mappings.iter().map(|mapping| mapping.0).collect::<Vec<_>>();
+                let destination_uids = mappings.iter().map(|mapping| mapping.1).collect::<Vec<_>>();
                 let destination_sel = match mailbox::load_selected_mailbox(
                     &mail_root,
                     authed_mailbox.as_ref().unwrap(),
@@ -7759,9 +7743,12 @@ async fn process_stream_inner(
                         .await?,
                     );
                 }
-                let copyuid =
-                    copy_uid_pairs(&source_uids, &destination_uids, destination_sel.uidvalidity)
-                        .unwrap_or_default();
+                let copyuid = copy_uid_pairs(
+                    &mapped_source_uids,
+                    &destination_uids,
+                    destination_sel.uidvalidity,
+                )
+                .unwrap_or_default();
                 let w = reader.get_mut();
                 w.write_all(format!("{} OK {}{} completed\r\n", tag, copyuid, cmd).as_bytes())
                     .await?;
@@ -8268,58 +8255,44 @@ async fn process_stream_inner(
                     }
                     let source_uids =
                         uids_from_set_or_saved(uid_set, sel, session_state.saved_search_uids());
-                    let mut destination_uids = Vec::new();
-                    let mut command_error = None;
-                    for uid in &source_uids {
+                    let batch_result = tokio::task::spawn_blocking({
                         let mail_root = mail_root.clone();
                         let domain = sel.domain.clone();
                         let local = sel.local.clone();
                         let mailbox = sel.mailbox.clone();
                         let destination = destination.clone();
-                        let uid = *uid;
-                        let copied = if subcmd == "COPY" {
-                            tokio::task::spawn_blocking(move || {
-                                rmail_common::imap_state::copy_message_by_uid(
-                                    Path::new(&mail_root),
-                                    &domain,
-                                    &local,
-                                    &mailbox,
-                                    uid,
-                                    &destination,
-                                )
-                            })
-                            .await?
-                        } else {
-                            tokio::task::spawn_blocking(move || {
-                                maildir::move_message_by_uid_for_mailbox(
-                                    Path::new(&mail_root),
-                                    &domain,
-                                    &local,
-                                    &mailbox,
-                                    uid,
-                                    &destination,
-                                )
-                            })
-                            .await?
-                        };
-                        match copied {
-                            Ok(Some(dest_uid)) => destination_uids.push(dest_uid),
-                            Ok(None) => {}
-                            Err(e) => {
-                                command_error = Some(e);
-                                break;
-                            }
+                        let source_uids = source_uids.clone();
+                        let move_messages = subcmd == "MOVE";
+                        move || {
+                            rmail_common::imap_state::transfer_messages_by_uid(
+                                Path::new(&mail_root),
+                                &domain,
+                                &local,
+                                &mailbox,
+                                &source_uids,
+                                &destination,
+                                move_messages,
+                            )
                         }
-                    }
-                    if let Some(e) = command_error {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} NO UID {} failed: {}\r\n", tag, subcmd, e).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
+                    })
+                    .await?;
+                    let mappings = match batch_result {
+                        Ok(mappings) => mappings,
+                        Err(error) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} NO UID {} failed: {}\r\n", tag, subcmd, error)
+                                    .as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                    };
+                    let mapped_source_uids =
+                        mappings.iter().map(|mapping| mapping.0).collect::<Vec<_>>();
+                    let destination_uids =
+                        mappings.iter().map(|mapping| mapping.1).collect::<Vec<_>>();
                     let destination_sel = match mailbox::load_selected_mailbox(
                         &mail_root,
                         authed_mailbox.as_ref().unwrap(),
@@ -8348,7 +8321,7 @@ async fn process_stream_inner(
                         );
                     }
                     let copyuid = copy_uid_pairs(
-                        &source_uids,
+                        &mapped_source_uids,
                         &destination_uids,
                         destination_sel.uidvalidity,
                     )
