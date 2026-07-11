@@ -254,6 +254,122 @@ async fn read_bounded_line(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrailingLiteralMarker {
+    start: usize,
+    size: usize,
+    non_sync: bool,
+    literal8: bool,
+}
+
+fn trailing_literal_marker(line: &[u8]) -> Option<TrailingLiteralMarker> {
+    let end = line
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\r' | b'\n'))?
+        + 1;
+    if line.get(end.checked_sub(1)?) != Some(&b'}') {
+        return None;
+    }
+    let open = line[..end].iter().rposition(|byte| *byte == b'{')?;
+    let literal8 = open > 0 && line[open - 1] == b'~';
+    let start = if literal8 { open - 1 } else { open };
+    let mut digits = &line[open + 1..end - 1];
+    let non_sync = digits.last() == Some(&b'+');
+    if non_sync {
+        digits = &digits[..digits.len().checked_sub(1)?];
+    }
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let size = std::str::from_utf8(digits).ok()?.parse::<usize>().ok()?;
+    Some(TrailingLiteralMarker {
+        start,
+        size,
+        non_sync,
+        literal8,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandLiteralError {
+    TooLarge,
+    NonSyncTooLarge,
+    Literal8,
+    NonSyncLiteral8,
+    InvalidUtf8,
+    Eof,
+    Io,
+}
+
+async fn read_textual_command_literals(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+    mut command: Vec<u8>,
+    line_limit: usize,
+) -> std::result::Result<Vec<u8>, CommandLiteralError> {
+    let mut total_literal_bytes = 0usize;
+    loop {
+        let Some(marker) = trailing_literal_marker(&command) else {
+            return Ok(command);
+        };
+        if marker.literal8 {
+            return Err(if marker.non_sync {
+                CommandLiteralError::NonSyncLiteral8
+            } else {
+                CommandLiteralError::Literal8
+            });
+        }
+        total_literal_bytes = total_literal_bytes
+            .checked_add(marker.size)
+            .ok_or(CommandLiteralError::TooLarge)?;
+        if total_literal_bytes > MAX_APPEND_LITERAL_BYTES {
+            return Err(CommandLiteralError::TooLarge);
+        }
+        if marker.non_sync && marker.size > MAX_LITERAL_MINUS_NON_SYNC_BYTES {
+            return Err(CommandLiteralError::NonSyncTooLarge);
+        }
+        if !marker.non_sync {
+            let w = reader.get_mut();
+            w.write_all(b"+ Ready for literal data\r\n")
+                .await
+                .map_err(|_| CommandLiteralError::Io)?;
+            w.flush().await.map_err(|_| CommandLiteralError::Io)?;
+        }
+        let mut literal = vec![0; marker.size];
+        reader
+            .read_exact(&mut literal)
+            .await
+            .map_err(|error| match error.kind() {
+                ErrorKind::UnexpectedEof => CommandLiteralError::Eof,
+                _ => CommandLiteralError::Io,
+            })?;
+        let literal_is_utf8 = std::str::from_utf8(&literal).is_ok();
+        command.truncate(marker.start);
+        command.push(b'"');
+        for byte in literal {
+            if matches!(byte, b'"' | b'\\') {
+                command.push(b'\\');
+            }
+            command.push(byte);
+        }
+        command.push(b'"');
+        let tail = match read_bounded_line(reader, line_limit)
+            .await
+            .map_err(|_| CommandLiteralError::Io)?
+        {
+            BoundedLine::Line(line) => line,
+            BoundedLine::Eof => return Err(CommandLiteralError::Eof),
+            BoundedLine::TooLong => return Err(CommandLiteralError::TooLarge),
+        };
+        command.extend_from_slice(&tail);
+        if !literal_is_utf8 {
+            return Err(CommandLiteralError::InvalidUtf8);
+        }
+        if command.len() > line_limit.saturating_add(total_literal_bytes) {
+            return Err(CommandLiteralError::TooLarge);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{process_stream, process_stream_inner};
@@ -2491,6 +2607,87 @@ mod tests {
         assert!(sent_date.iter().any(|l| l.trim_end() == "* SEARCH 2"));
 
         let _logout = read_until_contains(&mut reader, "A013 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn textual_command_literals_resume_search_list_and_nested_arguments() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("mailbox");
+        rmail_common::maildir::deliver(
+            &mail_root,
+            "example.test",
+            "user",
+            b"Subject: needle\r\n\r\nbody\r\n",
+        )
+        .expect("delivery");
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(process_stream(
+            Box::new(server),
+            mail_root.to_string_lossy().to_string(),
+            None,
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+        ));
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("greeting");
+        line.clear();
+        reader.read_line(&mut line).await.expect("capability");
+        reader
+            .get_mut()
+            .write_all(b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\n")
+            .await
+            .expect("setup");
+        reader.get_mut().flush().await.expect("flush");
+        let _login = read_until_contains(&mut reader, "A001 OK").await;
+        let _select = read_until_contains(&mut reader, "A002 OK").await;
+
+        reader
+            .get_mut()
+            .write_all(b"A003 SEARCH SUBJECT {6}\r\n")
+            .await
+            .expect("search marker");
+        reader.get_mut().flush().await.expect("flush");
+        let continuation = read_until_contains(&mut reader, "+ Ready").await.join("");
+        assert!(continuation.contains("+ Ready for literal data"));
+        reader
+            .get_mut()
+            .write_all(b"needle\r\n")
+            .await
+            .expect("search literal");
+        reader.get_mut().flush().await.expect("flush");
+        let search = read_until_contains(&mut reader, "A003 OK").await.join("");
+        assert!(search.contains("* SEARCH 1"));
+
+        reader
+            .get_mut()
+            .write_all(
+                b"A004 SEARCH OR SUBJECT {6}\r\nneedle SUBJECT {7+}\r\nmissing\r\nA005 LIST \"\" {5+}\r\nINBOX\r\nA006 ID (\"name\" {6+}\r\nGearyX)\r\nA007 LOGOUT\r\n",
+            )
+            .await
+            .expect("multi literal pipeline");
+        reader.get_mut().flush().await.expect("flush");
+        let second_continuation = read_until_contains(&mut reader, "+ Ready").await.join("");
+        assert!(second_continuation.contains("+ Ready for literal data"));
+        let multi = read_until_contains(&mut reader, "A004 OK").await.join("");
+        assert!(multi.contains("* SEARCH 1"));
+        let list = read_until_contains(&mut reader, "A005 OK").await.join("");
+        assert!(list.contains("* LIST") && list.contains("\"INBOX\""));
+        let id = read_until_contains(&mut reader, "A006 OK").await.join("");
+        assert!(id.contains("* ID (\"name\" \"rMail\""));
+        let _logout = read_until_contains(&mut reader, "A007 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -5430,7 +5627,7 @@ async fn process_stream_inner(
         } else {
             MAX_PREAUTH_LINE_BYTES
         };
-        let line = match read_bounded_line(&mut reader, line_limit).await {
+        let mut line = match read_bounded_line(&mut reader, line_limit).await {
             Ok(BoundedLine::Line(line)) => line,
             Ok(BoundedLine::Eof) => {
                 println!(
@@ -5460,6 +5657,55 @@ async fn process_stream_inner(
                 return Err(e.into());
             }
         };
+        let is_append = std::str::from_utf8(&line)
+            .ok()
+            .and_then(|line| line.split_ascii_whitespace().nth(1))
+            .is_some_and(|command| command.eq_ignore_ascii_case("APPEND"));
+        if !is_append && trailing_literal_marker(&line).is_some() {
+            line = match read_textual_command_literals(&mut reader, line, line_limit).await {
+                Ok(line) => line,
+                Err(CommandLiteralError::Eof) => break,
+                Err(CommandLiteralError::NonSyncTooLarge) => {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        b"* BYE Oversized non-synchronizing literal desynchronized command stream\r\n",
+                    )
+                    .await?;
+                    w.flush().await?;
+                    break;
+                }
+                Err(CommandLiteralError::NonSyncLiteral8) => {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        b"* BYE Non-synchronizing literal8 desynchronized command stream\r\n",
+                    )
+                    .await?;
+                    w.flush().await?;
+                    break;
+                }
+                Err(CommandLiteralError::TooLarge) => {
+                    let w = reader.get_mut();
+                    w.write_all(b"* BAD Command literal too large\r\n").await?;
+                    w.flush().await?;
+                    continue;
+                }
+                Err(CommandLiteralError::Literal8) => {
+                    let w = reader.get_mut();
+                    w.write_all(b"* BAD Literal8 is not valid for this command\r\n")
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                Err(CommandLiteralError::InvalidUtf8) => {
+                    let w = reader.get_mut();
+                    w.write_all(b"* BAD Textual command literal is not valid UTF-8\r\n")
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                Err(CommandLiteralError::Io) => return Err(anyhow!("command literal read error")),
+            };
+        }
         let input = match std::str::from_utf8(&line) {
             Ok(input) => input.trim_end_matches(['\r', '\n']),
             Err(_) => {
