@@ -513,7 +513,7 @@ fn patch_message(
         uid,
         flags,
     ) {
-        Ok(()) => Response::empty(204),
+        Ok(_) => Response::empty(204),
         Err(err) => Response::text(500, &err.to_string()),
     }
 }

@@ -1,3 +1,5 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD as BASE64_NO_PAD;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -163,12 +165,90 @@ pub fn normalize_mailbox_name(mailbox: &str) -> anyhow::Result<String> {
     {
         return Err(anyhow::anyhow!("invalid mailbox name"));
     }
-    let mut parts = mailbox.split('/');
-    let first = parts.next().unwrap_or_default();
-    if parts.next().is_some() || first.starts_with('.') {
-        return Err(anyhow::anyhow!("nested mailboxes are not supported"));
+    if mailbox
+        .split('/')
+        .any(|part| part.is_empty() || part.starts_with('.') || part.eq_ignore_ascii_case("INBOX"))
+    {
+        return Err(anyhow::anyhow!("invalid mailbox name"));
     }
-    Ok(first.to_string())
+    Ok(mailbox.to_string())
+}
+
+fn is_imap_utf7_direct_char(ch: char) -> bool {
+    matches!(ch, '\u{20}'..='\u{25}' | '\u{27}'..='\u{7e}')
+}
+
+fn push_encoded_utf16_segment(out: &mut String, segment: &str) -> anyhow::Result<()> {
+    if segment.is_empty() {
+        return Ok(());
+    }
+    let mut utf16_bytes = Vec::new();
+    for unit in segment.encode_utf16() {
+        utf16_bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    let encoded = BASE64_NO_PAD.encode(&utf16_bytes).replace('/', ",");
+    out.push('&');
+    out.push_str(&encoded);
+    out.push('-');
+    Ok(())
+}
+
+pub fn utf8_to_imap_utf7(input: &str) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut shifted = String::new();
+    for ch in input.chars() {
+        if ch == '&' {
+            push_encoded_utf16_segment(&mut out, &shifted)?;
+            shifted.clear();
+            out.push_str("&-");
+        } else if is_imap_utf7_direct_char(ch) {
+            push_encoded_utf16_segment(&mut out, &shifted)?;
+            shifted.clear();
+            out.push(ch);
+        } else {
+            shifted.push(ch);
+        }
+    }
+    push_encoded_utf16_segment(&mut out, &shifted)?;
+    Ok(out)
+}
+
+pub fn imap_utf7_to_utf8(input: &str) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(shift_start) = rest.find('&') {
+        out.push_str(&rest[..shift_start]);
+        rest = &rest[shift_start + 1..];
+        if let Some(after_ampersand) = rest.strip_prefix('-') {
+            out.push('&');
+            rest = after_ampersand;
+            continue;
+        }
+        let Some(shift_end) = rest.find('-') else {
+            anyhow::bail!("mailbox name is not valid modified UTF-7");
+        };
+        let encoded = &rest[..shift_end];
+        if encoded.is_empty() || encoded.contains('&') {
+            anyhow::bail!("mailbox name is not valid modified UTF-7");
+        }
+        let b64 = encoded.replace(',', "/");
+        let bytes = BASE64_NO_PAD
+            .decode(b64.as_bytes())
+            .map_err(|_| anyhow::anyhow!("mailbox name is not valid modified UTF-7"))?;
+        if bytes.is_empty() || bytes.len() % 2 != 0 {
+            anyhow::bail!("mailbox name is not valid modified UTF-7");
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        let decoded = String::from_utf16(&units)
+            .map_err(|_| anyhow::anyhow!("mailbox name is not valid modified UTF-7"))?;
+        out.push_str(&decoded);
+        rest = &rest[shift_end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 pub fn ensure_account_standard_mailboxes(
@@ -302,7 +382,7 @@ pub fn set_uid_flags(
     uid: u64,
     flags: Vec<String>,
 ) -> anyhow::Result<()> {
-    set_uid_flags_for_mailbox(maildir_root, domain, localpart, "INBOX", uid, flags)
+    set_uid_flags_for_mailbox(maildir_root, domain, localpart, "INBOX", uid, flags).map(|_| ())
 }
 
 pub fn set_uid_flags_for_mailbox(
@@ -312,7 +392,7 @@ pub fn set_uid_flags_for_mailbox(
     mailbox: &str,
     uid: u64,
     flags: Vec<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     crate::imap_state::set_uid_flags(maildir_root, domain, localpart, mailbox, uid, flags)
 }
 
@@ -362,4 +442,29 @@ pub fn delete_or_trash_message_by_uid_for_mailbox(
     uid: u64,
 ) -> anyhow::Result<()> {
     crate::imap_state::delete_or_trash_message_by_uid(maildir_root, domain, localpart, mailbox, uid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imap_modified_utf7_matches_other_examples() {
+        let examples = [
+            ("&&x&&", "&-&-x&-&-"),
+            ("~peter/mail/台北/日本語", "~peter/mail/&U,BTFw-/&ZeVnLIqe-"),
+            ("tietä&jä&", "tiet&AOQ-&-j&AOQ-&-"),
+        ];
+        for (utf8, imap_utf7) in examples {
+            assert_eq!(utf8_to_imap_utf7(utf8).unwrap(), imap_utf7);
+            assert_eq!(imap_utf7_to_utf8(imap_utf7).unwrap(), utf8);
+        }
+        assert_eq!(
+            normalize_mailbox_name("旅行 & Stuff").unwrap(),
+            "旅行 & Stuff"
+        );
+        assert!(imap_utf7_to_utf8("&").is_err());
+        assert!(imap_utf7_to_utf8("&Jjo").is_err());
+        assert!(imap_utf7_to_utf8("&Jjo!").is_err());
+    }
 }

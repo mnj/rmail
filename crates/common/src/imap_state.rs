@@ -17,6 +17,7 @@ pub struct Folder {
     pub subscribed: bool,
     pub uidvalidity: u64,
     pub uidnext: u64,
+    pub highest_modseq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,9 @@ pub struct Message {
     pub flags: Vec<String>,
     pub size: u64,
     pub internaldate: i64,
+    pub internaldate_tz: i32,
+    pub save_date: i64,
+    pub modseq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +37,12 @@ pub struct FolderSummary {
     pub folder: Folder,
     pub messages: usize,
     pub unseen: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QresyncChanges {
+    pub vanished_uids: Vec<u64>,
+    pub changed_messages: Vec<Message>,
 }
 
 pub fn account_maildir(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
@@ -75,7 +85,8 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             special_use TEXT,
             subscribed INTEGER NOT NULL,
             uidvalidity INTEGER NOT NULL,
-            uidnext INTEGER NOT NULL
+            uidnext INTEGER NOT NULL,
+            highest_modseq INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS messages(
             id INTEGER PRIMARY KEY,
@@ -86,14 +97,63 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             flags TEXT NOT NULL,
             size INTEGER NOT NULL,
             internaldate INTEGER NOT NULL,
+            internaldate_tz INTEGER NOT NULL DEFAULT 0,
+            save_date INTEGER NOT NULL DEFAULT 0,
+            modseq INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_folder_filename
             ON messages(folder_id, filename);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_folder_uid
             ON messages(folder_id, uid);
+        CREATE TABLE IF NOT EXISTS expunges(
+            folder_id INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            modseq INTEGER NOT NULL,
+            PRIMARY KEY(folder_id, uid),
+            FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_expunges_folder_modseq
+            ON expunges(folder_id, modseq);
         ",
     )?;
+    add_column_if_missing(
+        conn,
+        "folders",
+        "highest_modseq",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(conn, "messages", "save_date", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute(
+        "UPDATE messages SET save_date = internaldate WHERE save_date = 0",
+        [],
+    )?;
+    add_column_if_missing(conn, "messages", "modseq", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "internaldate_tz",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -120,8 +180,8 @@ fn insert_folder(
 ) -> Result<()> {
     let uidvalidity = new_uidvalidity();
     conn.execute(
-        "INSERT OR IGNORE INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext)
-         VALUES(?1, ?2, ?3, ?4, ?5, 1)",
+        "INSERT OR IGNORE INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq)
+         VALUES(?1, ?2, ?3, ?4, ?5, 1, 1)",
         params![
             name,
             path,
@@ -161,7 +221,7 @@ fn new_uidvalidity() -> u64 {
 pub fn list_folders(maildir_root: &Path, domain: &str, localpart: &str) -> Result<Vec<Folder>> {
     let conn = open_account(maildir_root, domain, localpart)?;
     let mut stmt = conn.prepare(
-        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext
+        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq
          FROM folders ORDER BY CASE WHEN name = 'INBOX' THEN 0 ELSE 1 END, name COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -172,6 +232,7 @@ pub fn list_folders(maildir_root: &Path, domain: &str, localpart: &str) -> Resul
             subscribed: row.get::<_, i64>(3)? != 0,
             uidvalidity: row.get::<_, i64>(4)? as u64,
             uidnext: row.get::<_, i64>(5)? as u64,
+            highest_modseq: row.get::<_, i64>(6)? as u64,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -318,17 +379,33 @@ pub fn set_uid_flags(
     mailbox: &str,
     uid: u64,
     flags: Vec<String>,
-) -> Result<()> {
+) -> Result<u64> {
     let name = normalize_mailbox_name(mailbox)?;
-    let conn = open_account(maildir_root, domain, localpart)?;
+    let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
-    conn.execute(
+    let tx = conn.transaction()?;
+    let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
+    let message_exists = tx
+        .query_row(
+            "SELECT 1 FROM messages WHERE folder_id = ?1 AND uid = ?2",
+            params![folder_id, uid as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !message_exists {
+        tx.commit()?;
+        return Ok(0);
+    }
+    let modseq = next_modseq(&tx, folder_id)?;
+    tx.execute(
         "UPDATE messages
-         SET flags = ?1
-         WHERE folder_id = (SELECT id FROM folders WHERE name = ?2) AND uid = ?3",
-        params![flags_to_text(&flags)?, name, uid as i64],
+         SET flags = ?1, modseq = ?2
+         WHERE folder_id = ?3 AND uid = ?4",
+        params![flags_to_text(&flags)?, modseq as i64, folder_id, uid as i64],
     )?;
-    Ok(())
+    tx.commit()?;
+    Ok(modseq)
 }
 
 pub fn delete_message_by_uid(
@@ -366,6 +443,8 @@ pub fn delete_message_by_uid(
     if path.exists() {
         let _ = fs::remove_file(&path);
     }
+    let modseq = next_modseq(&tx, folder_id)?;
+    record_expunge(&tx, folder_id, uid, modseq)?;
     tx.execute(
         "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
         params![folder_id, uid as i64],
@@ -399,9 +478,9 @@ pub fn move_message_by_uid(
     let tx = conn.transaction()?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
-    let Some((filename, subdir, flags, size, internaldate)) = tx
+    let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
         .query_row(
-            "SELECT filename, subdir, flags, size, internaldate
+            "SELECT filename, subdir, flags, size, internaldate, internaldate_tz
              FROM messages WHERE folder_id = ?1 AND uid = ?2",
             params![source_id, uid as i64],
             |row| {
@@ -411,6 +490,7 @@ pub fn move_message_by_uid(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i32>(5)?,
                 ))
             },
         )
@@ -441,6 +521,8 @@ pub fn move_message_by_uid(
         )
     })?;
 
+    let source_modseq = next_modseq(&tx, source_id)?;
+    record_expunge(&tx, source_id, uid, source_modseq)?;
     tx.execute(
         "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
         params![source_id, uid as i64],
@@ -450,9 +532,10 @@ pub fn move_message_by_uid(
         params![destination_id],
         |row| row.get(0),
     )?;
+    let destination_modseq = next_modseq(&tx, destination_id)?;
     tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             destination_id,
             destination_filename,
@@ -460,7 +543,10 @@ pub fn move_message_by_uid(
             uidnext,
             flags,
             size,
-            internaldate
+            internaldate,
+            internaldate_tz,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+            destination_modseq as i64
         ],
     )?;
     tx.execute(
@@ -493,9 +579,9 @@ pub fn copy_message_by_uid(
     let tx = conn.transaction()?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
-    let Some((filename, subdir, flags, size, internaldate)) = tx
+    let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
         .query_row(
-            "SELECT filename, subdir, flags, size, internaldate
+            "SELECT filename, subdir, flags, size, internaldate, internaldate_tz
              FROM messages WHERE folder_id = ?1 AND uid = ?2",
             params![source_id, uid as i64],
             |row| {
@@ -505,6 +591,7 @@ pub fn copy_message_by_uid(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i32>(5)?,
                 ))
             },
         )
@@ -536,9 +623,10 @@ pub fn copy_message_by_uid(
         )
     })?;
 
+    let destination_modseq = next_modseq(&tx, destination_id)?;
     tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             destination_id,
             destination_filename,
@@ -546,7 +634,10 @@ pub fn copy_message_by_uid(
             uidnext,
             flags,
             size,
-            internaldate
+            internaldate,
+            internaldate_tz,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+            destination_modseq as i64
         ],
     )?;
     tx.execute(
@@ -643,6 +734,47 @@ pub fn list_message_metadata(
     Ok(load_folder(maildir_root, domain, localpart, mailbox)?.1)
 }
 
+pub fn qresync_changes(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    since_modseq: u64,
+    known_uids: Option<&[u64]>,
+) -> Result<QresyncChanges> {
+    let name = normalize_mailbox_name(mailbox)?;
+    let conn = open_account(maildir_root, domain, localpart)?;
+    ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
+    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    let folder = get_folder(&conn, &name)?.context("missing folder")?;
+    let folder_id = folder_id(&conn, &name)?.context("missing folder")?;
+    let known = known_uids.map(|uids| uids.iter().copied().collect::<HashSet<_>>());
+    let mut stmt =
+        conn.prepare("SELECT uid FROM expunges WHERE folder_id = ?1 AND modseq > ?2 ORDER BY uid")?;
+    let vanished_uids = stmt
+        .query_map(params![folder_id, since_modseq as i64], |row| {
+            Ok(row.get::<_, i64>(0)? as u64)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|uid| known.as_ref().is_none_or(|known| known.contains(uid)))
+        .collect();
+    let changed_messages =
+        list_messages_for_folder(&conn, maildir_root, domain, localpart, &folder)?
+            .into_iter()
+            .filter(|message| {
+                message.modseq > since_modseq
+                    && known
+                        .as_ref()
+                        .is_none_or(|known| known.contains(&message.uid))
+            })
+            .collect();
+    Ok(QresyncChanges {
+        vanished_uids,
+        changed_messages,
+    })
+}
+
 pub fn append_message(
     maildir_root: &Path,
     domain: &str,
@@ -650,6 +782,19 @@ pub fn append_message(
     mailbox: &str,
     data: &[u8],
     flags: Vec<String>,
+) -> Result<(u64, u64)> {
+    append_message_with_internal_date(maildir_root, domain, localpart, mailbox, data, flags, None)
+}
+
+/// Appends a message with an optional RFC INTERNALDATE `(Unix timestamp, UTC offset minutes)`.
+pub fn append_message_with_internal_date(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    data: &[u8],
+    flags: Vec<String>,
+    internal_date: Option<(i64, i32)>,
 ) -> Result<(u64, u64)> {
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
@@ -661,6 +806,7 @@ pub fn append_message(
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
     ensure_maildir(&dir)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let (internaldate, internaldate_tz) = internal_date.unwrap_or((now.as_secs() as i64, 0));
     let filename = format!(
         "{}.{}.{}.append",
         now.as_nanos(),
@@ -672,22 +818,27 @@ pub fn append_message(
     let mut file = fs::File::create(&tmp_path)?;
     file.write_all(data)?;
     file.sync_all()?;
+    set_file_mtime(&tmp_path, internaldate)?;
     fs::rename(&tmp_path, &new_path)?;
 
     let tx = conn.transaction()?;
     let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
     let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
     let uid = folder.uidnext;
+    let modseq = next_modseq(&tx, folder_id)?;
     tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
-         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6)",
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
+         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             folder_id,
             filename,
             uid as i64,
             flags_to_text(&flags)?,
             data.len() as i64,
-            now.as_secs() as i64
+            internaldate,
+            internaldate_tz,
+            now.as_secs() as i64,
+            modseq as i64
         ],
     )?;
     tx.execute(
@@ -696,6 +847,33 @@ pub fn append_message(
     )?;
     tx.commit()?;
     Ok((folder.uidvalidity, uid))
+}
+
+#[cfg(unix)]
+fn set_file_mtime(path: &Path, timestamp: i64) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: timestamp,
+            tv_nsec: 0,
+        },
+    ];
+    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_file_mtime(_path: &Path, _timestamp: i64) -> Result<()> {
+    Ok(())
 }
 
 fn ensure_folder(
@@ -728,7 +906,7 @@ fn folder_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
 
 fn get_folder(conn: &Connection, name: &str) -> Result<Option<Folder>> {
     conn.query_row(
-        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext
+        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq
          FROM folders WHERE name = ?1",
         params![name],
         |row| {
@@ -739,11 +917,35 @@ fn get_folder(conn: &Connection, name: &str) -> Result<Option<Folder>> {
                 subscribed: row.get::<_, i64>(3)? != 0,
                 uidvalidity: row.get::<_, i64>(4)? as u64,
                 uidnext: row.get::<_, i64>(5)? as u64,
+                highest_modseq: row.get::<_, i64>(6)? as u64,
             })
         },
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn next_modseq(conn: &Connection, folder_id: i64) -> Result<u64> {
+    let current: i64 = conn.query_row(
+        "SELECT highest_modseq FROM folders WHERE id = ?1",
+        params![folder_id],
+        |row| row.get(0),
+    )?;
+    let next = current.saturating_add(1).max(2);
+    conn.execute(
+        "UPDATE folders SET highest_modseq = ?1 WHERE id = ?2",
+        params![next, folder_id],
+    )?;
+    Ok(next as u64)
+}
+
+fn record_expunge(conn: &Connection, folder_id: i64, uid: u64, modseq: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO expunges(folder_id, uid, modseq) VALUES(?1, ?2, ?3)
+         ON CONFLICT(folder_id, uid) DO UPDATE SET modseq = excluded.modseq",
+        params![folder_id, uid as i64, modseq as i64],
+    )?;
+    Ok(())
 }
 
 fn reconcile_folder(
@@ -783,10 +985,14 @@ fn reconcile_folder(
     disk.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut existing = HashMap::new();
-    let mut stmt = conn.prepare("SELECT filename FROM messages WHERE folder_id = ?1")?;
-    for row in stmt.query_map(params![folder_id], |row| row.get::<_, String>(0))? {
-        existing.insert(row?, ());
+    let mut stmt = conn.prepare("SELECT filename, uid FROM messages WHERE folder_id = ?1")?;
+    for row in stmt.query_map(params![folder_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+    })? {
+        let (filename, uid) = row?;
+        existing.insert(filename, uid);
     }
+    drop(stmt);
     let disk_names = disk
         .iter()
         .map(|(name, _, _, _)| name.clone())
@@ -794,6 +1000,8 @@ fn reconcile_folder(
 
     for filename in existing.keys() {
         if !disk_names.contains(filename) {
+            let modseq = next_modseq(conn, folder_id)?;
+            record_expunge(conn, folder_id, existing[filename], modseq)?;
             conn.execute(
                 "DELETE FROM messages WHERE folder_id = ?1 AND filename = ?2",
                 params![folder_id, filename],
@@ -804,9 +1012,9 @@ fn reconcile_folder(
     for (filename, subdir, size, internaldate) in disk {
         let updated = conn.execute(
             "UPDATE messages
-             SET subdir = ?1, size = ?2, internaldate = ?3
-             WHERE folder_id = ?4 AND filename = ?5",
-            params![subdir, size, internaldate, folder_id, filename],
+             SET subdir = ?1, size = ?2
+             WHERE folder_id = ?3 AND filename = ?4",
+            params![subdir, size, folder_id, filename],
         )?;
         if updated == 0 {
             let uidnext: i64 = conn.query_row(
@@ -814,9 +1022,10 @@ fn reconcile_folder(
                 params![folder_id],
                 |row| row.get(0),
             )?;
+            let modseq = next_modseq(conn, folder_id)?;
             conn.execute(
-                "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, save_date, modseq)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     folder_id,
                     filename,
@@ -824,7 +1033,9 @@ fn reconcile_folder(
                     uidnext,
                     "[]",
                     size,
-                    internaldate
+                    internaldate,
+                    internaldate,
+                    modseq as i64
                 ],
             )?;
             conn.execute(
@@ -846,7 +1057,7 @@ fn list_messages_for_folder(
     let dir = mailbox_dir(maildir_root, domain, localpart, &folder.name)?;
     let folder_id = folder_id(conn, &folder.name)?.context("missing folder")?;
     let mut stmt = conn.prepare(
-        "SELECT uid, filename, subdir, flags, size, internaldate
+        "SELECT uid, filename, subdir, flags, size, internaldate, internaldate_tz, save_date, modseq
          FROM messages WHERE folder_id = ?1 ORDER BY filename",
     )?;
     let rows = stmt.query_map(params![folder_id], |row| {
@@ -858,18 +1069,34 @@ fn list_messages_for_folder(
             flags_text,
             row.get::<_, i64>(4)? as u64,
             row.get::<_, i64>(5)?,
+            row.get::<_, i32>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)? as u64,
         ))
     })?;
 
     let mut messages = Vec::new();
     for row in rows {
-        let (uid, filename, subdir, flags_text, size, internaldate) = row?;
+        let (
+            uid,
+            filename,
+            subdir,
+            flags_text,
+            size,
+            internaldate,
+            internaldate_tz,
+            save_date,
+            modseq,
+        ) = row?;
         messages.push(Message {
             uid,
             path: dir.join(subdir).join(filename),
             flags: flags_from_text(&flags_text)?,
             size,
             internaldate,
+            internaldate_tz,
+            save_date,
+            modseq,
         });
     }
     Ok(messages)
@@ -923,6 +1150,118 @@ mod tests {
         .unwrap();
         let (_, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
         assert_eq!(messages[0].flags, vec!["\\Seen"]);
+    }
+
+    #[test]
+    fn message_mutations_advance_modseqs() {
+        let td = tempfile::tempdir().unwrap();
+        let (_uidvalidity, uid) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: a\r\n\r\n",
+            vec![],
+        )
+        .unwrap();
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(messages[0].uid, uid);
+        assert!(folder.highest_modseq >= messages[0].modseq);
+        let original_modseq = messages[0].modseq;
+
+        let updated_modseq = set_uid_flags(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            uid,
+            vec!["\\Seen".to_string()],
+        )
+        .unwrap();
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert!(updated_modseq > original_modseq);
+        assert_eq!(messages[0].modseq, updated_modseq);
+        assert_eq!(folder.highest_modseq, updated_modseq);
+
+        delete_message_by_uid(td.path(), "example.test", "user", "INBOX", uid).unwrap();
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert!(messages.is_empty());
+        assert!(folder.highest_modseq > updated_modseq);
+    }
+
+    #[test]
+    fn qresync_journals_flag_changes_expunges_moves_and_external_deletions() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let mut uids = Vec::new();
+        for subject in ["one", "two", "three"] {
+            let (_, uid) = append_message(
+                td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                format!("Subject: {}\r\n\r\n", subject).as_bytes(),
+                Vec::new(),
+            )
+            .unwrap();
+            uids.push(uid);
+        }
+        let baseline = load_folder(td.path(), "example.test", "user", "INBOX")
+            .unwrap()
+            .0
+            .highest_modseq;
+        set_uid_flags(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            uids[0],
+            vec!["\\Seen".to_string()],
+        )
+        .unwrap();
+        delete_message_by_uid(td.path(), "example.test", "user", "INBOX", uids[1]).unwrap();
+        move_message_by_uid(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            uids[2],
+            "Archive",
+        )
+        .unwrap();
+        let changes = qresync_changes(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            baseline,
+            Some(&uids),
+        )
+        .unwrap();
+        assert_eq!(changes.vanished_uids, vec![uids[1], uids[2]]);
+        assert_eq!(changes.changed_messages.len(), 1);
+        assert_eq!(changes.changed_messages[0].uid, uids[0]);
+        assert_eq!(changes.changed_messages[0].flags, vec!["\\Seen"]);
+
+        let (_, external_uid) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: external\r\n\r\n",
+            Vec::new(),
+        )
+        .unwrap();
+        let (_, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        let external = messages
+            .iter()
+            .find(|message| message.uid == external_uid)
+            .unwrap();
+        let baseline = messages.iter().map(|message| message.modseq).max().unwrap();
+        fs::remove_file(&external.path).unwrap();
+        let changes =
+            qresync_changes(td.path(), "example.test", "user", "INBOX", baseline, None).unwrap();
+        assert_eq!(changes.vanished_uids, vec![external_uid]);
     }
 
     #[test]
@@ -1050,6 +1389,55 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn append_internal_date_survives_reconciliation_and_copy() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let timestamp = 837_596_665;
+        let timezone_offset = -7 * 60;
+        let before_append = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (_, uid) = append_message_with_internal_date(
+            td.path(),
+            "example.test",
+            "user",
+            "Sent",
+            b"Subject: dated\r\n\r\nbody\r\n",
+            vec!["\\Seen".to_string()],
+            Some((timestamp, timezone_offset)),
+        )
+        .unwrap();
+
+        let (_, sent) = load_folder(td.path(), "example.test", "user", "Sent").unwrap();
+        assert_eq!(sent[0].internaldate, timestamp);
+        assert_eq!(sent[0].internaldate_tz, timezone_offset);
+        assert!(sent[0].save_date >= before_append);
+        assert_ne!(sent[0].save_date, sent[0].internaldate);
+        let mtime = fs::metadata(&sent[0].path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(mtime, timestamp);
+
+        let copied_uid =
+            copy_message_by_uid(td.path(), "example.test", "user", "Sent", uid, "Archive")
+                .unwrap()
+                .unwrap();
+        let (_, archived) = load_folder(td.path(), "example.test", "user", "Archive").unwrap();
+        let copied = archived
+            .iter()
+            .find(|message| message.uid == copied_uid)
+            .unwrap();
+        assert_eq!(copied.internaldate, timestamp);
+        assert_eq!(copied.internaldate_tz, timezone_offset);
+        assert!(copied.save_date >= sent[0].save_date);
     }
 
     #[test]
