@@ -8127,6 +8127,7 @@ async fn process_stream_inner(
                         "IMAP UID STORE peer={:?} uid_set={} ids={:?} op={} flags={:?} silent={} unchanged_since={:?}",
                         peer, uid_set, ids, op, flags, silent, unchanged_since
                     );
+                    let mut updates = Vec::new();
                     for uid in ids {
                         if let Some(pos) = sel.msgs.iter().position(|(u, _, _, _)| *u == uid) {
                             let seq = pos + 1;
@@ -8145,30 +8146,38 @@ async fn process_stream_inner(
                                 "IMAP UID STORE apply peer={:?} seq={} uid={} old_flags={:?} new_flags={:?}",
                                 peer, seq, uid, current, updated
                             );
-                            let updated_modseq = maildir::set_uid_flags_for_mailbox(
-                                Path::new(&mail_root),
-                                &sel.domain,
-                                &sel.local,
-                                &sel.mailbox,
-                                uid,
-                                updated.clone(),
-                            )?;
-                            if !silent {
-                                let w = reader.get_mut();
-                                w.write_all(
-                                    format!(
-                                        "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
-                                        seq,
-                                        updated.join(" "),
-                                        uid,
-                                        updated_modseq
-                                    )
-                                    .as_bytes(),
-                                )
-                                .await?;
-                                w.flush().await?;
-                            }
+                            updates.push((seq, uid, updated));
                         }
+                    }
+                    let flag_updates = updates
+                        .iter()
+                        .map(|(_, uid, flags)| (*uid, flags.clone()))
+                        .collect::<Vec<_>>();
+                    let modseqs = rmail_common::imap_state::set_uid_flags_batch(
+                        Path::new(&mail_root),
+                        &sel.domain,
+                        &sel.local,
+                        &sel.mailbox,
+                        &flag_updates,
+                    )?;
+                    if !silent {
+                        let w = reader.get_mut();
+                        for ((seq, uid, updated), (_, updated_modseq)) in
+                            updates.iter().zip(modseqs.iter())
+                        {
+                            w.write_all(
+                                format!(
+                                    "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
+                                    seq,
+                                    updated.join(" "),
+                                    uid,
+                                    updated_modseq
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                        }
+                        w.flush().await?;
                     }
                     if let Some(addr) = authed_mailbox.as_ref() {
                         let mailbox = selected_mailbox_name(&selected).to_string();
@@ -8550,6 +8559,7 @@ async fn process_stream_inner(
                     peer, seq_set, op, flags, silent, unchanged_since
                 );
                 let mut modified = Vec::new();
+                let mut updates = Vec::new();
                 for seq in seqs_from_set_or_saved(&seq_set, sel, session_state.saved_search_uids())
                 {
                     if seq == 0 || seq > sel.msgs.len() {
@@ -8571,16 +8581,24 @@ async fn process_stream_inner(
                         "IMAP STORE apply peer={:?} seq={} uid={} old_flags={:?} new_flags={:?}",
                         peer, seq, uid, current, updated
                     );
-                    let updated_modseq = maildir::set_uid_flags_for_mailbox(
-                        Path::new(&mail_root),
-                        &sel.domain,
-                        &sel.local,
-                        &sel.mailbox,
-                        uid,
-                        updated.clone(),
-                    )?;
-                    if !silent {
-                        let w = reader.get_mut();
+                    updates.push((seq, uid, updated));
+                }
+                let flag_updates = updates
+                    .iter()
+                    .map(|(_, uid, flags)| (*uid, flags.clone()))
+                    .collect::<Vec<_>>();
+                let modseqs = rmail_common::imap_state::set_uid_flags_batch(
+                    Path::new(&mail_root),
+                    &sel.domain,
+                    &sel.local,
+                    &sel.mailbox,
+                    &flag_updates,
+                )?;
+                if !silent {
+                    let w = reader.get_mut();
+                    for ((seq, uid, updated), (_, updated_modseq)) in
+                        updates.iter().zip(modseqs.iter())
+                    {
                         w.write_all(
                             format!(
                                 "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
@@ -8592,8 +8610,8 @@ async fn process_stream_inner(
                             .as_bytes(),
                         )
                         .await?;
-                        w.flush().await?;
                     }
+                    w.flush().await?;
                 }
                 if let Some(addr) = authed_mailbox.as_ref() {
                     let mailbox = selected_mailbox_name(&selected).to_string();

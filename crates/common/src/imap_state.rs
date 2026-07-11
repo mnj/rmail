@@ -380,32 +380,55 @@ pub fn set_uid_flags(
     uid: u64,
     flags: Vec<String>,
 ) -> Result<u64> {
+    Ok(
+        set_uid_flags_batch(maildir_root, domain, localpart, mailbox, &[(uid, flags)])?
+            .into_iter()
+            .next()
+            .map(|(_, modseq)| modseq)
+            .unwrap_or(0),
+    )
+}
+
+pub fn set_uid_flags_batch(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    updates: &[(u64, Vec<String>)],
+) -> Result<Vec<(u64, u64)>> {
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
     let tx = conn.transaction()?;
     let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
-    let message_exists = tx
-        .query_row(
-            "SELECT 1 FROM messages WHERE folder_id = ?1 AND uid = ?2",
-            params![folder_id, uid as i64],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some();
-    if !message_exists {
-        tx.commit()?;
-        return Ok(0);
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    for (uid, flags) in updates {
+        if !seen.insert(*uid) {
+            anyhow::bail!("duplicate UID {uid} in flag update batch");
+        }
+        let message_exists = tx
+            .query_row(
+                "SELECT 1 FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![folder_id, *uid as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !message_exists {
+            continue;
+        }
+        let modseq = next_modseq(&tx, folder_id)?;
+        tx.execute(
+            "UPDATE messages
+             SET flags = ?1, modseq = ?2
+             WHERE folder_id = ?3 AND uid = ?4",
+            params![flags_to_text(flags)?, modseq as i64, folder_id, *uid as i64],
+        )?;
+        results.push((*uid, modseq));
     }
-    let modseq = next_modseq(&tx, folder_id)?;
-    tx.execute(
-        "UPDATE messages
-         SET flags = ?1, modseq = ?2
-         WHERE folder_id = ?3 AND uid = ?4",
-        params![flags_to_text(&flags)?, modseq as i64, folder_id, uid as i64],
-    )?;
     tx.commit()?;
-    Ok(modseq)
+    Ok(results)
 }
 
 pub fn delete_message_by_uid(
@@ -1762,6 +1785,66 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn flag_update_batch_is_atomic_when_a_later_message_fails() {
+        let td = tempfile::tempdir().unwrap();
+        let (_, first) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: first\r\n\r\n",
+            Vec::new(),
+        )
+        .unwrap();
+        let (_, second) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: second\r\n\r\n",
+            Vec::new(),
+        )
+        .unwrap();
+        let (before, messages_before) =
+            load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second_flag_update
+             BEFORE UPDATE OF flags ON messages
+             WHEN OLD.uid = 2
+             BEGIN SELECT RAISE(FAIL, 'injected flag update failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            set_uid_flags_batch(
+                td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                &[
+                    (first, vec!["\\Seen".to_string()]),
+                    (second, vec!["\\Flagged".to_string()]),
+                ],
+            )
+            .is_err()
+        );
+        let (after, messages_after) =
+            load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(after.highest_modseq, before.highest_modseq);
+        assert_eq!(messages_after.len(), messages_before.len());
+        for message in messages_after {
+            let original = messages_before
+                .iter()
+                .find(|candidate| candidate.uid == message.uid)
+                .unwrap();
+            assert_eq!(message.flags, original.flags);
+            assert_eq!(message.modseq, original.modseq);
+        }
     }
 
     #[test]
