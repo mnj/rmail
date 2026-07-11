@@ -440,9 +440,19 @@ pub fn delete_message_by_uid(
 
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
     let path = dir.join(&subdir).join(&filename);
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
+    let tombstone = dir.join("tmp").join(format!(
+        "{}.expunge.{}.{}",
+        filename,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        rand::random::<u64>()
+    ));
+    let file_guard = if path.exists() {
+        fs::rename(&path, &tombstone)
+            .with_context(|| format!("staging message UID {uid} for expunge"))?;
+        Some(FileMutationGuard::moved(path, tombstone.clone()))
+    } else {
+        None
+    };
     let modseq = next_modseq(&tx, folder_id)?;
     record_expunge(&tx, folder_id, uid, modseq)?;
     tx.execute(
@@ -450,6 +460,16 @@ pub fn delete_message_by_uid(
         params![folder_id, uid as i64],
     )?;
     tx.commit()?;
+    if let Some(guard) = file_guard {
+        guard.commit();
+        if let Err(error) = fs::remove_file(&tombstone) {
+            eprintln!(
+                "failed to remove committed expunge tombstone {}: {}",
+                tombstone.display(),
+                error
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1010,10 +1030,13 @@ pub fn append_message_with_internal_date(
     let tmp_path = dir.join("tmp").join(&filename);
     let new_path = dir.join("new").join(&filename);
     let mut file = fs::File::create(&tmp_path)?;
+    let tmp_guard = FileMutationGuard::copied(tmp_path.clone());
     file.write_all(data)?;
     file.sync_all()?;
     set_file_mtime(&tmp_path, internaldate)?;
     fs::rename(&tmp_path, &new_path)?;
+    tmp_guard.commit();
+    let new_guard = FileMutationGuard::copied(new_path);
 
     let tx = conn.transaction()?;
     let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
@@ -1040,6 +1063,7 @@ pub fn append_message_with_internal_date(
         params![uid.saturating_add(1) as i64, folder_id],
     )?;
     tx.commit()?;
+    new_guard.commit();
     Ok((folder.uidvalidity, uid))
 }
 
@@ -1663,6 +1687,81 @@ mod tests {
             assert!(messages_after.is_empty());
             assert_eq!(destination_after.uidnext, destination_before.uidnext);
         }
+    }
+
+    #[test]
+    fn append_and_expunge_roll_back_maildir_when_database_changes_fail() {
+        let append_td = tempfile::tempdir().unwrap();
+        init_account(append_td.path(), "example.test", "user").unwrap();
+        let (before, _) = load_folder(append_td.path(), "example.test", "user", "INBOX").unwrap();
+        let conn =
+            Connection::open(state_db_path(append_td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_append_insert
+             BEFORE INSERT ON messages
+             WHEN NEW.folder_id = (SELECT id FROM folders WHERE name = 'INBOX')
+             BEGIN SELECT RAISE(FAIL, 'injected append failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            append_message(
+                append_td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                b"Subject: rejected\r\n\r\nbody",
+                Vec::new(),
+            )
+            .is_err()
+        );
+        let (after, messages) =
+            load_folder(append_td.path(), "example.test", "user", "INBOX").unwrap();
+        assert!(messages.is_empty());
+        assert_eq!(after.uidnext, before.uidnext);
+        let inbox = account_maildir(append_td.path(), "example.test", "user");
+        assert_eq!(fs::read_dir(inbox.join("new")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(inbox.join("tmp")).unwrap().count(), 0);
+
+        let expunge_td = tempfile::tempdir().unwrap();
+        let (_, uid) = append_message(
+            expunge_td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: retained\r\n\r\nbody",
+            Vec::new(),
+        )
+        .unwrap();
+        let (_, messages) =
+            load_folder(expunge_td.path(), "example.test", "user", "INBOX").unwrap();
+        let original_path = messages[0].path.clone();
+        let conn =
+            Connection::open(state_db_path(expunge_td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_expunge_journal
+             BEFORE INSERT ON expunges
+             BEGIN SELECT RAISE(FAIL, 'injected expunge failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            delete_message_by_uid(expunge_td.path(), "example.test", "user", "INBOX", uid,)
+                .is_err()
+        );
+        assert!(original_path.is_file());
+        let (_, messages) =
+            load_folder(expunge_td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].uid, uid);
+        assert_eq!(
+            fs::read_dir(account_maildir(expunge_td.path(), "example.test", "user").join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
