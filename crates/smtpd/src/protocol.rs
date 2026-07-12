@@ -115,7 +115,8 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
 }
 
 pub(crate) fn valid_helo_domain(value: &str) -> bool {
-    valid_domain(value, false) || valid_address_literal(value)
+    canonical_domain(value, false).is_some()
+        || rmail_common::domain::canonicalize_address_literal(value).is_ok()
 }
 
 fn is_atext(character: char) -> bool {
@@ -179,51 +180,11 @@ fn valid_local_part(value: &str, allow_utf8: bool) -> bool {
     })
 }
 
-fn valid_domain(value: &str, allow_utf8: bool) -> bool {
-    if value.is_empty() || value.as_bytes().len() > 255 {
-        return false;
+fn canonical_domain(value: &str, allow_utf8: bool) -> Option<String> {
+    if !allow_utf8 && !value.is_ascii() {
+        return None;
     }
-    value.split('.').all(|label| {
-        !label.is_empty()
-            && label.as_bytes().len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || character == '-'
-                    || (allow_utf8 && !character.is_ascii() && !character.is_control())
-            })
-    })
-}
-
-fn valid_address_literal(value: &str) -> bool {
-    let Some(inner) = value
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-    else {
-        return false;
-    };
-    if let Some((tag, address)) = inner.split_once(':') {
-        if tag.eq_ignore_ascii_case("IPv6") {
-            return address.parse::<std::net::Ipv6Addr>().is_ok();
-        }
-        return valid_domain_label(tag)
-            && !address.is_empty()
-            && address
-                .bytes()
-                .all(|byte| (33..=90).contains(&byte) || (94..=126).contains(&byte));
-    }
-    inner.parse::<std::net::Ipv4Addr>().is_ok()
-}
-
-fn valid_domain_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.as_bytes().len() <= 63
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    rmail_common::domain::canonicalize_domain(value).ok()
 }
 
 fn strip_source_route(value: &str) -> Option<&str> {
@@ -234,7 +195,7 @@ fn strip_source_route(value: &str) -> Option<&str> {
     if route.split(',').all(|domain| {
         domain
             .strip_prefix('@')
-            .is_some_and(|domain| valid_domain(domain, false))
+            .is_some_and(|domain| canonical_domain(domain, false).is_some())
     }) {
         Some(mailbox)
     } else {
@@ -264,12 +225,15 @@ fn parse_mailbox(value: &str, allow_utf8: bool) -> Option<String> {
     let separator = separator?;
     let (local, domain_with_at) = value.split_at(separator);
     let domain = &domain_with_at[1..];
-    if !valid_local_part(local, allow_utf8)
-        || !(valid_domain(domain, allow_utf8) || valid_address_literal(domain))
-    {
+    if !valid_local_part(local, allow_utf8) {
         return None;
     }
-    Some(format!("{local}@{}", domain.to_lowercase()))
+    let domain = if domain.starts_with('[') {
+        rmail_common::domain::canonicalize_address_literal(domain).ok()?
+    } else {
+        canonical_domain(domain, allow_utf8)?
+    };
+    Some(format!("{local}@{domain}"))
 }
 
 fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
@@ -445,6 +409,12 @@ mod tests {
         assert!(parse_mail_from_args("FROM:<a@example..test>").is_err());
         assert!(parse_mail_from_args("FROM:<ü@example.test>").is_err());
         assert!(parse_mail_from_args("FROM:<ü@example.test> SMTPUTF8").is_ok());
+        assert_eq!(
+            parse_mail_from_args("FROM:<user@BÜCHER.example> SMTPUTF8")
+                .unwrap()
+                .sender,
+            Some("user@xn--bcher-kva.example".to_string())
+        );
         assert_eq!(
             parse_rcpt_to_args("TO:<\"quoted local\"@[127.0.0.1]>", false),
             Ok("\"quoted local\"@[127.0.0.1]".to_string())

@@ -508,6 +508,10 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
     };
     let at = mf.rfind('@');
     let domain = if let Some(i) = at { &mf[i + 1..] } else { mf };
+    let domain = match crate::domain::canonicalize_domain(domain) {
+        Ok(domain) => domain,
+        Err(_) => return Ok(Some("permerror".to_string())),
+    };
     if peer_ip.is_none() {
         return Ok(None);
     }
@@ -626,7 +630,7 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
     }
 
     let mut visited = HashSet::new();
-    if let Some(res) = eval_spf_for_domain(domain, peer, 0, &mut visited, mf) {
+    if let Some(res) = eval_spf_for_domain(&domain, peer, 0, &mut visited, mf) {
         return Ok(Some(res));
     }
     Ok(None)
@@ -647,6 +651,7 @@ fn verify_dmarc(
     let from_domain = match from_addr
         .as_deref()
         .and_then(|s| s.rfind('@').map(|i| s[i + 1..].to_string()))
+        .and_then(|domain| crate::domain::canonicalize_domain(&domain).ok())
     {
         Some(d) => d,
         None => return Ok(None),
@@ -686,6 +691,7 @@ fn verify_dmarc(
             if let Some(pos) = dkim_s.find("d=") {
                 let rem = &dkim_s[pos + 2..];
                 let dval = rem.split_whitespace().next().unwrap_or("");
+                let dval = crate::domain::canonicalize_domain(dval).unwrap_or_default();
                 if dval == from_domain || dval.ends_with(&format!(".{}", from_domain)) {
                     return Ok(Some("pass".to_string()));
                 }
@@ -696,7 +702,8 @@ fn verify_dmarc(
                     for part in v.split(';') {
                         let p = part.trim();
                         if p.starts_with("d=") {
-                            let d = p[2..].trim();
+                            let d = crate::domain::canonicalize_domain(p[2..].trim())
+                                .unwrap_or_default();
                             if d == from_domain || d.ends_with(&format!(".{}", from_domain)) {
                                 return Ok(Some("pass".to_string()));
                             }
@@ -712,7 +719,8 @@ fn verify_dmarc(
             // envelope-from domain alignment
             if let Some(mf) = mail_from {
                 if let Some(idx) = mf.rfind('@') {
-                    let ef_domain = &mf[idx + 1..];
+                    let ef_domain = crate::domain::canonicalize_domain(&mf[idx + 1..])
+                        .unwrap_or_default();
                     if ef_domain == from_domain || ef_domain.ends_with(&format!(".{}", from_domain))
                     {
                         return Ok(Some("pass".to_string()));
@@ -758,6 +766,7 @@ fn extract_addr_from_header(s: &str) -> Option<String> {
 
 /// Parse the DMARC _dmarc TXT record for rua= addresses and return mailto: recipients.
 pub fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
+    let domain = crate::domain::canonicalize_domain(domain)?;
     let name = format!("_dmarc.{}", domain);
     if let Some(txts) = cached_txt_lookup(&name) {
         let mut out: Vec<String> = Vec::new();
@@ -782,6 +791,7 @@ pub fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
 
 /// Retrieve the published DMARC policy (p=) for a domain, if any.
 pub fn get_dmarc_policy(domain: &str) -> Result<Option<String>> {
+    let domain = crate::domain::canonicalize_domain(domain)?;
     let name = format!("_dmarc.{}", domain);
     if let Some(txts) = cached_txt_lookup(&name) {
         for txt in txts.iter() {

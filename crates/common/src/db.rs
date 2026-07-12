@@ -106,6 +106,7 @@ pub fn add_mailbox<P: AsRef<Path>>(
     maildir: Option<&str>,
     scram: Option<&str>,
 ) -> Result<()> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     conn.execute(
         "INSERT OR REPLACE INTO mailboxes (address, password_hash, maildir, created_at, scram) VALUES (?1, ?2, ?3, strftime('%s','now'), ?4)",
@@ -116,6 +117,7 @@ pub fn add_mailbox<P: AsRef<Path>>(
 
 /// Remove a mailbox from the account database.
 pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     conn.execute("DELETE FROM mailboxes WHERE address = ?1", params![address])?;
     Ok(())
@@ -123,6 +125,7 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
 
 /// Get mailbox by exact address
 pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mailbox>> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare(
         "SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address = ?1",
@@ -200,6 +203,7 @@ pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
 
 /// Get catchall target for a domain
 pub fn get_catchall<P: AsRef<Path>>(path: P, domain: &str) -> Result<Option<String>> {
+    let domain = crate::domain::canonicalize_domain(domain)?;
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare("SELECT target FROM catchalls WHERE domain = ?1")?;
     let mut rows = stmt.query(params![domain])?;
@@ -213,6 +217,8 @@ pub fn get_catchall<P: AsRef<Path>>(path: P, domain: &str) -> Result<Option<Stri
 
 /// Set a catchall mapping
 pub fn set_catchall<P: AsRef<Path>>(path: P, domain: &str, target: &str) -> Result<()> {
+    let domain = crate::domain::canonicalize_domain(domain)?;
+    let target = crate::domain::canonicalize_mailbox_address(target)?;
     let conn = Connection::open(path)?;
     conn.execute(
         "INSERT OR REPLACE INTO catchalls (domain, target) VALUES (?1, ?2)",
@@ -223,6 +229,7 @@ pub fn set_catchall<P: AsRef<Path>>(path: P, domain: &str, target: &str) -> Resu
 
 /// Remove a catchall mapping.
 pub fn remove_catchall<P: AsRef<Path>>(path: P, domain: &str) -> Result<()> {
+    let domain = crate::domain::canonicalize_domain(domain)?;
     let conn = Connection::open(path)?;
     conn.execute("DELETE FROM catchalls WHERE domain = ?1", params![domain])?;
     Ok(())
@@ -242,14 +249,20 @@ pub fn list_catchalls<P: AsRef<Path>>(path: P) -> Result<Vec<(String, String)>> 
 
 /// Add or update an alias mapping. Targets is a JSON array of address strings (may include remote addresses).
 pub fn add_alias<P: AsRef<Path>>(path: P, address: &str, targets: &[&str]) -> Result<()> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
+    let targets = targets
+        .iter()
+        .map(|target| crate::domain::canonicalize_mailbox_address(target))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let conn = Connection::open(path)?;
-    let targets_json = serde_json::to_string(targets)?;
+    let targets_json = serde_json::to_string(&targets)?;
     conn.execute("INSERT OR REPLACE INTO aliases (address, targets, created_at) VALUES (?1, ?2, strftime('%s','now'))", params![address, targets_json])?;
     Ok(())
 }
 
 /// Get alias targets for an exact address, or None if no alias exists.
 pub fn get_alias_targets<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Vec<String>>> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare("SELECT targets FROM aliases WHERE address = ?1")?;
     let mut rows = stmt.query(params![address])?;
@@ -264,6 +277,7 @@ pub fn get_alias_targets<P: AsRef<Path>>(path: P, address: &str) -> Result<Optio
 
 /// Remove an alias mapping
 pub fn remove_alias<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     conn.execute("DELETE FROM aliases WHERE address = ?1", params![address])?;
     Ok(())
@@ -660,7 +674,7 @@ pub fn ensure_outbound_columns<P: AsRef<Path>>(path: P) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::init_db;
+    use super::{add_alias, add_mailbox, get_alias_targets, get_catchall, get_mailbox, init_db, set_catchall};
     use rusqlite::Connection;
     use tempfile::tempdir;
 
@@ -681,5 +695,44 @@ mod tests {
 
         assert!(columns.iter().any(|c| c == "priority"));
         assert!(columns.iter().any(|c| c == "max_attempts"));
+    }
+
+    #[test]
+    fn identity_boundaries_canonicalize_idn_domains() {
+        let td = tempdir().expect("tempdir");
+        let db_path = td.path().join("test.db");
+        init_db(&db_path).unwrap();
+        add_mailbox(&db_path, "User@BÜCHER.example", None, None, None).unwrap();
+        assert_eq!(
+            get_mailbox(&db_path, "User@xn--bcher-kva.example")
+                .unwrap()
+                .unwrap()
+                .address,
+            "User@xn--bcher-kva.example"
+        );
+        add_alias(
+            &db_path,
+            "team@BÜCHER.example",
+            &["User@BÜCHER.example"],
+        )
+        .unwrap();
+        assert_eq!(
+            get_alias_targets(&db_path, "team@xn--bcher-kva.example")
+                .unwrap()
+                .unwrap(),
+            ["User@xn--bcher-kva.example"]
+        );
+        set_catchall(
+            &db_path,
+            "BÜCHER.example",
+            "User@BÜCHER.example",
+        )
+        .unwrap();
+        assert_eq!(
+            get_catchall(&db_path, "xn--bcher-kva.example")
+                .unwrap()
+                .as_deref(),
+            Some("User@xn--bcher-kva.example")
+        );
     }
 }

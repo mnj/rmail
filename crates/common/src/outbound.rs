@@ -58,6 +58,10 @@ pub fn queue_outbound(
     data: &[u8],
     envelope_from: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
+    let recipient = crate::domain::canonicalize_mailbox_address(recipient)?;
+    let envelope_from = envelope_from
+        .map(crate::domain::canonicalize_mailbox_address)
+        .transpose()?;
     let outbound_dir = maildir_root.join("outbound").join("maildrop");
     let tmp_dir = outbound_dir.join("tmp");
     let queue_dir = outbound_dir.join("queue");
@@ -79,7 +83,7 @@ pub fn queue_outbound(
     let mut f = File::create(&tmp_path)?;
 
     // Persist envelope metadata as an internal header so the outbound worker can reconstruct the SMTP envelope.
-    if let Some(env) = envelope_from {
+    if let Some(env) = envelope_from.as_deref() {
         writeln!(f, "X-RMail-Envelope-From: {}", env)?;
     }
     writeln!(f, "X-RMail-Envelope-To: {}", recipient)?;
@@ -104,7 +108,7 @@ pub fn queue_outbound(
 
 #[cfg(test)]
 mod tests {
-    use super::control_path_for_eml;
+    use super::{control_path_for_eml, queue_outbound};
     use std::path::Path;
 
     #[test]
@@ -114,5 +118,20 @@ mod tests {
             control_path_for_eml(path),
             Path::new("/tmp/message.eml.json")
         );
+    }
+
+    #[test]
+    fn queue_metadata_canonicalizes_idn_envelope_domains() {
+        let temp = tempfile::tempdir().unwrap();
+        let queued = queue_outbound(
+            temp.path(),
+            "to@BÜCHER.example",
+            b"Subject: test\r\n\r\nbody\r\n",
+            Some("from@BÜCHER.example"),
+        )
+        .unwrap();
+        let data = std::fs::read_to_string(queued).unwrap();
+        assert!(data.contains("X-RMail-Envelope-From: from@xn--bcher-kva.example"));
+        assert!(data.contains("X-RMail-Envelope-To: to@xn--bcher-kva.example"));
     }
 }

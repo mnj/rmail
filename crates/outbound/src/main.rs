@@ -413,6 +413,12 @@ async fn deliver_to_remote(
     recipient: &str,
     body: &[u8],
 ) -> anyhow::Result<()> {
+    let recipient = rmail_common::domain::canonicalize_mailbox_address(recipient)
+        .context("canonicalizing recipient IDN")?;
+    let envelope_from = envelope_from
+        .map(rmail_common::domain::canonicalize_mailbox_address)
+        .transpose()
+        .context("canonicalizing sender IDN")?;
     let at = recipient
         .rfind('@')
         .ok_or_else(|| anyhow::anyhow!("invalid recipient address"))?;
@@ -575,7 +581,14 @@ async fn deliver_to_remote(
     }
 
     // Send the mail over the established reader (plain or TLS)
-    smtp_send_with_reader(&mut reader, envelope_from, recipient, body, &capabilities).await?;
+    smtp_send_with_reader(
+        &mut reader,
+        envelope_from.as_deref(),
+        &recipient,
+        body,
+        &capabilities,
+    )
+    .await?;
 
     Ok(())
 }

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod domain;
 pub mod imap_state;
 pub mod mail_auth;
 pub mod maildir;

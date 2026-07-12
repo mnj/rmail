@@ -21,6 +21,7 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.21"
 unicode-normalization = "0.1"
+idna = "1.1"
 
 # DNS / mail auth helpers
 trust-dns-resolver = "0.22"
