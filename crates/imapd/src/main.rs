@@ -337,12 +337,14 @@ mod tests {
     }
 
     async fn run_scripted_fixture(reader: &mut BufReader<tokio::io::DuplexStream>, fixture: &str) {
+        let mut command_response = Vec::new();
         for raw_line in fixture.lines() {
             let line = raw_line.trim_end();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             if let Some(command) = line.strip_prefix("C: ") {
+                command_response.clear();
                 reader
                     .get_mut()
                     .write_all(format!("{}\r\n", command).as_bytes())
@@ -350,10 +352,15 @@ mod tests {
                     .expect("write fixture command");
                 reader.get_mut().flush().await.expect("flush fixture");
             } else if let Some(expected) = line.strip_prefix("S: ") {
-                let lines = read_until_contains(reader, expected).await;
+                if !command_response
+                    .iter()
+                    .any(|line: &String| line.contains(expected))
+                {
+                    command_response.extend(read_until_contains(reader, expected).await);
+                }
                 assert!(
-                    lines.iter().any(|line| line.contains(expected)),
-                    "expected fixture response containing {expected:?}, got {lines:?}"
+                    command_response.iter().any(|line| line.contains(expected)),
+                    "expected fixture response containing {expected:?}, got {command_response:?}"
                 );
             } else {
                 panic!("invalid fixture line: {line}");

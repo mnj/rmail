@@ -171,7 +171,7 @@ fn attributes(
             .to_string(),
         );
     }
-    if request.returns.subscribed && subscribed {
+    if (request.selection.subscribed || request.returns.subscribed) && subscribed {
         attributes.push("\\Subscribed".to_string());
     }
     if command_name == "XLIST" && summary.folder.name.eq_ignore_ascii_case("INBOX") {
