@@ -730,17 +730,21 @@ async fn process_stream(
                             let dbp2 = dbp.clone();
                             let addr2 = addr.clone();
                             match tokio::task::spawn_blocking(move || {
-                                rmail_common::db::mailbox_exists(dbp2, &addr2)
+                                if addr2.contains('@') {
+                                    rmail_common::db::get_mailbox(dbp2, &addr2)
+                                } else {
+                                    rmail_common::db::find_mailbox_by_localpart(dbp2, &addr2)
+                                }
                             })
                             .await
                             {
-                                Ok(Ok(true)) => {
+                                Ok(Ok(Some(mailbox))) => {
                                     if rcpts.len() >= MAX_RCPT {
                                         let w = reader.get_mut();
                                         w.write_all(b"452 Too many recipients\r\n").await?;
                                         w.flush().await?;
                                     } else {
-                                        rcpts.push(addr.clone());
+                                        rcpts.push(mailbox.address.to_ascii_lowercase());
                                         println!(
                                             "SMTP RCPT accepted peer={:?} rcpt_count={} current_rcpts={:?}",
                                             peer,
@@ -752,7 +756,7 @@ async fn process_stream(
                                         w.flush().await?;
                                     }
                                 }
-                                Ok(Ok(false)) => {
+                                Ok(Ok(None)) => {
                                     if let Some(at) = addr.find('@') {
                                         let domain = addr[at + 1..].to_string();
                                         // First, check for alias mappings for this exact address
@@ -771,20 +775,33 @@ async fn process_stream(
                                                     "SMTP RCPT alias match peer={:?} rcpt={} targets={:?}",
                                                     peer, addr, targets
                                                 );
-                                                // Expand alias targets (allow forwarding even when unauthenticated)
-                                                for t in targets {
-                                                    if rcpts.len() >= MAX_RCPT {
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"452 Too many recipients\r\n")
-                                                            .await?;
-                                                        w.flush().await?;
-                                                        break;
-                                                    } else {
-                                                        rcpts.push(t.clone());
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"250 OK\r\n").await?;
-                                                        w.flush().await?;
-                                                    }
+                                                if targets.is_empty() {
+                                                    let writer = reader.get_mut();
+                                                    writer
+                                                        .write_all(
+                                                            b"550 5.1.1 Alias has no targets\r\n",
+                                                        )
+                                                        .await?;
+                                                    writer.flush().await?;
+                                                } else if rcpts.len().saturating_add(targets.len())
+                                                    > MAX_RCPT
+                                                {
+                                                    let writer = reader.get_mut();
+                                                    writer
+                                                        .write_all(
+                                                            b"452 4.5.3 Too many recipients\r\n",
+                                                        )
+                                                        .await?;
+                                                    writer.flush().await?;
+                                                } else {
+                                                    rcpts.extend(
+                                                        targets.into_iter().map(|target| {
+                                                            target.to_ascii_lowercase()
+                                                        }),
+                                                    );
+                                                    let writer = reader.get_mut();
+                                                    writer.write_all(b"250 OK\r\n").await?;
+                                                    writer.flush().await?;
                                                 }
                                             }
                                             Ok(Ok(None)) => {
@@ -1081,6 +1098,62 @@ async fn process_stream(
                         data.len(),
                         rcpts
                     );
+                    let data_for_analysis = data.clone();
+                    let peer_ip_for_analysis = peer.map(|peer| peer.ip());
+                    let envelope_for_analysis = mail_from.clone();
+                    let (dkim_res, spf_res, dmarc_res, _header_from_res) =
+                        match tokio::task::spawn_blocking(move || {
+                            rmail_common::mail_auth::analyze_message(
+                                &data_for_analysis,
+                                peer_ip_for_analysis,
+                                envelope_for_analysis.as_deref(),
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(results)) => results,
+                            Ok(Err(error)) => {
+                                eprintln!("mail auth analyze error: {error}");
+                                (None, None, None, None)
+                            }
+                            Err(error) => {
+                                eprintln!("mail auth join error: {error}");
+                                (None, None, None, None)
+                            }
+                        };
+                    if let Some(result) = dkim_res.as_deref() {
+                        if result.starts_with("pass") {
+                            rmail_common::metrics::inc_dkim_pass();
+                        } else {
+                            rmail_common::metrics::inc_dkim_fail();
+                        }
+                    }
+                    if let Some(result) = spf_res.as_deref() {
+                        if result == "pass" {
+                            rmail_common::metrics::inc_spf_pass();
+                        } else {
+                            rmail_common::metrics::inc_spf_fail();
+                        }
+                    }
+                    if let Some(result) = dmarc_res.as_deref() {
+                        match result {
+                            "pass" => rmail_common::metrics::inc_dmarc_pass(),
+                            "quarantine" => rmail_common::metrics::inc_dmarc_quarantine(),
+                            "reject" => rmail_common::metrics::inc_dmarc_reject(),
+                            _ => {}
+                        }
+                    }
+                    if enforce_dmarc && dmarc_res.as_deref() == Some("reject") {
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"554 5.7.1 Message rejected by DMARC policy\r\n")
+                            .await?;
+                        writer.flush().await?;
+                        rcpts.clear();
+                        mail_from = None;
+                        mail_from_seen = false;
+                        continue;
+                    }
                     let mut any_accepted = false;
                     let mut any_rejected = false;
                     for rcpt in &rcpts {
@@ -1106,72 +1179,6 @@ async fn process_stream(
                             };
 
                             if is_local {
-                                // perform message auth analysis (DKIM/SPF/DMARC) in blocking thread
-                                let data_for_analysis = data.clone();
-                                let peer_ip_for_analysis = peer.map(|p| p.ip());
-                                let mail_from_clone_analysis = mail_from.clone();
-                                let (dkim_res, spf_res, dmarc_res, _header_from_res) =
-                                    match tokio::task::spawn_blocking(move || {
-                                        rmail_common::mail_auth::analyze_message(
-                                            &data_for_analysis,
-                                            peer_ip_for_analysis,
-                                            mail_from_clone_analysis.as_deref(),
-                                        )
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok((dkim, spf, dmarc, header_from))) => {
-                                            (dkim, spf, dmarc, header_from)
-                                        }
-                                        Ok(Err(e)) => {
-                                            eprintln!("mail auth analyze error: {}", e);
-                                            (None, None, None, None)
-                                        }
-                                        Err(e) => {
-                                            eprintln!("mail auth join error: {}", e);
-                                            (None, None, None, None)
-                                        }
-                                    };
-
-                                // Record mail auth metrics
-                                if let Some(dk) = dkim_res.as_deref() {
-                                    if dk.starts_with("pass") {
-                                        rmail_common::metrics::inc_dkim_pass();
-                                    } else {
-                                        rmail_common::metrics::inc_dkim_fail();
-                                    }
-                                }
-                                if let Some(sf) = spf_res.as_deref() {
-                                    if sf == "pass" {
-                                        rmail_common::metrics::inc_spf_pass();
-                                    } else {
-                                        rmail_common::metrics::inc_spf_fail();
-                                    }
-                                }
-                                if let Some(dm) = dmarc_res.as_deref() {
-                                    match dm {
-                                        "pass" => rmail_common::metrics::inc_dmarc_pass(),
-                                        "quarantine" => {
-                                            rmail_common::metrics::inc_dmarc_quarantine()
-                                        }
-                                        "reject" => rmail_common::metrics::inc_dmarc_reject(),
-                                        _ => {}
-                                    }
-                                }
-
-                                // Enforce DMARC if configured: reject when DMARC policy indicates 'reject'
-                                if enforce_dmarc && dmarc_res.as_deref() == Some("reject") {
-                                    let w = reader.get_mut();
-                                    let msg = format!(
-                                        "554 5.7.1 Message rejected by DMARC policy for {}\r\n",
-                                        rcpt
-                                    );
-                                    w.write_all(msg.as_bytes()).await?;
-                                    w.flush().await?;
-                                    any_rejected = true;
-                                    continue;
-                                }
-
                                 // measure per-recipient delivery latency
                                 let start = std::time::Instant::now();
                                 // If DMARC recommends quarantine, deliver to quarantine Maildir
@@ -1210,9 +1217,6 @@ async fn process_stream(
                                                 "quarantine deliver error for {}: {}",
                                                 rcpt, e
                                             );
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Requested action aborted: local error in processing\r\n").await?;
-                                            w.flush().await?;
                                         }
                                     }
                                 } else {
@@ -1246,9 +1250,6 @@ async fn process_stream(
                                             any_rejected = true;
                                             rmail_common::metrics::inc_failed_deliveries();
                                             eprintln!("deliver error for {}: {}", rcpt, e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Requested action aborted: local error in processing\r\n").await?;
-                                            w.flush().await?;
                                         }
                                     }
                                 }
@@ -1283,22 +1284,10 @@ async fn process_stream(
                                         Ok(Err(e)) => {
                                             any_rejected = true;
                                             eprintln!("failed to queue outbound {}: {}", rcpt, e);
-                                            let w = reader.get_mut();
-                                            w.write_all(
-                                            b"451 Requested action aborted: temporary failure\r\n",
-                                        )
-                                        .await?;
-                                            w.flush().await?;
                                         }
                                         Err(e) => {
                                             any_rejected = true;
                                             eprintln!("queue spawn_blocking join error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(
-                                            b"451 Requested action aborted: temporary failure\r\n",
-                                        )
-                                        .await?;
-                                            w.flush().await?;
                                         }
                                     }
                                 }
@@ -1316,10 +1305,10 @@ async fn process_stream(
                         w.write_all(b"250 OK\r\n").await?;
                     } else if any_rejected {
                         println!(
-                            "SMTP DATA completed peer={:?} accepted=false rejected=true",
+                            "SMTP DATA completed peer={:?} accepted=false temporary_failure=true",
                             peer
                         );
-                        w.write_all(b"554 5.7.1 Message rejected by policy\r\n")
+                        w.write_all(b"451 4.3.0 Temporary delivery failure\r\n")
                             .await?;
                     } else {
                         println!(
@@ -1538,6 +1527,20 @@ mod tests {
             Some(&scram),
         )
         .expect("add mailbox");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "postmaster@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add postmaster mailbox");
+        rmail_common::db::add_alias(
+            &db_path,
+            "team@example.test",
+            &["user@example.test", "postmaster@example.test"],
+        )
+        .expect("add team alias");
         (td, mail_root, db_path)
     }
 
@@ -1790,6 +1793,51 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("555 5.5.4 Unsupported RCPT TO parameter"))
         );
+    }
+
+    #[tokio::test]
+    async fn bare_postmaster_forward_path_resolves_to_local_postmaster_mailbox() {
+        let (responses, td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<Postmaster>\r\nDATA\r\nSubject: postmaster\r\n\r\nmessage\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert_eq!(
+            std::fs::read_dir(td.path().join("mail/example.test/postmaster/Maildir/new"))
+                .expect("postmaster maildir")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_target_alias_emits_one_rcpt_reply_and_delivers_atomically() {
+        let (responses, td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<team@example.test>\r\nDATA\r\nSubject: team\r\n\r\nmessage\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.as_str() == "250 OK\r\n")
+                .count(),
+            4
+        );
+        for localpart in ["user", "postmaster"] {
+            assert_eq!(
+                std::fs::read_dir(
+                    td.path()
+                        .join(format!("mail/example.test/{localpart}/Maildir/new"))
+                )
+                .expect("alias target maildir")
+                .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

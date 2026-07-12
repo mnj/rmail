@@ -203,13 +203,27 @@ fn valid_address_literal(value: &str) -> bool {
     else {
         return false;
     };
-    if let Some(ipv6) = inner
-        .strip_prefix("IPv6:")
-        .or_else(|| inner.strip_prefix("ipv6:"))
-    {
-        return ipv6.parse::<std::net::Ipv6Addr>().is_ok();
+    if let Some((tag, address)) = inner.split_once(':') {
+        if tag.eq_ignore_ascii_case("IPv6") {
+            return address.parse::<std::net::Ipv6Addr>().is_ok();
+        }
+        return valid_domain_label(tag)
+            && !address.is_empty()
+            && address
+                .bytes()
+                .all(|byte| (33..=90).contains(&byte) || (94..=126).contains(&byte));
     }
     inner.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn valid_domain_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.as_bytes().len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
 fn strip_source_route(value: &str) -> Option<&str> {
@@ -268,9 +282,28 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
     if !rest.starts_with('<') || rest.as_bytes().len() > 256 {
         return None;
     }
-    let end = rest.find('>')?;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (index, character) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == '>' && !quoted {
+            end = Some(index);
+            break;
+        }
+    }
+    let end = end?;
     let path = &rest[..=end];
-    rest = rest[end + 1..].trim_start();
+    rest = &rest[end + 1..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    rest = rest.trim_start_matches([' ', '\t']);
     Some((path, rest))
 }
 
@@ -280,19 +313,17 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut body = None;
     let mut smtp_utf8 = false;
     for parameter in params.split_whitespace() {
-        if let Some(size) = parameter
-            .strip_prefix("SIZE=")
-            .or_else(|| parameter.strip_prefix("size="))
-        {
+        let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
             if declared_size.is_some() {
                 return Err(EnvelopeError::Syntax);
             }
-            declared_size = Some(size.parse().map_err(|_| EnvelopeError::Syntax)?);
-        } else if parameter.eq_ignore_ascii_case("BODY=7BIT") {
+            declared_size = Some(value.parse().map_err(|_| EnvelopeError::Syntax)?);
+        } else if name.eq_ignore_ascii_case("BODY") && value.eq_ignore_ascii_case("7BIT") {
             if body.replace(MailBody::SevenBit).is_some() {
                 return Err(EnvelopeError::Syntax);
             }
-        } else if parameter.eq_ignore_ascii_case("BODY=8BITMIME") {
+        } else if name.eq_ignore_ascii_case("BODY") && value.eq_ignore_ascii_case("8BITMIME") {
             if body.replace(MailBody::EightBitMime).is_some() {
                 return Err(EnvelopeError::Syntax);
             }
@@ -334,6 +365,9 @@ pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<String, 
         .ok_or(EnvelopeError::Syntax)?;
     if inner.is_empty() {
         return Err(EnvelopeError::Syntax);
+    }
+    if inner.eq_ignore_ascii_case("postmaster") {
+        return Ok("postmaster".to_string());
     }
     parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)
 }
@@ -416,8 +450,27 @@ mod tests {
             Ok("\"quoted local\"@[127.0.0.1]".to_string())
         );
         assert_eq!(
+            parse_rcpt_to_args("TO:<\"quoted>local\"@[X-TEST:value]>", false),
+            Ok("\"quoted>local\"@[x-test:value]".to_string())
+        );
+        assert_eq!(
             parse_rcpt_to_args("TO:<@old.example,@relay.example:user@Example.TEST>", false),
             Ok("user@example.test".to_string())
+        );
+        assert_eq!(
+            parse_rcpt_to_args("TO:<Postmaster>", false),
+            Ok("postmaster".to_string())
+        );
+        assert!(parse_mail_from_args("FROM:<a@example.test>SiZe=1").is_err());
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> SiZe=42 BoDy=8bItMiMe"),
+            Ok(MailFromArgs {
+                sender: Some("a@example.test".to_string()),
+                declared_size: Some(42),
+                body: MailBody::EightBitMime,
+                smtp_utf8: false,
+                has_esmtp_parameters: true,
+            })
         );
     }
 
