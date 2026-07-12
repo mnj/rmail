@@ -2019,7 +2019,7 @@ mod tests {
 
     #[test]
     fn normalize_fetch_items_keeps_nested_header_fields_together() {
-        let items = super::normalize_fetch_items(
+        let items = super::parser::normalize_fetch_items(
             "(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To Received)])",
         );
 
@@ -4162,6 +4162,15 @@ mod tests {
             None,
         )
         .expect("add mailbox");
+        rmail_common::imap_state::append_message(
+            &mail_root,
+            "example.test",
+            "user",
+            "Sent",
+            b"Subject: sent\r\n\r\nbody",
+            Vec::new(),
+        )
+        .expect("append sent message");
 
         let (client, server) = duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
@@ -4188,7 +4197,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects/Child\r\nA004 UNSUBSCRIBE Projects\r\nA005 LIST \"\" \"Projects\" RETURN (CHILDREN)\r\nA006 LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"Projects%\" RETURN (SUBSCRIBED CHILDREN)\r\nA007 LIST (REMOTE) \"\" \"*\"\r\nA008 LIST (SPECIAL-USE) \"\" (\"INBOX\" \"Sent\") RETURN (SPECIAL-USE STATUS (MESSAGES UIDNEXT UNSEEN))\r\nA009 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects/Child\r\nA004 UNSUBSCRIBE Projects\r\nA005 LIST \"\" \"Projects\" RETURN (CHILDREN)\r\nA006 LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"Projects%\" RETURN (SUBSCRIBED CHILDREN)\r\nA007 LIST (REMOTE) \"\" \"*\"\r\nA008 LIST (SPECIAL-USE) \"\" (\"INBOX\" \"Sent\") RETURN (SPECIAL-USE STATUS (MESSAGES UIDNEXT UNSEEN SIZE))\r\nA009 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
@@ -4218,11 +4227,9 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("* LIST (\\Sent)") && l.contains("\"Sent\""))
         );
-        assert!(
-            special_status
-                .iter()
-                .any(|l| l.contains("* STATUS \"Sent\"") && l.contains("MESSAGES 0"))
-        );
+        assert!(special_status.iter().any(|l| {
+            l.contains("* STATUS \"Sent\"") && l.contains("MESSAGES 1") && l.contains("SIZE 21")
+        }));
         assert!(
             !special_status
                 .iter()
@@ -5141,10 +5148,6 @@ fn copy_uid_pairs(
     mailbox::copy_uid_pairs(source_set, destination_uids, uidvalidity)
 }
 
-fn normalize_fetch_items(spec: &str) -> Vec<String> {
-    parser::normalize_fetch_items(spec)
-}
-
 fn fetch_marks_seen(requested: &[String]) -> bool {
     requested.iter().any(|item| {
         item == "RFC822"
@@ -5309,15 +5312,22 @@ fn has_child_folder(name: &str, folders: &[rmail_common::imap_state::FolderSumma
         .any(|candidate| candidate.folder.name.starts_with(&prefix))
 }
 
-fn list_status_value(summary: &rmail_common::imap_state::FolderSummary, item: &str) -> String {
-    match item.to_ascii_uppercase().as_str() {
-        "MESSAGES" => format!("MESSAGES {}", summary.messages),
-        "UIDNEXT" => format!("UIDNEXT {}", summary.folder.uidnext),
-        "UIDVALIDITY" => format!("UIDVALIDITY {}", summary.folder.uidvalidity),
-        "HIGHESTMODSEQ" => format!("HIGHESTMODSEQ {}", summary.folder.highest_modseq),
-        "UNSEEN" => format!("UNSEEN {}", summary.unseen),
-        "RECENT" => "RECENT 0".to_string(),
-        unsupported => format!("{} 0", unsupported),
+fn list_status_value(
+    summary: &rmail_common::imap_state::FolderSummary,
+    item: parser::StatusItem,
+) -> String {
+    match item {
+        parser::StatusItem::Messages => format!("MESSAGES {}", summary.messages),
+        parser::StatusItem::UidNext => format!("UIDNEXT {}", summary.folder.uidnext),
+        parser::StatusItem::UidValidity => {
+            format!("UIDVALIDITY {}", summary.folder.uidvalidity)
+        }
+        parser::StatusItem::HighestModSeq => {
+            format!("HIGHESTMODSEQ {}", summary.folder.highest_modseq)
+        }
+        parser::StatusItem::Unseen => format!("UNSEEN {}", summary.unseen),
+        parser::StatusItem::Recent => "RECENT 0".to_string(),
+        parser::StatusItem::Size => format!("SIZE {}", summary.size),
     }
 }
 
@@ -5371,7 +5381,7 @@ fn append_list_response(
             .returns
             .status
             .iter()
-            .map(|item| list_status_value(summary, item))
+            .map(|item| list_status_value(summary, *item))
             .collect::<Vec<_>>()
             .join(" ");
         response.push_str(&format!(
@@ -7728,15 +7738,20 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
-                let Some((mailbox_name, items)) = split_first_imap_astring(args) else {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid STATUS arguments\r\n", tag).as_bytes())
+                let status_request = match parser::parse_status_request(args) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid STATUS item or arguments\r\n", tag).as_bytes(),
+                        )
                         .await?;
-                    w.flush().await?;
-                    continue;
+                        w.flush().await?;
+                        continue;
+                    }
                 };
                 let mailbox_name = match decode_imap_mailbox_arg(
-                    &mailbox_name,
+                    &status_request.mailbox,
                     session_state.feature_enabled("UTF8=ACCEPT"),
                 ) {
                     Ok(name) => name,
@@ -7760,51 +7775,31 @@ async fn process_stream_inner(
                             continue;
                         }
                     };
-                let items_upper = normalize_fetch_items(items);
-                let supported_status_items = [
-                    "MESSAGES",
-                    "UIDNEXT",
-                    "UIDVALIDITY",
-                    "HIGHESTMODSEQ",
-                    "UNSEEN",
-                    "RECENT",
-                    "SIZE",
-                ];
-                if items_upper.iter().any(|item| {
-                    !supported_status_items
-                        .iter()
-                        .any(|supported| item == supported)
-                }) {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid STATUS item\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
                 println!(
                     "IMAP STATUS peer={:?} mailbox={:?} items={:?}",
-                    peer, mailbox_name, items_upper
+                    peer, mailbox_name, status_request.items
                 );
                 let mut values = Vec::new();
-                if items_upper.iter().any(|i| i == "MESSAGES") {
+                let requested = |item| status_request.items.contains(&item);
+                if requested(parser::StatusItem::Messages) {
                     values.push(format!("MESSAGES {}", sel.msgs.len()));
                 }
-                if items_upper.iter().any(|i| i == "UIDNEXT") {
+                if requested(parser::StatusItem::UidNext) {
                     values.push(format!("UIDNEXT {}", next_uid(&sel)));
                 }
-                if items_upper.iter().any(|i| i == "UIDVALIDITY") {
+                if requested(parser::StatusItem::UidValidity) {
                     values.push(format!("UIDVALIDITY {}", sel.uidvalidity));
                 }
-                if items_upper.iter().any(|i| i == "HIGHESTMODSEQ") {
+                if requested(parser::StatusItem::HighestModSeq) {
                     values.push(format!("HIGHESTMODSEQ {}", sel.highest_modseq));
                 }
-                if items_upper.iter().any(|i| i == "UNSEEN") {
+                if requested(parser::StatusItem::Unseen) {
                     values.push(format!("UNSEEN {}", unseen_count(&sel)));
                 }
-                if items_upper.iter().any(|i| i == "RECENT") {
+                if requested(parser::StatusItem::Recent) {
                     values.push("RECENT 0".to_string());
                 }
-                if items_upper.iter().any(|i| i == "SIZE") {
+                if requested(parser::StatusItem::Size) {
                     values.push(format!("SIZE {}", sel.sizes.values().copied().sum::<u64>()));
                 }
                 let w = reader.get_mut();

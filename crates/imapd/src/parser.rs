@@ -1716,7 +1716,73 @@ pub(crate) struct ListReturnOptions {
     pub(crate) subscribed: bool,
     pub(crate) children: bool,
     pub(crate) special_use: bool,
-    pub(crate) status: Vec<String>,
+    pub(crate) status: Vec<StatusItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusItem {
+    Messages,
+    Recent,
+    UidNext,
+    UidValidity,
+    Unseen,
+    HighestModSeq,
+    Size,
+}
+
+impl StatusItem {
+    fn parse(argument: &ImapArg) -> Result<Self, ParseError> {
+        match argument
+            .as_text()
+            .ok_or(ParseError::InvalidAtom)?
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "MESSAGES" => Ok(Self::Messages),
+            "RECENT" => Ok(Self::Recent),
+            "UIDNEXT" => Ok(Self::UidNext),
+            "UIDVALIDITY" => Ok(Self::UidValidity),
+            "UNSEEN" => Ok(Self::Unseen),
+            "HIGHESTMODSEQ" => Ok(Self::HighestModSeq),
+            "SIZE" => Ok(Self::Size),
+            _ => Err(ParseError::InvalidAtom),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusRequest {
+    pub(crate) mailbox: String,
+    pub(crate) items: Vec<StatusItem>,
+}
+
+fn parse_status_items(arguments: &[ImapArg]) -> Result<Vec<StatusItem>, ParseError> {
+    if arguments.is_empty() {
+        return Err(ParseError::UnexpectedEnd);
+    }
+    let mut items = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let item = StatusItem::parse(argument)?;
+        if items.contains(&item) {
+            return Err(ParseError::InvalidAtom);
+        }
+        items.push(item);
+    }
+    Ok(items)
+}
+
+pub(crate) fn parse_status_request(input: &str) -> Result<StatusRequest, ParseError> {
+    let arguments = parse_imap_args(input)?;
+    let [mailbox, ImapArg::List(items)] = arguments.as_slice() else {
+        return Err(ParseError::InvalidAtom);
+    };
+    Ok(StatusRequest {
+        mailbox: mailbox
+            .as_text()
+            .ok_or(ParseError::InvalidAtom)?
+            .to_string(),
+        items: parse_status_items(items)?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1769,13 +1835,7 @@ fn parse_list_return(items: &[ImapArg]) -> Result<ListReturnOptions, ParseError>
             "STATUS" => {
                 pos += 1;
                 let status_items = arg_list(items.get(pos).ok_or(ParseError::UnexpectedEnd)?)?;
-                out.status = status_items
-                    .iter()
-                    .map(arg_text)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .map(|item| item.to_ascii_uppercase())
-                    .collect();
+                out.status = parse_status_items(status_items)?;
             }
             _ => return Err(ParseError::InvalidAtom),
         }
@@ -2238,7 +2298,28 @@ mod tests {
         assert!(request.returns.children);
         assert_eq!(
             request.returns.status,
-            vec!["MESSAGES", "UIDNEXT", "UNSEEN"]
+            vec![
+                StatusItem::Messages,
+                StatusItem::UidNext,
+                StatusItem::Unseen
+            ]
         );
+        assert!(parse_list_request(r#""" "*" RETURN (STATUS (MESSAGES UNKNOWN))"#, false).is_err());
+
+        let status = parse_status_request("INBOX (MESSAGES UIDNEXT SIZE)").unwrap();
+        assert_eq!(status.mailbox, "INBOX");
+        assert_eq!(
+            status.items,
+            [StatusItem::Messages, StatusItem::UidNext, StatusItem::Size]
+        );
+        for invalid in [
+            "INBOX MESSAGES",
+            "INBOX ()",
+            "INBOX (UNKNOWN)",
+            "INBOX (MESSAGES MESSAGES)",
+            "INBOX (MESSAGES) trailing",
+        ] {
+            assert!(parse_status_request(invalid).is_err(), "accepted {invalid}");
+        }
     }
 }

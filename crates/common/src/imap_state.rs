@@ -37,6 +37,7 @@ pub struct FolderSummary {
     pub folder: Folder,
     pub messages: usize,
     pub unseen: usize,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -988,6 +989,7 @@ pub fn list_folder_summaries(
             folder,
             messages: messages.len(),
             unseen,
+            size: messages.iter().map(|message| message.size).sum(),
         });
     }
     Ok(summaries)
