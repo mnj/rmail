@@ -5731,30 +5731,20 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Check => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
+                let outcome = commands::session::check(tag);
                 let w = reader.get_mut();
-                let response = commands::basic::completed(tag, "CHECK").encode();
+                let response = outcome.response.encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Unselect => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
+                let outcome = commands::session::unselect(tag);
+                if outcome.selection_effect == commands::session::SelectionEffect::Clear {
+                    selected = None;
+                    session_state.selected_mailbox = None;
                 }
-                selected = None;
-                session_state.selected_mailbox = None;
                 let w = reader.get_mut();
-                let response = commands::basic::completed(tag, "UNSELECT").encode();
+                let response = outcome.response.encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
