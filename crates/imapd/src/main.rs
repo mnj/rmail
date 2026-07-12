@@ -23,7 +23,6 @@ mod thread;
 mod tls;
 use commands::authenticate::{
     ProtocolError as SaslProtocolError, read_response as read_sasl_wire_response,
-    run_password_exchange as run_password_sasl_exchange,
 };
 use mailbox::SelectedMailbox;
 use tls::load_tls_context;
@@ -5528,141 +5527,33 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
-                if mechanism == "LOGIN" {
-                    let mut exchange = auth::LoginExchange::default();
-                    let credentials = match run_password_sasl_exchange(
+                if mechanism == "PLAIN" || mechanism == "LOGIN" {
+                    let outcome = commands::authenticate::handle_password(
                         &mut reader,
-                        &mut exchange,
+                        tag,
+                        &mechanism,
                         initial_response.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(credentials) => credentials,
-                        Err(SaslProtocolError::Eof) => return Ok(()),
-                        Err(SaslProtocolError::Cancelled) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD AUTHENTICATE cancelled\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(SaslProtocolError::ResponseTooLarge) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD AUTHENTICATE response too large\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(SaslProtocolError::InvalidResponse) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD Invalid AUTHENTICATE LOGIN response\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let user = credentials.authcid;
-                    let pass = credentials.password;
-                    println!(
-                        "IMAP AUTHENTICATE LOGIN attempt peer={:?} encrypted={} user={:?} password_len={}",
+                        db_path.as_ref(),
                         peer,
-                        session_encrypted,
-                        user,
-                        pass.len()
-                    );
-                    match auth::verify_password(db_path.as_ref(), &user, &pass).await {
-                        auth::PasswordAuthResult::Success(mailbox) => {
-                            authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
-                            session_state.authenticated_mailbox = authed_mailbox.clone();
-                            if let Some(peer_addr) = peer {
-                                auth::reset_auth_failures(peer_addr.ip());
-                            }
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} OK AUTHENTICATE completed\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                        }
-                        auth::PasswordAuthResult::Rejected => {
-                            if let Some(peer_addr) = peer {
-                                auth::record_auth_failure(peer_addr.ip());
-                            }
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!(
-                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                    tag
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                        }
-                        auth::PasswordAuthResult::Unavailable { mailbox, message } => {
-                            if let Some(peer_addr) = peer {
-                                auth::record_auth_failure(peer_addr.ip());
-                            }
-                            eprintln!(
-                                "IMAP AUTHENTICATE LOGIN verify error peer={:?} mailbox={} err={}",
-                                peer,
-                                mailbox.as_ref().map(|m| m.address.as_str()).unwrap_or("-"),
-                                message
-                            );
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                        }
+                    )
+                    .await;
+                    if outcome.disconnected {
+                        return Ok(());
+                    }
+                    if let Some(mailbox) = outcome.authenticated_mailbox {
+                        authed_mailbox = Some(mailbox.clone());
+                        session_state.authenticated_mailbox = Some(mailbox);
+                    }
+                    if let Some(response) = outcome.response {
+                        let response = response.encode();
+                        log_imap_response(peer, tag, &cmd, &response);
+                        let w = reader.get_mut();
+                        w.write_all(response.as_bytes()).await?;
+                        w.flush().await?;
                     }
                     continue;
                 }
-                let plain_credentials = if mechanism == "PLAIN" {
-                    let mut exchange = auth::PlainExchange::default();
-                    match run_password_sasl_exchange(
-                        &mut reader,
-                        &mut exchange,
-                        initial_response.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(credentials) => Some(credentials),
-                        Err(SaslProtocolError::Eof) => return Ok(()),
-                        Err(error) => {
-                            let (status, message) = match error {
-                                SaslProtocolError::Cancelled => ("BAD", "AUTHENTICATE cancelled"),
-                                SaslProtocolError::ResponseTooLarge => {
-                                    ("BAD", "AUTHENTICATE response too large")
-                                }
-                                SaslProtocolError::InvalidResponse => {
-                                    ("BAD", "Invalid AUTHENTICATE PLAIN response")
-                                }
-                                SaslProtocolError::Eof => unreachable!(),
-                            };
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} {} {}\r\n", tag, status, message).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-                let response = if plain_credentials.is_some() {
-                    String::new()
-                } else if let Some(initial_response) = initial_response {
+                let response = if let Some(initial_response) = initial_response {
                     initial_response
                 } else {
                     {
@@ -6001,80 +5892,6 @@ async fn process_stream_inner(
                         }
                     }
                     continue;
-                }
-                let credentials = plain_credentials.expect("non-SCRAM mechanism is PLAIN");
-                let user = credentials.authcid;
-                if credentials.authzid.as_ref().is_some_and(|authzid| {
-                    common_auth::saslprep(authzid).to_ascii_lowercase()
-                        != common_auth::saslprep(&user).to_ascii_lowercase()
-                }) {
-                    if let Some(peer_addr) = peer {
-                        auth::record_auth_failure(peer_addr.ip());
-                    }
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} NO [AUTHORIZATIONFAILED] Authorization identity is not permitted\r\n",
-                            tag
-                        )
-                            .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let pass = credentials.password;
-                println!(
-                    "IMAP AUTHENTICATE PLAIN attempt peer={:?} encrypted={} user={:?} password_len={}",
-                    peer,
-                    session_encrypted,
-                    user,
-                    pass.len()
-                );
-                match auth::verify_password(db_path.as_ref(), &user, &pass).await {
-                    auth::PasswordAuthResult::Success(mailbox) => {
-                        authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
-                        session_state.authenticated_mailbox = authed_mailbox.clone();
-                        if let Some(peer_addr) = peer {
-                            auth::reset_auth_failures(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} OK AUTHENTICATE completed\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
-                    auth::PasswordAuthResult::Rejected => {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    auth::PasswordAuthResult::Unavailable { mailbox, message } => {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        eprintln!(
-                            "IMAP AUTHENTICATE PLAIN verify error peer={:?} mailbox={} err={}",
-                            peer,
-                            mailbox.as_ref().map(|m| m.address.as_str()).unwrap_or("-"),
-                            message
-                        );
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
                 }
             }
             parser::Command::Noop => {
