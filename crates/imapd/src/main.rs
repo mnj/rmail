@@ -6924,8 +6924,14 @@ async fn process_stream_inner(
             }
             parser::Command::Noop => {
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK NOOP completed\r\n", tag).as_bytes())
-                    .await?;
+                let response = response::Response::new()
+                    .status(response::StatusLine::tagged(
+                        tag,
+                        response::Status::Ok,
+                        "NOOP completed",
+                    ))
+                    .encode();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Check => {
@@ -6937,8 +6943,14 @@ async fn process_stream_inner(
                     continue;
                 }
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK CHECK completed\r\n", tag).as_bytes())
-                    .await?;
+                let response = response::Response::new()
+                    .status(response::StatusLine::tagged(
+                        tag,
+                        response::Status::Ok,
+                        "CHECK completed",
+                    ))
+                    .encode();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Unselect => {
@@ -6952,8 +6964,14 @@ async fn process_stream_inner(
                 selected = None;
                 session_state.selected_mailbox = None;
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK UNSELECT completed\r\n", tag).as_bytes())
-                    .await?;
+                let response = response::Response::new()
+                    .status(response::StatusLine::tagged(
+                        tag,
+                        response::Status::Ok,
+                        "UNSELECT completed",
+                    ))
+                    .encode();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Append => {
@@ -7001,7 +7019,10 @@ async fn process_stream_inner(
                 }
                 if !append_request.non_sync {
                     let w = reader.get_mut();
-                    w.write_all(b"+ Ready for literal data\r\n").await?;
+                    let response = response::Response::new()
+                        .continuation("Ready for literal data")
+                        .encode();
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 }
                 let mut literal = vec![0u8; append_request.literal_len];
@@ -7633,17 +7654,19 @@ async fn process_stream_inner(
                     let keys = fields.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
                     println!("IMAP ID peer={:?} field_keys={:?}", peer, keys);
                 }
-                let w = reader.get_mut();
-                w.write_all(
-                    format!(
-                        "* ID (\"name\" \"rMail\" \"vendor\" \"rMail\" \"version\" \"{}\")\r\n",
+                let response = response::Response::new()
+                    .data(format!(
+                        "ID (\"name\" \"rMail\" \"vendor\" \"rMail\" \"version\" \"{}\")",
                         env!("CARGO_PKG_VERSION")
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-                w.write_all(format!("{} OK ID completed\r\n", tag).as_bytes())
-                    .await?;
+                    ))
+                    .status(response::StatusLine::tagged(
+                        tag,
+                        response::Status::Ok,
+                        "ID completed",
+                    ))
+                    .encode();
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Select { .. } => {
@@ -7707,10 +7730,17 @@ async fn process_stream_inner(
                 .await??;
                 if !exists {
                     let w = reader.get_mut();
-                    w.write_all(
-                        format!("{} NO [NONEXISTENT] Mailbox does not exist\r\n", tag).as_bytes(),
-                    )
-                    .await?;
+                    let response = response::Response::new()
+                        .status(
+                            response::StatusLine::tagged(
+                                tag,
+                                response::Status::No,
+                                "Mailbox does not exist",
+                            )
+                            .with_code("NONEXISTENT"),
+                        )
+                        .encode();
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                     continue;
                 }
@@ -9233,19 +9263,32 @@ async fn process_stream_inner(
             }
             parser::Command::Logout => {
                 let w = reader.get_mut();
-                w.write_all(b"* BYE Logging out\r\n").await?;
-                w.flush().await?;
-                let w = reader.get_mut();
-                w.write_all(format!("{} OK LOGOUT completed\r\n", tag).as_bytes())
-                    .await?;
+                let response = response::Response::new()
+                    .status(response::StatusLine::untagged(
+                        response::Status::Bye,
+                        "Logging out",
+                    ))
+                    .status(response::StatusLine::tagged(
+                        tag,
+                        response::Status::Ok,
+                        "LOGOUT completed",
+                    ))
+                    .encode();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
                 break;
             }
             parser::Command::Unknown { .. } => {
                 log_unsupported_imap(peer, &selected, tag, &cmd, args);
                 let w = reader.get_mut();
-                w.write_all(format!("{} BAD Unknown or unimplemented command\r\n", tag).as_bytes())
-                    .await?;
+                let response = response::Response::new()
+                    .status(response::StatusLine::tagged(
+                        tag,
+                        response::Status::Bad,
+                        "Unknown or unimplemented command",
+                    ))
+                    .encode();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
         }
