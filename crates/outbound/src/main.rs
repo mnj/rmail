@@ -223,9 +223,10 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
         let line = std::str::from_utf8(&line)
             .map_err(|_| anyhow::anyhow!("SMTP reply is not valid ASCII/UTF-8"))?;
         full.push_str(&line);
-        let code = line[0..3]
-            .parse::<u16>()
-            .map_err(|_| anyhow::anyhow!("invalid SMTP reply code"))?;
+        let code = std::str::from_utf8(&line.as_bytes()[..3])
+            .ok()
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid SMTP reply code"))?;
         if !(200..=599).contains(&code) {
             anyhow::bail!("SMTP reply code is outside the valid range");
         }

@@ -332,6 +332,7 @@ enum DataReadResult {
     Complete(Vec<u8>),
     TooLarge,
     LineTooLong,
+    InvalidLineEnding,
     Timeout,
     Eof,
 }
@@ -353,8 +354,13 @@ async fn read_smtp_data<R: tokio::io::AsyncRead + Unpin>(
         if dline.len() > MAX_DATA_LINE_BYTES && failure.is_none() {
             failure = Some(DataReadResult::LineTooLong);
         }
-
-        while matches!(dline.last(), Some(b'\n' | b'\r')) {
+        let valid_line_ending = dline.ends_with(b"\r\n");
+        if !valid_line_ending && failure.is_none() {
+            failure = Some(DataReadResult::InvalidLineEnding);
+        }
+        if valid_line_ending {
+            dline.truncate(dline.len() - 2);
+        } else if dline.ends_with(b"\n") {
             dline.pop();
         }
 
@@ -1002,6 +1008,17 @@ async fn process_stream(
                         let w = reader.get_mut();
                         w.write_all(b"500 5.5.2 Line too long in data\r\n").await?;
                         w.flush().await?;
+                        rcpts.clear();
+                        mail_from = None;
+                        mail_from_seen = false;
+                        continue;
+                    }
+                    DataReadResult::InvalidLineEnding => {
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"554 5.6.0 DATA lines must end with CRLF\r\n")
+                            .await?;
+                        writer.flush().await?;
                         rcpts.clear();
                         mail_from = None;
                         mail_from_seen = false;
@@ -1967,6 +1984,25 @@ mod tests {
             .count();
         assert_eq!(line_too_long, 1);
         assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+    }
+
+    #[tokio::test]
+    async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization() {
+        let input = b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: bad\n\nbody\n.\nQUIT\r\n"
+            .to_vec();
+        let (responses, td) = run_session(input, 16 * 1024).await;
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.starts_with("554 5.6.0"))
+                .count(),
+            1
+        );
+        assert!(responses.iter().any(|response| response.starts_with("221 Bye")));
+        assert!(!td
+            .path()
+            .join("mail/example.test/user/Maildir/new")
+            .exists());
     }
 
     #[tokio::test]
