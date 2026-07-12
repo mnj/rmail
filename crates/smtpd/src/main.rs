@@ -460,6 +460,14 @@ async fn process_stream(
             }
             Ok(Ok(protocol::BoundedLine::Line(line))) => line,
         };
+        if !line.ends_with(b"\r\n") {
+            let writer = reader.get_mut();
+            writer
+                .write_all(b"500 5.5.2 Command line must end with CRLF\r\n")
+                .await?;
+            writer.flush().await?;
+            continue;
+        }
         let cmd = match std::str::from_utf8(&line) {
             Ok(line) => line.trim_end_matches(['\r', '\n']),
             Err(_) => {
@@ -1437,7 +1445,7 @@ async fn process_stream(
                     peer, session_encrypted, cmd
                 );
                 let w = reader.get_mut();
-                w.write_all(b"502 Command not implemented\r\n").await?;
+                w.write_all(b"500 5.5.2 Command unrecognized\r\n").await?;
                 w.flush().await?;
             }
         }
@@ -1925,10 +1933,40 @@ mod tests {
                 .iter()
                 .filter(|r| r.starts_with("501 5.5.2"))
                 .count(),
-            2
+            1
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("500 5.5.2 Command unrecognized"))
         );
         assert!(responses.iter().any(|r| r.starts_with("250 OK")));
         assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+    }
+
+    #[tokio::test]
+    async fn bare_lf_command_is_rejected_without_losing_following_crlf_commands() {
+        let (responses, _td) = run_session(
+            b"EHLO localhost\nEHLO localhost\r\nNOOP\r\nQUIT\r\n".to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("500 5.5.2 Command line must end with CRLF"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("250-Hello"))
+        );
+        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("221 Bye"))
+        );
     }
 
     #[tokio::test]

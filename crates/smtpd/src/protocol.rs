@@ -110,15 +110,6 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "EXPN" if !args.is_empty() => Command::Expn,
         "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "RSET" | "QUIT" | "STARTTLS" | "AUTH"
         | "VRFY" | "EXPN" => Command::BadSyntax,
-        _ if [
-            "HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "QUIT", "STARTTLS", "AUTH", "VRFY",
-            "EXPN",
-        ]
-        .iter()
-        .any(|known| verb_upper.starts_with(known)) =>
-        {
-            Command::BadSyntax
-        }
         _ => Command::Unknown,
     }
 }
@@ -434,6 +425,7 @@ mod tests {
     fn command_and_helo_grammar_reject_leading_space_missing_args_and_bad_domains() {
         assert_eq!(parse_command(" DATA"), Command::BadSyntax);
         assert_eq!(parse_command("VRFY"), Command::BadSyntax);
+        assert_eq!(parse_command("QUITzzz"), Command::Unknown);
         assert!(valid_helo_domain("mail.example.test"));
         assert!(valid_helo_domain("[IPv6:2001:db8::1]"));
         assert!(!valid_helo_domain("-bad.example"));
