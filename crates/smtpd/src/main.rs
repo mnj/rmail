@@ -548,7 +548,7 @@ async fn process_stream(
                     if !session_encrypted && tls_ctx.is_some() {
                         resp.push_str("250-STARTTLS\r\n");
                     }
-                    if session_encrypted && db_path.is_some() {
+                    if session_encrypted && db_path.is_some() && authenticated_user.is_none() {
                         resp.push_str(&format!(
                             "250-AUTH {}\r\n",
                             protocol::advertised_sasl_mechanisms(&security.smtp_sasl_mechanisms)
@@ -556,6 +556,8 @@ async fn process_stream(
                     }
                     resp.push_str(&format!("250-SIZE {}\r\n", MAX_MESSAGE_BYTES));
                     resp.push_str("250-8BITMIME\r\n");
+                    resp.push_str("250-PIPELINING\r\n");
+                    resp.push_str("250-SMTPUTF8\r\n");
                     resp.push_str("250 OK\r\n");
                 }
                 let w = reader.get_mut();
@@ -2087,7 +2089,17 @@ async fn process_stream(
             SmtpCommand::StartTls => {
                 println!("SMTP STARTTLS peer={:?}", peer);
                 // if we have an acceptor available, perform TLS handshake and continue inside TLS
-                if let Some(acceptor_ctx) = tls_ctx {
+                if let Some(acceptor_ctx) = tls_ctx.clone() {
+                    if !reader.buffer().is_empty() {
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(
+                                b"554 5.5.1 Client did not wait for STARTTLS reply before sending more data\r\n",
+                            )
+                            .await?;
+                        writer.flush().await?;
+                        continue;
+                    }
                     // Signal readiness and pause plain-text protocol processing while the TLS handshake occurs.
                     // After a successful accept, control is transferred to a new process_stream invocation
                     // running over the negotiated TLS stream with session_encrypted=true to indicate
@@ -2167,6 +2179,24 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, duplex};
     use tokio::net::UnixListener;
+
+    async fn read_until<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        needle: &str,
+    ) -> String {
+        let mut output = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read response");
+            if line.is_empty() {
+                return output;
+            }
+            output.push_str(&line);
+            if line.contains(needle) {
+                return output;
+            }
+        }
+    }
 
     fn setup_mailbox() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let td = tempfile::tempdir().expect("tempdir");
@@ -2468,6 +2498,50 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("221 Bye"))
         );
+    }
+
+    #[tokio::test]
+    async fn starttls_rejects_pipelined_plaintext_without_losing_commands() {
+        let (td, mail_root, db_path) = setup_mailbox();
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(
+                tokio_rustls::rustls::server::ResolvesServerCertUsingSni::new(),
+            ));
+        let tls_context = Arc::new(super::tls::TlsContext {
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+            server_end_point: vec![0; 32],
+        });
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(process_stream(
+            Box::new(server),
+            mail_root.to_string_lossy().to_string(),
+            Some(tls_context),
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            false,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+        ));
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        reader
+            .get_mut()
+            .write_all(b"EHLO localhost\r\nSTARTTLS\r\nNOOP\r\nQUIT\r\n")
+            .await
+            .expect("commands");
+        reader.get_mut().flush().await.expect("flush");
+        let ehlo = read_until(&mut reader, "250 OK").await;
+        assert!(ehlo.contains("STARTTLS"));
+        let rejection = read_until(&mut reader, "554 5.5.1").await;
+        assert!(rejection.contains("did not wait for STARTTLS reply"));
+        assert!(read_until(&mut reader, "250 OK").await.contains("250 OK"));
+        assert!(read_until(&mut reader, "221 Bye").await.contains("221 Bye"));
+        server_task.await.expect("join").expect("server");
+        drop(td);
     }
 
     #[tokio::test]

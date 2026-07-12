@@ -24,6 +24,39 @@ bun run build
 
 Deployment and packaging guidance lives in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
+## SMTP standards support
+
+rMail implements an ESMTP receiver and authenticated submission path with
+phase-aware `EHLO` extensions. SMTP commands are parsed through bounded
+streaming input, transaction and authentication state are validated before
+dispatch, and unsupported envelope extensions are rejected rather than
+silently accepted. The percentages use the same server-applicable engineering
+coverage methodology described in the IMAP section below; they are not formal
+certification results.
+
+| RFC | Feature | Estimated compliance | Remaining limitation |
+| --- | --- | ---: | --- |
+| RFC 5321 | SMTP transport and transactions | 90% | Core greeting, envelope, DATA, reset, sequencing, relay policy, limits, and recovery are implemented; exhaustive address grammar and external conformance testing remain. |
+| RFC 1869 | ESMTP framework | 95% | EHLO negotiation and extension parameters are implemented; no external conformance certification. |
+| RFC 1870 | `SIZE` | 100% | The fixed maximum is advertised and declared or received oversized messages are rejected while preserving stream synchronization. |
+| RFC 6152 | `8BITMIME` | 95% | Eight-bit message bodies and `BODY=7BIT`/`BODY=8BITMIME` are supported; exhaustive content corpus validation remains. |
+| RFC 2920 | `PIPELINING` | 100% | Command pipelining is supported with ordered replies and guarded STARTTLS transitions. |
+| RFC 3207 | `STARTTLS` | 90% | TLS upgrade, state reset, timeout, and plaintext-pipelining rejection are implemented; external conformance testing remains. |
+| RFC 4954 | SMTP AUTH | 80% | PLAIN, LOGIN, and SCRAM-SHA-256 are configurable and TLS-gated; the SASL dispatcher/continuation refactor is still in progress. |
+| RFC 4616 | SASL `PLAIN` | 90% | Initial and continuation forms are implemented under TLS; shared bounded exchange handling is still being consolidated. |
+| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 85% | Stored verifiers and proof validation are implemented; SMTP exchange handling still needs the shared SASL state-machine cleanup. |
+| RFC 6531 | `SMTPUTF8` | 85% | UTF-8 envelope addresses and message bytes are accepted and advertised; internationalized-domain normalization is not exhaustive. |
+| RFC 3463 | Enhanced status codes | 70% | Main policy, sequencing, size, scanner, and authentication failures use enhanced codes; some legacy replies still need conversion. |
+| RFC 3461 | Delivery Status Notifications | 0% | `DSN` is not advertised; `NOTIFY` and `ORCPT` are rejected. |
+| RFC 3030 | `CHUNKING`/`BINARYMIME` | 0% | Not implemented or advertised. |
+| RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
+| RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
+| RFC 7489 | DMARC policy | 80% | Alignment, policy outcomes, quarantine, and optional rejection are implemented; aggregate/forensic reporting is not implemented. |
+
+SMTP AUTH mechanisms are configured independently with
+`security.smtp_sasl_mechanisms`. OAuth mechanisms, DSN, CHUNKING, BINARYMIME,
+and REQUIRETLS are not currently advertised.
+
 ## IMAP standards support
 
 rMail advertises `IMAP4rev1` and implements the core mailbox, message, search,

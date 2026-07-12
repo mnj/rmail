@@ -163,15 +163,8 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Option<MailFromArgs> {
 pub(crate) fn parse_rcpt_to_args(args: &str) -> Option<String> {
     let (path, params) = parse_path_with_params(args, "TO:")?;
     let address = extract_address(path)?;
-    for parameter in params.split_whitespace() {
-        let uppercase = parameter.to_ascii_uppercase();
-        if !(uppercase == "NOTIFY=NEVER"
-            || uppercase.starts_with("NOTIFY=")
-            || uppercase.starts_with("ORCPT=")
-            || uppercase.starts_with('X'))
-        {
-            return None;
-        }
+    if !params.is_empty() {
+        return None;
     }
     Some(address)
 }
@@ -235,6 +228,7 @@ mod tests {
                 declared_size: Some(42),
             })
         );
+        assert!(parse_rcpt_to_args("TO:<a@b> NOTIFY=SUCCESS").is_none());
     }
 
     #[tokio::test]
