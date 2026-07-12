@@ -10,6 +10,7 @@ use argon2::{Argon2, PasswordVerifier};
 use base64::Engine;
 use password_hash::PasswordHash;
 
+use crate::db::Mailbox;
 use hmac::Hmac;
 use hmac::Mac;
 use hmac::digest::KeyInit;
@@ -38,6 +39,67 @@ pub fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bo
     match argon2.verify_password(password.as_bytes(), &parsed) {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
+    }
+}
+
+pub enum PasswordAuthResult {
+    Success(Mailbox),
+    Rejected,
+    Unavailable {
+        mailbox: Option<Mailbox>,
+        message: String,
+    },
+}
+
+pub async fn lookup_mailbox(
+    db_path: Option<&String>,
+    user: &str,
+) -> Result<Option<Mailbox>, String> {
+    let Some(db_path) = db_path else {
+        return Err("authentication database is not configured".to_string());
+    };
+    let user = saslprep(user).to_ascii_lowercase();
+    let db_path = db_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if user.contains('@') {
+            crate::db::get_mailbox(db_path, &user)
+        } else {
+            crate::db::find_mailbox_by_localpart(db_path, &user)
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(mailbox)) => Ok(mailbox),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub async fn authenticate_password(
+    db_path: Option<&String>,
+    user: &str,
+    password: &str,
+) -> PasswordAuthResult {
+    let mailbox = match lookup_mailbox(db_path, user).await {
+        Ok(Some(mailbox)) => mailbox,
+        Ok(None) => return PasswordAuthResult::Rejected,
+        Err(message) => {
+            return PasswordAuthResult::Unavailable {
+                mailbox: None,
+                message,
+            };
+        }
+    };
+    let Some(hash) = mailbox.password_hash.as_ref() else {
+        return PasswordAuthResult::Rejected;
+    };
+    match verify_password(password, hash) {
+        Ok(true) => PasswordAuthResult::Success(mailbox),
+        Ok(false) => PasswordAuthResult::Rejected,
+        Err(error) => PasswordAuthResult::Unavailable {
+            mailbox: Some(mailbox),
+            message: error.to_string(),
+        },
     }
 }
 

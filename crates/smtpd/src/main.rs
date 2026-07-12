@@ -17,7 +17,9 @@ use rmail_common::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
+mod protocol;
 mod tls;
+use protocol::{Command as SmtpCommand, parse_command, parse_mail_from_args, parse_rcpt_to_args};
 use rand::RngCore;
 use tls::load_tls_context;
 
@@ -308,139 +310,9 @@ async fn run_smtps_listener(
     }
 }
 
-// function to extract address
-fn extract_addr(s: &str) -> Option<String> {
-    let s = s.trim();
-    let s = s.trim_matches(|c| c == '<' || c == '>' || c == ' ');
-    if s.contains('@') {
-        Some(s.to_ascii_lowercase())
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 fn parse_mail_from_arg(cmd: &str) -> Option<Option<String>> {
     parse_mail_from_args(cmd.strip_prefix("MAIL")?.trim_start()).map(|parsed| parsed.sender)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct MailFromArgs {
-    sender: Option<String>,
-    declared_size: Option<usize>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SmtpCommand<'a> {
-    Helo(&'a str),
-    Ehlo(&'a str),
-    Mail(&'a str),
-    Rcpt(&'a str),
-    Data,
-    Rset,
-    Noop,
-    Quit,
-    StartTls,
-    Auth(&'a str),
-    Vrfy,
-    Expn,
-    Unknown,
-    BadSyntax,
-}
-
-fn parse_command(cmd: &str) -> SmtpCommand<'_> {
-    let trimmed = cmd.trim();
-    let (verb, args) = match trimmed.split_once(|c: char| c == ' ' || c == '\t') {
-        Some((verb, rest)) => (verb, rest.trim_start()),
-        None => (trimmed, ""),
-    };
-    let verb_upper = verb.to_ascii_uppercase();
-    match verb_upper.as_str() {
-        "HELO" if !args.is_empty() => SmtpCommand::Helo(args),
-        "EHLO" if !args.is_empty() => SmtpCommand::Ehlo(args),
-        "MAIL" if !args.is_empty() => SmtpCommand::Mail(args),
-        "RCPT" if !args.is_empty() => SmtpCommand::Rcpt(args),
-        "DATA" if args.is_empty() => SmtpCommand::Data,
-        "RSET" if args.is_empty() => SmtpCommand::Rset,
-        "NOOP" => SmtpCommand::Noop,
-        "QUIT" if args.is_empty() => SmtpCommand::Quit,
-        "STARTTLS" if args.is_empty() => SmtpCommand::StartTls,
-        "AUTH" if !args.is_empty() => SmtpCommand::Auth(args),
-        "VRFY" => SmtpCommand::Vrfy,
-        "EXPN" => SmtpCommand::Expn,
-        "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "RSET" | "QUIT" | "STARTTLS" | "AUTH" => {
-            SmtpCommand::BadSyntax
-        }
-        _ if [
-            "HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "QUIT", "STARTTLS", "AUTH",
-        ]
-        .iter()
-        .any(|known| verb_upper.starts_with(known)) =>
-        {
-            SmtpCommand::BadSyntax
-        }
-        _ => SmtpCommand::Unknown,
-    }
-}
-
-fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
-    let trimmed = args.trim_start();
-    let prefix_len = keyword.len();
-    if trimmed.len() < prefix_len || !trimmed[..prefix_len].eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    let mut rest = trimmed[prefix_len..].trim_start();
-    if !rest.starts_with('<') {
-        return None;
-    }
-    let end = rest.find('>')?;
-    let path = &rest[..=end];
-    rest = rest[end + 1..].trim_start();
-    Some((path, rest))
-}
-
-fn parse_mail_from_args(args: &str) -> Option<MailFromArgs> {
-    let (path, params) = parse_path_with_params(args, "FROM:")?;
-    let sender = if path == "<>" {
-        None
-    } else {
-        extract_addr(path).map(Some)?
-    };
-    let mut declared_size = None;
-    for param in params.split_whitespace() {
-        if let Some(size) = param
-            .strip_prefix("SIZE=")
-            .or_else(|| param.strip_prefix("size="))
-        {
-            declared_size = Some(size.parse().ok()?);
-        } else if param.eq_ignore_ascii_case("BODY=7BIT")
-            || param.eq_ignore_ascii_case("BODY=8BITMIME")
-            || param.eq_ignore_ascii_case("SMTPUTF8")
-        {
-            continue;
-        } else {
-            return None;
-        }
-    }
-    Some(MailFromArgs {
-        sender,
-        declared_size,
-    })
-}
-
-fn parse_rcpt_to_args(args: &str) -> Option<String> {
-    let (path, params) = parse_path_with_params(args, "TO:")?;
-    let addr = extract_addr(path)?;
-    for param in params.split_whitespace() {
-        let ok = param.eq_ignore_ascii_case("NOTIFY=NEVER")
-            || param.to_ascii_uppercase().starts_with("NOTIFY=")
-            || param.to_ascii_uppercase().starts_with("ORCPT=")
-            || param.to_ascii_uppercase().starts_with("X");
-        if !ok {
-            return None;
-        }
-    }
-    Some(addr)
 }
 
 async fn timed_read_line<R: tokio::io::AsyncRead + Unpin>(
@@ -574,6 +446,7 @@ async fn process_stream(
     // track authenticated identity when AUTH is used (local mailbox address)
     let mut authenticated_user: Option<String> = None;
     let mut helo_name: Option<String> = None;
+    let mut extended_smtp = false;
 
     loop {
         line.clear();
@@ -619,6 +492,23 @@ async fn process_stream(
             rcpts.len()
         );
 
+        if let Some(reply) = protocol::preflight(
+            &parsed_command,
+            protocol::SessionContext {
+                greeted: helo_name.is_some(),
+                extended_smtp,
+                encrypted: session_encrypted,
+                authenticated: authenticated_user.is_some(),
+                transaction_active: mail_from_seen,
+                recipients: rcpts.len(),
+            },
+        ) {
+            let writer = reader.get_mut();
+            writer.write_all(reply).await?;
+            writer.flush().await?;
+            continue;
+        }
+
         match parsed_command {
             SmtpCommand::Helo(name) | SmtpCommand::Ehlo(name) => {
                 let is_ehlo = matches!(parsed_command, SmtpCommand::Ehlo(_));
@@ -628,6 +518,7 @@ async fn process_stream(
                     if is_ehlo { "EHLO" } else { "HELO" }
                 );
                 helo_name = Some(name.to_string());
+                extended_smtp = is_ehlo;
                 let mut resp = if is_ehlo {
                     String::from("250-Hello\r\n")
                 } else {
@@ -2509,6 +2400,32 @@ mod tests {
         );
         assert!(responses.iter().any(|r| r.starts_with("250 OK")));
         assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+    }
+
+    #[tokio::test]
+    async fn command_preflight_enforces_greeting_transaction_and_auth_order() {
+        let (responses, _td) = run_session(
+            b"MAIL FROM:<user@example.test>\r\nSTARTTLS\r\nEHLO localhost\r\nMAIL FROM:<user@example.test>\r\nAUTH PLAIN =\r\nRSET\r\nAUTH PLAIN =\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("503 5.5.1 Send HELO/EHLO first"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("503 5.5.1 Send EHLO before STARTTLS"))
+        );
+        assert!(responses.iter().any(|response| response
+            .starts_with("503 5.5.1 AUTH not permitted during a mail transaction")));
+        assert!(responses
+            .iter()
+            .any(|response| response.starts_with("538 5.7.11 Encryption required")));
+        assert!(responses.iter().any(|response| response.starts_with("221 Bye")));
     }
 
     #[tokio::test]

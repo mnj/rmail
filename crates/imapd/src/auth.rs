@@ -2,7 +2,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use once_cell::sync::Lazy;
 use rand::RngCore;
-use rmail_common::db::Mailbox;
 use std::{
     collections::HashMap,
     net::IpAddr,
@@ -156,65 +155,14 @@ pub(crate) fn reset_auth_failures(ip: IpAddr) {
     m.remove(&ip);
 }
 
-pub(crate) enum PasswordAuthResult {
-    Success(Mailbox),
-    Rejected,
-    Unavailable {
-        mailbox: Option<Mailbox>,
-        message: String,
-    },
-}
-
-pub(crate) async fn lookup_mailbox(
-    db_path: Option<&String>,
-    user: &str,
-) -> Result<Option<Mailbox>, String> {
-    let Some(db_path) = db_path else {
-        return Err("authentication database is not configured".to_string());
-    };
-    let user = rmail_common::auth::saslprep(user).to_ascii_lowercase();
-    let db_path = db_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        if user.contains('@') {
-            rmail_common::db::get_mailbox(db_path, &user)
-        } else {
-            rmail_common::db::find_mailbox_by_localpart(db_path, &user)
-        }
-    })
-    .await;
-    match result {
-        Ok(Ok(mailbox)) => Ok(mailbox),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(error) => Err(error.to_string()),
-    }
-}
+pub(crate) use rmail_common::auth::{PasswordAuthResult, lookup_mailbox};
 
 pub(crate) async fn verify_password(
     db_path: Option<&String>,
     user: &str,
     password: &str,
 ) -> PasswordAuthResult {
-    let mailbox = match lookup_mailbox(db_path, user).await {
-        Ok(Some(mailbox)) => mailbox,
-        Ok(None) => return PasswordAuthResult::Rejected,
-        Err(message) => {
-            return PasswordAuthResult::Unavailable {
-                mailbox: None,
-                message,
-            };
-        }
-    };
-    let Some(hash) = mailbox.password_hash.as_ref() else {
-        return PasswordAuthResult::Rejected;
-    };
-    match rmail_common::auth::verify_password(password, hash) {
-        Ok(true) => PasswordAuthResult::Success(mailbox),
-        Ok(false) => PasswordAuthResult::Rejected,
-        Err(error) => PasswordAuthResult::Unavailable {
-            mailbox: Some(mailbox),
-            message: error.to_string(),
-        },
-    }
+    rmail_common::auth::authenticate_password(db_path, user, password).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
