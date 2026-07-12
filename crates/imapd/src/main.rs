@@ -313,6 +313,7 @@ mod tests {
     use async_compression::tokio::bufread::ZlibDecoder;
     use async_compression::tokio::write::ZlibEncoder;
     use base64::Engine;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
 
@@ -490,6 +491,21 @@ mod tests {
     #[test]
     fn capability_advertises_starttls_and_login_policy() {
         let plain_caps = capability_tokens(CapabilityPhase::NotAuthenticatedPlain, false);
+        let plain_tokens = plain_caps.split_ascii_whitespace().collect::<HashSet<_>>();
+        assert_eq!(
+            plain_tokens,
+            HashSet::from([
+                "IMAP4rev1",
+                "ID",
+                "ENABLE",
+                "IDLE",
+                "SASL-IR",
+                "LITERAL+",
+                "LITERAL-",
+                "LOGINDISABLED",
+                "AUTH=SCRAM-SHA-256",
+            ])
+        );
         assert!(plain_caps.contains("LOGINDISABLED"));
         assert!(plain_caps.contains("SASL-IR"));
         assert!(plain_caps.contains("ENABLE"));
@@ -524,6 +540,50 @@ mod tests {
         assert!(tls_binding_caps.contains("AUTH=SCRAM-SHA-256-PLUS"));
 
         let authenticated = capability_tokens(CapabilityPhase::Authenticated, false);
+        let authenticated_tokens = authenticated
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            authenticated_tokens,
+            HashSet::from([
+                "IMAP4rev1",
+                "ID",
+                "ENABLE",
+                "IDLE",
+                "SASL-IR",
+                "LITERAL+",
+                "LITERAL-",
+                "UIDPLUS",
+                "NAMESPACE",
+                "SPECIAL-USE",
+                "LIST-EXTENDED",
+                "CHILDREN",
+                "LIST-STATUS",
+                "CONDSTORE",
+                "QRESYNC",
+                "ESEARCH",
+                "SEARCHRES",
+                "SORT",
+                "THREAD=ORDEREDSUBJECT",
+                "THREAD=REFERENCES",
+                "THREAD=REFS",
+                "WITHIN",
+                "STATUS=SIZE",
+                "SAVEDATE",
+                "BINARY",
+                "UTF8=ACCEPT",
+                "COMPRESS=DEFLATE",
+                "MOVE",
+                "UNSELECT",
+            ])
+        );
+        assert!(
+            !authenticated_tokens.contains("QRESYNC") || authenticated_tokens.contains("CONDSTORE")
+        );
+        assert!(
+            !authenticated_tokens.contains("LIST-STATUS")
+                || authenticated_tokens.contains("LIST-EXTENDED")
+        );
         assert!(authenticated.contains("UIDPLUS"));
         assert!(authenticated.contains("CONDSTORE"));
         assert!(authenticated.contains("UNSELECT"));
