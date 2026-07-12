@@ -102,6 +102,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             internaldate_tz INTEGER NOT NULL DEFAULT 0,
             save_date INTEGER NOT NULL DEFAULT 0,
             modseq INTEGER NOT NULL DEFAULT 1,
+            recent INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_folder_filename
@@ -136,6 +137,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
     add_column_if_missing(conn, "messages", "modseq", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "messages", "recent", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(
         conn,
         "messages",
@@ -496,6 +498,52 @@ pub fn folder_exists(
     let conn = open_account(maildir_root, domain, localpart)?;
     Ok(folder_id(&conn, &name)?.is_some()
         && mailbox_dir(maildir_root, domain, localpart, &name)?.is_dir())
+}
+
+pub fn claim_recent_uids(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+) -> Result<Vec<u64>> {
+    let name = normalize_mailbox_name(mailbox)?;
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    let tx = conn.transaction()?;
+    let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
+    let uids = {
+        let mut statement = tx.prepare(
+            "SELECT uid FROM messages WHERE folder_id = ?1 AND recent != 0 ORDER BY uid",
+        )?;
+        statement
+            .query_map(params![folder_id], |row| row.get::<_, i64>(0))?
+            .map(|uid| uid.map(|uid| uid as u64))
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute(
+        "UPDATE messages SET recent = 0 WHERE folder_id = ?1 AND recent != 0",
+        params![folder_id],
+    )?;
+    tx.commit()?;
+    Ok(uids)
+}
+
+pub fn recent_count(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+) -> Result<usize> {
+    let name = normalize_mailbox_name(mailbox)?;
+    let conn = open_account(maildir_root, domain, localpart)?;
+    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    let folder_id = folder_id(&conn, &name)?.context("missing folder")?;
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND recent != 0",
+        params![folder_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count as usize)
 }
 
 pub fn load_folder(
@@ -1469,8 +1517,8 @@ fn reconcile_folder(
             allocatable_uid(uidnext)?;
             let modseq = next_modseq(conn, folder_id)?;
             conn.execute(
-                "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, save_date, modseq)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, save_date, modseq, recent)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     folder_id,
                     filename,
@@ -1481,6 +1529,7 @@ fn reconcile_folder(
                     internaldate,
                     internaldate,
                     modseq as i64
+                    ,i64::from(subdir == "new")
                 ],
             )?;
             conn.execute(
@@ -1574,6 +1623,49 @@ mod tests {
         assert_eq!(folders.len(), STANDARD_FOLDERS.len());
         assert!(folders.iter().any(|f| f.name == "INBOX"));
         assert!(state_db_path(td.path(), "example.test", "user").is_file());
+    }
+
+    #[test]
+    fn recent_uids_are_external_delivery_only_and_claimed_once() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let (_, appended_uid) = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"Subject: appended\r\n\r\nbody",
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            recent_count(td.path(), "example.test", "user", "INBOX").unwrap(),
+            0
+        );
+
+        let inbox = mailbox_dir(td.path(), "example.test", "user", "INBOX").unwrap();
+        write_msg(
+            &inbox,
+            "external-delivery",
+            b"Subject: delivered\r\n\r\nbody",
+        );
+        assert_eq!(
+            recent_count(td.path(), "example.test", "user", "INBOX").unwrap(),
+            1
+        );
+
+        let claimed = claim_recent_uids(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(!claimed.contains(&appended_uid));
+        assert!(
+            claim_recent_uids(td.path(), "example.test", "user", "INBOX")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            recent_count(td.path(), "example.test", "user", "INBOX").unwrap(),
+            0
+        );
     }
 
     #[test]
