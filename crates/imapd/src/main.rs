@@ -5159,78 +5159,6 @@ fn generate_scram_nonce() -> String {
     auth::generate_scram_nonce()
 }
 
-enum PasswordAuthResult {
-    Success(Mailbox),
-    NoSuchUser,
-    NoPassword,
-    BadPassword(Mailbox),
-    Error {
-        mailbox: Option<Mailbox>,
-        message: String,
-    },
-}
-
-async fn lookup_mailbox_for_auth(db_path: Option<&String>, user: &str) -> Option<Mailbox> {
-    let db_path = db_path?;
-    let user_lookup = common_auth::saslprep(user).to_ascii_lowercase();
-    if user_lookup.contains('@') {
-        let dbp = db_path.clone();
-        match tokio::task::spawn_blocking(move || rmail_common::db::get_mailbox(dbp, &user_lookup))
-            .await
-        {
-            Ok(Ok(Some(mailbox))) => Some(mailbox),
-            Ok(Ok(None)) => None,
-            Ok(Err(e)) => {
-                eprintln!("db get_mailbox error: {}", e);
-                None
-            }
-            Err(e) => {
-                eprintln!("db task join error: {}", e);
-                None
-            }
-        }
-    } else {
-        let dbp = db_path.clone();
-        match tokio::task::spawn_blocking(move || {
-            rmail_common::db::find_mailbox_by_localpart(dbp, &user_lookup)
-        })
-        .await
-        {
-            Ok(Ok(Some(mailbox))) => Some(mailbox),
-            Ok(Ok(None)) => None,
-            Ok(Err(e)) => {
-                eprintln!("db find_mailbox_by_localpart error: {}", e);
-                None
-            }
-            Err(e) => {
-                eprintln!("db task join error: {}", e);
-                None
-            }
-        }
-    }
-}
-
-async fn authenticate_password(
-    db_path: Option<&String>,
-    user: &str,
-    password: &str,
-) -> PasswordAuthResult {
-    let Some(mailbox) = lookup_mailbox_for_auth(db_path, user).await else {
-        return PasswordAuthResult::NoSuchUser;
-    };
-    let Some(hash) = mailbox.password_hash.as_ref() else {
-        return PasswordAuthResult::NoPassword;
-    };
-    match common_auth::verify_password(password, hash) {
-        Ok(true) => PasswordAuthResult::Success(mailbox),
-        Ok(false) => PasswordAuthResult::BadPassword(mailbox),
-        Err(e) => PasswordAuthResult::Error {
-            mailbox: Some(mailbox),
-            message: e.to_string(),
-        },
-    }
-}
-
 async fn sync_selected_mailbox(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     mail_root: &str,
@@ -5578,145 +5506,16 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Login => {
-                // Rate-limiting: block repeated failures per remote IP
-                if let Some(peer_addr) = peer {
-                    if let Some(rem) = auth::auth_block_remaining(peer_addr.ip()) {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO Too many failed auth attempts; try again in {}s\r\n",
-                                tag,
-                                rem.as_secs()
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
+                let outcome = commands::login::handle(tag, args, db_path.as_ref(), peer).await;
+                if let Some(mailbox) = outcome.authenticated_mailbox {
+                    authed_mailbox = Some(mailbox.clone());
+                    session_state.authenticated_mailbox = Some(mailbox);
                 }
-                // Require an encrypted session for LOGIN to avoid sending cleartext passwords
-                if !session_encrypted {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} NO [PRIVACYREQUIRED] Encryption required for authentication\r\n",
-                            tag
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let (user, pass) = match parser::parse_login_args(args) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid LOGIN arguments: {:?}\r\n", tag, err)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                println!(
-                    "IMAP LOGIN attempt peer={:?} encrypted={} user={:?} password_len={}",
-                    peer,
-                    session_encrypted,
-                    user,
-                    pass.len()
-                );
-                match authenticate_password(db_path.as_ref(), &user, &pass).await {
-                    PasswordAuthResult::Success(mailbox) => {
-                        authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
-                        session_state.authenticated_mailbox = authed_mailbox.clone();
-                        println!(
-                            "IMAP LOGIN success peer={:?} mailbox={}",
-                            peer, mailbox.address
-                        );
-                        if let Some(peer_addr) = peer {
-                            auth::reset_auth_failures(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        let response = format!("{} OK LOGIN completed\r\n", tag);
-                        log_imap_response(peer, tag, &cmd, &response);
-                        w.write_all(response.as_bytes()).await?;
-                        w.flush().await?;
-                    }
-                    PasswordAuthResult::NoSuchUser => {
-                        println!(
-                            "IMAP LOGIN user lookup failed peer={:?} user={:?}",
-                            peer, user
-                        );
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    PasswordAuthResult::NoPassword => {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    PasswordAuthResult::BadPassword(mailbox) => {
-                        println!(
-                            "IMAP LOGIN bad password peer={:?} mailbox={}",
-                            peer, mailbox.address
-                        );
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    PasswordAuthResult::Error { mailbox, message } => {
-                        eprintln!(
-                            "IMAP LOGIN auth verify error peer={:?} mailbox={} err={}",
-                            peer,
-                            mailbox.as_ref().map(|m| m.address.as_str()).unwrap_or("-"),
-                            message
-                        );
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
             }
             parser::Command::Authenticate => {
                 let (mechanism, initial_response) = match parser::parse_authenticate_args(args) {
@@ -5833,8 +5632,8 @@ async fn process_stream_inner(
                         user,
                         pass.len()
                     );
-                    match authenticate_password(db_path.as_ref(), &user, &pass).await {
-                        PasswordAuthResult::Success(mailbox) => {
+                    match auth::verify_password(db_path.as_ref(), &user, &pass).await {
+                        auth::PasswordAuthResult::Success(mailbox) => {
                             authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
                             session_state.authenticated_mailbox = authed_mailbox.clone();
                             if let Some(peer_addr) = peer {
@@ -5847,7 +5646,7 @@ async fn process_stream_inner(
                             .await?;
                             w.flush().await?;
                         }
-                        PasswordAuthResult::NoSuchUser | PasswordAuthResult::BadPassword(_) => {
+                        auth::PasswordAuthResult::Rejected => {
                             if let Some(peer_addr) = peer {
                                 auth::record_auth_failure(peer_addr.ip());
                             }
@@ -5862,22 +5661,7 @@ async fn process_stream_inner(
                             .await?;
                             w.flush().await?;
                         }
-                        PasswordAuthResult::NoPassword => {
-                            if let Some(peer_addr) = peer {
-                                auth::record_auth_failure(peer_addr.ip());
-                            }
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!(
-                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                    tag
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                        }
-                        PasswordAuthResult::Error { mailbox, message } => {
+                        auth::PasswordAuthResult::Unavailable { mailbox, message } => {
                             if let Some(peer_addr) = peer {
                                 auth::record_auth_failure(peer_addr.ip());
                             }
@@ -6301,8 +6085,8 @@ async fn process_stream_inner(
                     user,
                     pass.len()
                 );
-                match authenticate_password(db_path.as_ref(), &user, &pass).await {
-                    PasswordAuthResult::Success(mailbox) => {
+                match auth::verify_password(db_path.as_ref(), &user, &pass).await {
+                    auth::PasswordAuthResult::Success(mailbox) => {
                         authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
                         session_state.authenticated_mailbox = authed_mailbox.clone();
                         if let Some(peer_addr) = peer {
@@ -6313,7 +6097,7 @@ async fn process_stream_inner(
                             .await?;
                         w.flush().await?;
                     }
-                    PasswordAuthResult::NoSuchUser | PasswordAuthResult::BadPassword(_) => {
+                    auth::PasswordAuthResult::Rejected => {
                         if let Some(peer_addr) = peer {
                             auth::record_auth_failure(peer_addr.ip());
                         }
@@ -6328,22 +6112,7 @@ async fn process_stream_inner(
                         .await?;
                         w.flush().await?;
                     }
-                    PasswordAuthResult::NoPassword => {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    PasswordAuthResult::Error { mailbox, message } => {
+                    auth::PasswordAuthResult::Unavailable { mailbox, message } => {
                         if let Some(peer_addr) = peer {
                             auth::record_auth_failure(peer_addr.ip());
                         }

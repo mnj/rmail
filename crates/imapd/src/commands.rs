@@ -341,6 +341,7 @@ pub(crate) mod expunge;
 pub(crate) mod fetch;
 pub(crate) mod idle;
 pub(crate) mod list;
+pub(crate) mod login;
 pub(crate) mod mailboxes;
 pub(crate) mod search;
 pub(crate) mod select;
