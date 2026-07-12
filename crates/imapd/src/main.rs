@@ -2354,7 +2354,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 IDLE\r\nDONE\r\nA004 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 IDLE\r\n",
             )
             .await
             .expect("write commands");
@@ -2364,6 +2364,19 @@ mod tests {
         let _select_lines = read_until_contains(&mut reader, "A002 OK").await;
         let idle_start = read_until_contains(&mut reader, "+ idling").await;
         assert!(idle_start.iter().any(|line| line.contains("+ idling")));
+        reader
+            .get_mut()
+            .write_all(b"DO")
+            .await
+            .expect("partial done");
+        reader.get_mut().flush().await.expect("flush partial done");
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        reader
+            .get_mut()
+            .write_all(b"NE\r\nA004 LOGOUT\r\n")
+            .await
+            .expect("finish done and logout");
+        reader.get_mut().flush().await.expect("flush done");
         let idle_done = read_until_contains(&mut reader, "A003 OK").await;
         assert!(idle_done.iter().any(|line| line.contains("IDLE completed")));
         let _logout_lines = read_until_contains(&mut reader, "A004 OK").await;
@@ -7030,68 +7043,17 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Idle => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                sync_selected_mailbox(
+                let outcome = commands::idle::handle(
                     &mut reader,
+                    tag,
                     &mail_root,
                     &mut selected,
                     session_state.feature_enabled("QRESYNC"),
                 )
                 .await?;
-                let idle_tag = tag.to_string();
-                let w = reader.get_mut();
-                w.write_all(b"+ idling\r\n").await?;
-                w.flush().await?;
-                let mut idle_line = String::new();
-                let mut idle_bad = false;
-                loop {
-                    idle_line.clear();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        reader.read_line(&mut idle_line),
-                    )
-                    .await
-                    {
-                        Ok(Ok(0)) => return Ok(()),
-                        Ok(Ok(_)) => {
-                            if idle_line
-                                .trim_end_matches("\r\n")
-                                .eq_ignore_ascii_case("DONE")
-                            {
-                                break;
-                            }
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} BAD Expected DONE\r\n", idle_tag).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            idle_bad = true;
-                            break;
-                        }
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(_) => {
-                            sync_selected_mailbox(
-                                &mut reader,
-                                &mail_root,
-                                &mut selected,
-                                session_state.feature_enabled("QRESYNC"),
-                            )
-                            .await?;
-                        }
-                    }
+                if outcome == commands::idle::Outcome::Disconnected {
+                    return Ok(());
                 }
-                if idle_bad {
-                    continue;
-                }
-                let w = reader.get_mut();
-                w.write_all(format!("{} OK IDLE completed\r\n", idle_tag).as_bytes())
-                    .await?;
-                w.flush().await?;
             }
             parser::Command::Logout => {
                 let w = reader.get_mut();
