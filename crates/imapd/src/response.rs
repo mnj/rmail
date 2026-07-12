@@ -245,20 +245,6 @@ pub(crate) fn greeting(capabilities: &str) -> String {
         .encode()
 }
 
-pub(crate) fn capability_response(tag: &str, capabilities: &str) -> String {
-    Response::new()
-        .data(format!("CAPABILITY {capabilities}"))
-        .status(StatusLine::tagged(tag, Status::Ok, "CAPABILITY completed"))
-        .encode()
-}
-
-pub(crate) fn namespace_response(tag: &str) -> String {
-    Response::new()
-        .data("NAMESPACE ((\"\" \"/\")) NIL NIL")
-        .status(StatusLine::tagged(tag, Status::Ok, "NAMESPACE completed"))
-        .encode()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6088,7 +6088,7 @@ async fn process_stream_inner(
                     tls_ctx.is_some(),
                     auth_policy.as_ref(),
                 );
-                let response = response::capability_response(tag, &caps);
+                let response = commands::basic::capability(tag, &caps).encode();
                 log_imap_response(peer, tag, &cmd, &response);
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
@@ -6924,13 +6924,7 @@ async fn process_stream_inner(
             }
             parser::Command::Noop => {
                 let w = reader.get_mut();
-                let response = response::Response::new()
-                    .status(response::StatusLine::tagged(
-                        tag,
-                        response::Status::Ok,
-                        "NOOP completed",
-                    ))
-                    .encode();
+                let response = commands::basic::completed(tag, "NOOP").encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
@@ -6943,13 +6937,7 @@ async fn process_stream_inner(
                     continue;
                 }
                 let w = reader.get_mut();
-                let response = response::Response::new()
-                    .status(response::StatusLine::tagged(
-                        tag,
-                        response::Status::Ok,
-                        "CHECK completed",
-                    ))
-                    .encode();
+                let response = commands::basic::completed(tag, "CHECK").encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
@@ -6964,13 +6952,7 @@ async fn process_stream_inner(
                 selected = None;
                 session_state.selected_mailbox = None;
                 let w = reader.get_mut();
-                let response = response::Response::new()
-                    .status(response::StatusLine::tagged(
-                        tag,
-                        response::Status::Ok,
-                        "UNSELECT completed",
-                    ))
-                    .encode();
+                let response = commands::basic::completed(tag, "UNSELECT").encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
@@ -7300,61 +7282,36 @@ async fn process_stream_inner(
             parser::Command::Namespace => {
                 println!("IMAP NAMESPACE peer={:?}", peer);
                 let w = reader.get_mut();
-                let response = response::namespace_response(tag);
+                let response = commands::basic::namespace(tag).encode();
                 log_imap_response(peer, tag, &cmd, &response);
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Enable => {
-                let args = match parser::parse_imap_args(args) {
-                    Ok(args) => args,
+                let response = match commands::enable::handle(
+                    tag,
+                    args,
+                    &mut session_state,
+                    selected.as_ref().map(|mailbox| mailbox.highest_modseq),
+                ) {
+                    Ok(response) => response.encode(),
                     Err(err) => {
                         let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid ENABLE arguments: {:?}\r\n", tag, err)
-                                .as_bytes(),
-                        )
-                        .await?;
+                        let response = response::Response::new()
+                            .status(response::StatusLine::tagged(
+                                tag,
+                                response::Status::Bad,
+                                format!("Invalid ENABLE arguments: {err:?}"),
+                            ))
+                            .encode();
+                        w.write_all(response.as_bytes()).await?;
                         w.flush().await?;
                         continue;
                     }
                 };
-                let mut newly_enabled = Vec::new();
-                let mut invalid_args = false;
-                for arg in args {
-                    let Some(feature) = arg.as_text() else {
-                        invalid_args = true;
-                        break;
-                    };
-                    if session_state.enable_feature(feature) {
-                        newly_enabled.push(feature.to_ascii_uppercase());
-                    }
-                }
-                if invalid_args {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid ENABLE arguments\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                newly_enabled.sort();
-                newly_enabled.dedup();
-                let mut response_text = String::new();
-                if !newly_enabled.is_empty() {
-                    response_text.push_str(&format!("* ENABLED {}\r\n", newly_enabled.join(" ")));
-                }
-                if newly_enabled.iter().any(|feature| feature == "CONDSTORE") {
-                    if let Some(sel) = selected.as_ref() {
-                        response_text.push_str(&format!(
-                            "* OK [HIGHESTMODSEQ {}] Highest\r\n",
-                            sel.highest_modseq
-                        ));
-                    }
-                }
-                response_text.push_str(&format!("{} OK ENABLE completed\r\n", tag));
-                log_imap_response(peer, tag, &cmd, &response_text);
+                log_imap_response(peer, tag, &cmd, &response);
                 let w = reader.get_mut();
-                w.write_all(response_text.as_bytes()).await?;
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Create => {
@@ -7654,17 +7611,7 @@ async fn process_stream_inner(
                     let keys = fields.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
                     println!("IMAP ID peer={:?} field_keys={:?}", peer, keys);
                 }
-                let response = response::Response::new()
-                    .data(format!(
-                        "ID (\"name\" \"rMail\" \"vendor\" \"rMail\" \"version\" \"{}\")",
-                        env!("CARGO_PKG_VERSION")
-                    ))
-                    .status(response::StatusLine::tagged(
-                        tag,
-                        response::Status::Ok,
-                        "ID completed",
-                    ))
-                    .encode();
+                let response = commands::basic::id(tag).encode();
                 let w = reader.get_mut();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
@@ -9263,17 +9210,7 @@ async fn process_stream_inner(
             }
             parser::Command::Logout => {
                 let w = reader.get_mut();
-                let response = response::Response::new()
-                    .status(response::StatusLine::untagged(
-                        response::Status::Bye,
-                        "Logging out",
-                    ))
-                    .status(response::StatusLine::tagged(
-                        tag,
-                        response::Status::Ok,
-                        "LOGOUT completed",
-                    ))
-                    .encode();
+                let response = commands::basic::logout(tag).encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
                 break;
@@ -9281,13 +9218,7 @@ async fn process_stream_inner(
             parser::Command::Unknown { .. } => {
                 log_unsupported_imap(peer, &selected, tag, &cmd, args);
                 let w = reader.get_mut();
-                let response = response::Response::new()
-                    .status(response::StatusLine::tagged(
-                        tag,
-                        response::Status::Bad,
-                        "Unknown or unimplemented command",
-                    ))
-                    .encode();
+                let response = commands::basic::unknown(tag).encode();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
