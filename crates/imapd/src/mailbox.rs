@@ -119,40 +119,6 @@ pub(crate) async fn load_selected_mailbox(
     }
 }
 
-pub(crate) async fn expunge_deleted(
-    mail_root: &str,
-    selected: &SelectedMailbox,
-) -> Result<Vec<(usize, u64)>> {
-    let mut deleted: Vec<(usize, u64)> = selected
-        .msgs
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, (uid, _, flags, _))| {
-            flags
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case("\\Deleted"))
-                .then_some((idx + 1, *uid))
-        })
-        .collect();
-    deleted.sort_by(|a, b| b.0.cmp(&a.0));
-    let uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
-    let mail_root = mail_root.to_string();
-    let domain = selected.domain.clone();
-    let local = selected.local.clone();
-    let mailbox = selected.mailbox.clone();
-    tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::delete_messages_by_uid(
-            Path::new(&mail_root),
-            &domain,
-            &local,
-            &mailbox,
-            &uids,
-        )
-    })
-    .await??;
-    Ok(deleted)
-}
-
 pub(crate) async fn refresh_selected_mailbox(
     mail_root: &str,
     selected: &SelectedMailbox,

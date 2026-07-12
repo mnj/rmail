@@ -5126,26 +5126,6 @@ fn log_unsupported_imap(
     );
 }
 
-fn uids_from_set(uid_set: &str, msgs: &[(u64, std::path::PathBuf, Vec<String>, u64)]) -> Vec<u64> {
-    parser::uids_from_set(uid_set, msgs)
-}
-
-fn uids_from_set_or_saved(
-    uid_set: &str,
-    selected: &SelectedMailbox,
-    saved_uids: &[u64],
-) -> Vec<u64> {
-    if uid_set == "$" {
-        saved_uids
-            .iter()
-            .copied()
-            .filter(|saved_uid| selected.msgs.iter().any(|(uid, _, _, _)| uid == saved_uid))
-            .collect()
-    } else {
-        uids_from_set(uid_set, &selected.msgs)
-    }
-}
-
 fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseError> {
     parser::parse_append_args(args)
 }
@@ -5237,24 +5217,6 @@ async fn authenticate_password(
             message: e.to_string(),
         },
     }
-}
-
-fn compress_search_ids(ids: &[u64]) -> String {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < ids.len() {
-        let mut end = start;
-        while end + 1 < ids.len() && ids[end + 1] == ids[end].saturating_add(1) {
-            end += 1;
-        }
-        if start == end {
-            ranges.push(ids[start].to_string());
-        } else {
-            ranges.push(format!("{}:{}", ids[start], ids[end]));
-        }
-        start = end + 1;
-    }
-    ranges.join(",")
 }
 
 async fn sync_selected_mailbox(
@@ -6979,68 +6941,40 @@ async fn process_stream_inner(
                     w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "EXPUNGE" {
-                    if selected.is_none() {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let uid_set = subargs.trim();
-                    let sel = selected.as_ref().unwrap();
-                    if sel.read_only {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO Mailbox is read-only\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let requested =
-                        uids_from_set_or_saved(uid_set, sel, session_state.saved_search_uids());
-                    let requested: std::collections::HashSet<u64> = requested.into_iter().collect();
-                    let mut deleted: Vec<(usize, u64)> = sel
-                        .msgs
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, (uid, _, flags, _))| {
-                            (requested.contains(uid)
-                                && flags.iter().any(|f| f.eq_ignore_ascii_case("\\Deleted")))
-                            .then_some((idx + 1, *uid))
-                        })
-                        .collect();
-                    deleted.sort_by(|a, b| b.0.cmp(&a.0));
-                    let deleted_uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
-                    rmail_common::imap_state::delete_messages_by_uid(
-                        Path::new(&mail_root),
-                        &sel.domain,
-                        &sel.local,
-                        &sel.mailbox,
-                        &deleted_uids,
-                    )?;
-                    let w = reader.get_mut();
-                    if session_state.feature_enabled("QRESYNC") && !deleted.is_empty() {
-                        let uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
-                        w.write_all(
-                            format!("* VANISHED {}\r\n", compress_search_ids(&uids)).as_bytes(),
-                        )
-                        .await?;
-                    } else {
-                        for (seq, _) in &deleted {
-                            w.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes())
-                                .await?;
+                    let outcome = commands::expunge::uid_expunge(
+                        tag,
+                        subargs,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        session_state.feature_enabled("QRESYNC"),
+                    )
+                    .await;
+                    match outcome.selection_effect {
+                        commands::expunge::SelectionEffect::Refresh => {
+                            let mailbox_name = selected_mailbox_name(&selected).to_string();
+                            selected = Some(
+                                reload_selected_mailbox_preserving_mode(
+                                    &mail_root,
+                                    authed_mailbox.as_ref().unwrap(),
+                                    &mailbox_name,
+                                    &selected,
+                                )
+                                .await?,
+                            );
                         }
+                        commands::expunge::SelectionEffect::Clear => {
+                            selected = None;
+                            session_state.selected_mailbox = None;
+                        }
+                        commands::expunge::SelectionEffect::Keep => {}
                     }
-                    if let Some(addr) = authed_mailbox.as_ref() {
-                        let mailbox = selected_mailbox_name(&selected).to_string();
-                        selected = Some(
-                            reload_selected_mailbox_preserving_mode(
-                                &mail_root, addr, &mailbox, &selected,
-                            )
-                            .await?,
-                        );
-                    }
-                    w.write_all(format!("{} OK UID EXPUNGE completed\r\n", tag).as_bytes())
-                        .await?;
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, "UID EXPUNGE", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "COPY" || subcmd == "MOVE" {
                     let command_name = format!("UID {subcmd}");
@@ -7167,78 +7101,50 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-            parser::Command::Expunge => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let sel = selected.as_ref().unwrap();
-                if sel.read_only {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Mailbox is read-only\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let deleted = mailbox::expunge_deleted(&mail_root, sel).await?;
-                println!("IMAP EXPUNGE peer={:?} removed={:?}", peer, deleted);
-                let w = reader.get_mut();
-                if session_state.feature_enabled("QRESYNC") && !deleted.is_empty() {
-                    let mut uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
-                    uids.sort_unstable();
-                    w.write_all(
-                        format!("* VANISHED {}\r\n", compress_search_ids(&uids)).as_bytes(),
+            parser::Command::Expunge | parser::Command::Close => {
+                let outcome = if matches!(request.command, parser::Command::Close) {
+                    commands::expunge::close(
+                        tag,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
                     )
-                    .await?;
+                    .await
                 } else {
-                    for (seq, _) in &deleted {
-                        w.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes())
-                            .await?;
-                    }
-                }
-                selected = if let Some(addr) = authed_mailbox.as_ref() {
-                    let mailbox = selected_mailbox_name(&selected).to_string();
-                    Some(
-                        reload_selected_mailbox_preserving_mode(
-                            &mail_root, addr, &mailbox, &selected,
-                        )
-                        .await?,
+                    commands::expunge::expunge(
+                        tag,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.feature_enabled("QRESYNC"),
                     )
-                } else {
-                    None
+                    .await
                 };
-                w.write_all(format!("{} OK EXPUNGE completed\r\n", tag).as_bytes())
-                    .await?;
-                w.flush().await?;
-            }
-            parser::Command::Close => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
+                match outcome.selection_effect {
+                    commands::expunge::SelectionEffect::Refresh => {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
+                        selected = Some(
+                            reload_selected_mailbox_preserving_mode(
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
+                            )
+                            .await?,
+                        );
+                    }
+                    commands::expunge::SelectionEffect::Clear => {
+                        selected = None;
+                        session_state.selected_mailbox = None;
+                    }
+                    commands::expunge::SelectionEffect::Keep => {}
                 }
-                let sel = selected.as_ref().unwrap();
-                if sel.read_only {
-                    selected = None;
-                    session_state.selected_mailbox = None;
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} OK CLOSE completed\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let deleted = mailbox::expunge_deleted(&mail_root, sel).await?;
-                println!("IMAP CLOSE peer={:?} expunged={:?}", peer, deleted);
-                selected = None;
-                session_state.selected_mailbox = None;
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK CLOSE completed\r\n", tag).as_bytes())
-                    .await?;
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Idle => {
