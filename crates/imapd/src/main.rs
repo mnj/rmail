@@ -1608,6 +1608,32 @@ mod tests {
         reader.read_line(&mut capability).await.expect("capability");
         assert!(capability.contains("AUTH=SCRAM-SHA-256"));
 
+        reader
+            .get_mut()
+            .write_all(b"A000 AUTHENTICATE SCRAM-SHA-256\r\n")
+            .await
+            .expect("start cancellable scram");
+        reader.get_mut().flush().await.expect("flush");
+        let challenge = read_until_contains(&mut reader, "+ ").await;
+        assert!(challenge.iter().any(|line| line == "+ \r\n"));
+        reader
+            .get_mut()
+            .write_all(b"*\r\n")
+            .await
+            .expect("cancel scram");
+        reader.get_mut().flush().await.expect("flush");
+        let cancelled = read_until_contains(&mut reader, "A000 BAD").await.join("");
+        assert!(cancelled.contains("AUTHENTICATE cancelled"));
+
+        reader
+            .get_mut()
+            .write_all(b"A000B AUTHENTICATE SCRAM-SHA-256 !!!\r\n")
+            .await
+            .expect("malformed scram");
+        reader.get_mut().flush().await.expect("flush");
+        let malformed = read_until_contains(&mut reader, "A000B BAD").await.join("");
+        assert!(malformed.contains("Invalid SCRAM client-first message"));
+
         let client_first_bare = "n=user@example.test,r=clientnonce";
         let client_first = format!("n,,{}", client_first_bare);
         let client_first_b64 = crate::BASE64_ENGINE.encode(client_first.as_bytes());

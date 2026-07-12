@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const STATE_DB_FILENAME: &str = ".rmail-state.sqlite";
 
@@ -67,6 +67,7 @@ fn open_account(maildir_root: &Path, domain: &str, localpart: &str) -> Result<Co
     let root = account_maildir(maildir_root, domain, localpart);
     fs::create_dir_all(&root)?;
     let conn = Connection::open(root.join(STATE_DB_FILENAME))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
     ensure_schema(&conn)?;
     ensure_standard_folders(&conn, maildir_root, domain, localpart)?;
     Ok(conn)
