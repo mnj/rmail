@@ -135,6 +135,19 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "internaldate_tz",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    let invalid_uidvalidity_ids = {
+        let mut statement = conn
+            .prepare("SELECT id FROM folders WHERE uidvalidity <= 0 OR uidvalidity > 4294967295")?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for folder_id in invalid_uidvalidity_ids {
+        conn.execute(
+            "UPDATE folders SET uidvalidity = ?1 WHERE id = ?2",
+            params![new_uidvalidity() as i64, folder_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -211,11 +224,14 @@ fn special_use(special: &str) -> Option<&str> {
 }
 
 fn new_uidvalidity() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1);
-    (now ^ rand::random::<u64>()).max(1)
+    u64::from(rand::random::<u32>().max(1))
+}
+
+fn allocatable_uid(value: i64) -> Result<u64> {
+    if !(1..i64::from(u32::MAX)).contains(&value) {
+        anyhow::bail!("mailbox UID space is exhausted or invalid");
+    }
+    Ok(value as u64)
 }
 
 pub fn list_folders(maildir_root: &Path, domain: &str, localpart: &str) -> Result<Vec<Folder>> {
@@ -616,6 +632,7 @@ pub fn transfer_messages_by_uid(
         params![destination_id],
         |row| row.get(0),
     )?;
+    allocatable_uid(destination_uid)?;
     let mut guards = Vec::new();
     let mut mappings = Vec::new();
     for uid in requested {
@@ -667,6 +684,7 @@ pub fn transfer_messages_by_uid(
             guards.push(FileMutationGuard::copied(destination_path));
         }
         let destination_modseq = next_modseq(&tx, destination_id)?;
+        allocatable_uid(destination_uid)?;
         tx.execute(
             "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -777,6 +795,7 @@ pub fn move_message_by_uid(
         params![destination_id],
         |row| row.get(0),
     )?;
+    allocatable_uid(uidnext)?;
     let destination_modseq = next_modseq(&tx, destination_id)?;
     tx.execute(
         "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
@@ -855,6 +874,7 @@ pub fn copy_message_by_uid(
         params![destination_id],
         |row| row.get(0),
     )?;
+    allocatable_uid(uidnext)?;
     let destination_filename = format!(
         "{}.copy.{}.{}",
         filename,
@@ -1075,7 +1095,7 @@ pub fn append_message_with_internal_date(
     let tx = conn.transaction()?;
     let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
     let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
-    let uid = folder.uidnext;
+    let uid = allocatable_uid(i64::try_from(folder.uidnext).unwrap_or(i64::MAX))?;
     let modseq = next_modseq(&tx, folder_id)?;
     tx.execute(
         "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
@@ -1274,6 +1294,7 @@ fn reconcile_folder(
                 params![folder_id],
                 |row| row.get(0),
             )?;
+            allocatable_uid(uidnext)?;
             let modseq = next_modseq(conn, folder_id)?;
             conn.execute(
                 "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, save_date, modseq)
@@ -1381,6 +1402,24 @@ mod tests {
         assert_eq!(folders.len(), STANDARD_FOLDERS.len());
         assert!(folders.iter().any(|f| f.name == "INBOX"));
         assert!(state_db_path(td.path(), "example.test", "user").is_file());
+    }
+
+    #[test]
+    fn migrates_uidvalidity_into_the_imap_32_bit_range() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let db = state_db_path(td.path(), "example.test", "user");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE folders SET uidvalidity = ?1 WHERE name = 'INBOX'",
+            params![1_i64 << 40],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (folder, _) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert!((1..=u64::from(u32::MAX)).contains(&folder.uidvalidity));
+        assert_ne!(folder.uidvalidity, 1_u64 << 40);
     }
 
     #[test]

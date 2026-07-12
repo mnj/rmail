@@ -538,6 +538,13 @@ pub(crate) struct SequenceSet {
     ranges: Vec<(u64, u64)>,
 }
 
+fn parse_nz_number(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| (1..=u64::from(u32::MAX)).contains(value))
+}
+
 impl SequenceSet {
     pub(crate) fn parse(input: &str, star_value: u64) -> Option<Self> {
         if input.is_empty() {
@@ -549,7 +556,10 @@ impl SequenceSet {
                 if value == "*" {
                     Some(star_value)
                 } else {
-                    value.parse::<u64>().ok()
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| (1..=u64::from(u32::MAX)).contains(value))
                 }
             };
             let (start, end) = if let Some((start, end)) = component.split_once(':') {
@@ -573,9 +583,9 @@ impl SequenceSet {
         let mut ranges = Vec::new();
         for component in input.split(',') {
             let (start, end) = if let Some((start, end)) = component.split_once(':') {
-                (start.parse::<u64>().ok()?, end.parse::<u64>().ok()?)
+                (parse_nz_number(start)?, parse_nz_number(end)?)
             } else {
-                let value = component.parse::<u64>().ok()?;
+                let value = parse_nz_number(component)?;
                 (value, value)
             };
             if start == 0 || end == 0 {
@@ -684,8 +694,7 @@ pub(crate) fn parse_select_request(input: &str) -> Result<SelectRequest, ParseEr
                 }
                 let uidvalidity = parameters[0]
                     .as_text()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|value| *value > 0)
+                    .and_then(parse_nz_number)
                     .ok_or(ParseError::InvalidAtom)?;
                 let modseq = parameters[1]
                     .as_text()
@@ -2068,6 +2077,8 @@ mod tests {
         assert!(qresync.sample.is_some());
 
         assert!(parse_select_request("INBOX (QRESYNC (1 2 1:*))").is_err());
+        assert!(parse_select_request("INBOX (QRESYNC (4294967296 2))").is_err());
+        assert!(parse_select_request("INBOX (QRESYNC (1 2 4294967296))").is_err());
         assert!(parse_select_request("INBOX (QRESYNC (1 2 1:4 (1:2 1:3)))").is_err());
         assert!(parse_select_request("INBOX (UNKNOWN)").is_err());
         assert!(parse_select_request("INBOX (CONDSTORE CONDSTORE)").is_err());
@@ -2083,6 +2094,8 @@ mod tests {
     #[test]
     fn sequence_set_handles_reverse_ranges_star_and_deduplication() {
         assert_eq!(ids_from_set("4:2,*,2", 5), vec![2, 3, 4, 5]);
+        assert!(SequenceSet::parse("4294967296", 1).is_none());
+        assert!(SequenceSet::parse_nostar("4294967296").is_none());
     }
 
     #[test]
