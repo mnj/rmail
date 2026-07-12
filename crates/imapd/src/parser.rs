@@ -425,6 +425,24 @@ impl<'a> RequestLine<'a> {
     }
 }
 
+impl Command {
+    pub(crate) fn requires_empty_arguments(&self) -> bool {
+        matches!(
+            self,
+            Self::Capability
+                | Self::Noop
+                | Self::Check
+                | Self::Close
+                | Self::Expunge
+                | Self::Idle
+                | Self::Logout
+                | Self::Namespace
+                | Self::StartTls
+                | Self::Unselect
+        )
+    }
+}
+
 pub(crate) fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 1024

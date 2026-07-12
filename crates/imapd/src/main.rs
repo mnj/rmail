@@ -825,7 +825,7 @@ mod tests {
         input.extend_from_slice(b"A001\r\n");
         input.extend_from_slice(b"A002 NOOP \xff\r\n");
         input.extend_from_slice(&vec![b'x'; super::MAX_PREAUTH_LINE_BYTES + 1]);
-        input.extend_from_slice(b"\r\nA003 NOOP\r\nA004 LOGOUT\r\n");
+        input.extend_from_slice(b"\r\nA003 NOOP trailing\r\nA004 NOOP\r\nA005 LOGOUT\r\n");
         reader.get_mut().write_all(&input).await.expect("commands");
         reader.get_mut().flush().await.expect("flush");
 
@@ -837,9 +837,11 @@ mod tests {
         assert!(invalid_utf8.contains("not valid UTF-8"));
         let oversized = read_until_contains(&mut reader, "* BAD").await.join("");
         assert!(oversized.contains("Command line too long"));
-        let recovered = read_until_contains(&mut reader, "A003 OK").await.join("");
+        let trailing = read_until_contains(&mut reader, "A003 BAD").await.join("");
+        assert!(trailing.contains("Invalid NOOP arguments"));
+        let recovered = read_until_contains(&mut reader, "A004 OK").await.join("");
         assert!(recovered.contains("NOOP completed"));
-        let _logout = read_until_contains(&mut reader, "A004 OK").await;
+        let _logout = read_until_contains(&mut reader, "A005 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -6034,6 +6036,13 @@ async fn process_stream_inner(
             w.flush().await?;
             continue;
         }
+        if request.command.requires_empty_arguments() && !args.is_empty() {
+            let w = reader.get_mut();
+            w.write_all(format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes())
+                .await?;
+            w.flush().await?;
+            continue;
+        }
         if command_spec
             .is_some_and(|spec| spec.requires_sync || spec.uses_sequences || spec.breaks_sequences)
             && selected.is_some()
@@ -7518,8 +7527,20 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
+                let mailbox_argument = match parser::parse_mailbox_argument(args) {
+                    Ok(mailbox) => mailbox,
+                    Err(_) => {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
                 let mailbox_name = match decode_imap_mailbox_arg(
-                    unquote(args.trim()),
+                    &mailbox_argument,
                     session_state.feature_enabled("UTF8=ACCEPT"),
                 ) {
                     Ok(name) => name,
