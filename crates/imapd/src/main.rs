@@ -776,6 +776,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn starttls_rejects_pipelined_plaintext_without_losing_commands() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(
+                tokio_rustls::rustls::server::ResolvesServerCertUsingSni::new(),
+            ));
+        let tls_context = Arc::new(super::tls::TlsContext {
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+            server_end_point: vec![0; 32],
+        });
+        let (client, server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(process_stream(
+            Box::new(server),
+            td.path().to_string_lossy().to_string(),
+            Some(tls_context),
+            None,
+            None,
+            false,
+        ));
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capabilities = String::new();
+        reader
+            .read_line(&mut capabilities)
+            .await
+            .expect("capabilities");
+        assert!(capabilities.contains("STARTTLS"));
+
+        reader
+            .get_mut()
+            .write_all(b"A001 STARTTLS\r\nA002 NOOP\r\nA003 LOGOUT\r\n")
+            .await
+            .expect("pipelined commands");
+        reader.get_mut().flush().await.expect("flush");
+        let rejected = read_until_contains(&mut reader, "A001 BAD").await.join("");
+        assert!(rejected.contains("did not wait for STARTTLS reply"));
+        let noop = read_until_contains(&mut reader, "A002 OK").await.join("");
+        assert!(noop.contains("NOOP completed"));
+        let _logout = read_until_contains(&mut reader, "A003 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
     async fn id_accepts_nil_and_client_fields_and_rejects_malformed_lists() {
         let td = tempfile::tempdir().expect("tempdir");
         let (client, server) = duplex(8 * 1024);
@@ -5977,6 +6023,19 @@ async fn process_stream_inner(
                     let w = reader.get_mut();
                     w.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes())
                         .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                if !reader.buffer().is_empty() {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!(
+                            "{} BAD Client did not wait for STARTTLS reply before sending more data\r\n",
+                            tag
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
                     w.flush().await?;
                     continue;
                 }
