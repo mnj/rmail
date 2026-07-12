@@ -15,6 +15,46 @@ pub(crate) struct CommandSpec {
     pub(crate) requires_sync: bool,
 }
 
+impl CommandSpec {
+    pub(crate) fn needs_mailbox_sync(self) -> bool {
+        self.requires_sync || self.uses_sequences || self.breaks_sequences
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionContext {
+    pub(crate) authenticated: bool,
+    pub(crate) selected: bool,
+    pub(crate) encrypted: bool,
+}
+
+pub(crate) fn preflight(
+    spec: Option<CommandSpec>,
+    session: SessionContext,
+) -> Option<&'static str> {
+    let spec = spec?;
+    match spec.auth {
+        CommandAuth::Any => {}
+        CommandAuth::NotAuthenticated if session.authenticated => {
+            return Some("BAD Command not allowed after authentication");
+        }
+        CommandAuth::NotAuthenticated => {}
+        CommandAuth::Authenticated if !session.authenticated => {
+            return Some("NO Authentication required");
+        }
+        CommandAuth::Authenticated => {}
+        CommandAuth::Selected if !session.authenticated => {
+            return Some("NO Authentication required");
+        }
+        CommandAuth::Selected if !session.selected => return Some("BAD No mailbox selected"),
+        CommandAuth::Selected => {}
+    }
+    if spec.tls_required && !session.encrypted {
+        return Some("NO [PRIVACYREQUIRED] Encryption required for authentication");
+    }
+    None
+}
+
 const ANY: CommandSpec = CommandSpec {
     auth: CommandAuth::Any,
     tls_required: false,
@@ -73,7 +113,11 @@ const LOGIN: CommandSpec = CommandSpec {
 
 pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
     match command {
-        Command::Capability | Command::Noop | Command::Logout | Command::Id => Some(ANY),
+        Command::Capability | Command::Logout | Command::Id => Some(ANY),
+        Command::Noop => Some(CommandSpec {
+            breaks_sequences: true,
+            ..ANY
+        }),
         Command::StartTls => Some(NOT_AUTH),
         Command::Login => Some(LOGIN),
         Command::Authenticate => Some(NOT_AUTH),
@@ -101,7 +145,12 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
             requires_sync: true,
             ..SELECTED_BREAKS_SEQS
         }),
-        Command::Check | Command::Unselect => Some(SELECTED),
+        Command::Check => Some(CommandSpec {
+            breaks_sequences: true,
+            requires_sync: true,
+            ..SELECTED
+        }),
+        Command::Unselect => Some(SELECTED),
         Command::Uid { command } => match command {
             UidCommand::Fetch
             | UidCommand::Search
@@ -218,6 +267,70 @@ mod tests {
         let request = parse_request_line("A1 X-UNKNOWN arg").unwrap();
         assert!(matches!(request.command, Command::Unknown { .. }));
         assert!(command_spec(&request.command).is_none());
+    }
+
+    #[test]
+    fn preflight_enforces_state_and_transport_policy() {
+        let plain_unauthenticated = SessionContext {
+            authenticated: false,
+            selected: false,
+            encrypted: false,
+        };
+        assert_eq!(
+            preflight(Some(LOGIN), plain_unauthenticated),
+            Some("NO [PRIVACYREQUIRED] Encryption required for authentication")
+        );
+        assert_eq!(
+            preflight(Some(SELECTED), plain_unauthenticated),
+            Some("NO Authentication required")
+        );
+        assert_eq!(
+            preflight(
+                Some(SELECTED),
+                SessionContext {
+                    authenticated: true,
+                    ..plain_unauthenticated
+                }
+            ),
+            Some("BAD No mailbox selected")
+        );
+        assert_eq!(
+            preflight(
+                Some(NOT_AUTH),
+                SessionContext {
+                    authenticated: true,
+                    encrypted: true,
+                    ..plain_unauthenticated
+                }
+            ),
+            Some("BAD Command not allowed after authentication")
+        );
+    }
+
+    #[test]
+    fn synchronization_policy_matches_command_sequence_effects() {
+        for command in [
+            "NOOP",
+            "CHECK",
+            "FETCH 1 FLAGS",
+            "UID FETCH 1 FLAGS",
+            "EXPUNGE",
+        ] {
+            let line = format!("A1 {command}");
+            let request = parse_request_line(&line).unwrap();
+            assert!(
+                command_spec(&request.command).unwrap().needs_mailbox_sync(),
+                "{command}"
+            );
+        }
+        for command in ["CAPABILITY", "CREATE Archive", "STATUS INBOX (MESSAGES)"] {
+            let line = format!("A1 {command}");
+            let request = parse_request_line(&line).unwrap();
+            assert!(
+                !command_spec(&request.command).unwrap().needs_mailbox_sync(),
+                "{command}"
+            );
+        }
     }
 }
 use crate::parser::{Command, UidCommand};

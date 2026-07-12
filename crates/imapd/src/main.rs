@@ -5828,35 +5828,6 @@ async fn reload_selected_mailbox_preserving_mode(
     Ok(refreshed)
 }
 
-fn command_preflight_response(
-    spec: Option<commands::CommandSpec>,
-    authenticated: bool,
-    selected: bool,
-    encrypted: bool,
-) -> Option<&'static str> {
-    let spec = spec?;
-    match spec.auth {
-        commands::CommandAuth::Any => {}
-        commands::CommandAuth::NotAuthenticated if authenticated => {
-            return Some("BAD Command not allowed after authentication");
-        }
-        commands::CommandAuth::NotAuthenticated => {}
-        commands::CommandAuth::Authenticated if !authenticated => {
-            return Some("NO Authentication required");
-        }
-        commands::CommandAuth::Authenticated => {}
-        commands::CommandAuth::Selected if !authenticated => {
-            return Some("NO Authentication required");
-        }
-        commands::CommandAuth::Selected if !selected => return Some("BAD No mailbox selected"),
-        commands::CommandAuth::Selected => {}
-    }
-    if spec.tls_required && !encrypted {
-        return Some("NO [PRIVACYREQUIRED] Encryption required for authentication");
-    }
-    None
-}
-
 // session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
 // and after a successful STARTTLS). Enforcing authentication methods (like LOGIN) only on
 // encrypted sessions prevents accidental credential disclosure over plain-text.
@@ -6069,11 +6040,13 @@ async fn process_stream_inner(
             session_state.selected_mailbox.is_some()
         );
         let command_spec = commands::command_spec(&request.command);
-        if let Some(reason) = command_preflight_response(
+        if let Some(reason) = commands::preflight(
             command_spec,
-            session_state.authenticated_mailbox.is_some(),
-            session_state.selected_mailbox.is_some(),
-            session_encrypted,
+            commands::SessionContext {
+                authenticated: session_state.authenticated_mailbox.is_some(),
+                selected: session_state.selected_mailbox.is_some(),
+                encrypted: session_encrypted,
+            },
         ) {
             let w = reader.get_mut();
             w.write_all(format!("{} {}\r\n", tag, reason).as_bytes())
@@ -6088,9 +6061,7 @@ async fn process_stream_inner(
             w.flush().await?;
             continue;
         }
-        if command_spec
-            .is_some_and(|spec| spec.requires_sync || spec.uses_sequences || spec.breaks_sequences)
-            && selected.is_some()
+        if command_spec.is_some_and(commands::CommandSpec::needs_mailbox_sync) && selected.is_some()
         {
             sync_selected_mailbox(
                 &mut reader,
@@ -6952,13 +6923,6 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Noop => {
-                sync_selected_mailbox(
-                    &mut reader,
-                    &mail_root,
-                    &mut selected,
-                    session_state.feature_enabled("QRESYNC"),
-                )
-                .await?;
                 let w = reader.get_mut();
                 w.write_all(format!("{} OK NOOP completed\r\n", tag).as_bytes())
                     .await?;
@@ -6972,13 +6936,6 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
-                sync_selected_mailbox(
-                    &mut reader,
-                    &mail_root,
-                    &mut selected,
-                    session_state.feature_enabled("QRESYNC"),
-                )
-                .await?;
                 let w = reader.get_mut();
                 w.write_all(format!("{} OK CHECK completed\r\n", tag).as_bytes())
                     .await?;
