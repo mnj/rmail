@@ -4220,7 +4220,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects/Child\r\nA004 UNSUBSCRIBE Projects\r\nA005 LIST \"\" \"Projects\" RETURN (CHILDREN)\r\nA006 LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"Projects%\" RETURN (SUBSCRIBED CHILDREN)\r\nA007 LIST (REMOTE) \"\" \"*\"\r\nA008 LIST (SPECIAL-USE) \"\" (\"INBOX\" \"Sent\") RETURN (SPECIAL-USE STATUS (MESSAGES UIDNEXT UNSEEN SIZE))\r\nA009 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects/Child\r\nA004 DELETE Projects\r\nA005 UNSUBSCRIBE Projects\r\nA006 LIST \"\" \"Projects\" RETURN (CHILDREN)\r\nA007 LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"Projects%\" RETURN (SUBSCRIBED CHILDREN)\r\nA008 LIST (REMOTE) \"\" \"*\"\r\nA009 LIST (SPECIAL-USE) \"\" (\"INBOX\" \"Sent\") RETURN (SPECIAL-USE STATUS (MESSAGES UIDNEXT UNSEEN SIZE))\r\nA010 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
@@ -4229,22 +4229,28 @@ mod tests {
         let _login = read_until_contains(&mut reader, "A001 OK").await;
         let _create_parent = read_until_contains(&mut reader, "A002 OK").await;
         let _create_child = read_until_contains(&mut reader, "A003 OK").await;
-        let _unsubscribe_parent = read_until_contains(&mut reader, "A004 OK").await;
-        let children = read_until_contains(&mut reader, "A005 OK").await;
+        let parent_delete = read_until_contains(&mut reader, "A004 NO").await;
+        assert!(
+            parent_delete
+                .iter()
+                .any(|line| line.contains("mailbox has children"))
+        );
+        let _unsubscribe_parent = read_until_contains(&mut reader, "A005 OK").await;
+        let children = read_until_contains(&mut reader, "A006 OK").await;
         assert!(
             children
                 .iter()
                 .any(|l| l.contains("* LIST (\\HasChildren)") && l.contains("\"Projects\""))
         );
-        let recursive = read_until_contains(&mut reader, "A006 OK").await;
+        let recursive = read_until_contains(&mut reader, "A007 OK").await;
         assert!(
             recursive
                 .iter()
                 .any(|line| { line.contains("\"Projects\" (CHILDINFO (\"SUBSCRIBED\"))") })
         );
-        let remote = read_until_contains(&mut reader, "A007 OK").await;
+        let remote = read_until_contains(&mut reader, "A008 OK").await;
         assert!(!remote.iter().any(|line| line.starts_with("* LIST")));
-        let special_status = read_until_contains(&mut reader, "A008 OK").await;
+        let special_status = read_until_contains(&mut reader, "A009 OK").await;
         assert!(
             special_status
                 .iter()
@@ -4258,7 +4264,7 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("* STATUS \"INBOX\""))
         );
-        let _logout = read_until_contains(&mut reader, "A009 OK").await;
+        let _logout = read_until_contains(&mut reader, "A010 OK").await;
         server_task.await.expect("join").expect("server");
     }
 

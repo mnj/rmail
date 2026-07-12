@@ -307,6 +307,18 @@ pub fn delete_folder(
     }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     let id = folder_id(&conn, &name)?.context("mailbox does not exist")?;
+    let child_prefix = format!("{name}/");
+    let has_children = conn
+        .query_row(
+            "SELECT 1 FROM folders WHERE substr(name, 1, ?1) = ?2 LIMIT 1",
+            params![child_prefix.len() as i64, child_prefix],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if has_children {
+        anyhow::bail!("mailbox has children, delete them first");
+    }
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
     let tombstone = account_maildir(maildir_root, domain, localpart)
         .join("tmp")
@@ -2149,10 +2161,14 @@ mod tests {
     fn folder_create_delete_and_subscribe() {
         let td = tempfile::tempdir().unwrap();
         create_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
         assert!(folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
         set_subscription(td.path(), "example.test", "user", "Projects", false).unwrap();
         let subscribed = list_subscribed_folders(td.path(), "example.test", "user").unwrap();
         assert!(!subscribed.iter().any(|f| f.name == "Projects"));
+        assert!(delete_folder(td.path(), "example.test", "user", "Projects").is_err());
+        assert!(folder_exists(td.path(), "example.test", "user", "Projects/Child").unwrap());
+        delete_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
         delete_folder(td.path(), "example.test", "user", "Projects").unwrap();
         assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
     }
