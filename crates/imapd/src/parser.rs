@@ -843,7 +843,7 @@ pub(crate) struct SearchMessage<'a> {
     pub(crate) data: &'a [u8],
 }
 
-pub(crate) fn tokenize_search(input: &str) -> Vec<String> {
+pub(crate) fn tokenize_search(input: &str) -> Result<Vec<String>, ()> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -853,6 +853,7 @@ pub(crate) fn tokenize_search(input: &str) -> Vec<String> {
             '"' => {
                 let mut token = String::new();
                 let mut escaped = false;
+                let mut closed = false;
                 for next in chars.by_ref() {
                     if escaped {
                         token.push(next);
@@ -860,10 +861,20 @@ pub(crate) fn tokenize_search(input: &str) -> Vec<String> {
                     } else if next == '\\' {
                         escaped = true;
                     } else if next == '"' {
+                        closed = true;
                         break;
                     } else {
                         token.push(next);
                     }
+                }
+                if !closed || escaped {
+                    return Err(());
+                }
+                if chars
+                    .peek()
+                    .is_some_and(|next| !next.is_whitespace() && !matches!(next, '(' | ')'))
+                {
+                    return Err(());
                 }
                 tokens.push(token);
             }
@@ -874,6 +885,9 @@ pub(crate) fn tokenize_search(input: &str) -> Vec<String> {
                     if next.is_whitespace() || next == '(' || next == ')' {
                         break;
                     }
+                    if next == '"' {
+                        return Err(());
+                    }
                     token.push(next);
                     chars.next();
                 }
@@ -881,7 +895,7 @@ pub(crate) fn tokenize_search(input: &str) -> Vec<String> {
             }
         }
     }
-    tokens
+    Ok(tokens)
 }
 
 fn parse_imap_date(token: &str) -> Option<chrono::NaiveDate> {
@@ -1077,7 +1091,7 @@ pub(crate) enum SearchParseError {
 }
 
 pub(crate) fn parse_search_request(input: &str) -> Result<SearchRequest, SearchParseError> {
-    let tokens = tokenize_search(input);
+    let tokens = tokenize_search(input).map_err(|_| SearchParseError::Syntax)?;
     let mut pos = 0;
     let return_options = if tokens
         .first()
@@ -1174,7 +1188,7 @@ pub(crate) fn parse_sort_request(input: &str) -> Result<SortRequest, SortParseEr
 fn parse_sort_request_inner(input: &str) -> Option<SortRequest> {
     use std::collections::HashSet;
 
-    let tokens = tokenize_search(input);
+    let tokens = tokenize_search(input).ok()?;
     if tokens.first().map(String::as_str) != Some("(") {
         return None;
     }
@@ -1232,7 +1246,7 @@ pub(crate) struct ThreadRequest {
 }
 
 pub(crate) fn parse_thread_request(input: &str) -> Result<ThreadRequest, SortParseError> {
-    let tokens = tokenize_search(input);
+    let tokens = tokenize_search(input).map_err(|_| SortParseError::Syntax)?;
     let algorithm = match tokens.first().map(|token| token.to_ascii_uppercase()) {
         Some(value) if value == "ORDEREDSUBJECT" => ThreadAlgorithm::OrderedSubject,
         Some(value) if value == "REFERENCES" => ThreadAlgorithm::References,
@@ -2418,6 +2432,14 @@ mod tests {
         for invalid in ["0", "0,1", "1,,2", "1::2", "UID 0", "UID 1,,2"] {
             assert!(parse_search_request(invalid).is_err(), "accepted {invalid}");
         }
+        for invalid in [
+            "SUBJECT \"unterminated",
+            "SUBJECT \"trailing\\",
+            "SUBJECT \"value\"suffix",
+            "SUBJECT atom\"suffix",
+        ] {
+            assert!(parse_search_request(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
@@ -2440,6 +2462,8 @@ mod tests {
                 },
             ]
         );
+        assert!(parse_sort_request("(DATE) UTF-8 SUBJECT \"unterminated").is_err());
+        assert!(parse_thread_request("REFERENCES UTF-8 SUBJECT \"unterminated").is_err());
         assert_eq!(request.charset, "UTF-8");
         assert!(matches!(request.search, SearchCriterion::Unseen));
         assert!(parse_sort_request("() UTF-8 ALL").is_err());
