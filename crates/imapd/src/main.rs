@@ -3643,8 +3643,10 @@ mod tests {
         commands.extend_from_slice(&large_non_sync);
         commands.extend_from_slice(b"\r\n");
         commands.extend_from_slice(format!("A006 APPEND Missing {{{}}}\r\n", raw.len()).as_bytes());
+        commands
+            .extend_from_slice(format!("A007 APPEND Missing {{{}+}}\r\n", raw.len()).as_bytes());
         commands.extend_from_slice(raw);
-        commands.extend_from_slice(b"\r\nA007 LOGOUT\r\n");
+        commands.extend_from_slice(b"\r\nA008 LOGOUT\r\n");
         reader
             .get_mut()
             .write_all(&commands)
@@ -3673,9 +3675,22 @@ mod tests {
         assert!(large_non_sync_lines.iter().any(|l| l.contains("APPENDUID")));
 
         let missing_lines = read_until_contains(&mut reader, "A006 NO").await;
-        assert!(missing_lines.iter().any(|l| l.contains("APPEND failed")));
+        assert!(!missing_lines.iter().any(|l| l.starts_with("+ ")));
+        assert!(missing_lines.iter().any(|l| l.contains("TRYCREATE")));
 
-        let _logout = read_until_contains(&mut reader, "A007 OK").await;
+        let non_sync_missing_lines = read_until_contains(&mut reader, "A007 NO").await;
+        assert!(
+            non_sync_missing_lines
+                .iter()
+                .any(|l| l.contains("APPEND failed"))
+        );
+        assert!(
+            non_sync_missing_lines
+                .iter()
+                .any(|l| l.contains("TRYCREATE"))
+        );
+
+        let _logout = read_until_contains(&mut reader, "A008 OK").await;
         server_task.await.expect("join").expect("server");
 
         let (_, sent) =
@@ -5097,10 +5112,6 @@ fn log_imap_response(peer: Option<SocketAddr>, tag: &str, cmd: &str, response: &
     response::log_imap_response(peer, tag, cmd, response)
 }
 
-fn address_parts(address: &str) -> Result<(String, String)> {
-    mailbox::address_parts(address)
-}
-
 fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
     mailbox::selected_mailbox_name(selected)
 }
@@ -5124,18 +5135,6 @@ fn log_unsupported_imap(
         command,
         raw_args
     );
-}
-
-fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseError> {
-    parser::parse_append_args(args)
-}
-
-fn decode_imap_mailbox_arg(name: &str, utf8_accept: bool) -> Result<String> {
-    if !utf8_accept && name.contains('&') {
-        rmail_common::maildir::imap_utf7_to_utf8(name).map_err(Into::into)
-    } else {
-        Ok(name.to_string())
-    }
 }
 
 #[cfg(test)]
@@ -6385,145 +6384,28 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Append => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let append_request = match parse_append_args(args) {
-                    Ok(request) => request,
-                    Err(parser::ParseError::InvalidDateTime) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid APPEND internal date\r\n", tag).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid APPEND arguments\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                if append_request.utf8 && !session_state.feature_enabled("UTF8=ACCEPT") {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD UTF8=ACCEPT is not enabled\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if append_request.literal_len > MAX_APPEND_LITERAL_BYTES {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!("{} NO [TOOBIG] APPEND literal too large\r\n", tag).as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if !append_request.non_sync {
-                    let w = reader.get_mut();
-                    let response = response::Response::new()
-                        .continuation("Ready for literal data")
-                        .encode();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                }
-                let mut literal = vec![0u8; append_request.literal_len];
-                if let Err(e) = reader.read_exact(&mut literal).await {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Error reading literal\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    eprintln!("IMAP APPEND literal read error peer={:?}: {}", peer, e);
-                    continue;
-                }
-                if append_request.utf8 && std::str::from_utf8(&literal).is_err() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO [UTF8] Invalid UTF-8 message\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                let mailbox_name = match decode_imap_mailbox_arg(
-                    &append_request.mailbox,
+                let outcome = commands::append::handle(
+                    &mut reader,
+                    tag,
+                    args,
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
                     session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let mailbox_for_task = mailbox_name.clone();
-                let flags = append_request.flags;
-                const INTERNALDATE_MAX_FUTURE_SECONDS: i64 = 2 * 60 * 60;
-                let internal_date = append_request
-                    .internal_date
-                    .filter(|date| {
-                        date.timestamp
-                            <= chrono::Utc::now().timestamp() + INTERNALDATE_MAX_FUTURE_SECONDS
-                    })
-                    .map(|date| (date.timestamp, date.timezone_offset_minutes));
-                let append_result = tokio::task::spawn_blocking(move || {
-                    rmail_common::imap_state::append_message_with_internal_date(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                        &mailbox_for_task,
-                        &literal,
-                        flags,
-                        internal_date,
-                    )
-                })
+                )
                 .await?;
-                match append_result {
-                    Ok((uidvalidity, uid)) => {
-                        if let Some(addr) = authed_mailbox.as_ref() {
-                            if selected
-                                .as_ref()
-                                .map(|sel| sel.mailbox.eq_ignore_ascii_case(&mailbox_name))
-                                .unwrap_or(false)
-                            {
-                                selected = Some(
-                                    reload_selected_mailbox_preserving_mode(
-                                        &mail_root,
-                                        addr,
-                                        &mailbox_name,
-                                        &selected,
-                                    )
-                                    .await?,
-                                );
-                            }
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} OK [APPENDUID {} {}] APPEND completed\r\n",
-                                tag, uidvalidity, uid
+                if let Some(mailbox_name) = outcome.appended_mailbox {
+                    if selected.as_ref().is_some_and(|selected_mailbox| {
+                        selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
+                    }) {
+                        selected = Some(
+                            reload_selected_mailbox_preserving_mode(
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
                             )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    Err(e) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO APPEND failed: {}\r\n", tag, e).as_bytes())
-                            .await?;
-                        w.flush().await?;
+                            .await?,
+                        );
                     }
                 }
             }
