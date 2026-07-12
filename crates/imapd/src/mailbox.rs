@@ -272,28 +272,6 @@ pub(crate) fn format_internal_date(timestamp: i64, timezone_offset_minutes: i32)
         .to_string()
 }
 
-pub(crate) fn copy_uid_pairs(
-    source_set: &[u64],
-    destination_uids: &[u64],
-    uidvalidity: u64,
-) -> Option<String> {
-    if source_set.is_empty() || destination_uids.is_empty() {
-        None
-    } else {
-        let source = source_set
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let dest = destination_uids
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        Some(format!("[COPYUID {} {} {}] ", uidvalidity, source, dest))
-    }
-}
-
 pub(crate) fn fetch_inner_spec(spec: &str) -> &str {
     let trimmed = spec.trim();
     trimmed

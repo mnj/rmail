@@ -5093,10 +5093,6 @@ async fn run_imaps_listener(
     }
 }
 
-fn unquote(s: &str) -> &str {
-    parser::unquote(s)
-}
-
 fn log_imap_response(peer: Option<SocketAddr>, tag: &str, cmd: &str, response: &str) {
     response::log_imap_response(peer, tag, cmd, response)
 }
@@ -5130,31 +5126,8 @@ fn log_unsupported_imap(
     );
 }
 
-fn seqs_from_set(seq_set: &str, total: usize) -> Vec<usize> {
-    parser::seqs_from_set(seq_set, total)
-}
-
 fn uids_from_set(uid_set: &str, msgs: &[(u64, std::path::PathBuf, Vec<String>, u64)]) -> Vec<u64> {
     parser::uids_from_set(uid_set, msgs)
-}
-
-fn seqs_from_set_or_saved(
-    sequence_set: &str,
-    selected: &SelectedMailbox,
-    saved_uids: &[u64],
-) -> Vec<usize> {
-    if sequence_set == "$" {
-        selected
-            .msgs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (uid, _, _, _))| {
-                saved_uids.binary_search(uid).is_ok().then_some(index + 1)
-            })
-            .collect()
-    } else {
-        seqs_from_set(sequence_set, selected.msgs.len())
-    }
 }
 
 fn uids_from_set_or_saved(
@@ -5171,14 +5144,6 @@ fn uids_from_set_or_saved(
     } else {
         uids_from_set(uid_set, &selected.msgs)
     }
-}
-
-fn copy_uid_pairs(
-    source_set: &[u64],
-    destination_uids: &[u64],
-    uidvalidity: u64,
-) -> Option<String> {
-    mailbox::copy_uid_pairs(source_set, destination_uids, uidvalidity)
 }
 
 fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseError> {
@@ -6865,114 +6830,38 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Copy | parser::Command::Move => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let mut parts = args.trim().splitn(2, ' ');
-                let seq_set = parts.next().unwrap_or("");
-                let destination = match decode_imap_mailbox_arg(
-                    unquote(parts.next().unwrap_or("").trim()),
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let sel = selected.as_ref().unwrap();
-                if cmd == "MOVE" && sel.read_only {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Mailbox is read-only\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let seqs = seqs_from_set_or_saved(seq_set, sel, session_state.saved_search_uids());
-                let source_uids = seqs
-                    .iter()
-                    .filter_map(|seq| {
-                        (*seq > 0 && *seq <= sel.msgs.len()).then_some(sel.msgs[*seq - 1].0)
-                    })
-                    .collect::<Vec<_>>();
-                let batch_result = tokio::task::spawn_blocking({
-                    let mail_root = mail_root.clone();
-                    let domain = sel.domain.clone();
-                    let local = sel.local.clone();
-                    let mailbox = sel.mailbox.clone();
-                    let destination = destination.clone();
-                    let source_uids = source_uids.clone();
-                    let move_messages = cmd == "MOVE";
-                    move || {
-                        rmail_common::imap_state::transfer_messages_by_uid(
-                            Path::new(&mail_root),
-                            &domain,
-                            &local,
-                            &mailbox,
-                            &source_uids,
-                            &destination,
-                            move_messages,
-                        )
-                    }
-                })
-                .await?;
-                let mappings = match batch_result {
-                    Ok(mappings) => mappings,
-                    Err(error) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, error).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let mapped_source_uids =
-                    mappings.iter().map(|mapping| mapping.0).collect::<Vec<_>>();
-                let destination_uids = mappings.iter().map(|mapping| mapping.1).collect::<Vec<_>>();
-                let destination_sel = match mailbox::load_selected_mailbox(
+                let outcome = commands::transfer::handle(
+                    tag,
+                    &cmd,
+                    args,
                     &mail_root,
                     authed_mailbox.as_ref().unwrap(),
-                    &destination,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                    session_state.feature_enabled("UTF8=ACCEPT"),
                 )
-                .await
-                {
-                    Ok(sel) => sel,
-                    Err(e) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, e).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                if let Some(addr) = authed_mailbox.as_ref() {
-                    let mailbox = selected_mailbox_name(&selected).to_string();
+                .await;
+                if outcome.refresh_selected {
+                    let mailbox_name = selected_mailbox_name(&selected).to_string();
                     selected = Some(
                         reload_selected_mailbox_preserving_mode(
-                            &mail_root, addr, &mailbox, &selected,
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
                         )
                         .await?,
                     );
                 }
-                let copyuid = copy_uid_pairs(
-                    &mapped_source_uids,
-                    &destination_uids,
-                    destination_sel.uidvalidity,
-                )
-                .unwrap_or_default();
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
                 let w = reader.get_mut();
-                w.write_all(format!("{} OK {}{} completed\r\n", tag, copyuid, cmd).as_bytes())
-                    .await?;
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-
             parser::Command::Uid {
                 command: uid_command,
             } => {
@@ -7154,117 +7043,39 @@ async fn process_stream_inner(
                         .await?;
                     w.flush().await?;
                 } else if subcmd == "COPY" || subcmd == "MOVE" {
-                    if selected.is_none() {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let mut parts = subargs.trim().splitn(2, ' ');
-                    let uid_set = parts.next().unwrap_or("");
-                    let destination = match decode_imap_mailbox_arg(
-                        unquote(parts.next().unwrap_or("").trim()),
-                        session_state.feature_enabled("UTF8=ACCEPT"),
-                    ) {
-                        Ok(name) => name,
-                        Err(_) => {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let sel = selected.as_ref().unwrap();
-                    if subcmd == "MOVE" && sel.read_only {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO Mailbox is read-only\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let source_uids =
-                        uids_from_set_or_saved(uid_set, sel, session_state.saved_search_uids());
-                    let batch_result = tokio::task::spawn_blocking({
-                        let mail_root = mail_root.clone();
-                        let domain = sel.domain.clone();
-                        let local = sel.local.clone();
-                        let mailbox = sel.mailbox.clone();
-                        let destination = destination.clone();
-                        let source_uids = source_uids.clone();
-                        let move_messages = subcmd == "MOVE";
-                        move || {
-                            rmail_common::imap_state::transfer_messages_by_uid(
-                                Path::new(&mail_root),
-                                &domain,
-                                &local,
-                                &mailbox,
-                                &source_uids,
-                                &destination,
-                                move_messages,
-                            )
-                        }
-                    })
-                    .await?;
-                    let mappings = match batch_result {
-                        Ok(mappings) => mappings,
-                        Err(error) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} NO UID {} failed: {}\r\n", tag, subcmd, error)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let mapped_source_uids =
-                        mappings.iter().map(|mapping| mapping.0).collect::<Vec<_>>();
-                    let destination_uids =
-                        mappings.iter().map(|mapping| mapping.1).collect::<Vec<_>>();
-                    let destination_sel = match mailbox::load_selected_mailbox(
+                    let command_name = format!("UID {subcmd}");
+                    let outcome = commands::transfer::handle(
+                        tag,
+                        &command_name,
+                        subargs,
                         &mail_root,
                         authed_mailbox.as_ref().unwrap(),
-                        &destination,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                        session_state.feature_enabled("UTF8=ACCEPT"),
                     )
-                    .await
-                    {
-                        Ok(sel) => sel,
-                        Err(e) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} NO UID {} failed: {}\r\n", tag, subcmd, e).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    if let Some(addr) = authed_mailbox.as_ref() {
-                        let mailbox = selected_mailbox_name(&selected).to_string();
+                    .await;
+                    if outcome.refresh_selected {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
                         selected = Some(
                             reload_selected_mailbox_preserving_mode(
-                                &mail_root, addr, &mailbox, &selected,
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
                             )
                             .await?,
                         );
                     }
-                    let copyuid = copy_uid_pairs(
-                        &mapped_source_uids,
-                        &destination_uids,
-                        destination_sel.uidvalidity,
-                    )
-                    .unwrap_or_default();
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, &command_name, &response);
                     let w = reader.get_mut();
-                    w.write_all(
-                        format!("{} OK {}UID {} completed\r\n", tag, copyuid, subcmd).as_bytes(),
-                    )
-                    .await?;
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
-                } else {
-                    log_unsupported_imap(peer, &selected, tag, &format!("UID {}", subcmd), subargs);
+
                     let w = reader.get_mut();
                     w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes())
                         .await?;

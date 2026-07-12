@@ -546,15 +546,6 @@ pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseEr
     })
 }
 
-pub(crate) fn unquote(s: &str) -> &str {
-    let s = s.trim();
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        &s[1..(s.len() - 1)]
-    } else {
-        s
-    }
-}
-
 pub(crate) fn seqs_from_set(seq_set: &str, total: usize) -> Vec<usize> {
     SequenceSet::parse(seq_set, total as u64)
         .map(|set| {
@@ -1695,6 +1686,29 @@ pub(crate) struct StoreRequest {
     pub(crate) mode: StoreMode,
     pub(crate) silent: bool,
     pub(crate) flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransferRequest {
+    pub(crate) message_set: String,
+    pub(crate) destination: String,
+}
+
+pub(crate) fn parse_transfer_request(input: &str) -> Result<TransferRequest, ParseError> {
+    let arguments = parse_imap_args(input)?;
+    let [ImapArg::Atom(message_set), destination] = arguments.as_slice() else {
+        return Err(ParseError::InvalidAtom);
+    };
+    if message_set != "$" {
+        SequenceSet::parse(message_set, 1).ok_or(ParseError::InvalidAtom)?;
+    }
+    Ok(TransferRequest {
+        message_set: message_set.clone(),
+        destination: destination
+            .as_text()
+            .ok_or(ParseError::InvalidAtom)?
+            .to_string(),
+    })
 }
 
 pub(crate) fn parse_store_request(input: &str) -> Result<StoreRequest, ParseError> {
