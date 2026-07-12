@@ -12,15 +12,6 @@ pub(crate) fn namespace(tag: &str) -> Response {
         .status(StatusLine::tagged(tag, Status::Ok, "NAMESPACE completed"))
 }
 
-pub(crate) fn id(tag: &str) -> Response {
-    Response::new()
-        .data(format!(
-            "ID (\"name\" \"rMail\" \"vendor\" \"rMail\" \"version\" \"{}\")",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .status(StatusLine::tagged(tag, Status::Ok, "ID completed"))
-}
-
 pub(crate) fn completed(tag: &str, command: &str) -> Response {
     Response::new().status(StatusLine::tagged(
         tag,
@@ -74,6 +65,5 @@ mod tests {
             unknown("A5").encode(),
             "A5 BAD Unknown or unimplemented command\r\n"
         );
-        assert!(id("A6").encode().contains("A6 OK ID completed\r\n"));
     }
 }

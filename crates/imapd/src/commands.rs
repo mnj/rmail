@@ -340,6 +340,7 @@ pub(crate) mod basic;
 pub(crate) mod enable;
 pub(crate) mod expunge;
 pub(crate) mod fetch;
+pub(crate) mod id;
 pub(crate) mod idle;
 pub(crate) mod list;
 pub(crate) mod login;

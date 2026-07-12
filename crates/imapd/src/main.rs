@@ -5916,21 +5916,14 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Id => {
-                let client_id = match parser::parse_id_args(args) {
-                    Ok(fields) => fields,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid ID arguments\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                if let Some(fields) = client_id {
-                    let keys = fields.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
-                    println!("IMAP ID peer={:?} field_keys={:?}", peer, keys);
+                let outcome = commands::id::handle(tag, args);
+                if !outcome.field_keys.is_empty() {
+                    println!(
+                        "IMAP ID peer={:?} field_keys={:?}",
+                        peer, outcome.field_keys
+                    );
                 }
-                let response = commands::basic::id(tag).encode();
+                let response = outcome.response.encode();
                 let w = reader.get_mut();
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
