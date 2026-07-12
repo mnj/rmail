@@ -24,9 +24,9 @@ pub(crate) async fn handle_password(
     peer: Option<SocketAddr>,
     authenticated_capabilities: &str,
 ) -> Outcome {
-    let mut exchange: Box<dyn auth::SaslExchange> = match mechanism {
-        "PLAIN" => Box::new(auth::PlainExchange::default()),
-        "LOGIN" => Box::new(auth::LoginExchange::default()),
+    let mut exchange: Box<dyn rmail_common::auth::PasswordSaslExchange> = match mechanism {
+        "PLAIN" => Box::new(rmail_common::auth::PlainExchange::default()),
+        "LOGIN" => Box::new(rmail_common::auth::LoginExchange::default()),
         _ => {
             return terminal(
                 tag,
@@ -375,16 +375,18 @@ pub(crate) async fn read_response(
 
 pub(crate) async fn run_password_exchange(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
-    exchange: &mut dyn auth::SaslExchange,
+    exchange: &mut dyn rmail_common::auth::PasswordSaslExchange,
     initial: Option<&str>,
-) -> Result<auth::SaslCredentials, ProtocolError> {
+) -> Result<rmail_common::auth::SaslCredentials, ProtocolError> {
     let mut progress = exchange
         .start(initial)
         .map_err(|_| ProtocolError::InvalidResponse)?;
     loop {
         match progress {
-            auth::SaslProgress::Credentials(credentials) => return Ok(credentials),
-            auth::SaslProgress::Challenge(challenge) => {
+            rmail_common::auth::PasswordSaslProgress::Credentials(credentials) => {
+                return Ok(credentials);
+            }
+            rmail_common::auth::PasswordSaslProgress::Challenge(challenge) => {
                 let continuation = Response::new().continuation(challenge).encode();
                 reader
                     .get_mut()
@@ -401,9 +403,6 @@ pub(crate) async fn run_password_exchange(
                     .receive(&line)
                     .map_err(|_| ProtocolError::InvalidResponse)?;
             }
-            auth::SaslProgress::ScramClientFirst(_)
-            | auth::SaslProgress::ScramClientFinal(_)
-            | auth::SaslProgress::Complete => return Err(ProtocolError::InvalidResponse),
         }
     }
 }

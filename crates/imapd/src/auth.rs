@@ -166,16 +166,8 @@ pub(crate) async fn verify_password(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SaslCredentials {
-    pub(crate) authcid: String,
-    pub(crate) authzid: Option<String>,
-    pub(crate) password: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SaslProgress {
     Challenge(&'static str),
-    Credentials(SaslCredentials),
     ScramClientFirst(ScramClientFirst),
     ScramClientFinal(ScramClientFinal),
     Complete,
@@ -263,118 +255,6 @@ impl SaslExchange for ScramExchange {
             ScramState::FinalAcknowledgment | ScramState::Complete => {
                 Err(SaslExchangeError::UnexpectedResponse)
             }
-        }
-    }
-}
-
-fn plain_credentials(response: &str) -> Option<SaslCredentials> {
-    let decoded = BASE64_ENGINE.decode(response.trim()).ok()?;
-    let mut parts = decoded.split(|byte| *byte == 0);
-    let authzid = parts.next()?;
-    let authcid = parts.next()?;
-    let password = parts.next()?;
-    if parts.next().is_some() || authcid.is_empty() {
-        return None;
-    }
-    Some(SaslCredentials {
-        authcid: String::from_utf8(authcid.to_vec()).ok()?,
-        authzid: if authzid.is_empty() {
-            None
-        } else {
-            Some(String::from_utf8(authzid.to_vec()).ok()?)
-        },
-        password: String::from_utf8(password.to_vec()).ok()?,
-    })
-}
-
-#[derive(Default)]
-pub(crate) struct PlainExchange {
-    waiting: bool,
-}
-
-impl SaslExchange for PlainExchange {
-    fn start(&mut self, initial: Option<&str>) -> Result<SaslProgress, SaslExchangeError> {
-        if self.waiting {
-            return Err(SaslExchangeError::UnexpectedResponse);
-        }
-        match initial {
-            Some(response) => plain_credentials(response)
-                .map(SaslProgress::Credentials)
-                .ok_or(SaslExchangeError::InvalidResponse),
-            None => {
-                self.waiting = true;
-                Ok(SaslProgress::Challenge(""))
-            }
-        }
-    }
-
-    fn receive(&mut self, response: &str) -> Result<SaslProgress, SaslExchangeError> {
-        if !self.waiting {
-            return Err(SaslExchangeError::UnexpectedResponse);
-        }
-        self.waiting = false;
-        plain_credentials(response)
-            .map(SaslProgress::Credentials)
-            .ok_or(SaslExchangeError::InvalidResponse)
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct LoginExchange {
-    state: LoginState,
-    username: Option<String>,
-}
-
-#[derive(Default)]
-enum LoginState {
-    #[default]
-    New,
-    Username,
-    Password,
-    Complete,
-}
-
-impl SaslExchange for LoginExchange {
-    fn start(&mut self, initial: Option<&str>) -> Result<SaslProgress, SaslExchangeError> {
-        if !matches!(self.state, LoginState::New) {
-            return Err(SaslExchangeError::UnexpectedResponse);
-        }
-        match initial {
-            Some(response) => {
-                self.username =
-                    Some(decode_sasl_message(response).ok_or(SaslExchangeError::InvalidResponse)?);
-                self.state = LoginState::Password;
-                Ok(SaslProgress::Challenge("UGFzc3dvcmQ6"))
-            }
-            None => {
-                self.state = LoginState::Username;
-                Ok(SaslProgress::Challenge("VXNlcm5hbWU6"))
-            }
-        }
-    }
-
-    fn receive(&mut self, response: &str) -> Result<SaslProgress, SaslExchangeError> {
-        match self.state {
-            LoginState::Username => {
-                self.username =
-                    Some(decode_sasl_message(response).ok_or(SaslExchangeError::InvalidResponse)?);
-                self.state = LoginState::Password;
-                Ok(SaslProgress::Challenge("UGFzc3dvcmQ6"))
-            }
-            LoginState::Password => {
-                let password =
-                    decode_sasl_message(response).ok_or(SaslExchangeError::InvalidResponse)?;
-                self.state = LoginState::Complete;
-                Ok(SaslProgress::Credentials(SaslCredentials {
-                    authcid: self
-                        .username
-                        .take()
-                        .ok_or(SaslExchangeError::UnexpectedResponse)?,
-                    authzid: None,
-                    password,
-                }))
-            }
-            LoginState::New | LoginState::Complete => Err(SaslExchangeError::UnexpectedResponse),
         }
     }
 }
@@ -554,46 +434,6 @@ mod tests {
     fn sasl_payload_decoding_rejects_invalid_utf8() {
         assert!(decode_sasl_message("/w==").is_none());
         assert_eq!(decode_sasl_message("="), Some(String::new()));
-    }
-
-    #[test]
-    fn plain_and_login_exchanges_share_stateful_challenge_lifecycle() {
-        let mut plain = PlainExchange::default();
-        assert_eq!(plain.start(None), Ok(SaslProgress::Challenge("")));
-        assert_eq!(
-            plain.receive("AHVzZXIAcGFzcw=="),
-            Ok(SaslProgress::Credentials(SaslCredentials {
-                authcid: "user".to_string(),
-                authzid: None,
-                password: "pass".to_string(),
-            }))
-        );
-        assert_eq!(
-            PlainExchange::default().start(Some("YWRtaW4AdXNlcgBwYXNz")),
-            Ok(SaslProgress::Credentials(SaslCredentials {
-                authcid: "user".to_string(),
-                authzid: Some("admin".to_string()),
-                password: "pass".to_string(),
-            }))
-        );
-
-        let mut login = LoginExchange::default();
-        assert_eq!(
-            login.start(None),
-            Ok(SaslProgress::Challenge("VXNlcm5hbWU6"))
-        );
-        assert_eq!(
-            login.receive("dXNlcg=="),
-            Ok(SaslProgress::Challenge("UGFzc3dvcmQ6"))
-        );
-        assert!(matches!(
-            login.receive("cGFzcw=="),
-            Ok(SaslProgress::Credentials(_))
-        ));
-        assert_eq!(
-            login.receive("cGFzcw=="),
-            Err(SaslExchangeError::UnexpectedResponse)
-        );
     }
 
     #[test]
