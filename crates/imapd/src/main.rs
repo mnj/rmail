@@ -5274,87 +5274,6 @@ async fn authenticate_password(
     }
 }
 
-async fn execute_sort(
-    selected: &SelectedMailbox,
-    request: &parser::SortRequest,
-    saved_search_uids: &[u64],
-) -> Result<Vec<sort::SortRecord>> {
-    debug_assert!(request.charset == "UTF-8" || request.charset == "US-ASCII");
-    let mut records = Vec::new();
-    let now = chrono::Utc::now().timestamp();
-    for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
-        let data = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || std::fs::read(path)
-        })
-        .await??;
-        let internal_date = selected
-            .internal_dates
-            .get(uid)
-            .map(|date| date.0)
-            .unwrap_or(0);
-        let message = parser::SearchMessage {
-            seq: index + 1,
-            uid: *uid,
-            flags,
-            internal_date,
-            in_saved_result: saved_search_uids.binary_search(uid).is_ok(),
-            now,
-            data: &data,
-        };
-        if parser::search_matches(&request.search, &message, selected.msgs.len()) {
-            records.push(sort::SortRecord::from_message(
-                index as u64 + 1,
-                *uid,
-                internal_date,
-                &data,
-            ));
-        }
-    }
-    records.sort_by(|left, right| sort::compare_records(left, right, &request.criteria));
-    Ok(records)
-}
-
-async fn execute_thread(
-    selected: &SelectedMailbox,
-    request: &parser::ThreadRequest,
-    saved_search_uids: &[u64],
-) -> Result<Vec<thread::ThreadMessage>> {
-    debug_assert!(request.charset == "UTF-8" || request.charset == "US-ASCII");
-    let mut messages = Vec::new();
-    let now = chrono::Utc::now().timestamp();
-    for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
-        let data = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || std::fs::read(path)
-        })
-        .await??;
-        let internal_date = selected
-            .internal_dates
-            .get(uid)
-            .map(|date| date.0)
-            .unwrap_or(0);
-        let search_message = parser::SearchMessage {
-            seq: index + 1,
-            uid: *uid,
-            flags,
-            internal_date,
-            in_saved_result: saved_search_uids.binary_search(uid).is_ok(),
-            now,
-            data: &data,
-        };
-        if parser::search_matches(&request.search, &search_message, selected.msgs.len()) {
-            messages.push(thread::ThreadMessage::from_message(
-                index as u64 + 1,
-                *uid,
-                internal_date,
-                &data,
-            ));
-        }
-    }
-    Ok(messages)
-}
-
 fn compress_search_ids(ids: &[u64]) -> String {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -7090,76 +7009,36 @@ async fn process_stream_inner(
                         );
                     }
                 } else if subcmd == "THREAD" {
-                    let request = match parser::parse_thread_request(subargs) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            let response = match error {
-                                parser::SortParseError::UnsupportedCharset(_) => format!(
-                                    "{} NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n",
-                                    tag
-                                ),
-                                parser::SortParseError::Syntax => {
-                                    format!("{} BAD Invalid UID THREAD arguments\r\n", tag)
-                                }
-                            };
-                            let w = reader.get_mut();
-                            w.write_all(response.as_bytes()).await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let sel = selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox");
-                    let messages =
-                        execute_thread(sel, &request, session_state.saved_search_uids()).await?;
-                    let body = match request.algorithm {
-                        parser::ThreadAlgorithm::OrderedSubject => {
-                            thread::ordered_subject(&messages, true)
-                        }
-                        parser::ThreadAlgorithm::References => thread::references(&messages, true),
-                        parser::ThreadAlgorithm::Refs => thread::refs(&messages, true),
-                    };
+                    let response = commands::sort_thread::thread(
+                        tag,
+                        subargs,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                    )
+                    .await
+                    .encode();
+                    log_imap_response(peer, tag, "UID THREAD", &response);
                     let w = reader.get_mut();
-                    w.write_all(format!("* THREAD {}\r\n", body).as_bytes())
-                        .await?;
-                    w.write_all(format!("{} OK UID THREAD completed\r\n", tag).as_bytes())
-                        .await?;
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "SORT" {
-                    let request = match parser::parse_sort_request(subargs) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            let response = match error {
-                                parser::SortParseError::UnsupportedCharset(_) => format!(
-                                    "{} NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n",
-                                    tag
-                                ),
-                                parser::SortParseError::Syntax => {
-                                    format!("{} BAD Invalid UID SORT arguments\r\n", tag)
-                                }
-                            };
-                            let w = reader.get_mut();
-                            w.write_all(response.as_bytes()).await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let sel = selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox");
-                    let records =
-                        execute_sort(sel, &request, session_state.saved_search_uids()).await?;
-                    let ids = records
-                        .iter()
-                        .map(|record| record.uid.to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let response = commands::sort_thread::sort(
+                        tag,
+                        subargs,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                    )
+                    .await
+                    .encode();
+                    log_imap_response(peer, tag, "UID SORT", &response);
                     let w = reader.get_mut();
-                    w.write_all(format!("* SORT {}\r\n", ids).as_bytes())
-                        .await?;
-                    w.write_all(format!("{} OK UID SORT completed\r\n", tag).as_bytes())
-                        .await?;
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "SEARCH" {
                     let outcome = commands::search::handle(
@@ -7414,77 +7293,37 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Thread => {
-                let request = match parser::parse_thread_request(args) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let response = match error {
-                            parser::SortParseError::UnsupportedCharset(_) => format!(
-                                "{} NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n",
-                                tag
-                            ),
-                            parser::SortParseError::Syntax => {
-                                format!("{} BAD Invalid THREAD arguments\r\n", tag)
-                            }
-                        };
-                        let w = reader.get_mut();
-                        w.write_all(response.as_bytes()).await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let sel = selected
-                    .as_ref()
-                    .expect("preflight requires selected mailbox");
-                let messages =
-                    execute_thread(sel, &request, session_state.saved_search_uids()).await?;
-                let body = match request.algorithm {
-                    parser::ThreadAlgorithm::OrderedSubject => {
-                        thread::ordered_subject(&messages, false)
-                    }
-                    parser::ThreadAlgorithm::References => thread::references(&messages, false),
-                    parser::ThreadAlgorithm::Refs => thread::refs(&messages, false),
-                };
+                let response = commands::sort_thread::thread(
+                    tag,
+                    args,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                )
+                .await
+                .encode();
+                log_imap_response(peer, tag, "THREAD", &response);
                 let w = reader.get_mut();
-                w.write_all(format!("* THREAD {}\r\n", body).as_bytes())
-                    .await?;
-                w.write_all(format!("{} OK THREAD completed\r\n", tag).as_bytes())
-                    .await?;
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Sort => {
-                let request = match parser::parse_sort_request(args) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let response = match error {
-                            parser::SortParseError::UnsupportedCharset(_) => format!(
-                                "{} NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n",
-                                tag
-                            ),
-                            parser::SortParseError::Syntax => {
-                                format!("{} BAD Invalid SORT arguments\r\n", tag)
-                            }
-                        };
-                        let w = reader.get_mut();
-                        w.write_all(response.as_bytes()).await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let sel = selected
-                    .as_ref()
-                    .expect("preflight requires selected mailbox");
-                let records =
-                    execute_sort(sel, &request, session_state.saved_search_uids()).await?;
-                let ids = records
-                    .iter()
-                    .map(|record| record.seq.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let response = commands::sort_thread::sort(
+                    tag,
+                    args,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                )
+                .await
+                .encode();
+                log_imap_response(peer, tag, "SORT", &response);
                 let w = reader.get_mut();
-                w.write_all(format!("* SORT {}\r\n", ids).as_bytes())
-                    .await?;
-                w.write_all(format!("{} OK SORT completed\r\n", tag).as_bytes())
-                    .await?;
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Store => {
