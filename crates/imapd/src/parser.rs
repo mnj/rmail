@@ -606,7 +606,7 @@ impl SequenceSet {
                 (value, value)
             };
             if start == 0 || end == 0 {
-                continue;
+                return None;
             }
             ranges.push((start.min(end), start.max(end)));
         }
@@ -784,41 +784,12 @@ pub(crate) fn parse_select_request(input: &str) -> Result<SelectRequest, ParseEr
 }
 
 pub(crate) fn ids_from_set(id_set: &str, max: u64) -> Vec<u64> {
-    if id_set == "*" {
-        return (1..=max).collect();
+    if max == 0 {
+        return Vec::new();
     }
-    let mut out = Vec::new();
-    for part in id_set.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((start, end)) = part.split_once(':') {
-            let start = if start == "*" {
-                max
-            } else {
-                start.parse::<u64>().unwrap_or(1)
-            };
-            let end = if end == "*" {
-                max
-            } else {
-                end.parse::<u64>().unwrap_or(max)
-            };
-            let (lo, hi) = if start <= end {
-                (start, end)
-            } else {
-                (end, start)
-            };
-            out.extend(lo..=hi);
-        } else if part == "*" {
-            out.push(max);
-        } else if let Ok(id) = part.parse::<u64>() {
-            out.push(id);
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
+    SequenceSet::parse(id_set, max).map_or_else(Vec::new, |set| {
+        (1..=max).filter(|id| set.contains(*id)).collect()
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -960,6 +931,7 @@ fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCr
         "UID" => {
             let set = tokens.get(*pos)?.clone();
             *pos += 1;
+            SequenceSet::parse(&set, 1)?;
             Some(SearchCriterion::UidSet(set))
         }
         "$" => Some(SearchCriterion::SavedResult),
@@ -1047,6 +1019,7 @@ fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCr
             .chars()
             .all(|c| c.is_ascii_digit() || c == ':' || c == '*' || c == ',') =>
         {
+            SequenceSet::parse(&token, 1)?;
             Some(SearchCriterion::SeqSet(token))
         }
         _ => None,
@@ -2344,6 +2317,12 @@ mod tests {
         assert_eq!(ids_from_set("4:2,*,2", 5), vec![2, 3, 4, 5]);
         assert!(SequenceSet::parse("4294967296", 1).is_none());
         assert!(SequenceSet::parse_nostar("4294967296").is_none());
+        for invalid in ["0", "0,1", "1,,2", "1::2", ",1", "1,"] {
+            assert!(
+                SequenceSet::parse(invalid, 5).is_none(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -2436,6 +2415,9 @@ mod tests {
                 .save
         );
         assert!(parse_search_request("RETURN MIN ALL").is_err());
+        for invalid in ["0", "0,1", "1,,2", "1::2", "UID 0", "UID 1,,2"] {
+            assert!(parse_search_request(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
