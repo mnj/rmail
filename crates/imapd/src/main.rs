@@ -4038,7 +4038,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 RENAME Projects \"Renamed\"\r\nA003 LIST \"\" \"*\"\r\nA004 SELECT Renamed\r\nA005 RENAME INBOX Nope\r\nA006 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 RENAME Projects \"Renamed\"\r\nA003 LIST \"\" \"*\"\r\nA004 SELECT Renamed\r\nA005 DELETE Renamed\r\nA006 FETCH 1 FLAGS\r\nA007 RENAME INBOX Nope\r\nA008 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
@@ -4056,14 +4056,23 @@ mod tests {
         let select = read_until_contains(&mut reader, "A004 OK").await;
         assert!(select.iter().any(|l| l.contains("* 1 EXISTS")));
 
-        let inbox_rename = read_until_contains(&mut reader, "A005 NO").await;
+        let deleted = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(deleted.iter().any(|line| line.contains("DELETE completed")));
+        let stale_selection = read_until_contains(&mut reader, "A006 BAD").await;
+        assert!(
+            stale_selection
+                .iter()
+                .any(|line| line.contains("No mailbox selected"))
+        );
+
+        let inbox_rename = read_until_contains(&mut reader, "A007 NO").await;
         assert!(
             inbox_rename
                 .iter()
                 .any(|l| l.contains("cannot rename INBOX"))
         );
 
-        let _logout = read_until_contains(&mut reader, "A006 OK").await;
+        let _logout = read_until_contains(&mut reader, "A008 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -7335,17 +7344,24 @@ async fn process_stream_inner(
                 let addr = authed_mailbox.as_ref().unwrap();
                 let (local, domain) = address_parts(addr)?;
                 let mail_root_clone = mail_root.clone();
+                let mailbox_for_task = mailbox_name.clone();
                 match tokio::task::spawn_blocking(move || {
                     maildir::delete_mailbox(
                         Path::new(&mail_root_clone),
                         &domain,
                         &local,
-                        &mailbox_name,
+                        &mailbox_for_task,
                     )
                 })
                 .await?
                 {
                     Ok(()) => {
+                        if selected.as_ref().is_some_and(|selected_mailbox| {
+                            selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
+                        }) {
+                            selected = None;
+                            session_state.selected_mailbox = None;
+                        }
                         let w = reader.get_mut();
                         w.write_all(format!("{} OK DELETE completed\r\n", tag).as_bytes())
                             .await?;

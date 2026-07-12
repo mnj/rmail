@@ -289,13 +289,35 @@ pub fn delete_folder(
     if name.eq_ignore_ascii_case("INBOX") {
         anyhow::bail!("cannot delete INBOX");
     }
-    let conn = open_account(maildir_root, domain, localpart)?;
-    if let Some(id) = folder_id(&conn, &name)? {
-        conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
-    }
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    let id = folder_id(&conn, &name)?.context("mailbox does not exist")?;
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
-    if dir.exists() {
-        fs::remove_dir_all(dir)?;
+    let tombstone = account_maildir(maildir_root, domain, localpart)
+        .join("tmp")
+        .join(format!(
+            ".mailbox-delete.{}.{}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            rand::random::<u64>()
+        ));
+    let guard = if dir.exists() {
+        fs::rename(&dir, &tombstone)
+            .with_context(|| format!("staging mailbox {name} for deletion"))?;
+        Some(FileMutationGuard::moved(dir, tombstone.clone()))
+    } else {
+        None
+    };
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    tx.commit()?;
+    if let Some(guard) = guard {
+        guard.commit();
+        if let Err(error) = fs::remove_dir_all(&tombstone) {
+            eprintln!(
+                "failed to remove committed mailbox tombstone {}: {}",
+                tombstone.display(),
+                error
+            );
+        }
     }
     Ok(())
 }
@@ -316,12 +338,36 @@ pub fn rename_folder(
         return Ok(());
     }
 
-    let conn = open_account(maildir_root, domain, localpart)?;
-    let Some(source_id) = folder_id(&conn, &source)? else {
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    let Some(_) = folder_id(&conn, &source)? else {
         anyhow::bail!("source mailbox does not exist");
     };
-    if folder_id(&conn, &destination)?.is_some() {
-        anyhow::bail!("destination mailbox already exists");
+    let prefix = format!("{source}/");
+    let mut mappings = list_folders(maildir_root, domain, localpart)?
+        .into_iter()
+        .filter_map(|folder| {
+            if folder.name.eq_ignore_ascii_case(&source) {
+                Some((folder.name, destination.clone()))
+            } else if folder.name.starts_with(&prefix) {
+                Some((
+                    folder.name.clone(),
+                    format!("{destination}/{}", &folder.name[prefix.len()..]),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    mappings.sort_by(|left, right| left.0.len().cmp(&right.0.len()));
+    for (_, new_name) in &mappings {
+        if let Some(existing_id) = folder_id(&conn, new_name)? {
+            let replacing_source = mappings.iter().any(|(old_name, _)| {
+                folder_id(&conn, old_name).ok().flatten() == Some(existing_id)
+            });
+            if !replacing_source {
+                anyhow::bail!("destination mailbox already exists");
+            }
+        }
     }
 
     let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
@@ -332,16 +378,18 @@ pub fn rename_folder(
     if destination_dir.exists() {
         anyhow::bail!("destination mailbox directory already exists");
     }
-    fs::rename(&source_dir, &destination_dir).with_context(|| {
-        format!(
-            "renaming mailbox {} to {}",
-            source_mailbox, destination_mailbox
-        )
-    })?;
-    conn.execute(
-        "UPDATE folders SET name = ?1, path = ?2 WHERE id = ?3",
-        params![destination, folder_path(&destination)?, source_id],
-    )?;
+    fs::rename(&source_dir, &destination_dir)
+        .with_context(|| format!("renaming mailbox {source} to {destination}"))?;
+    let guard = FileMutationGuard::moved(source_dir, destination_dir);
+    let tx = conn.transaction()?;
+    for (old_name, new_name) in &mappings {
+        tx.execute(
+            "UPDATE folders SET name = ?1, path = ?2 WHERE name = ?3",
+            params![new_name, folder_path(new_name)?, old_name],
+        )?;
+    }
+    tx.commit()?;
+    guard.commit();
     Ok(())
 }
 
@@ -2085,9 +2133,14 @@ mod tests {
     fn rename_folder_preserves_messages_flags_and_subscription() {
         let td = tempfile::tempdir().unwrap();
         create_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
         let projects = mailbox_dir(td.path(), "example.test", "user", "Projects").unwrap();
+        let child = mailbox_dir(td.path(), "example.test", "user", "Projects/Child").unwrap();
         write_msg(&projects, "a", b"Subject: a\r\n\r\nbody");
+        write_msg(&child, "b", b"Subject: b\r\n\r\nchild");
         let (_, messages) = load_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        let (_, child_messages) =
+            load_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
         set_uid_flags(
             td.path(),
             "example.test",
@@ -2101,7 +2154,9 @@ mod tests {
 
         rename_folder(td.path(), "example.test", "user", "Projects", "Renamed").unwrap();
         assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+        assert!(!folder_exists(td.path(), "example.test", "user", "Projects/Child").unwrap());
         assert!(folder_exists(td.path(), "example.test", "user", "Renamed").unwrap());
+        assert!(folder_exists(td.path(), "example.test", "user", "Renamed/Child").unwrap());
         let (folder, renamed) = load_folder(td.path(), "example.test", "user", "Renamed").unwrap();
         assert_eq!(renamed.len(), 1);
         assert_eq!(renamed[0].uid, messages[0].uid);
@@ -2111,7 +2166,68 @@ mod tests {
             fs::read(&renamed[0].path).unwrap(),
             b"Subject: a\r\n\r\nbody"
         );
+        let (_, renamed_child) =
+            load_folder(td.path(), "example.test", "user", "Renamed/Child").unwrap();
+        assert_eq!(renamed_child[0].uid, child_messages[0].uid);
+        assert_eq!(
+            fs::read(&renamed_child[0].path).unwrap(),
+            b"Subject: b\r\n\r\nchild"
+        );
 
         assert!(rename_folder(td.path(), "example.test", "user", "INBOX", "Nope").is_err());
+    }
+
+    #[test]
+    fn hierarchy_rename_rolls_back_filesystem_and_database_together() {
+        let td = tempfile::tempdir().unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
+        let parent_dir = mailbox_dir(td.path(), "example.test", "user", "Projects").unwrap();
+        let child_dir = mailbox_dir(td.path(), "example.test", "user", "Projects/Child").unwrap();
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_child_rename
+             BEFORE UPDATE OF name ON folders
+             WHEN OLD.name = 'Projects/Child'
+             BEGIN SELECT RAISE(FAIL, 'injected child rename failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(rename_folder(td.path(), "example.test", "user", "Projects", "Renamed").is_err());
+        assert!(parent_dir.is_dir());
+        assert!(child_dir.is_dir());
+        assert!(folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+        assert!(folder_exists(td.path(), "example.test", "user", "Projects/Child").unwrap());
+        assert!(!folder_exists(td.path(), "example.test", "user", "Renamed").unwrap());
+        assert!(!folder_exists(td.path(), "example.test", "user", "Renamed/Child").unwrap());
+    }
+
+    #[test]
+    fn mailbox_delete_rolls_back_filesystem_when_database_delete_fails() {
+        let td = tempfile::tempdir().unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        let projects = mailbox_dir(td.path(), "example.test", "user", "Projects").unwrap();
+        write_msg(&projects, "a", b"Subject: retained\r\n\r\nbody");
+        load_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_mailbox_delete
+             BEFORE DELETE ON folders
+             WHEN OLD.name = 'Projects'
+             BEGIN SELECT RAISE(FAIL, 'injected mailbox delete failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(delete_folder(td.path(), "example.test", "user", "Projects").is_err());
+        assert!(projects.is_dir());
+        assert!(folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+        let (_, messages) = load_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            fs::read(&messages[0].path).unwrap(),
+            b"Subject: retained\r\n\r\nbody"
+        );
     }
 }
