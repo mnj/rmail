@@ -4188,7 +4188,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects/Child\r\nA004 LIST \"\" \"Projects\" RETURN (CHILDREN)\r\nA005 LIST (SPECIAL-USE) \"\" (\"INBOX\" \"Sent\") RETURN (SPECIAL-USE STATUS (MESSAGES UIDNEXT UNSEEN))\r\nA006 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects/Child\r\nA004 UNSUBSCRIBE Projects\r\nA005 LIST \"\" \"Projects\" RETURN (CHILDREN)\r\nA006 LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"Projects%\" RETURN (SUBSCRIBED CHILDREN)\r\nA007 LIST (REMOTE) \"\" \"*\"\r\nA008 LIST (SPECIAL-USE) \"\" (\"INBOX\" \"Sent\") RETURN (SPECIAL-USE STATUS (MESSAGES UIDNEXT UNSEEN))\r\nA009 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
@@ -4197,13 +4197,22 @@ mod tests {
         let _login = read_until_contains(&mut reader, "A001 OK").await;
         let _create_parent = read_until_contains(&mut reader, "A002 OK").await;
         let _create_child = read_until_contains(&mut reader, "A003 OK").await;
-        let children = read_until_contains(&mut reader, "A004 OK").await;
+        let _unsubscribe_parent = read_until_contains(&mut reader, "A004 OK").await;
+        let children = read_until_contains(&mut reader, "A005 OK").await;
         assert!(
             children
                 .iter()
                 .any(|l| l.contains("* LIST (\\HasChildren)") && l.contains("\"Projects\""))
         );
-        let special_status = read_until_contains(&mut reader, "A005 OK").await;
+        let recursive = read_until_contains(&mut reader, "A006 OK").await;
+        assert!(
+            recursive
+                .iter()
+                .any(|line| { line.contains("\"Projects\" (CHILDINFO (\"SUBSCRIBED\"))") })
+        );
+        let remote = read_until_contains(&mut reader, "A007 OK").await;
+        assert!(!remote.iter().any(|line| line.starts_with("* LIST")));
+        let special_status = read_until_contains(&mut reader, "A008 OK").await;
         assert!(
             special_status
                 .iter()
@@ -4219,7 +4228,7 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("* STATUS \"INBOX\""))
         );
-        let _logout = read_until_contains(&mut reader, "A006 OK").await;
+        let _logout = read_until_contains(&mut reader, "A009 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -5319,6 +5328,7 @@ fn append_list_response(
     summary: &rmail_common::imap_state::FolderSummary,
     all_folders: &[rmail_common::imap_state::FolderSummary],
     utf8_accept: bool,
+    child_info: &[&str],
 ) {
     let mut attrs = Vec::new();
     if request.returns.children {
@@ -5340,11 +5350,22 @@ fn append_list_response(
         }
     }
     response.push_str(&format!(
-        "* {} ({}) \"/\" {}\r\n",
+        "* {} ({}) \"/\" {}",
         command_name,
         attrs.join(" "),
         quote_imap_mailbox_name(&summary.folder.name, utf8_accept)
     ));
+    if !child_info.is_empty() {
+        response.push_str(&format!(
+            " (CHILDINFO ({}))",
+            child_info
+                .iter()
+                .map(|item| format!("\"{}\"", item))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    response.push_str("\r\n");
     if !request.returns.status.is_empty() {
         let values = request
             .returns
@@ -5359,6 +5380,37 @@ fn append_list_response(
             values
         ));
     }
+}
+
+fn list_selection_child_info<'a>(
+    request: &parser::ListRequest,
+    summary: &rmail_common::imap_state::FolderSummary,
+    all_folders: &'a [rmail_common::imap_state::FolderSummary],
+) -> Vec<&'static str> {
+    if !request.selection.recursive_match {
+        return Vec::new();
+    }
+    let prefix = format!("{}/", summary.folder.name);
+    let descendants = all_folders
+        .iter()
+        .filter(|candidate| candidate.folder.name.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    let mut info = Vec::new();
+    if request.selection.subscribed
+        && descendants
+            .iter()
+            .any(|candidate| candidate.folder.subscribed)
+    {
+        info.push("SUBSCRIBED");
+    }
+    if request.selection.special_use
+        && descendants
+            .iter()
+            .any(|candidate| candidate.folder.special_use.is_some())
+    {
+        info.push("SPECIAL-USE");
+    }
+    info
 }
 
 #[cfg(test)]
@@ -7059,10 +7111,14 @@ async fn process_stream_inner(
                     response.push_str("* LIST (\\Noselect \\HasChildren) \"/\" \"\"\r\n");
                 }
                 for summary in &summaries {
-                    if request.selection.subscribed && !summary.folder.subscribed {
+                    if request.selection.remote {
                         continue;
                     }
-                    if request.selection.special_use && summary.folder.special_use.is_none() {
+                    let directly_selected = (!request.selection.subscribed
+                        || summary.folder.subscribed)
+                        && (!request.selection.special_use || summary.folder.special_use.is_some());
+                    let child_info = list_selection_child_info(&request, summary, &summaries);
+                    if !directly_selected && child_info.is_empty() {
                         continue;
                     }
                     if !request.patterns.iter().any(|pattern| {
@@ -7077,6 +7133,7 @@ async fn process_stream_inner(
                         summary,
                         &summaries,
                         utf8_accept,
+                        &child_info,
                     );
                 }
                 response.push_str(&format!("{} OK {} completed\r\n", tag, cmd));
@@ -7138,6 +7195,7 @@ async fn process_stream_inner(
                         summary,
                         &summaries,
                         utf8_accept,
+                        &[],
                     );
                 }
                 response.push_str(&format!("{} OK LSUB completed\r\n", tag));
