@@ -5193,179 +5193,12 @@ fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseE
     parser::parse_append_args(args)
 }
 
-fn mailbox_pattern_matches(name: &str, reference: &str, pattern: &str) -> bool {
-    parser::mailbox_pattern_matches(name, reference, pattern)
-}
-
-fn quote_imap_string(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{}\"", escaped)
-}
-
-fn imap_wire_mailbox_name(name: &str, utf8_accept: bool) -> String {
-    if utf8_accept {
-        name.to_string()
-    } else {
-        rmail_common::maildir::utf8_to_imap_utf7(name).unwrap_or_else(|_| name.to_string())
-    }
-}
-
-fn quote_imap_mailbox_name(name: &str, utf8_accept: bool) -> String {
-    quote_imap_string(&imap_wire_mailbox_name(name, utf8_accept))
-}
-
 fn decode_imap_mailbox_arg(name: &str, utf8_accept: bool) -> Result<String> {
     if !utf8_accept && name.contains('&') {
         rmail_common::maildir::imap_utf7_to_utf8(name).map_err(Into::into)
     } else {
         Ok(name.to_string())
     }
-}
-
-fn decode_list_request(
-    mut request: parser::ListRequest,
-    utf8_accept: bool,
-) -> Result<parser::ListRequest> {
-    request.reference = decode_imap_mailbox_arg(&request.reference, utf8_accept)?;
-    request.patterns = request
-        .patterns
-        .into_iter()
-        .map(|pattern| decode_imap_mailbox_arg(&pattern, utf8_accept))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(request)
-}
-
-fn has_child_folder(name: &str, folders: &[rmail_common::imap_state::FolderSummary]) -> bool {
-    let prefix = format!("{}/", name);
-    folders
-        .iter()
-        .any(|candidate| candidate.folder.name.starts_with(&prefix))
-}
-
-fn list_status_value(
-    summary: &rmail_common::imap_state::FolderSummary,
-    item: parser::StatusItem,
-) -> String {
-    commands::status::status_values(summary, &[item])
-        .pop()
-        .expect("one status item produces one value")
-}
-
-fn append_list_response(
-    response: &mut String,
-    command_name: &str,
-    request: &parser::ListRequest,
-    summary: &rmail_common::imap_state::FolderSummary,
-    all_folders: &[rmail_common::imap_state::FolderSummary],
-    utf8_accept: bool,
-    child_info: &[&str],
-) {
-    let mut attrs = Vec::new();
-    if request.returns.children {
-        if has_child_folder(&summary.folder.name, all_folders) {
-            attrs.push("\\HasChildren".to_string());
-        } else {
-            attrs.push("\\HasNoChildren".to_string());
-        }
-    }
-    if request.returns.subscribed && summary.folder.subscribed {
-        attrs.push("\\Subscribed".to_string());
-    }
-    if command_name == "XLIST" && summary.folder.name.eq_ignore_ascii_case("INBOX") {
-        attrs.push("\\Inbox".to_string());
-    }
-    if request.returns.special_use {
-        if let Some(special) = summary.folder.special_use.as_ref() {
-            attrs.push(special.clone());
-        }
-    }
-    response.push_str(&format!(
-        "* {} ({}) \"/\" {}",
-        command_name,
-        attrs.join(" "),
-        quote_imap_mailbox_name(&summary.folder.name, utf8_accept)
-    ));
-    if !child_info.is_empty() {
-        response.push_str(&format!(
-            " (CHILDINFO ({}))",
-            child_info
-                .iter()
-                .map(|item| format!("\"{}\"", item))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-    }
-    response.push_str("\r\n");
-    if !request.returns.status.is_empty() {
-        let values = request
-            .returns
-            .status
-            .iter()
-            .map(|item| list_status_value(summary, *item))
-            .collect::<Vec<_>>()
-            .join(" ");
-        response.push_str(&format!(
-            "* STATUS {} ({})\r\n",
-            quote_imap_mailbox_name(&summary.folder.name, utf8_accept),
-            values
-        ));
-    }
-}
-
-fn list_selection_child_info<'a>(
-    request: &parser::ListRequest,
-    summary: &rmail_common::imap_state::FolderSummary,
-    all_folders: &'a [rmail_common::imap_state::FolderSummary],
-    subscriptions: &[String],
-) -> Vec<&'static str> {
-    if !request.selection.recursive_match {
-        return Vec::new();
-    }
-    let prefix = format!("{}/", summary.folder.name);
-    let descendants = all_folders
-        .iter()
-        .filter(|candidate| candidate.folder.name.starts_with(&prefix))
-        .collect::<Vec<_>>();
-    let mut info = Vec::new();
-    if request.selection.subscribed
-        && (descendants
-            .iter()
-            .any(|candidate| candidate.folder.subscribed)
-            || subscriptions.iter().any(|name| name.starts_with(&prefix)))
-    {
-        info.push("SUBSCRIBED");
-    }
-    if request.selection.special_use
-        && descendants
-            .iter()
-            .any(|candidate| candidate.folder.special_use.is_some())
-    {
-        info.push("SPECIAL-USE");
-    }
-    info
-}
-
-fn append_nonexistent_subscription_response(
-    response: &mut String,
-    command_name: &str,
-    request: &parser::ListRequest,
-    name: &str,
-    utf8_accept: bool,
-) {
-    let mut attrs = vec![if command_name == "LSUB" {
-        "\\Noselect"
-    } else {
-        "\\NonExistent"
-    }];
-    if request.returns.subscribed {
-        attrs.push("\\Subscribed");
-    }
-    response.push_str(&format!(
-        "* {} ({}) \"/\" {}\r\n",
-        command_name,
-        attrs.join(" "),
-        quote_imap_mailbox_name(name, utf8_accept)
-    ));
 }
 
 #[cfg(test)]
@@ -6856,183 +6689,27 @@ async fn process_stream_inner(
                     }
                 }
             }
-            parser::Command::List { .. } => {
-                // Require authentication to list user's mailboxes in this simple implementation
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
+            parser::Command::List { .. } | parser::Command::Lsub => {
+                let operation = cmd.clone();
+                let root = mail_root.clone();
+                let address = authed_mailbox.as_ref().unwrap().clone();
+                let raw_args = args.to_string();
+                let tag_owned = tag.to_string();
                 let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
-                let request = match parser::parse_list_request(args, false).and_then(|request| {
-                    decode_list_request(request, utf8_accept)
-                        .map_err(|_| parser::ParseError::InvalidAtom)
-                }) {
-                    Ok(request) => request,
-                    Err(err) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid {} arguments: {:?}\r\n", tag, cmd, err)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                let (summaries, subscriptions) = tokio::task::spawn_blocking(move || {
-                    let root = Path::new(&mail_root_clone);
-                    Ok::<_, anyhow::Error>((
-                        rmail_common::imap_state::list_folder_summaries(root, &domain, &local)?,
-                        rmail_common::imap_state::list_subscriptions(root, &domain, &local)?,
-                    ))
-                })
-                .await??;
-                println!(
-                    "IMAP {} peer={:?} returning {} mailboxes extended={}",
-                    cmd,
-                    peer,
-                    summaries.len(),
-                    request.extended
-                );
-                let w = reader.get_mut();
-                let mut response = String::new();
-                if !request.extended
-                    && request.reference.is_empty()
-                    && request.patterns.iter().any(|pattern| pattern.is_empty())
-                {
-                    response.push_str("* LIST (\\Noselect \\HasChildren) \"/\" \"\"\r\n");
-                }
-                for summary in &summaries {
-                    if request.selection.remote {
-                        continue;
-                    }
-                    let directly_selected = (!request.selection.subscribed
-                        || summary.folder.subscribed)
-                        && (!request.selection.special_use || summary.folder.special_use.is_some());
-                    let child_info =
-                        list_selection_child_info(&request, summary, &summaries, &subscriptions);
-                    if !directly_selected && child_info.is_empty() {
-                        continue;
-                    }
-                    if !request.patterns.iter().any(|pattern| {
-                        mailbox_pattern_matches(&summary.folder.name, &request.reference, pattern)
-                    }) {
-                        continue;
-                    }
-                    append_list_response(
-                        &mut response,
-                        &cmd,
-                        &request,
-                        summary,
-                        &summaries,
+                let response = tokio::task::spawn_blocking(move || {
+                    commands::list::handle(
+                        &tag_owned,
+                        &operation,
+                        &raw_args,
+                        Path::new(&root),
+                        &address,
                         utf8_accept,
-                        &child_info,
-                    );
-                }
-                if request.selection.subscribed {
-                    for name in &subscriptions {
-                        if summaries.iter().any(|summary| summary.folder.name == *name)
-                            || !request.patterns.iter().any(|pattern| {
-                                mailbox_pattern_matches(name, &request.reference, pattern)
-                            })
-                        {
-                            continue;
-                        }
-                        append_nonexistent_subscription_response(
-                            &mut response,
-                            &cmd,
-                            &request,
-                            name,
-                            utf8_accept,
-                        );
-                    }
-                }
-                response.push_str(&format!("{} OK {} completed\r\n", tag, cmd));
+                    )
+                    .encode()
+                })
+                .await?;
                 log_imap_response(peer, tag, &cmd, &response);
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Lsub => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
-                let request = match parser::parse_list_request(args, true).and_then(|request| {
-                    decode_list_request(request, utf8_accept)
-                        .map_err(|_| parser::ParseError::InvalidAtom)
-                }) {
-                    Ok(request) => request,
-                    Err(err) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid LSUB arguments: {:?}\r\n", tag, err).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                let (summaries, subscriptions) = tokio::task::spawn_blocking(move || {
-                    let root = Path::new(&mail_root_clone);
-                    Ok::<_, anyhow::Error>((
-                        rmail_common::imap_state::list_folder_summaries(root, &domain, &local)?,
-                        rmail_common::imap_state::list_subscriptions(root, &domain, &local)?,
-                    ))
-                })
-                .await??;
-                println!("IMAP LSUB peer={:?} returning subscriptions", peer);
                 let w = reader.get_mut();
-                let mut response = String::new();
-                for summary in &summaries {
-                    if !summary.folder.subscribed {
-                        continue;
-                    }
-                    if !request.patterns.iter().any(|pattern| {
-                        mailbox_pattern_matches(&summary.folder.name, &request.reference, pattern)
-                    }) {
-                        continue;
-                    }
-                    append_list_response(
-                        &mut response,
-                        "LSUB",
-                        &request,
-                        summary,
-                        &summaries,
-                        utf8_accept,
-                        &[],
-                    );
-                }
-                for name in &subscriptions {
-                    if summaries.iter().any(|summary| summary.folder.name == *name)
-                        || !request.patterns.iter().any(|pattern| {
-                            mailbox_pattern_matches(name, &request.reference, pattern)
-                        })
-                    {
-                        continue;
-                    }
-                    append_nonexistent_subscription_response(
-                        &mut response,
-                        "LSUB",
-                        &request,
-                        name,
-                        utf8_accept,
-                    );
-                }
-                response.push_str(&format!("{} OK LSUB completed\r\n", tag));
-                log_imap_response(peer, tag, "LSUB", &response);
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
