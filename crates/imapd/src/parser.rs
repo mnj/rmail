@@ -1559,21 +1559,6 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
     })
 }
 
-pub(crate) fn normalize_fetch_items(spec: &str) -> Vec<String> {
-    let trimmed = spec.trim();
-    let inner = trimmed
-        .strip_prefix('(')
-        .and_then(|value| value.strip_suffix(')'))
-        .unwrap_or(trimmed);
-    let mut items = split_fetch_items(inner)
-        .into_iter()
-        .map(|item| item.to_ascii_uppercase())
-        .collect::<Vec<_>>();
-    items.sort();
-    items.dedup();
-    items
-}
-
 pub(crate) fn split_fetch_items(spec: &str) -> Vec<&str> {
     let mut items = Vec::new();
     let mut start = None;
@@ -1626,8 +1611,81 @@ pub(crate) fn split_fetch_items(spec: &str) -> Vec<&str> {
     items
 }
 
-pub(crate) fn parse_store_items(spec: &str) -> Vec<String> {
-    normalize_fetch_items(spec)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreMode {
+    Replace,
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreRequest {
+    pub(crate) message_set: String,
+    pub(crate) unchanged_since: Option<u64>,
+    pub(crate) mode: StoreMode,
+    pub(crate) silent: bool,
+    pub(crate) flags: Vec<String>,
+}
+
+pub(crate) fn parse_store_request(input: &str) -> Result<StoreRequest, ParseError> {
+    let arguments = parse_imap_args(input)?;
+    let Some(ImapArg::Atom(message_set)) = arguments.first() else {
+        return Err(ParseError::InvalidAtom);
+    };
+    if message_set != "$" {
+        SequenceSet::parse(message_set, 1).ok_or(ParseError::InvalidAtom)?;
+    }
+    let mut index = 1;
+    let unchanged_since = if let Some(ImapArg::List(modifiers)) = arguments.get(index) {
+        let [ImapArg::Atom(name), ImapArg::Atom(value)] = modifiers.as_slice() else {
+            return Err(ParseError::InvalidAtom);
+        };
+        if !name.eq_ignore_ascii_case("UNCHANGEDSINCE") {
+            return Err(ParseError::InvalidAtom);
+        }
+        index += 1;
+        Some(value.parse().map_err(|_| ParseError::InvalidAtom)?)
+    } else {
+        None
+    };
+    let Some(ImapArg::Atom(operation)) = arguments.get(index) else {
+        return Err(ParseError::InvalidAtom);
+    };
+    index += 1;
+    let upper_operation = operation.to_ascii_uppercase();
+    let (operation, silent) = upper_operation
+        .strip_suffix(".SILENT")
+        .map_or((upper_operation.as_str(), false), |operation| {
+            (operation, true)
+        });
+    let mode = match operation {
+        "FLAGS" => StoreMode::Replace,
+        "+FLAGS" => StoreMode::Add,
+        "-FLAGS" => StoreMode::Remove,
+        _ => return Err(ParseError::InvalidAtom),
+    };
+    let flag_arguments = arguments.get(index..).ok_or(ParseError::UnexpectedEnd)?;
+    let raw_flags: Vec<&ImapArg> = match flag_arguments {
+        [ImapArg::List(flags)] => flags.iter().collect(),
+        [] => return Err(ParseError::UnexpectedEnd),
+        flags => flags.iter().collect(),
+    };
+    let mut flags = raw_flags
+        .into_iter()
+        .map(|flag| match flag {
+            ImapArg::Atom(flag) => Ok(flag.to_ascii_uppercase()),
+            _ => Err(ParseError::InvalidAtom),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    flags.sort();
+    flags.dedup();
+    Ok(StoreRequest {
+        message_set: message_set.clone(),
+        unchanged_since,
+        mode,
+        silent,
+        flags,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2113,6 +2171,24 @@ mod tests {
             Err(ParseError::InvalidDateTime)
         );
         assert!(parse_append_args(r#"Sent "17-Jul-1996 02:44:25 -0700" () {1}"#).is_err());
+    }
+
+    #[test]
+    fn parses_store_request_and_rejects_unknown_operations_or_modifiers() {
+        assert_eq!(
+            parse_store_request("1:4 (UNCHANGEDSINCE 42) +FLAGS.SILENT (\\Seen keyword)").unwrap(),
+            StoreRequest {
+                message_set: "1:4".to_string(),
+                unchanged_since: Some(42),
+                mode: StoreMode::Add,
+                silent: true,
+                flags: vec!["KEYWORD".to_string(), "\\SEEN".to_string()],
+            }
+        );
+        assert!(parse_store_request("1 XFLAGS (\\Seen)").is_err());
+        assert!(parse_store_request("1 (UNKNOWN 1) FLAGS (\\Seen)").is_err());
+        assert!(parse_store_request("1 FLAGS (\"\\Seen\")").is_err());
+        assert!(parse_store_request("bogus FLAGS (\\Seen)").is_err());
     }
 
     #[test]

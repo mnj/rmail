@@ -2020,10 +2020,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_fetch_items_keeps_nested_header_fields_together() {
-        let items = super::parser::normalize_fetch_items(
+    fn fetch_parser_keeps_nested_header_fields_together() {
+        let items = super::parser::parse_fetch_request(
             "(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To Received)])",
-        );
+        )
+        .unwrap()
+        .items;
 
         assert_eq!(
             items,
@@ -5218,10 +5220,6 @@ fn apply_implicit_seen(
     )
 }
 
-fn parse_store_items(spec: &str) -> Vec<String> {
-    parser::parse_store_items(spec)
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct FetchModifiers {
     changed_since: Option<u64>,
@@ -5261,37 +5259,6 @@ fn parse_fetch_modifiers(spec: &str) -> Result<FetchModifiers, &'static str> {
         changed_since: Some(changed_since),
         vanished,
     })
-}
-
-fn parse_store_command_args(input: &str) -> Option<(String, Option<u64>, String, String)> {
-    let input = input.trim();
-    let (message_set, rest) = input.split_once(char::is_whitespace)?;
-    let mut rest = rest.trim_start();
-    let mut unchanged_since = None;
-    if rest.to_ascii_uppercase().starts_with("(UNCHANGEDSINCE") {
-        let close = rest.find(')')?;
-        let option = &rest[1..close];
-        let mut option_parts = option.split_whitespace();
-        if !option_parts
-            .next()
-            .map(|name| name.eq_ignore_ascii_case("UNCHANGEDSINCE"))
-            .unwrap_or(false)
-        {
-            return None;
-        }
-        unchanged_since = option_parts
-            .next()
-            .and_then(|value| value.parse::<u64>().ok());
-        unchanged_since?;
-        rest = rest[close + 1..].trim_start();
-    }
-    let (op, flags) = rest.split_once(char::is_whitespace)?;
-    Some((
-        message_set.to_string(),
-        unchanged_since,
-        op.to_string(),
-        flags.trim().to_string(),
-    ))
 }
 
 fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseError> {
@@ -5552,28 +5519,6 @@ async fn authenticate_password(
             message: e.to_string(),
         },
     }
-}
-
-fn apply_flag_operation(existing: &[String], op: &str, flags: &[String]) -> Vec<String> {
-    let mut current = existing.to_vec();
-    let silent_op = op.trim_end_matches(".SILENT");
-    match silent_op {
-        "FLAGS" => current = flags.to_vec(),
-        "+FLAGS" => {
-            for flag in flags {
-                if !current.iter().any(|f| f == flag) {
-                    current.push(flag.clone());
-                }
-            }
-        }
-        "-FLAGS" => {
-            current.retain(|f| !flags.iter().any(|x| x == f));
-        }
-        _ => {}
-    }
-    current.sort();
-    current.dedup();
-    current
 }
 
 async fn write_fetch_response(
@@ -8113,117 +8058,33 @@ async fn process_stream_inner(
                     w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "STORE" {
-                    if selected.is_none() {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let sel = selected.as_ref().unwrap();
-                    if sel.read_only {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO Mailbox is read-only\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let Some((uid_set, unchanged_since, op, flags_raw)) =
-                        parse_store_command_args(subargs)
-                    else {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid UID STORE arguments\r\n", tag).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    };
-                    let flags = parse_store_items(&flags_raw);
-                    let silent = op.to_uppercase().ends_with(".SILENT");
-                    let ids =
-                        uids_from_set_or_saved(&uid_set, sel, session_state.saved_search_uids());
-                    let mut modified = Vec::new();
-                    println!(
-                        "IMAP UID STORE peer={:?} uid_set={} ids={:?} op={} flags={:?} silent={} unchanged_since={:?}",
-                        peer, uid_set, ids, op, flags, silent, unchanged_since
-                    );
-                    let mut updates = Vec::new();
-                    for uid in ids {
-                        if let Some(pos) = sel.msgs.iter().position(|(u, _, _, _)| *u == uid) {
-                            let seq = pos + 1;
-                            let current = sel.msgs[pos].2.clone();
-                            let modseq = sel.msgs[pos].3;
-                            if unchanged_since
-                                .map(|threshold| modseq > threshold)
-                                .unwrap_or(false)
-                            {
-                                modified.push(uid.to_string());
-                                continue;
-                            }
-                            let updated =
-                                apply_flag_operation(&current, &op.to_uppercase(), &flags);
-                            println!(
-                                "IMAP UID STORE apply peer={:?} seq={} uid={} old_flags={:?} new_flags={:?}",
-                                peer, seq, uid, current, updated
-                            );
-                            updates.push((seq, uid, updated));
-                        }
-                    }
-                    let flag_updates = updates
-                        .iter()
-                        .map(|(_, uid, flags)| (*uid, flags.clone()))
-                        .collect::<Vec<_>>();
-                    let modseqs = rmail_common::imap_state::set_uid_flags_batch(
-                        Path::new(&mail_root),
-                        &sel.domain,
-                        &sel.local,
-                        &sel.mailbox,
-                        &flag_updates,
-                    )?;
-                    if !silent {
-                        let w = reader.get_mut();
-                        for ((seq, uid, updated), (_, updated_modseq)) in
-                            updates.iter().zip(modseqs.iter())
-                        {
-                            w.write_all(
-                                format!(
-                                    "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
-                                    seq,
-                                    updated.join(" "),
-                                    uid,
-                                    updated_modseq
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                        }
-                        w.flush().await?;
-                    }
-                    if let Some(addr) = authed_mailbox.as_ref() {
-                        let mailbox = selected_mailbox_name(&selected).to_string();
+                    let outcome = commands::store::handle(
+                        tag,
+                        subargs,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                    )
+                    .await;
+                    if outcome.refresh_selected {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
                         selected = Some(
                             reload_selected_mailbox_preserving_mode(
-                                &mail_root, addr, &mailbox, &selected,
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
                             )
                             .await?,
                         );
                     }
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, "UID STORE", &response);
                     let w = reader.get_mut();
-                    if modified.is_empty() {
-                        w.write_all(format!("{} OK UID STORE completed\r\n", tag).as_bytes())
-                            .await?;
-                    } else {
-                        w.write_all(
-                            format!(
-                                "{} OK [MODIFIED {}] UID STORE completed\r\n",
-                                tag,
-                                modified.join(",")
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    }
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "EXPUNGE" {
                     if selected.is_none() {
@@ -8503,115 +8364,33 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Store => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let sel = selected.as_ref().unwrap();
-                if sel.read_only {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Mailbox is read-only\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let Some((seq_set, unchanged_since, op, flags_raw)) =
-                    parse_store_command_args(args)
-                else {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid STORE arguments\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                };
-                let flags = parse_store_items(&flags_raw);
-                let silent = op.to_uppercase().ends_with(".SILENT");
-                println!(
-                    "IMAP STORE peer={:?} seq_set={} op={} flags={:?} silent={} unchanged_since={:?}",
-                    peer, seq_set, op, flags, silent, unchanged_since
-                );
-                let mut modified = Vec::new();
-                let mut updates = Vec::new();
-                for seq in seqs_from_set_or_saved(&seq_set, sel, session_state.saved_search_uids())
-                {
-                    if seq == 0 || seq > sel.msgs.len() {
-                        continue;
-                    }
-                    let idx = seq - 1;
-                    let uid = sel.msgs[idx].0;
-                    let current = sel.msgs[idx].2.clone();
-                    let modseq = sel.msgs[idx].3;
-                    if unchanged_since
-                        .map(|threshold| modseq > threshold)
-                        .unwrap_or(false)
-                    {
-                        modified.push(seq.to_string());
-                        continue;
-                    }
-                    let updated = apply_flag_operation(&current, &op.to_uppercase(), &flags);
-                    println!(
-                        "IMAP STORE apply peer={:?} seq={} uid={} old_flags={:?} new_flags={:?}",
-                        peer, seq, uid, current, updated
-                    );
-                    updates.push((seq, uid, updated));
-                }
-                let flag_updates = updates
-                    .iter()
-                    .map(|(_, uid, flags)| (*uid, flags.clone()))
-                    .collect::<Vec<_>>();
-                let modseqs = rmail_common::imap_state::set_uid_flags_batch(
-                    Path::new(&mail_root),
-                    &sel.domain,
-                    &sel.local,
-                    &sel.mailbox,
-                    &flag_updates,
-                )?;
-                if !silent {
-                    let w = reader.get_mut();
-                    for ((seq, uid, updated), (_, updated_modseq)) in
-                        updates.iter().zip(modseqs.iter())
-                    {
-                        w.write_all(
-                            format!(
-                                "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
-                                seq,
-                                updated.join(" "),
-                                uid,
-                                updated_modseq
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    }
-                    w.flush().await?;
-                }
-                if let Some(addr) = authed_mailbox.as_ref() {
-                    let mailbox = selected_mailbox_name(&selected).to_string();
+                let outcome = commands::store::handle(
+                    tag,
+                    args,
+                    &mail_root,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                )
+                .await;
+                if outcome.refresh_selected {
+                    let mailbox_name = selected_mailbox_name(&selected).to_string();
                     selected = Some(
                         reload_selected_mailbox_preserving_mode(
-                            &mail_root, addr, &mailbox, &selected,
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
                         )
                         .await?,
                     );
                 }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, "STORE", &response);
                 let w = reader.get_mut();
-                if modified.is_empty() {
-                    w.write_all(format!("{} OK STORE completed\r\n", tag).as_bytes())
-                        .await?;
-                } else {
-                    w.write_all(
-                        format!(
-                            "{} OK [MODIFIED {}] STORE completed\r\n",
-                            tag,
-                            modified.join(",")
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                }
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Expunge => {

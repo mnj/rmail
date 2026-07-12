@@ -339,3 +339,4 @@ pub(crate) mod enable;
 pub(crate) mod mailboxes;
 pub(crate) mod search;
 pub(crate) mod status;
+pub(crate) mod store;
