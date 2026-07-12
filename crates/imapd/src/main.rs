@@ -5130,14 +5130,6 @@ fn log_unsupported_imap(
     );
 }
 
-fn next_uid(sel: &SelectedMailbox) -> u64 {
-    mailbox::next_uid(sel)
-}
-
-fn first_unseen(sel: &SelectedMailbox) -> u64 {
-    mailbox::first_unseen(sel)
-}
-
 fn seqs_from_set(seq_set: &str, total: usize) -> Vec<usize> {
     parser::seqs_from_set(seq_set, total)
 }
@@ -6841,243 +6833,26 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Select { .. } => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let select_request = match parser::parse_select_request(args) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                if select_request.qresync.is_some() && !session_state.feature_enabled("QRESYNC") {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD QRESYNC is not enabled\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let mailbox_name = match decode_imap_mailbox_arg(
-                    &select_request.mailbox,
+                let outcome = commands::select::handle(
+                    tag,
+                    &cmd,
+                    args,
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
                     session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let condstore_requested =
-                    select_request.condstore || session_state.feature_enabled("CONDSTORE");
-                println!(
-                    "IMAP {} peer={:?} raw_args={:?} normalized_mailbox={:?}",
-                    cmd, peer, args, mailbox_name
-                );
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let root = mail_root.clone();
-                let name = mailbox_name.clone();
-                let exists = tokio::task::spawn_blocking(move || {
-                    rmail_common::imap_state::folder_exists(
-                        Path::new(&root),
-                        &domain,
-                        &local,
-                        &name,
-                    )
-                })
-                .await??;
-                if !exists {
-                    let w = reader.get_mut();
-                    let response = response::Response::new()
-                        .status(
-                            response::StatusLine::tagged(
-                                tag,
-                                response::Status::No,
-                                "Mailbox does not exist",
-                            )
-                            .with_code("NONEXISTENT"),
-                        )
-                        .encode();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                    continue;
-                }
-                match mailbox::load_selected_mailbox(&mail_root, addr, &mailbox_name).await {
-                    Ok(mut sel) => {
-                        let had_selected_mailbox = selected.is_some();
-                        let count = sel.msgs.len();
-                        let uidvalidity = sel.uidvalidity;
-                        let uidnext = next_uid(&sel);
-                        let unseen = first_unseen(&sel);
-                        let highest_modseq = sel.highest_modseq;
-                        let qresync_changes = if let Some(qresync) = select_request.qresync.as_ref()
-                        {
-                            if qresync.uidvalidity == uidvalidity {
-                                let mail_root = mail_root.clone();
-                                let domain = sel.domain.clone();
-                                let local = sel.local.clone();
-                                let mailbox = sel.mailbox.clone();
-                                let since = qresync.modseq;
-                                let known = qresync.known_uids.clone();
-                                let sample_endpoints = qresync
-                                    .sample
-                                    .as_ref()
-                                    .and_then(|(sequences, uids)| {
-                                        parser::SequenceSet::qresync_sample_endpoints(
-                                            sequences, uids,
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                let mut changes = tokio::task::spawn_blocking(move || {
-                                    rmail_common::imap_state::qresync_changes(
-                                        Path::new(&mail_root),
-                                        &domain,
-                                        &local,
-                                        &mailbox,
-                                        since,
-                                        None,
-                                    )
-                                })
-                                .await??;
-                                if let Some(known) = known {
-                                    changes.vanished_uids.retain(|uid| known.contains(*uid));
-                                    changes
-                                        .changed_messages
-                                        .retain(|message| known.contains(message.uid));
-                                }
-                                for (_, sampled_uid) in sample_endpoints {
-                                    let known_allows = qresync
-                                        .known_uids
-                                        .as_ref()
-                                        .is_none_or(|known| known.contains(sampled_uid));
-                                    if sampled_uid < uidnext
-                                        && known_allows
-                                        && !sel.msgs.iter().any(|message| message.0 == sampled_uid)
-                                    {
-                                        changes.vanished_uids.push(sampled_uid);
-                                    }
-                                }
-                                changes.vanished_uids.sort_unstable();
-                                changes.vanished_uids.dedup();
-                                Some(changes)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        let mut qresync_response = String::new();
-                        if let Some(changes) = qresync_changes.as_ref() {
-                            if !changes.vanished_uids.is_empty() {
-                                qresync_response.push_str(&format!(
-                                    "* VANISHED (EARLIER) {}\r\n",
-                                    compress_search_ids(&changes.vanished_uids)
-                                ));
-                            }
-                            for message in &changes.changed_messages {
-                                if let Some(sequence) = sel
-                                    .msgs
-                                    .iter()
-                                    .position(|(uid, _, _, _)| *uid == message.uid)
-                                {
-                                    qresync_response.push_str(&format!(
-                                        "* {} FETCH (UID {} FLAGS ({}) MODSEQ ({}))\r\n",
-                                        sequence + 1,
-                                        message.uid,
-                                        message.flags.join(" "),
-                                        message.modseq
-                                    ));
-                                }
-                            }
-                        }
-                        sel.read_only = cmd == "EXAMINE";
-                        println!(
-                            "IMAP {} success peer={:?} mailbox={} exists={} uidvalidity={}",
-                            cmd, peer, mailbox_name, count, uidvalidity
-                        );
-                        selected = Some(sel);
-                        session_state.selected_mailbox = Some(mailbox_name.clone());
-                        let w = reader.get_mut();
-                        if had_selected_mailbox && session_state.feature_enabled("QRESYNC") {
-                            w.write_all(b"* OK [CLOSED] Previous mailbox closed\r\n")
-                                .await?;
-                        }
-                        w.write_all(b"* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n")
-                            .await?;
-                        w.flush().await?;
-                        let w = reader.get_mut();
-                        w.write_all(
-                            b"* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)] Flags permitted.\r\n",
-                        )
-                        .await?;
-                        w.flush().await?;
-                        let w = reader.get_mut();
-                        w.write_all(format!("* {} EXISTS\r\n", count).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        let w = reader.get_mut();
-                        w.write_all(b"* 0 RECENT\r\n").await?;
-                        w.flush().await?;
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("* OK [UIDVALIDITY {}] UIDs valid\r\n", uidvalidity).as_bytes(),
-                        )
-                        .await?;
-                        w.write_all(
-                            format!("* OK [UIDNEXT {}] Predicted next UID\r\n", uidnext).as_bytes(),
-                        )
-                        .await?;
-                        w.write_all(
-                            format!("* OK [UNSEEN {}] First unseen\r\n", unseen).as_bytes(),
-                        )
-                        .await?;
-                        if condstore_requested {
-                            w.write_all(
-                                format!("* OK [HIGHESTMODSEQ {}] Highest\r\n", highest_modseq)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                        }
-                        if !qresync_response.is_empty() {
-                            w.write_all(qresync_response.as_bytes()).await?;
-                        }
-                        w.write_all(
-                            format!(
-                                "{} OK [{}] {} completed\r\n",
-                                tag,
-                                if cmd == "EXAMINE" {
-                                    "READ-ONLY"
-                                } else {
-                                    "READ-WRITE"
-                                },
-                                cmd
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                    Err(e) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO Error opening mailbox\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        eprintln!("load_selected_mailbox error: {}", e);
-                    }
-                }
+                    session_state.feature_enabled("CONDSTORE"),
+                    session_state.feature_enabled("QRESYNC"),
+                    selected.is_some(),
+                )
+                .await;
+                selected = outcome.selected;
+                session_state.selected_mailbox =
+                    selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
             }
             parser::Command::Status => {
                 let root = mail_root.clone();

@@ -340,5 +340,6 @@ pub(crate) mod fetch;
 pub(crate) mod list;
 pub(crate) mod mailboxes;
 pub(crate) mod search;
+pub(crate) mod select;
 pub(crate) mod status;
 pub(crate) mod store;

@@ -249,10 +249,6 @@ pub(crate) fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &s
     selected.as_ref().map(|s| s.mailbox.as_str()).unwrap_or("-")
 }
 
-pub(crate) fn next_uid(sel: &SelectedMailbox) -> u64 {
-    sel.uidnext
-}
-
 pub(crate) fn first_unseen(sel: &SelectedMailbox) -> u64 {
     sel.msgs
         .iter()
