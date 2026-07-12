@@ -4,7 +4,7 @@ use async_compression::tokio::write::ZlibEncoder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use rmail_common::db::Mailbox;
-use rmail_common::{auth as common_auth, config::Config, maildir, net::bind_tcp_listener};
+use rmail_common::{auth as common_auth, config::Config, net::bind_tcp_listener};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::pin::Pin;
@@ -7314,287 +7314,77 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
-            parser::Command::Create => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let mailbox_argument = match parser::parse_mailbox_argument(args) {
-                    Ok(mailbox) => mailbox,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid CREATE arguments\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
+            parser::Command::Create
+            | parser::Command::Delete
+            | parser::Command::Rename
+            | parser::Command::Subscribe { .. } => {
+                let operation = match &request.command {
+                    parser::Command::Create => commands::mailboxes::Operation::Create,
+                    parser::Command::Delete => commands::mailboxes::Operation::Delete,
+                    parser::Command::Rename => commands::mailboxes::Operation::Rename,
+                    parser::Command::Subscribe { subscribe: true } => {
+                        commands::mailboxes::Operation::Subscribe
                     }
-                };
-                let mailbox_name = match decode_imap_mailbox_arg(
-                    &mailbox_argument,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
+                    parser::Command::Subscribe { subscribe: false } => {
+                        commands::mailboxes::Operation::Unsubscribe
                     }
+                    _ => unreachable!(),
                 };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                match tokio::task::spawn_blocking(move || {
-                    maildir::create_mailbox(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                        &mailbox_name,
+                let address = authed_mailbox.as_ref().unwrap().clone();
+                let root = mail_root.clone();
+                let raw_args = args.to_string();
+                let tag_owned = tag.to_string();
+                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let outcome = tokio::task::spawn_blocking(move || {
+                    commands::mailboxes::handle(
+                        operation,
+                        &tag_owned,
+                        &raw_args,
+                        Path::new(&root),
+                        &address,
+                        utf8_accept,
                     )
                 })
-                .await?
-                {
-                    Ok(()) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} OK CREATE completed\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
-                    Err(error) => {
-                        let response_code = if error.to_string().contains("already exists") {
-                            "[ALREADYEXISTS] "
-                        } else {
-                            ""
-                        };
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} NO {}CREATE failed: {}\r\n", tag, response_code, error)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                }
-            }
-            parser::Command::Delete => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let mailbox_argument = match parser::parse_mailbox_argument(args) {
-                    Ok(mailbox) => mailbox,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid DELETE arguments\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let mailbox_name = match decode_imap_mailbox_arg(
-                    &mailbox_argument,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                let mailbox_for_task = mailbox_name.clone();
-                match tokio::task::spawn_blocking(move || {
-                    maildir::delete_mailbox(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                        &mailbox_for_task,
-                    )
-                })
-                .await?
-                {
-                    Ok(()) => {
+                .await?;
+
+                let renamed_selection = selected.as_ref().and_then(|selected_mailbox| {
+                    outcome
+                        .selection_effect
+                        .renamed_selection(&selected_mailbox.mailbox)
+                });
+                match &outcome.selection_effect {
+                    commands::mailboxes::SelectionEffect::Deleted(mailbox_name) => {
                         if selected.as_ref().is_some_and(|selected_mailbox| {
                             selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
                         }) {
                             selected = None;
                             session_state.selected_mailbox = None;
                         }
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} OK DELETE completed\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
                     }
-                    Err(e) => {
-                        let response_code = if e.to_string().contains("does not exist") {
-                            "[NONEXISTENT] "
-                        } else {
-                            ""
-                        };
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} NO {}DELETE failed: {}\r\n", tag, response_code, e)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                    }
-                }
-            }
-            parser::Command::Rename => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let (source_mailbox, destination_mailbox) =
-                    match parser::parse_rename_arguments(args) {
-                        Ok(mailboxes) => mailboxes,
-                        Err(_) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD Invalid RENAME arguments\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
+                    commands::mailboxes::SelectionEffect::Renamed {
+                        source: _,
+                        destination: _,
+                    } => {
+                        if let Some(destination) = renamed_selection {
+                            selected = Some(
+                                mailbox::load_selected_mailbox(
+                                    &mail_root,
+                                    authed_mailbox.as_ref().unwrap(),
+                                    &destination,
+                                )
+                                .await?,
+                            );
+                            session_state.selected_mailbox = Some(destination);
                         }
-                    };
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
-                let (source_mailbox, destination_mailbox) = match (
-                    decode_imap_mailbox_arg(&source_mailbox, utf8_accept),
-                    decode_imap_mailbox_arg(&destination_mailbox, utf8_accept),
-                ) {
-                    (Ok(source), Ok(destination)) => (source, destination),
-                    _ => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
                     }
-                };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                let source_for_task = source_mailbox.clone();
-                let destination_for_task = destination_mailbox.clone();
-                match tokio::task::spawn_blocking(move || {
-                    maildir::rename_mailbox(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                        &source_for_task,
-                        &destination_for_task,
-                    )
-                })
-                .await?
-                {
-                    Ok(()) => {
-                        if let Some(addr) = authed_mailbox.as_ref() {
-                            if selected
-                                .as_ref()
-                                .map(|sel| sel.mailbox.eq_ignore_ascii_case(&source_mailbox))
-                                .unwrap_or(false)
-                            {
-                                selected = Some(
-                                    mailbox::load_selected_mailbox(
-                                        &mail_root,
-                                        addr,
-                                        &destination_mailbox,
-                                    )
-                                    .await?,
-                                );
-                            }
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} OK RENAME completed\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
-                    Err(e) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO RENAME failed: {}\r\n", tag, e).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
+                    commands::mailboxes::SelectionEffect::None => {}
                 }
-            }
-            parser::Command::Subscribe { .. } => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let mailbox_argument = match parser::parse_mailbox_argument(args) {
-                    Ok(mailbox) => mailbox,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let mailbox_name = match decode_imap_mailbox_arg(
-                    &mailbox_argument,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let (local, domain) = address_parts(addr)?;
-                let mail_root_clone = mail_root.clone();
-                let subscribed = cmd == "SUBSCRIBE";
-                match tokio::task::spawn_blocking(move || {
-                    maildir::set_mailbox_subscription(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                        &mailbox_name,
-                        subscribed,
-                    )
-                })
-                .await?
-                {
-                    Ok(()) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} OK {} completed\r\n", tag, cmd).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
-                    Err(e) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} NO {} failed: {}\r\n", tag, cmd, e).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
-                }
+
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
             }
             parser::Command::Id => {
                 let client_id = match parser::parse_id_args(args) {

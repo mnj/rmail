@@ -218,6 +218,14 @@ pub(crate) fn address_parts(address: &str) -> Result<(String, String)> {
     Ok((address[..at].to_string(), address[at + 1..].to_string()))
 }
 
+pub(crate) fn decode_wire_mailbox_name(name: &str, utf8_accept: bool) -> Result<String> {
+    if !utf8_accept && name.contains('&') {
+        rmail_common::maildir::imap_utf7_to_utf8(name).map_err(Into::into)
+    } else {
+        Ok(name.to_string())
+    }
+}
+
 pub(crate) fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
     selected
         .as_ref()
