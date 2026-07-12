@@ -165,7 +165,10 @@ pub(crate) enum PasswordAuthResult {
     },
 }
 
-async fn lookup_mailbox(db_path: Option<&String>, user: &str) -> Result<Option<Mailbox>, String> {
+pub(crate) async fn lookup_mailbox(
+    db_path: Option<&String>,
+    user: &str,
+) -> Result<Option<Mailbox>, String> {
     let Some(db_path) = db_path else {
         return Err("authentication database is not configured".to_string());
     };

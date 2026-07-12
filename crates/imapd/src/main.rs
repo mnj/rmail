@@ -3,7 +3,6 @@ use async_compression::tokio::bufread::ZlibDecoder;
 use async_compression::tokio::write::ZlibEncoder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
-use rmail_common::db::Mailbox;
 use rmail_common::{auth as common_auth, config::Config, net::bind_tcp_listener};
 use std::io::ErrorKind;
 use std::path::Path;
@@ -5631,48 +5630,35 @@ async fn process_stream_inner(
                         w.flush().await?;
                         continue;
                     }
-                    let mut mb: Option<Mailbox> = None;
-                    if let Some(dbp) = db_path.as_ref() {
-                        let dbp2 = dbp.clone();
-                        if user_lookup.contains('@') {
-                            match tokio::task::spawn_blocking(move || {
-                                rmail_common::db::get_mailbox(dbp2, &user_lookup)
-                            })
-                            .await
-                            {
-                                Ok(Ok(Some(m))) => mb = Some(m),
-                                Ok(Ok(None)) => {}
-                                Ok(Err(e)) => eprintln!("db get_mailbox error: {}", e),
-                                Err(e) => eprintln!("db task join error: {}", e),
+                    let mailbox = match auth::lookup_mailbox(db_path.as_ref(), &user_lookup).await {
+                        Ok(Some(mailbox)) => mailbox,
+                        Ok(None) => {
+                            if let Some(peer_addr) = peer {
+                                auth::record_auth_failure(peer_addr.ip());
                             }
-                        } else {
-                            match tokio::task::spawn_blocking(move || {
-                                rmail_common::db::find_mailbox_by_localpart(dbp2, &user_lookup)
-                            })
-                            .await
-                            {
-                                Ok(Ok(Some(m))) => mb = Some(m),
-                                Ok(Ok(None)) => {}
-                                Ok(Err(e)) => eprintln!("db query error: {}", e),
-                                Err(e) => eprintln!("db task join error: {}", e),
-                            }
-                        }
-                    }
-                    let Some(mailbox) = mb else {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!(
+                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
+                                    tag
+                                )
+                                .as_bytes(),
                             )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("IMAP SCRAM mailbox lookup error peer={peer:?}: {error}");
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag)
+                                    .as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
                     };
                     let Some(scram_json) = mailbox.scram.as_ref() else {
                         if let Some(peer_addr) = peer {
