@@ -22,6 +22,7 @@ pub(crate) async fn handle_password(
     initial: Option<&str>,
     db_path: Option<&String>,
     peer: Option<SocketAddr>,
+    authenticated_capabilities: &str,
 ) -> Outcome {
     let mut exchange: Box<dyn auth::SaslExchange> = match mechanism {
         "PLAIN" => Box::new(auth::PlainExchange::default()),
@@ -80,11 +81,12 @@ pub(crate) async fn handle_password(
                 auth::reset_auth_failures(peer.ip());
             }
             Outcome {
-                response: Some(Response::new().status(StatusLine::tagged(
-                    tag,
-                    Status::Ok,
-                    "AUTHENTICATE completed",
-                ))),
+                response: Some(
+                    Response::new().status(
+                        StatusLine::tagged(tag, Status::Ok, "AUTHENTICATE completed")
+                            .with_code(format!("CAPABILITY {authenticated_capabilities}")),
+                    ),
+                ),
                 authenticated_mailbox: Some(mailbox.address.to_ascii_lowercase()),
                 disconnected: false,
             }
@@ -120,6 +122,7 @@ pub(crate) async fn handle_scram(
     peer: Option<SocketAddr>,
     channel_binding_required: bool,
     tls_server_end_point: Option<&[u8]>,
+    authenticated_capabilities: &str,
 ) -> Outcome {
     let initial = match initial {
         Some(initial) => initial.to_string(),
@@ -274,11 +277,12 @@ pub(crate) async fn handle_scram(
         auth::reset_auth_failures(peer.ip());
     }
     Outcome {
-        response: Some(Response::new().status(StatusLine::tagged(
-            tag,
-            Status::Ok,
-            "AUTHENTICATE completed",
-        ))),
+        response: Some(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::Ok, "AUTHENTICATE completed")
+                    .with_code(format!("CAPABILITY {authenticated_capabilities}")),
+            ),
+        ),
         authenticated_mailbox: Some(mailbox.address.to_ascii_lowercase()),
         disconnected: false,
     }

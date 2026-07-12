@@ -1392,6 +1392,11 @@ mod tests {
         assert!(
             auth_lines
                 .iter()
+                .any(|line| line.contains("[CAPABILITY IMAP4rev1") && line.contains("UIDPLUS"))
+        );
+        assert!(
+            auth_lines
+                .iter()
                 .any(|l| l.contains("AUTHENTICATE completed"))
         );
         let select_lines = read_until_contains(&mut reader, "A002 OK").await;
@@ -1524,6 +1529,11 @@ mod tests {
             .expect("write password and commands");
         reader.get_mut().flush().await.expect("flush");
         let auth_lines = read_until_contains(&mut reader, "A001 OK").await;
+        assert!(
+            auth_lines
+                .iter()
+                .any(|line| line.contains("[CAPABILITY IMAP4rev1") && line.contains("UIDPLUS"))
+        );
         assert!(
             auth_lines
                 .iter()
@@ -1738,6 +1748,11 @@ mod tests {
         reader.get_mut().flush().await.expect("flush");
 
         let auth_lines = read_until_contains(&mut reader, "A001 OK").await;
+        assert!(
+            auth_lines
+                .iter()
+                .any(|line| line.contains("[CAPABILITY IMAP4rev1") && line.contains("UIDPLUS"))
+        );
         assert!(
             auth_lines
                 .iter()
@@ -5529,7 +5544,19 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Login => {
-                let outcome = commands::login::handle(tag, args, db_path.as_ref(), peer).await;
+                let authenticated_capabilities = response::capability_tokens_with_policy(
+                    response::CapabilityPhase::Authenticated,
+                    tls_ctx.is_some(),
+                    auth_policy.as_ref(),
+                );
+                let outcome = commands::login::handle(
+                    tag,
+                    args,
+                    db_path.as_ref(),
+                    peer,
+                    &authenticated_capabilities,
+                )
+                .await;
                 if let Some(mailbox) = outcome.authenticated_mailbox {
                     authed_mailbox = Some(mailbox.clone());
                     session_state.authenticated_mailbox = Some(mailbox);
@@ -5606,6 +5633,11 @@ async fn process_stream_inner(
                     continue;
                 }
                 if mechanism == "PLAIN" || mechanism == "LOGIN" {
+                    let authenticated_capabilities = response::capability_tokens_with_policy(
+                        response::CapabilityPhase::Authenticated,
+                        tls_ctx.is_some(),
+                        auth_policy.as_ref(),
+                    );
                     let outcome = commands::authenticate::handle_password(
                         &mut reader,
                         tag,
@@ -5613,6 +5645,7 @@ async fn process_stream_inner(
                         initial_response.as_deref(),
                         db_path.as_ref(),
                         peer,
+                        &authenticated_capabilities,
                     )
                     .await;
                     if outcome.disconnected {
@@ -5631,6 +5664,11 @@ async fn process_stream_inner(
                     }
                     continue;
                 }
+                let authenticated_capabilities = response::capability_tokens_with_policy(
+                    response::CapabilityPhase::Authenticated,
+                    tls_ctx.is_some(),
+                    auth_policy.as_ref(),
+                );
                 let outcome = commands::authenticate::handle_scram(
                     &mut reader,
                     tag,
@@ -5641,6 +5679,7 @@ async fn process_stream_inner(
                     tls_ctx
                         .as_ref()
                         .map(|context| context.server_end_point.as_slice()),
+                    &authenticated_capabilities,
                 )
                 .await;
                 if outcome.disconnected {

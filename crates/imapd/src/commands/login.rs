@@ -16,6 +16,7 @@ pub(crate) async fn handle(
     raw_args: &str,
     db_path: Option<&String>,
     peer: Option<SocketAddr>,
+    authenticated_capabilities: &str,
 ) -> Outcome {
     if let Some(remaining) = peer.and_then(|peer| auth::auth_block_remaining(peer.ip())) {
         return failure(
@@ -52,11 +53,10 @@ pub(crate) async fn handle(
             let address = mailbox.address.to_ascii_lowercase();
             println!("IMAP LOGIN success peer={peer:?} mailbox={address}");
             Outcome {
-                response: Response::new().status(StatusLine::tagged(
-                    tag,
-                    Status::Ok,
-                    "LOGIN completed",
-                )),
+                response: Response::new().status(
+                    StatusLine::tagged(tag, Status::Ok, "LOGIN completed")
+                        .with_code(format!("CAPABILITY {authenticated_capabilities}")),
+                ),
                 authenticated_mailbox: Some(address),
             }
         }
