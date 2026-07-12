@@ -5605,39 +5605,6 @@ async fn write_fetch_response(
     .await
 }
 
-async fn execute_search(
-    selected: &SelectedMailbox,
-    criterion: &parser::SearchCriterion,
-    saved_search_uids: &[u64],
-) -> Result<Vec<(u64, u64)>> {
-    let mut matches = Vec::new();
-    let now = chrono::Utc::now().timestamp();
-    for (idx, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
-        let data = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || std::fs::read(path)
-        })
-        .await??;
-        let msg = parser::SearchMessage {
-            seq: idx + 1,
-            uid: *uid,
-            flags,
-            internal_date: selected
-                .internal_dates
-                .get(uid)
-                .map(|date| date.0)
-                .unwrap_or(0),
-            in_saved_result: saved_search_uids.binary_search(uid).is_ok(),
-            now,
-            data: &data,
-        };
-        if parser::search_matches(criterion, &msg, selected.msgs.len()) {
-            matches.push((idx as u64 + 1, *uid));
-        }
-    }
-    Ok(matches)
-}
-
 async fn execute_sort(
     selected: &SelectedMailbox,
     request: &parser::SortRequest,
@@ -5735,46 +5702,6 @@ fn compress_search_ids(ids: &[u64]) -> String {
         start = end + 1;
     }
     ranges.join(",")
-}
-
-fn search_result_response(
-    tag: &str,
-    uid_mode: bool,
-    ids: &[u64],
-    return_options: Option<&parser::SearchReturnOptions>,
-) -> String {
-    let Some(options) = return_options else {
-        return format!(
-            "* SEARCH {}\r\n",
-            ids.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
-        );
-    };
-    if options.save && !options.min && !options.max && !options.all && !options.count {
-        return String::new();
-    }
-    let escaped_tag = tag.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut response = format!("* ESEARCH (TAG \"{}\")", escaped_tag);
-    if uid_mode {
-        response.push_str(" UID");
-    }
-    if options.min {
-        if let Some(min) = ids.first() {
-            response.push_str(&format!(" MIN {}", min));
-        }
-    }
-    if options.max {
-        if let Some(max) = ids.last() {
-            response.push_str(&format!(" MAX {}", max));
-        }
-    }
-    if options.all && !ids.is_empty() {
-        response.push_str(&format!(" ALL {}", compress_search_ids(ids)));
-    }
-    if options.count {
-        response.push_str(&format!(" COUNT {}", ids.len()));
-    }
-    response.push_str("\r\n");
-    response
 }
 
 async fn sync_selected_mailbox(
@@ -8166,69 +8093,24 @@ async fn process_stream_inner(
                         .await?;
                     w.flush().await?;
                 } else if subcmd == "SEARCH" {
-                    if selected.is_none() {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let request = match parser::parse_search_request(subargs) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            let response = match error {
-                                parser::SearchParseError::UnsupportedCharset(_) => format!(
-                                    "{} NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n",
-                                    tag
-                                ),
-                                parser::SearchParseError::Syntax => {
-                                    format!("{} BAD Invalid UID SEARCH arguments\r\n", tag)
-                                }
-                            };
-                            let w = reader.get_mut();
-                            w.write_all(response.as_bytes()).await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    if session_state.feature_enabled("UTF8=ACCEPT") && request.charset.is_some() {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} BAD Cannot set SEARCH charset when UTF8=ACCEPT is enabled\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let sel = selected.as_ref().unwrap();
-                    println!(
-                        "IMAP UID SEARCH peer={:?} criteria={:?}",
-                        peer, request.criterion
-                    );
-                    let matches =
-                        execute_search(sel, &request.criterion, session_state.saved_search_uids())
-                            .await?;
-                    let ids = matches.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
-                    if request
-                        .return_options
-                        .as_ref()
-                        .is_some_and(|options| options.save)
-                    {
-                        session_state.save_search_uids(ids.clone());
-                    }
-                    let w = reader.get_mut();
-                    println!("IMAP UID SEARCH matches peer={:?} uids={:?}", peer, ids);
-                    w.write_all(
-                        search_result_response(tag, true, &ids, request.return_options.as_ref())
-                            .as_bytes(),
+                    let outcome = commands::search::handle(
+                        tag,
+                        subargs,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                        session_state.feature_enabled("UTF8=ACCEPT"),
                     )
-                    .await?;
-                    w.write_all(format!("{} OK UID SEARCH completed\r\n", tag).as_bytes())
-                        .await?;
+                    .await;
+                    if let Some(saved_uids) = outcome.saved_uids {
+                        session_state.save_search_uids(saved_uids);
+                    }
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, "UID SEARCH", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "STORE" {
                     if selected.is_none() {
@@ -8526,69 +8408,24 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Search => {
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let request = match parser::parse_search_request(args) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let response = match error {
-                            parser::SearchParseError::UnsupportedCharset(_) => format!(
-                                "{} NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n",
-                                tag
-                            ),
-                            parser::SearchParseError::Syntax => {
-                                format!("{} BAD Invalid SEARCH arguments\r\n", tag)
-                            }
-                        };
-                        let w = reader.get_mut();
-                        w.write_all(response.as_bytes()).await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                if session_state.feature_enabled("UTF8=ACCEPT") && request.charset.is_some() {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} BAD Cannot set SEARCH charset when UTF8=ACCEPT is enabled\r\n",
-                            tag
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let sel = selected.as_ref().unwrap();
-                println!(
-                    "IMAP SEARCH peer={:?} criteria={:?}",
-                    peer, request.criterion
-                );
-                let matches =
-                    execute_search(sel, &request.criterion, session_state.saved_search_uids())
-                        .await?;
-                let ids = matches.iter().map(|(seq, _)| *seq).collect::<Vec<_>>();
-                if request
-                    .return_options
-                    .as_ref()
-                    .is_some_and(|options| options.save)
-                {
-                    session_state.save_search_uids(matches.iter().map(|(_, uid)| *uid).collect());
-                }
-                let w = reader.get_mut();
-                println!("IMAP SEARCH matches peer={:?} seqs={:?}", peer, ids);
-                w.write_all(
-                    search_result_response(tag, false, &ids, request.return_options.as_ref())
-                        .as_bytes(),
+                let outcome = commands::search::handle(
+                    tag,
+                    args,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                    session_state.feature_enabled("UTF8=ACCEPT"),
                 )
-                .await?;
-                w.write_all(format!("{} OK SEARCH completed\r\n", tag).as_bytes())
-                    .await?;
+                .await;
+                if let Some(saved_uids) = outcome.saved_uids {
+                    session_state.save_search_uids(saved_uids);
+                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, "SEARCH", &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::Thread => {
