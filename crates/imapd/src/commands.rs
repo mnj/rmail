@@ -337,3 +337,4 @@ use crate::parser::{Command, UidCommand};
 pub(crate) mod basic;
 pub(crate) mod enable;
 pub(crate) mod mailboxes;
+pub(crate) mod status;

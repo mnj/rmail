@@ -1130,6 +1130,40 @@ pub fn list_folder_summaries(
     Ok(summaries)
 }
 
+pub fn folder_summary(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+) -> Result<Option<FolderSummary>> {
+    let name = normalize_mailbox_name(mailbox)?;
+    let conn = open_account(maildir_root, domain, localpart)?;
+    if folder_id(&conn, &name)?.is_none()
+        || !mailbox_dir(maildir_root, domain, localpart, &name)?.is_dir()
+    {
+        return Ok(None);
+    }
+    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    let Some(folder) = get_folder(&conn, &name)? else {
+        return Ok(None);
+    };
+    let messages = list_messages_for_folder(&conn, maildir_root, domain, localpart, &folder)?;
+    Ok(Some(FolderSummary {
+        unseen: messages
+            .iter()
+            .filter(|message| {
+                !message
+                    .flags
+                    .iter()
+                    .any(|flag| flag.eq_ignore_ascii_case("\\Seen"))
+            })
+            .count(),
+        size: messages.iter().map(|message| message.size).sum(),
+        messages: messages.len(),
+        folder,
+    }))
+}
+
 pub fn list_message_metadata(
     maildir_root: &Path,
     domain: &str,
@@ -2253,6 +2287,23 @@ mod tests {
                 .iter()
                 .any(|name| name == "Ghost")
         );
+    }
+
+    #[test]
+    fn folder_summary_does_not_create_missing_mailboxes() {
+        let td = tempfile::tempdir().unwrap();
+        assert!(
+            folder_summary(td.path(), "example.test", "user", "Missing")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!folder_exists(td.path(), "example.test", "user", "Missing").unwrap());
+
+        let inbox = folder_summary(td.path(), "example.test", "user", "inbox")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inbox.folder.name, "INBOX");
+        assert_eq!(inbox.messages, 0);
     }
 
     #[test]

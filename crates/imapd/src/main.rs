@@ -5136,10 +5136,6 @@ fn first_unseen(sel: &SelectedMailbox) -> u64 {
     mailbox::first_unseen(sel)
 }
 
-fn unseen_count(sel: &SelectedMailbox) -> usize {
-    mailbox::unseen_count(sel)
-}
-
 fn seqs_from_set(seq_set: &str, total: usize) -> Vec<usize> {
     parser::seqs_from_set(seq_set, total)
 }
@@ -5355,19 +5351,9 @@ fn list_status_value(
     summary: &rmail_common::imap_state::FolderSummary,
     item: parser::StatusItem,
 ) -> String {
-    match item {
-        parser::StatusItem::Messages => format!("MESSAGES {}", summary.messages),
-        parser::StatusItem::UidNext => format!("UIDNEXT {}", summary.folder.uidnext),
-        parser::StatusItem::UidValidity => {
-            format!("UIDVALIDITY {}", summary.folder.uidvalidity)
-        }
-        parser::StatusItem::HighestModSeq => {
-            format!("HIGHESTMODSEQ {}", summary.folder.highest_modseq)
-        }
-        parser::StatusItem::Unseen => format!("UNSEEN {}", summary.unseen),
-        parser::StatusItem::Recent => "RECENT 0".to_string(),
-        parser::StatusItem::Size => format!("SIZE {}", summary.size),
-    }
+    commands::status::status_values(summary, &[item])
+        .pop()
+        .expect("one status item produces one value")
 }
 
 fn append_list_response(
@@ -7646,96 +7632,27 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Status => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let status_request = match parser::parse_status_request(args) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid STATUS item or arguments\r\n", tag).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let mailbox_name = match decode_imap_mailbox_arg(
-                    &status_request.mailbox,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                ) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid mailbox name\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let addr = authed_mailbox.as_ref().unwrap();
-                let sel =
-                    match mailbox::load_selected_mailbox(&mail_root, addr, &mailbox_name).await {
-                        Ok(sel) => sel,
-                        Err(_) => {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} NO No such mailbox\r\n", tag).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                println!(
-                    "IMAP STATUS peer={:?} mailbox={:?} items={:?}",
-                    peer, mailbox_name, status_request.items
-                );
-                let mut values = Vec::new();
-                let requested = |item| status_request.items.contains(&item);
-                if requested(parser::StatusItem::Messages) {
-                    values.push(format!("MESSAGES {}", sel.msgs.len()));
-                }
-                if requested(parser::StatusItem::UidNext) {
-                    values.push(format!("UIDNEXT {}", next_uid(&sel)));
-                }
-                if requested(parser::StatusItem::UidValidity) {
-                    values.push(format!("UIDVALIDITY {}", sel.uidvalidity));
-                }
-                if requested(parser::StatusItem::HighestModSeq) {
-                    values.push(format!("HIGHESTMODSEQ {}", sel.highest_modseq));
-                }
-                if requested(parser::StatusItem::Unseen) {
-                    values.push(format!("UNSEEN {}", unseen_count(&sel)));
-                }
-                if requested(parser::StatusItem::Recent) {
-                    values.push("RECENT 0".to_string());
-                }
-                if requested(parser::StatusItem::Size) {
-                    values.push(format!("SIZE {}", sel.sizes.values().copied().sum::<u64>()));
-                }
-                let w = reader.get_mut();
-                println!(
-                    "IMAP STATUS response peer={:?} mailbox={} values={:?}",
-                    peer, sel.mailbox, values
-                );
-                w.write_all(
-                    format!(
-                        "* STATUS {} ({})\r\n",
-                        quote_imap_mailbox_name(
-                            &sel.mailbox,
-                            session_state.feature_enabled("UTF8=ACCEPT"),
-                        ),
-                        values.join(" ")
+                let root = mail_root.clone();
+                let address = authed_mailbox.as_ref().unwrap().clone();
+                let raw_args = args.to_string();
+                let tag_owned = tag.to_string();
+                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let selected_name = selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
+                let response = tokio::task::spawn_blocking(move || {
+                    commands::status::handle(
+                        &tag_owned,
+                        &raw_args,
+                        Path::new(&root),
+                        &address,
+                        utf8_accept,
+                        selected_name.as_deref(),
                     )
-                    .as_bytes(),
-                )
+                    .encode()
+                })
                 .await?;
-                w.write_all(format!("{} OK STATUS completed\r\n", tag).as_bytes())
-                    .await?;
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
             parser::Command::StartTls => {

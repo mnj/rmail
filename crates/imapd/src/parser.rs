@@ -1751,12 +1751,10 @@ pub(crate) enum StatusItem {
 
 impl StatusItem {
     fn parse(argument: &ImapArg) -> Result<Self, ParseError> {
-        match argument
-            .as_text()
-            .ok_or(ParseError::InvalidAtom)?
-            .to_ascii_uppercase()
-            .as_str()
-        {
+        let ImapArg::Atom(argument) = argument else {
+            return Err(ParseError::InvalidAtom);
+        };
+        match argument.to_ascii_uppercase().as_str() {
             "MESSAGES" => Ok(Self::Messages),
             "RECENT" => Ok(Self::Recent),
             "UIDNEXT" => Ok(Self::UidNext),

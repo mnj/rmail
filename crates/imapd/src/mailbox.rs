@@ -226,6 +226,18 @@ pub(crate) fn decode_wire_mailbox_name(name: &str, utf8_accept: bool) -> Result<
     }
 }
 
+pub(crate) fn quote_wire_mailbox_name(name: &str, utf8_accept: bool) -> String {
+    let wire_name = if utf8_accept {
+        name.to_string()
+    } else {
+        rmail_common::maildir::utf8_to_imap_utf7(name).unwrap_or_else(|_| name.to_string())
+    };
+    format!(
+        "\"{}\"",
+        wire_name.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
 pub(crate) fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
     selected
         .as_ref()
@@ -248,13 +260,6 @@ pub(crate) fn first_unseen(sel: &SelectedMailbox) -> u64 {
         .find(|(_, (_, _, flags, _))| !flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen")))
         .map(|(idx, _)| idx as u64 + 1)
         .unwrap_or(0)
-}
-
-pub(crate) fn unseen_count(sel: &SelectedMailbox) -> usize {
-    sel.msgs
-        .iter()
-        .filter(|(_, _, flags, _)| !flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen")))
-        .count()
 }
 
 pub(crate) fn format_internal_date(timestamp: i64, timezone_offset_minutes: i32) -> String {
