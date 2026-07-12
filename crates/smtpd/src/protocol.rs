@@ -2,6 +2,22 @@
 pub(crate) struct MailFromArgs {
     pub(crate) sender: Option<String>,
     pub(crate) declared_size: Option<usize>,
+    pub(crate) body: MailBody,
+    pub(crate) smtp_utf8: bool,
+    pub(crate) has_esmtp_parameters: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvelopeError {
+    Syntax,
+    UnsupportedParameter,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MailBody {
+    #[default]
+    SevenBit,
+    EightBitMime,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,7 +82,13 @@ pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Optio
 }
 
 pub(crate) fn parse_command(command: &str) -> Command<'_> {
-    let trimmed = command.trim();
+    if command.is_empty()
+        || command.starts_with(|character: char| character == ' ' || character == '\t')
+        || command.chars().any(|character| character == '\0')
+    {
+        return Command::BadSyntax;
+    }
+    let trimmed = command;
     let (verb, args) =
         match trimmed.split_once(|character: char| character == ' ' || character == '\t') {
             Some((verb, rest)) => (verb, rest.trim_start()),
@@ -84,13 +106,13 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "QUIT" if args.is_empty() => Command::Quit,
         "STARTTLS" if args.is_empty() => Command::StartTls,
         "AUTH" if !args.is_empty() => Command::Auth(args),
-        "VRFY" => Command::Vrfy,
-        "EXPN" => Command::Expn,
-        "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "RSET" | "QUIT" | "STARTTLS" | "AUTH" => {
-            Command::BadSyntax
-        }
+        "VRFY" if !args.is_empty() => Command::Vrfy,
+        "EXPN" if !args.is_empty() => Command::Expn,
+        "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "RSET" | "QUIT" | "STARTTLS" | "AUTH"
+        | "VRFY" | "EXPN" => Command::BadSyntax,
         _ if [
-            "HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "QUIT", "STARTTLS", "AUTH",
+            "HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "QUIT", "STARTTLS", "AUTH", "VRFY",
+            "EXPN",
         ]
         .iter()
         .any(|known| verb_upper.starts_with(known)) =>
@@ -101,15 +123,148 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
     }
 }
 
-fn extract_address(value: &str) -> Option<String> {
-    let value = value
-        .trim()
-        .trim_matches(|character| matches!(character, '<' | '>' | ' '));
-    if value.contains('@') && !value.chars().any(char::is_whitespace) {
-        Some(value.to_ascii_lowercase())
+pub(crate) fn valid_helo_domain(value: &str) -> bool {
+    valid_domain(value, false) || valid_address_literal(value)
+}
+
+fn is_atext(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '!' | '#'
+                | '$'
+                | '%'
+                | '&'
+                | '\''
+                | '*'
+                | '+'
+                | '-'
+                | '/'
+                | '='
+                | '?'
+                | '^'
+                | '_'
+                | '`'
+                | '{'
+                | '|'
+                | '}'
+                | '~'
+        )
+}
+
+fn valid_local_part(value: &str, allow_utf8: bool) -> bool {
+    if value.is_empty() || value.as_bytes().len() > 64 {
+        return false;
+    }
+    if value.starts_with('"') {
+        if !value.ends_with('"') || value.len() < 2 {
+            return false;
+        }
+        let mut escaped = false;
+        for character in value[1..value.len() - 1].chars() {
+            if escaped {
+                if character == '\r' || character == '\n' {
+                    return false;
+                }
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"'
+                || character == '\r'
+                || character == '\n'
+                || (!allow_utf8 && !character.is_ascii())
+                || character.is_control()
+            {
+                return false;
+            }
+        }
+        return !escaped;
+    }
+    value.split('.').all(|atom| {
+        !atom.is_empty()
+            && atom
+                .chars()
+                .all(|character| is_atext(character) || (allow_utf8 && !character.is_ascii()))
+    })
+}
+
+fn valid_domain(value: &str, allow_utf8: bool) -> bool {
+    if value.is_empty() || value.as_bytes().len() > 255 {
+        return false;
+    }
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.as_bytes().len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || character == '-'
+                    || (allow_utf8 && !character.is_ascii() && !character.is_control())
+            })
+    })
+}
+
+fn valid_address_literal(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    if let Some(ipv6) = inner
+        .strip_prefix("IPv6:")
+        .or_else(|| inner.strip_prefix("ipv6:"))
+    {
+        return ipv6.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    inner.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn strip_source_route(value: &str) -> Option<&str> {
+    if !value.starts_with('@') {
+        return Some(value);
+    }
+    let (route, mailbox) = value.split_once(':')?;
+    if route.split(',').all(|domain| {
+        domain
+            .strip_prefix('@')
+            .is_some_and(|domain| valid_domain(domain, false))
+    }) {
+        Some(mailbox)
     } else {
         None
     }
+}
+
+fn parse_mailbox(value: &str, allow_utf8: bool) -> Option<String> {
+    let value = strip_source_route(value)?;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut separator = None;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == '@' && !quoted {
+            separator = Some(index);
+        }
+    }
+    if quoted || escaped {
+        return None;
+    }
+    let separator = separator?;
+    let (local, domain_with_at) = value.split_at(separator);
+    let domain = &domain_with_at[1..];
+    if !valid_local_part(local, allow_utf8)
+        || !(valid_domain(domain, allow_utf8) || valid_address_literal(domain))
+    {
+        return None;
+    }
+    Some(format!("{local}@{}", domain.to_lowercase()))
 }
 
 fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
@@ -119,7 +274,7 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
         return None;
     }
     let mut rest = trimmed[prefix_len..].trim_start();
-    if !rest.starts_with('<') {
+    if !rest.starts_with('<') || rest.as_bytes().len() > 256 {
         return None;
     }
     let end = rest.find('>')?;
@@ -128,45 +283,68 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
     Some((path, rest))
 }
 
-pub(crate) fn parse_mail_from_args(args: &str) -> Option<MailFromArgs> {
-    let (path, params) = parse_path_with_params(args, "FROM:")?;
-    let sender = if path == "<>" {
-        None
-    } else {
-        extract_address(path).map(Some)?
-    };
+pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeError> {
+    let (path, params) = parse_path_with_params(args, "FROM:").ok_or(EnvelopeError::Syntax)?;
     let mut declared_size = None;
+    let mut body = None;
+    let mut smtp_utf8 = false;
     for parameter in params.split_whitespace() {
         if let Some(size) = parameter
             .strip_prefix("SIZE=")
             .or_else(|| parameter.strip_prefix("size="))
         {
             if declared_size.is_some() {
-                return None;
+                return Err(EnvelopeError::Syntax);
             }
-            declared_size = Some(size.parse().ok()?);
-        } else if parameter.eq_ignore_ascii_case("BODY=7BIT")
-            || parameter.eq_ignore_ascii_case("BODY=8BITMIME")
-            || parameter.eq_ignore_ascii_case("SMTPUTF8")
-        {
-            continue;
+            declared_size = Some(size.parse().map_err(|_| EnvelopeError::Syntax)?);
+        } else if parameter.eq_ignore_ascii_case("BODY=7BIT") {
+            if body.replace(MailBody::SevenBit).is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+        } else if parameter.eq_ignore_ascii_case("BODY=8BITMIME") {
+            if body.replace(MailBody::EightBitMime).is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+        } else if parameter.eq_ignore_ascii_case("SMTPUTF8") {
+            if smtp_utf8 {
+                return Err(EnvelopeError::Syntax);
+            }
+            smtp_utf8 = true;
         } else {
-            return None;
+            return Err(EnvelopeError::UnsupportedParameter);
         }
     }
-    Some(MailFromArgs {
+    let inner = path
+        .strip_prefix('<')
+        .and_then(|path| path.strip_suffix('>'))
+        .ok_or(EnvelopeError::Syntax)?;
+    let sender = if inner.is_empty() {
+        None
+    } else {
+        Some(parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)?)
+    };
+    Ok(MailFromArgs {
         sender,
         declared_size,
+        body: body.unwrap_or_default(),
+        smtp_utf8,
+        has_esmtp_parameters: !params.is_empty(),
     })
 }
 
-pub(crate) fn parse_rcpt_to_args(args: &str) -> Option<String> {
-    let (path, params) = parse_path_with_params(args, "TO:")?;
-    let address = extract_address(path)?;
+pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<String, EnvelopeError> {
+    let (path, params) = parse_path_with_params(args, "TO:").ok_or(EnvelopeError::Syntax)?;
     if !params.is_empty() {
-        return None;
+        return Err(EnvelopeError::UnsupportedParameter);
     }
-    Some(address)
+    let inner = path
+        .strip_prefix('<')
+        .and_then(|path| path.strip_suffix('>'))
+        .ok_or(EnvelopeError::Syntax)?;
+    if inner.is_empty() {
+        return Err(EnvelopeError::Syntax);
+    }
+    parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)
 }
 
 #[cfg(test)]
@@ -219,16 +397,47 @@ mod tests {
 
     #[test]
     fn envelope_parser_rejects_duplicate_or_unknown_parameters() {
-        assert!(parse_mail_from_args("FROM:<a@b> SIZE=1 SIZE=2").is_none());
-        assert!(parse_mail_from_args("FROM:<a@b> UNKNOWN=x").is_none());
+        assert!(parse_mail_from_args("FROM:<a@b> SIZE=1 SIZE=2").is_err());
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@b> UNKNOWN=x"),
+            Err(EnvelopeError::UnsupportedParameter)
+        );
         assert_eq!(
             parse_mail_from_args("FROM:<a@b> SIZE=42 BODY=8BITMIME SMTPUTF8"),
-            Some(MailFromArgs {
+            Ok(MailFromArgs {
                 sender: Some("a@b".to_string()),
                 declared_size: Some(42),
+                body: MailBody::EightBitMime,
+                smtp_utf8: true,
+                has_esmtp_parameters: true,
             })
         );
-        assert!(parse_rcpt_to_args("TO:<a@b> NOTIFY=SUCCESS").is_none());
+        assert_eq!(
+            parse_rcpt_to_args("TO:<a@b> NOTIFY=SUCCESS", false),
+            Err(EnvelopeError::UnsupportedParameter)
+        );
+        assert!(parse_mail_from_args("FROM:<a..b@example.test>").is_err());
+        assert!(parse_mail_from_args("FROM:<a@example..test>").is_err());
+        assert!(parse_mail_from_args("FROM:<ü@example.test>").is_err());
+        assert!(parse_mail_from_args("FROM:<ü@example.test> SMTPUTF8").is_ok());
+        assert_eq!(
+            parse_rcpt_to_args("TO:<\"quoted local\"@[127.0.0.1]>", false),
+            Ok("\"quoted local\"@[127.0.0.1]".to_string())
+        );
+        assert_eq!(
+            parse_rcpt_to_args("TO:<@old.example,@relay.example:user@Example.TEST>", false),
+            Ok("user@example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn command_and_helo_grammar_reject_leading_space_missing_args_and_bad_domains() {
+        assert_eq!(parse_command(" DATA"), Command::BadSyntax);
+        assert_eq!(parse_command("VRFY"), Command::BadSyntax);
+        assert!(valid_helo_domain("mail.example.test"));
+        assert!(valid_helo_domain("[IPv6:2001:db8::1]"));
+        assert!(!valid_helo_domain("-bad.example"));
+        assert!(!valid_helo_domain("bad..example"));
     }
 
     #[tokio::test]

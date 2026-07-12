@@ -310,7 +310,9 @@ async fn run_smtps_listener(
 
 #[cfg(test)]
 fn parse_mail_from_arg(cmd: &str) -> Option<Option<String>> {
-    parse_mail_from_args(cmd.strip_prefix("MAIL")?.trim_start()).map(|parsed| parsed.sender)
+    parse_mail_from_args(cmd.strip_prefix("MAIL")?.trim_start())
+        .ok()
+        .map(|parsed| parsed.sender)
 }
 
 async fn timed_read_until<R: tokio::io::AsyncRead + Unpin>(
@@ -428,6 +430,8 @@ async fn process_stream(
     let mut rcpts: Vec<String> = Vec::new();
     let mut mail_from: Option<String> = None;
     let mut mail_from_seen = false;
+    let mut mail_body = protocol::MailBody::SevenBit;
+    let mut smtp_utf8 = false;
     // track authenticated identity when AUTH is used (local mailbox address)
     let mut authenticated_user: Option<String> = None;
     let mut helo_name: Option<String> = None;
@@ -516,6 +520,14 @@ async fn process_stream(
         match parsed_command {
             SmtpCommand::Helo(name) | SmtpCommand::Ehlo(name) => {
                 let is_ehlo = matches!(parsed_command, SmtpCommand::Ehlo(_));
+                if !protocol::valid_helo_domain(name) {
+                    let writer = reader.get_mut();
+                    writer
+                        .write_all(b"501 5.5.2 Invalid HELO/EHLO domain\r\n")
+                        .await?;
+                    writer.flush().await?;
+                    continue;
+                }
                 println!(
                     "SMTP greeting peer={:?} verb={}",
                     peer,
@@ -550,6 +562,8 @@ async fn process_stream(
                 // reset transaction state
                 mail_from = None;
                 mail_from_seen = false;
+                mail_body = protocol::MailBody::SevenBit;
+                smtp_utf8 = false;
                 rcpts.clear();
             }
             SmtpCommand::Auth(auth_args) => {
@@ -638,7 +652,15 @@ async fn process_stream(
             SmtpCommand::Mail(mail_args) => {
                 // Parse MAIL FROM and set sender; on syntax error return 501
                 match parse_mail_from_args(mail_args) {
-                    Some(parsed) => {
+                    Ok(parsed) => {
+                        if !extended_smtp && parsed.has_esmtp_parameters {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"555 5.5.4 ESMTP parameters require EHLO\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            continue;
+                        }
                         if parsed
                             .declared_size
                             .is_some_and(|size| size > MAX_MESSAGE_BYTES)
@@ -649,11 +671,23 @@ async fn process_stream(
                             w.flush().await?;
                             continue;
                         }
+                        mail_body = parsed.body;
+                        smtp_utf8 = parsed.smtp_utf8;
                         mail_from = parsed.sender;
                         mail_from_seen = true;
                         println!("SMTP MAIL FROM peer={:?} parsed={:?}", peer, mail_from);
                     }
-                    None => {
+                    Err(protocol::EnvelopeError::UnsupportedParameter) => {
+                        mail_from = None;
+                        mail_from_seen = false;
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"555 5.5.4 Unsupported MAIL FROM parameter\r\n")
+                            .await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                    Err(protocol::EnvelopeError::Syntax) => {
                         mail_from = None;
                         mail_from_seen = false;
                         println!("SMTP MAIL FROM peer={:?} parse failed", peer);
@@ -661,7 +695,8 @@ async fn process_stream(
                 }
                 if !mail_from_seen {
                     let w = reader.get_mut();
-                    w.write_all(b"501 Syntax: MAIL FROM:<address>\r\n").await?;
+                    w.write_all(b"501 5.5.2 Syntax: MAIL FROM:<address>\r\n")
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
@@ -679,99 +714,84 @@ async fn process_stream(
                     w.flush().await?;
                     continue;
                 }
-                if let Some(addr) = parse_rcpt_to_args(rcpt_args) {
-                    println!("SMTP RCPT TO peer={:?} parsed={}", peer, addr);
-                    // DB is authoritative — must be configured at startup
-                    if let Some(dbp) = db_path.as_ref() {
-                        let dbp2 = dbp.clone();
-                        let addr2 = addr.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            rmail_common::db::mailbox_exists(dbp2, &addr2)
-                        })
-                        .await
-                        {
-                            Ok(Ok(true)) => {
-                                if rcpts.len() >= MAX_RCPT {
-                                    let w = reader.get_mut();
-                                    w.write_all(b"452 Too many recipients\r\n").await?;
-                                    w.flush().await?;
-                                } else {
-                                    rcpts.push(addr.clone());
-                                    println!(
-                                        "SMTP RCPT accepted peer={:?} rcpt_count={} current_rcpts={:?}",
-                                        peer,
-                                        rcpts.len(),
-                                        rcpts
-                                    );
-                                    let w = reader.get_mut();
-                                    w.write_all(b"250 OK\r\n").await?;
-                                    w.flush().await?;
+                match parse_rcpt_to_args(rcpt_args, smtp_utf8) {
+                    Ok(addr) => {
+                        println!("SMTP RCPT TO peer={:?} parsed={}", peer, addr);
+                        // DB is authoritative — must be configured at startup
+                        if let Some(dbp) = db_path.as_ref() {
+                            let dbp2 = dbp.clone();
+                            let addr2 = addr.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                rmail_common::db::mailbox_exists(dbp2, &addr2)
+                            })
+                            .await
+                            {
+                                Ok(Ok(true)) => {
+                                    if rcpts.len() >= MAX_RCPT {
+                                        let w = reader.get_mut();
+                                        w.write_all(b"452 Too many recipients\r\n").await?;
+                                        w.flush().await?;
+                                    } else {
+                                        rcpts.push(addr.clone());
+                                        println!(
+                                            "SMTP RCPT accepted peer={:?} rcpt_count={} current_rcpts={:?}",
+                                            peer,
+                                            rcpts.len(),
+                                            rcpts
+                                        );
+                                        let w = reader.get_mut();
+                                        w.write_all(b"250 OK\r\n").await?;
+                                        w.flush().await?;
+                                    }
                                 }
-                            }
-                            Ok(Ok(false)) => {
-                                if let Some(at) = addr.find('@') {
-                                    let domain = addr[at + 1..].to_string();
-                                    // First, check for alias mappings for this exact address
-                                    let dbp_alias = dbp.clone();
-                                    let addr_for_alias = addr.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        rmail_common::db::get_alias_targets(
-                                            &dbp_alias,
-                                            &addr_for_alias,
-                                        )
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(Some(targets))) => {
-                                            println!(
-                                                "SMTP RCPT alias match peer={:?} rcpt={} targets={:?}",
-                                                peer, addr, targets
-                                            );
-                                            // Expand alias targets (allow forwarding even when unauthenticated)
-                                            for t in targets {
-                                                if rcpts.len() >= MAX_RCPT {
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"452 Too many recipients\r\n")
-                                                        .await?;
-                                                    w.flush().await?;
-                                                    break;
-                                                } else {
-                                                    rcpts.push(t.clone());
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"250 OK\r\n").await?;
-                                                    w.flush().await?;
-                                                }
-                                            }
-                                        }
-                                        Ok(Ok(None)) => {
-                                            // No alias; fallback to catchall logic
-                                            let dbp3 = dbp.clone();
-                                            match tokio::task::spawn_blocking(move || {
-                                                rmail_common::db::get_catchall(dbp3, &domain)
-                                            })
-                                            .await
-                                            {
-                                                Ok(Ok(Some(target))) => {
-                                                    println!(
-                                                        "SMTP RCPT catchall match peer={:?} rcpt={} target={}",
-                                                        peer, addr, target
-                                                    );
+                                Ok(Ok(false)) => {
+                                    if let Some(at) = addr.find('@') {
+                                        let domain = addr[at + 1..].to_string();
+                                        // First, check for alias mappings for this exact address
+                                        let dbp_alias = dbp.clone();
+                                        let addr_for_alias = addr.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            rmail_common::db::get_alias_targets(
+                                                &dbp_alias,
+                                                &addr_for_alias,
+                                            )
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(Some(targets))) => {
+                                                println!(
+                                                    "SMTP RCPT alias match peer={:?} rcpt={} targets={:?}",
+                                                    peer, addr, targets
+                                                );
+                                                // Expand alias targets (allow forwarding even when unauthenticated)
+                                                for t in targets {
                                                     if rcpts.len() >= MAX_RCPT {
                                                         let w = reader.get_mut();
                                                         w.write_all(b"452 Too many recipients\r\n")
                                                             .await?;
                                                         w.flush().await?;
+                                                        break;
                                                     } else {
-                                                        rcpts.push(target.clone());
+                                                        rcpts.push(t.clone());
                                                         let w = reader.get_mut();
                                                         w.write_all(b"250 OK\r\n").await?;
                                                         w.flush().await?;
                                                     }
                                                 }
-                                                Ok(Ok(None)) => {
-                                                    // Not a local recipient and no catchall configured for domain.
-                                                    // Allow relay to remote recipients only if the client has authenticated.
-                                                    if authenticated_user.is_some() {
+                                            }
+                                            Ok(Ok(None)) => {
+                                                // No alias; fallback to catchall logic
+                                                let dbp3 = dbp.clone();
+                                                match tokio::task::spawn_blocking(move || {
+                                                    rmail_common::db::get_catchall(dbp3, &domain)
+                                                })
+                                                .await
+                                                {
+                                                    Ok(Ok(Some(target))) => {
+                                                        println!(
+                                                            "SMTP RCPT catchall match peer={:?} rcpt={} target={}",
+                                                            peer, addr, target
+                                                        );
                                                         if rcpts.len() >= MAX_RCPT {
                                                             let w = reader.get_mut();
                                                             w.write_all(
@@ -780,73 +800,104 @@ async fn process_stream(
                                                             .await?;
                                                             w.flush().await?;
                                                         } else {
-                                                            rcpts.push(addr.clone());
+                                                            rcpts.push(target.clone());
                                                             let w = reader.get_mut();
                                                             w.write_all(b"250 OK\r\n").await?;
                                                             w.flush().await?;
                                                         }
-                                                    } else {
+                                                    }
+                                                    Ok(Ok(None)) => {
+                                                        // Not a local recipient and no catchall configured for domain.
+                                                        // Allow relay to remote recipients only if the client has authenticated.
+                                                        if authenticated_user.is_some() {
+                                                            if rcpts.len() >= MAX_RCPT {
+                                                                let w = reader.get_mut();
+                                                                w.write_all(
+                                                                    b"452 Too many recipients\r\n",
+                                                                )
+                                                                .await?;
+                                                                w.flush().await?;
+                                                            } else {
+                                                                rcpts.push(addr.clone());
+                                                                let w = reader.get_mut();
+                                                                w.write_all(b"250 OK\r\n").await?;
+                                                                w.flush().await?;
+                                                            }
+                                                        } else {
+                                                            let w = reader.get_mut();
+                                                            w.write_all(b"550 No such user\r\n")
+                                                                .await?;
+                                                            w.flush().await?;
+                                                        }
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        eprintln!("db get_catchall error: {}", e);
                                                         let w = reader.get_mut();
-                                                        w.write_all(b"550 No such user\r\n")
+                                                        w.write_all(b"451 Temporary error\r\n")
+                                                            .await?;
+                                                        w.flush().await?;
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("db task join error: {}", e);
+                                                        let w = reader.get_mut();
+                                                        w.write_all(b"451 Temporary error\r\n")
                                                             .await?;
                                                         w.flush().await?;
                                                     }
                                                 }
-                                                Ok(Err(e)) => {
-                                                    eprintln!("db get_catchall error: {}", e);
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                                    w.flush().await?;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("db task join error: {}", e);
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                                    w.flush().await?;
-                                                }
+                                            }
+                                            Ok(Err(e)) => {
+                                                eprintln!("db get_alias_targets error: {}", e);
+                                                let w = reader.get_mut();
+                                                w.write_all(b"451 Temporary error\r\n").await?;
+                                                w.flush().await?;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("db task join error: {}", e);
+                                                let w = reader.get_mut();
+                                                w.write_all(b"451 Temporary error\r\n").await?;
+                                                w.flush().await?;
                                             }
                                         }
-                                        Ok(Err(e)) => {
-                                            eprintln!("db get_alias_targets error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("db task join error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
+                                    } else {
+                                        let w = reader.get_mut();
+                                        w.write_all(b"550 Bad address\r\n").await?;
+                                        w.flush().await?;
                                     }
-                                } else {
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("db mailbox_exists error: {}", e);
                                     let w = reader.get_mut();
-                                    w.write_all(b"550 Bad address\r\n").await?;
+                                    w.write_all(b"451 Temporary error\r\n").await?;
+                                    w.flush().await?;
+                                }
+                                Err(e) => {
+                                    eprintln!("db task join error: {}", e);
+                                    let w = reader.get_mut();
+                                    w.write_all(b"451 Temporary error\r\n").await?;
                                     w.flush().await?;
                                 }
                             }
-                            Ok(Err(e)) => {
-                                eprintln!("db mailbox_exists error: {}", e);
-                                let w = reader.get_mut();
-                                w.write_all(b"451 Temporary error\r\n").await?;
-                                w.flush().await?;
-                            }
-                            Err(e) => {
-                                eprintln!("db task join error: {}", e);
-                                let w = reader.get_mut();
-                                w.write_all(b"451 Temporary error\r\n").await?;
-                                w.flush().await?;
-                            }
+                        } else {
+                            let w = reader.get_mut();
+                            w.write_all(b"451 No DB configured\r\n").await?;
+                            w.flush().await?;
                         }
-                    } else {
-                        let w = reader.get_mut();
-                        w.write_all(b"451 No DB configured\r\n").await?;
-                        w.flush().await?;
                     }
-                } else {
-                    let w = reader.get_mut();
-                    w.write_all(b"501 Syntax: RCPT TO:<address>\r\n").await?;
-                    w.flush().await?;
+                    Err(protocol::EnvelopeError::UnsupportedParameter) => {
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"555 5.5.4 Unsupported RCPT TO parameter\r\n")
+                            .await?;
+                        writer.flush().await?;
+                    }
+                    Err(protocol::EnvelopeError::Syntax) => {
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"501 5.5.2 Syntax: RCPT TO:<address>\r\n")
+                            .await?;
+                        writer.flush().await?;
+                    }
                 }
             }
             SmtpCommand::Data => {
@@ -868,6 +919,45 @@ async fn process_stream(
 
                 let mut data = match read_smtp_data(&mut reader).await? {
                     DataReadResult::Complete(mut data) => {
+                        if data.contains(&0) {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"554 5.6.3 NUL requires BINARYMIME\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            rcpts.clear();
+                            mail_from = None;
+                            mail_from_seen = false;
+                            continue;
+                        }
+                        if mail_body == protocol::MailBody::SevenBit
+                            && data.iter().any(|byte| !byte.is_ascii())
+                        {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"554 5.6.3 8-bit content requires BODY=8BITMIME\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            rcpts.clear();
+                            mail_from = None;
+                            mail_from_seen = false;
+                            continue;
+                        }
+                        let header_end = data
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map_or(data.len(), |position| position + 4);
+                        if !smtp_utf8 && data[..header_end].iter().any(|byte| !byte.is_ascii()) {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"554 5.6.7 UTF-8 headers require SMTPUTF8\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            rcpts.clear();
+                            mail_from = None;
+                            mail_from_seen = false;
+                            continue;
+                        }
                         let mut traced =
                             received_header(peer, helo_name.as_deref(), session_encrypted);
                         traced.append(&mut data);
@@ -1243,10 +1333,14 @@ async fn process_stream(
                 rcpts.clear();
                 mail_from = None;
                 mail_from_seen = false;
+                mail_body = protocol::MailBody::SevenBit;
+                smtp_utf8 = false;
             }
             SmtpCommand::Rset => {
                 mail_from = None;
                 mail_from_seen = false;
+                mail_body = protocol::MailBody::SevenBit;
+                smtp_utf8 = false;
                 rcpts.clear();
                 let w = reader.get_mut();
                 w.write_all(b"250 OK\r\n").await?;
@@ -1556,14 +1650,14 @@ mod tests {
     fn parse_mail_from_accepts_normal_address() {
         assert_eq!(
             parse_mail_from_arg("MAIL FROM:<User@Example.com>"),
-            Some(Some("user@example.com".to_string()))
+            Some(Some("User@example.com".to_string()))
         );
     }
 
     #[tokio::test]
     async fn smtp_data_preserves_non_utf8_bytes() {
         let (responses, td) = run_session(
-            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbinary:\xff\r\n.\r\nQUIT\r\n".to_vec(),
+            b"EHLO localhost\r\nMAIL FROM:<> BODY=8BITMIME\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbinary:\xff\r\n.\r\nQUIT\r\n".to_vec(),
             16 * 1024,
         )
         .await;
@@ -1582,6 +1676,112 @@ mod tests {
         );
         assert!(body.windows(8).any(|w| w == b"binary:\xff"));
         assert!(Path::new(&entries[0]).exists());
+    }
+
+    #[tokio::test]
+    async fn data_enforces_8bitmime_smtputf8_and_binarymime_declarations() {
+        let (seven_bit, seven_bit_td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbody:\xff\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            seven_bit
+                .iter()
+                .any(|response| response.starts_with("554 5.6.3 8-bit content"))
+        );
+        assert!(
+            !seven_bit_td
+                .path()
+                .join("mail/example.test/user/Maildir/new")
+                .exists()
+        );
+
+        let (utf8_header, utf8_header_td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<> BODY=8BITMIME\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: h\xff\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            utf8_header
+                .iter()
+                .any(|response| response.starts_with("554 5.6.7 UTF-8 headers"))
+        );
+        assert!(
+            !utf8_header_td
+                .path()
+                .join("mail/example.test/user/Maildir/new")
+                .exists()
+        );
+
+        let (binary, binary_td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<> BODY=8BITMIME SMTPUTF8\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: hi\r\n\r\nbin:\0\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            binary
+                .iter()
+                .any(|response| response.starts_with("554 5.6.3 NUL requires BINARYMIME"))
+        );
+        assert!(
+            !binary_td
+                .path()
+                .join("mail/example.test/user/Maildir/new")
+                .exists()
+        );
+
+        let (accepted, accepted_td) = run_session(
+            "EHLO localhost\r\nMAIL FROM:<> BODY=8BITMIME SMTPUTF8\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: héj\r\n\r\nbody: ø\r\n.\r\nQUIT\r\n"
+                .as_bytes()
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(accepted.iter().any(|response| response == "250 OK\r\n"));
+        assert_eq!(
+            std::fs::read_dir(
+                accepted_td
+                    .path()
+                    .join("mail/example.test/user/Maildir/new")
+            )
+            .expect("maildir")
+            .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_extensions_return_501_for_syntax_and_555_for_unsupported_parameters() {
+        let (responses, _td) = run_session(
+            b"HELO localhost\r\nMAIL FROM:<a@example.test> SIZE=1\r\nEHLO localhost\r\nMAIL FROM:<a@example.test> RET=FULL\r\nMAIL FROM:<a..b@example.test>\r\nMAIL FROM:<a@example.test>\r\nRCPT TO:<user@example.test> NOTIFY=SUCCESS\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("555 5.5.4 ESMTP parameters require EHLO"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("555 5.5.4 Unsupported MAIL FROM parameter"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("501 5.5.2 Syntax: MAIL FROM"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("555 5.5.4 Unsupported RCPT TO parameter"))
+        );
     }
 
     #[tokio::test]
