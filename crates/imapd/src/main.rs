@@ -4633,7 +4633,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 LSUB \"\" \"Projects\"\r\nA003 SUBSCRIBE Projects\r\nA004 LSUB \"\" \"Projects\"\r\nA005 UNSUBSCRIBE Projects\r\nA006 LSUB \"\" \"Projects\"\r\nA007 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 LSUB \"\" \"Projects\"\r\nA003 SUBSCRIBE Ghost\r\nA004 LSUB \"\" \"Ghost\"\r\nA005 LIST (SUBSCRIBED) \"\" \"Ghost\" RETURN (SUBSCRIBED)\r\nA006 SELECT Ghost\r\nA007 UNSUBSCRIBE Ghost\r\nA008 LSUB \"\" \"Ghost\"\r\nA009 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
@@ -4648,19 +4648,33 @@ mod tests {
         assert!(subscribe.iter().any(|l| l.contains("SUBSCRIBE completed")));
 
         let subscribed = read_until_contains(&mut reader, "A004 OK").await;
-        assert!(subscribed.join("").contains("\"Projects\""));
+        assert!(
+            subscribed
+                .join("")
+                .contains("* LSUB (\\Noselect) \"/\" \"Ghost\"")
+        );
 
-        let unsubscribe = read_until_contains(&mut reader, "A005 OK").await;
+        let extended = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(
+            extended
+                .join("")
+                .contains("* LIST (\\NonExistent \\Subscribed) \"/\" \"Ghost\"")
+        );
+
+        let select = read_until_contains(&mut reader, "A006 NO").await;
+        assert!(select.join("").contains("does not exist"));
+
+        let unsubscribe = read_until_contains(&mut reader, "A007 OK").await;
         assert!(
             unsubscribe
                 .iter()
                 .any(|l| l.contains("UNSUBSCRIBE completed"))
         );
 
-        let final_lsub = read_until_contains(&mut reader, "A006 OK").await;
-        assert!(!final_lsub.join("").contains("\"Projects\""));
+        let final_lsub = read_until_contains(&mut reader, "A008 OK").await;
+        assert!(!final_lsub.join("").contains("\"Ghost\""));
 
-        let _logout = read_until_contains(&mut reader, "A007 OK").await;
+        let _logout = read_until_contains(&mut reader, "A009 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -5421,6 +5435,7 @@ fn list_selection_child_info<'a>(
     request: &parser::ListRequest,
     summary: &rmail_common::imap_state::FolderSummary,
     all_folders: &'a [rmail_common::imap_state::FolderSummary],
+    subscriptions: &[String],
 ) -> Vec<&'static str> {
     if !request.selection.recursive_match {
         return Vec::new();
@@ -5432,9 +5447,10 @@ fn list_selection_child_info<'a>(
         .collect::<Vec<_>>();
     let mut info = Vec::new();
     if request.selection.subscribed
-        && descendants
+        && (descendants
             .iter()
             .any(|candidate| candidate.folder.subscribed)
+            || subscriptions.iter().any(|name| name.starts_with(&prefix)))
     {
         info.push("SUBSCRIBED");
     }
@@ -5446,6 +5462,29 @@ fn list_selection_child_info<'a>(
         info.push("SPECIAL-USE");
     }
     info
+}
+
+fn append_nonexistent_subscription_response(
+    response: &mut String,
+    command_name: &str,
+    request: &parser::ListRequest,
+    name: &str,
+    utf8_accept: bool,
+) {
+    let mut attrs = vec![if command_name == "LSUB" {
+        "\\Noselect"
+    } else {
+        "\\NonExistent"
+    }];
+    if request.returns.subscribed {
+        attrs.push("\\Subscribed");
+    }
+    response.push_str(&format!(
+        "* {} ({}) \"/\" {}\r\n",
+        command_name,
+        attrs.join(" "),
+        quote_imap_mailbox_name(name, utf8_accept)
+    ));
 }
 
 #[cfg(test)]
@@ -7129,12 +7168,12 @@ async fn process_stream_inner(
                 let addr = authed_mailbox.as_ref().unwrap();
                 let (local, domain) = address_parts(addr)?;
                 let mail_root_clone = mail_root.clone();
-                let summaries = tokio::task::spawn_blocking(move || {
-                    rmail_common::imap_state::list_folder_summaries(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                    )
+                let (summaries, subscriptions) = tokio::task::spawn_blocking(move || {
+                    let root = Path::new(&mail_root_clone);
+                    Ok::<_, anyhow::Error>((
+                        rmail_common::imap_state::list_folder_summaries(root, &domain, &local)?,
+                        rmail_common::imap_state::list_subscriptions(root, &domain, &local)?,
+                    ))
                 })
                 .await??;
                 println!(
@@ -7159,7 +7198,8 @@ async fn process_stream_inner(
                     let directly_selected = (!request.selection.subscribed
                         || summary.folder.subscribed)
                         && (!request.selection.special_use || summary.folder.special_use.is_some());
-                    let child_info = list_selection_child_info(&request, summary, &summaries);
+                    let child_info =
+                        list_selection_child_info(&request, summary, &summaries, &subscriptions);
                     if !directly_selected && child_info.is_empty() {
                         continue;
                     }
@@ -7177,6 +7217,24 @@ async fn process_stream_inner(
                         utf8_accept,
                         &child_info,
                     );
+                }
+                if request.selection.subscribed {
+                    for name in &subscriptions {
+                        if summaries.iter().any(|summary| summary.folder.name == *name)
+                            || !request.patterns.iter().any(|pattern| {
+                                mailbox_pattern_matches(name, &request.reference, pattern)
+                            })
+                        {
+                            continue;
+                        }
+                        append_nonexistent_subscription_response(
+                            &mut response,
+                            &cmd,
+                            &request,
+                            name,
+                            utf8_accept,
+                        );
+                    }
                 }
                 response.push_str(&format!("{} OK {} completed\r\n", tag, cmd));
                 log_imap_response(peer, tag, &cmd, &response);
@@ -7210,12 +7268,12 @@ async fn process_stream_inner(
                 let addr = authed_mailbox.as_ref().unwrap();
                 let (local, domain) = address_parts(addr)?;
                 let mail_root_clone = mail_root.clone();
-                let summaries = tokio::task::spawn_blocking(move || {
-                    rmail_common::imap_state::list_folder_summaries(
-                        Path::new(&mail_root_clone),
-                        &domain,
-                        &local,
-                    )
+                let (summaries, subscriptions) = tokio::task::spawn_blocking(move || {
+                    let root = Path::new(&mail_root_clone);
+                    Ok::<_, anyhow::Error>((
+                        rmail_common::imap_state::list_folder_summaries(root, &domain, &local)?,
+                        rmail_common::imap_state::list_subscriptions(root, &domain, &local)?,
+                    ))
                 })
                 .await??;
                 println!("IMAP LSUB peer={:?} returning subscriptions", peer);
@@ -7238,6 +7296,22 @@ async fn process_stream_inner(
                         &summaries,
                         utf8_accept,
                         &[],
+                    );
+                }
+                for name in &subscriptions {
+                    if summaries.iter().any(|summary| summary.folder.name == *name)
+                        || !request.patterns.iter().any(|pattern| {
+                            mailbox_pattern_matches(name, &request.reference, pattern)
+                        })
+                    {
+                        continue;
+                    }
+                    append_nonexistent_subscription_response(
+                        &mut response,
+                        "LSUB",
+                        &request,
+                        name,
+                        utf8_accept,
                     );
                 }
                 response.push_str(&format!("{} OK LSUB completed\r\n", tag));
@@ -7662,6 +7736,27 @@ async fn process_stream_inner(
                     cmd, peer, args, mailbox_name
                 );
                 let addr = authed_mailbox.as_ref().unwrap();
+                let (local, domain) = address_parts(addr)?;
+                let root = mail_root.clone();
+                let name = mailbox_name.clone();
+                let exists = tokio::task::spawn_blocking(move || {
+                    rmail_common::imap_state::folder_exists(
+                        Path::new(&root),
+                        &domain,
+                        &local,
+                        &name,
+                    )
+                })
+                .await??;
+                if !exists {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} NO [NONEXISTENT] Mailbox does not exist\r\n", tag).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                }
                 match mailbox::load_selected_mailbox(&mail_root, addr, &mailbox_name).await {
                     Ok(mut sel) => {
                         let had_selected_mailbox = selected.is_some();

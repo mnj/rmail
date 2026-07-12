@@ -116,6 +116,11 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_expunges_folder_modseq
             ON expunges(folder_id, modseq);
+        CREATE TABLE IF NOT EXISTS subscriptions(
+            name TEXT PRIMARY KEY
+        );
+        INSERT OR IGNORE INTO subscriptions(name)
+            SELECT name FROM folders WHERE subscribed != 0;
         ",
     )?;
     add_column_if_missing(
@@ -193,7 +198,7 @@ fn insert_folder(
     subscribed: bool,
 ) -> Result<()> {
     let uidvalidity = new_uidvalidity();
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq)
          VALUES(?1, ?2, ?3, ?4, ?5, 1, 1)",
         params![
@@ -208,6 +213,12 @@ fn insert_folder(
         "UPDATE folders SET path = ?2, special_use = ?3 WHERE name = ?1",
         params![name, path, special_use],
     )?;
+    if subscribed && inserted > 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO subscriptions(name) VALUES(?1)",
+            params![name],
+        )?;
+    }
     Ok(())
 }
 
@@ -267,6 +278,20 @@ pub fn list_subscribed_folders(
         .collect())
 }
 
+pub fn list_subscriptions(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+) -> Result<Vec<String>> {
+    let conn = open_account(maildir_root, domain, localpart)?;
+    let mut statement =
+        conn.prepare("SELECT name FROM subscriptions ORDER BY name COLLATE NOCASE")?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 pub fn create_folder(
     maildir_root: &Path,
     domain: &str,
@@ -289,6 +314,10 @@ pub fn create_folder(
         "INSERT INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq)
          VALUES(?1, ?2, NULL, 1, ?3, 1, 1)",
         params![name, folder_path(&name)?, new_uidvalidity() as i64],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO subscriptions(name) VALUES(?1)",
+        params![name],
     )?;
     tx.commit()?;
     guard.commit();
@@ -336,6 +365,7 @@ pub fn delete_folder(
     };
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    tx.execute("DELETE FROM subscriptions WHERE name = ?1", params![name])?;
     tx.commit()?;
     if let Some(guard) = guard {
         guard.commit();
@@ -412,8 +442,18 @@ pub fn rename_folder(
     let tx = conn.transaction()?;
     for (old_name, new_name) in &mappings {
         tx.execute(
+            "DELETE FROM subscriptions WHERE name = ?1 AND EXISTS (
+                 SELECT 1 FROM subscriptions WHERE name = ?2
+             )",
+            params![new_name, old_name],
+        )?;
+        tx.execute(
             "UPDATE folders SET name = ?1, path = ?2 WHERE name = ?3",
             params![new_name, folder_path(new_name)?, old_name],
+        )?;
+        tx.execute(
+            "UPDATE subscriptions SET name = ?1 WHERE name = ?2",
+            params![new_name, old_name],
         )?;
     }
     tx.commit()?;
@@ -430,7 +470,14 @@ pub fn set_subscription(
 ) -> Result<()> {
     let name = normalize_mailbox_name(mailbox)?;
     let conn = open_account(maildir_root, domain, localpart)?;
-    ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
+    if subscribed {
+        conn.execute(
+            "INSERT OR IGNORE INTO subscriptions(name) VALUES(?1)",
+            params![name],
+        )?;
+    } else {
+        conn.execute("DELETE FROM subscriptions WHERE name = ?1", params![name])?;
+    }
     conn.execute(
         "UPDATE folders SET subscribed = ?1 WHERE name = ?2",
         params![i64::from(subscribed), name],
@@ -2171,6 +2218,41 @@ mod tests {
         delete_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
         delete_folder(td.path(), "example.test", "user", "Projects").unwrap();
         assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+    }
+
+    #[test]
+    fn nonexistent_subscriptions_do_not_create_mailboxes() {
+        let td = tempfile::tempdir().unwrap();
+        set_subscription(td.path(), "example.test", "user", "Ghost", true).unwrap();
+        assert!(!folder_exists(td.path(), "example.test", "user", "Ghost").unwrap());
+        assert!(
+            list_subscriptions(td.path(), "example.test", "user")
+                .unwrap()
+                .iter()
+                .any(|name| name == "Ghost")
+        );
+
+        set_subscription(td.path(), "example.test", "user", "INBOX", false).unwrap();
+        assert!(
+            !list_subscriptions(td.path(), "example.test", "user")
+                .unwrap()
+                .iter()
+                .any(|name| name == "INBOX")
+        );
+        assert!(
+            !load_folder(td.path(), "example.test", "user", "INBOX")
+                .unwrap()
+                .0
+                .subscribed
+        );
+
+        set_subscription(td.path(), "example.test", "user", "Ghost", false).unwrap();
+        assert!(
+            !list_subscriptions(td.path(), "example.test", "user")
+                .unwrap()
+                .iter()
+                .any(|name| name == "Ghost")
+        );
     }
 
     #[test]
