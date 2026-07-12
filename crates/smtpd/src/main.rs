@@ -562,9 +562,9 @@ async fn process_stream(
                 helo_name = Some(name.to_string());
                 extended_smtp = is_ehlo;
                 let mut resp = if is_ehlo {
-                    String::from("250-Hello\r\n")
+                    format!("250-rMail Hello {name}\r\n")
                 } else {
-                    String::from("250 Hello\r\n")
+                    format!("250 2.0.0 rMail Hello {name}\r\n")
                 };
                 if is_ehlo {
                     if !session_encrypted && tls_ctx.is_some() {
@@ -580,7 +580,7 @@ async fn process_stream(
                     resp.push_str("250-8BITMIME\r\n");
                     resp.push_str("250-PIPELINING\r\n");
                     resp.push_str("250-SMTPUTF8\r\n");
-                    resp.push_str("250 OK\r\n");
+                    resp.push_str("250 ENHANCEDSTATUSCODES\r\n");
                 }
                 let w = reader.get_mut();
                 w.write_all(resp.as_bytes()).await?;
@@ -638,7 +638,7 @@ async fn process_stream(
                 // Require encryption (implicit SMTPS or STARTTLS) for authentication in production
                 if !session_encrypted {
                     let w = reader.get_mut();
-                    w.write_all(b"538 Encryption required for authentication\r\n")
+                    w.write_all(b"538 5.7.11 Encryption required for authentication\r\n")
                         .await?;
                     w.flush().await?;
                     continue;
@@ -728,14 +728,14 @@ async fn process_stream(
                 }
                 rcpts.clear();
                 let w = reader.get_mut();
-                w.write_all(b"250 OK\r\n").await?;
+                w.write_all(b"250 2.1.0 Sender OK\r\n").await?;
                 w.flush().await?;
             }
             SmtpCommand::Rcpt(rcpt_args) => {
                 // Require MAIL FROM before RCPT TO
                 if !mail_from_seen {
                     let w = reader.get_mut();
-                    w.write_all(b"503 Bad sequence of commands: MAIL required before RCPT\r\n")
+                    w.write_all(b"503 5.5.1 MAIL required before RCPT\r\n")
                         .await?;
                     w.flush().await?;
                     continue;
@@ -759,7 +759,7 @@ async fn process_stream(
                                 Ok(Ok(Some(mailbox))) => {
                                     if rcpts.len() >= MAX_RCPT {
                                         let w = reader.get_mut();
-                                        w.write_all(b"452 Too many recipients\r\n").await?;
+                                        w.write_all(b"452 4.5.3 Too many recipients\r\n").await?;
                                         w.flush().await?;
                                     } else {
                                         rcpts.push(mailbox.address.to_ascii_lowercase());
@@ -770,7 +770,7 @@ async fn process_stream(
                                             rcpts
                                         );
                                         let w = reader.get_mut();
-                                        w.write_all(b"250 OK\r\n").await?;
+                                        w.write_all(b"250 2.1.5 Recipient OK\r\n").await?;
                                         w.flush().await?;
                                     }
                                 }
@@ -818,7 +818,9 @@ async fn process_stream(
                                                         }),
                                                     );
                                                     let writer = reader.get_mut();
-                                                    writer.write_all(b"250 OK\r\n").await?;
+                                                    writer
+                                                        .write_all(b"250 2.1.5 Recipient OK\r\n")
+                                                        .await?;
                                                     writer.flush().await?;
                                                 }
                                             }
@@ -838,14 +840,17 @@ async fn process_stream(
                                                         if rcpts.len() >= MAX_RCPT {
                                                             let w = reader.get_mut();
                                                             w.write_all(
-                                                                b"452 Too many recipients\r\n",
+                                                                b"452 4.5.3 Too many recipients\r\n",
                                                             )
                                                             .await?;
                                                             w.flush().await?;
                                                         } else {
                                                             rcpts.push(target.clone());
                                                             let w = reader.get_mut();
-                                                            w.write_all(b"250 OK\r\n").await?;
+                                                            w.write_all(
+                                                                b"250 2.1.5 Recipient OK\r\n",
+                                                            )
+                                                            .await?;
                                                             w.flush().await?;
                                                         }
                                                     }
@@ -856,35 +861,44 @@ async fn process_stream(
                                                             if rcpts.len() >= MAX_RCPT {
                                                                 let w = reader.get_mut();
                                                                 w.write_all(
-                                                                    b"452 Too many recipients\r\n",
+                                                                    b"452 4.5.3 Too many recipients\r\n",
                                                                 )
                                                                 .await?;
                                                                 w.flush().await?;
                                                             } else {
                                                                 rcpts.push(addr.clone());
                                                                 let w = reader.get_mut();
-                                                                w.write_all(b"250 OK\r\n").await?;
+                                                                w.write_all(
+                                                                    b"250 2.1.5 Recipient OK\r\n",
+                                                                )
+                                                                .await?;
                                                                 w.flush().await?;
                                                             }
                                                         } else {
                                                             let w = reader.get_mut();
-                                                            w.write_all(b"550 No such user\r\n")
-                                                                .await?;
+                                                            w.write_all(
+                                                                b"550 5.1.1 No such user\r\n",
+                                                            )
+                                                            .await?;
                                                             w.flush().await?;
                                                         }
                                                     }
                                                     Ok(Err(e)) => {
                                                         eprintln!("db get_catchall error: {}", e);
                                                         let w = reader.get_mut();
-                                                        w.write_all(b"451 Temporary error\r\n")
-                                                            .await?;
+                                                        w.write_all(
+                                                            b"451 4.3.0 Temporary local error\r\n",
+                                                        )
+                                                        .await?;
                                                         w.flush().await?;
                                                     }
                                                     Err(e) => {
                                                         eprintln!("db task join error: {}", e);
                                                         let w = reader.get_mut();
-                                                        w.write_all(b"451 Temporary error\r\n")
-                                                            .await?;
+                                                        w.write_all(
+                                                            b"451 4.3.0 Temporary local error\r\n",
+                                                        )
+                                                        .await?;
                                                         w.flush().await?;
                                                     }
                                                 }
@@ -892,38 +906,42 @@ async fn process_stream(
                                             Ok(Err(e)) => {
                                                 eprintln!("db get_alias_targets error: {}", e);
                                                 let w = reader.get_mut();
-                                                w.write_all(b"451 Temporary error\r\n").await?;
+                                                w.write_all(b"451 4.3.0 Temporary local error\r\n")
+                                                    .await?;
                                                 w.flush().await?;
                                             }
                                             Err(e) => {
                                                 eprintln!("db task join error: {}", e);
                                                 let w = reader.get_mut();
-                                                w.write_all(b"451 Temporary error\r\n").await?;
+                                                w.write_all(b"451 4.3.0 Temporary local error\r\n")
+                                                    .await?;
                                                 w.flush().await?;
                                             }
                                         }
                                     } else {
                                         let w = reader.get_mut();
-                                        w.write_all(b"550 Bad address\r\n").await?;
+                                        w.write_all(b"550 5.1.3 Bad destination address\r\n")
+                                            .await?;
                                         w.flush().await?;
                                     }
                                 }
                                 Ok(Err(e)) => {
                                     eprintln!("db mailbox_exists error: {}", e);
                                     let w = reader.get_mut();
-                                    w.write_all(b"451 Temporary error\r\n").await?;
+                                    w.write_all(b"451 4.3.0 Temporary local error\r\n").await?;
                                     w.flush().await?;
                                 }
                                 Err(e) => {
                                     eprintln!("db task join error: {}", e);
                                     let w = reader.get_mut();
-                                    w.write_all(b"451 Temporary error\r\n").await?;
+                                    w.write_all(b"451 4.3.0 Temporary local error\r\n").await?;
                                     w.flush().await?;
                                 }
                             }
                         } else {
                             let w = reader.get_mut();
-                            w.write_all(b"451 No DB configured\r\n").await?;
+                            w.write_all(b"451 4.3.0 Recipient database unavailable\r\n")
+                                .await?;
                             w.flush().await?;
                         }
                     }
@@ -947,7 +965,8 @@ async fn process_stream(
                 // DATA requires recipients
                 if rcpts.is_empty() {
                     let w = reader.get_mut();
-                    w.write_all(b"554 No recipients\r\n").await?;
+                    w.write_all(b"503 5.5.1 RCPT required before DATA\r\n")
+                        .await?;
                     w.flush().await?;
                     continue;
                 }
@@ -1336,7 +1355,7 @@ async fn process_stream(
                             "SMTP DATA completed peer={:?} accepted=true rejected={}",
                             peer, any_rejected
                         );
-                        w.write_all(b"250 OK\r\n").await?;
+                        w.write_all(b"250 2.0.0 Message accepted\r\n").await?;
                     } else if any_rejected {
                         println!(
                             "SMTP DATA completed peer={:?} accepted=false temporary_failure=true",
@@ -1349,7 +1368,7 @@ async fn process_stream(
                             "SMTP DATA completed peer={:?} accepted=false rejected=false",
                             peer
                         );
-                        w.write_all(b"250 OK\r\n").await?;
+                        w.write_all(b"250 2.0.0 Message accepted\r\n").await?;
                     }
                     w.flush().await?;
                     if let Err(e) = rmail_common::metrics::persist_prometheus_snapshot(
@@ -1374,24 +1393,24 @@ async fn process_stream(
                 smtp_utf8 = false;
                 rcpts.clear();
                 let w = reader.get_mut();
-                w.write_all(b"250 OK\r\n").await?;
+                w.write_all(b"250 2.0.0 Reset state\r\n").await?;
                 w.flush().await?;
             }
             SmtpCommand::Noop => {
                 let w = reader.get_mut();
-                w.write_all(b"250 OK\r\n").await?;
+                w.write_all(b"250 2.0.0 OK\r\n").await?;
                 w.flush().await?;
             }
             SmtpCommand::Vrfy | SmtpCommand::Expn => {
                 let w = reader.get_mut();
-                w.write_all(b"252 Cannot VRFY user, but will accept message if valid\r\n")
+                w.write_all(b"252 2.5.2 Cannot VRFY user, but will accept message if valid\r\n")
                     .await?;
                 w.flush().await?;
             }
             SmtpCommand::Quit => {
                 println!("SMTP QUIT peer={:?}", peer);
                 let w = reader.get_mut();
-                w.write_all(b"221 Bye\r\n").await?;
+                w.write_all(b"221 2.0.0 Bye\r\n").await?;
                 w.flush().await?;
                 break;
             }
@@ -1414,7 +1433,7 @@ async fn process_stream(
                     // running over the negotiated TLS stream with session_encrypted=true to indicate
                     // that authentication is permitted and traffic is protected.
                     let w = reader.get_mut();
-                    w.write_all(b"220 Ready to start TLS\r\n").await?;
+                    w.write_all(b"220 2.0.0 Ready to start TLS\r\n").await?;
                     w.flush().await?;
                     // take ownership of the underlying stream and perform TLS accept
                     let inner = reader.into_inner();
@@ -1452,7 +1471,7 @@ async fn process_stream(
                     }
                 } else {
                     let w = reader.get_mut();
-                    w.write_all(b"454 TLS not available\r\n").await?;
+                    w.write_all(b"454 4.7.0 TLS not available\r\n").await?;
                     w.flush().await?;
                 }
             }
@@ -1618,7 +1637,7 @@ mod tests {
             if resp.is_empty() {
                 break;
             }
-            let is_bye = resp.starts_with("221 Bye");
+            let is_bye = resp.starts_with("221 2.0.0 Bye");
             responses.push(resp);
             if is_bye {
                 break;
@@ -1701,8 +1720,8 @@ mod tests {
 
     #[test]
     fn received_trace_identifies_smtp_transport_and_authentication_phase() {
-        let smtp = String::from_utf8(received_header(None, Some("client"), false, false, false))
-            .unwrap();
+        let smtp =
+            String::from_utf8(received_header(None, Some("client"), false, false, false)).unwrap();
         assert!(smtp.contains(" with SMTP;"));
         let submission =
             String::from_utf8(received_header(None, Some("client"), true, true, true)).unwrap();
@@ -1717,8 +1736,8 @@ mod tests {
             16 * 1024,
         )
         .await;
-        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
-        assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+        assert!(responses.iter().any(|r| r.starts_with("250 ")));
+        assert!(responses.iter().any(|r| r.starts_with("221 2.0.0 Bye")));
 
         let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
         let entries: Vec<_> = std::fs::read_dir(&delivered_dir)
@@ -1727,9 +1746,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         let body = std::fs::read(&entries[0]).expect("read message");
-        assert!(
-            body.starts_with(b"Received: from localhost by rMail SMTPD with ESMTP;")
-        );
+        assert!(body.starts_with(b"Received: from localhost by rMail SMTPD with ESMTP;"));
         assert!(body.windows(8).any(|w| w == b"binary:\xff"));
         assert!(Path::new(&entries[0]).exists());
     }
@@ -1797,7 +1814,7 @@ mod tests {
             16 * 1024,
         )
         .await;
-        assert!(accepted.iter().any(|response| response == "250 OK\r\n"));
+        assert!(accepted.iter().any(|response| response.starts_with("250 ")));
         assert_eq!(
             std::fs::read_dir(
                 accepted_td
@@ -1848,7 +1865,11 @@ mod tests {
             16 * 1024,
         )
         .await;
-        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("250 "))
+        );
         assert_eq!(
             std::fs::read_dir(td.path().join("mail/example.test/postmaster/Maildir/new"))
                 .expect("postmaster maildir")
@@ -1865,13 +1886,20 @@ mod tests {
             16 * 1024,
         )
         .await;
-        assert_eq!(
-            responses
-                .iter()
-                .filter(|response| response.as_str() == "250 OK\r\n")
-                .count(),
-            4
-        );
+        for expected in [
+            "250 2.1.0 Sender OK",
+            "250 2.1.5 Recipient OK",
+            "250 2.0.0 Message accepted",
+        ] {
+            assert_eq!(
+                responses
+                    .iter()
+                    .filter(|response| response.starts_with(expected))
+                    .count(),
+                1,
+                "{expected}"
+            );
+        }
         for localpart in ["user", "postmaster"] {
             assert_eq!(
                 std::fs::read_dir(
@@ -1897,7 +1925,7 @@ mod tests {
             },
         )
         .await;
-        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
+        assert!(responses.iter().any(|r| r.starts_with("250 ")));
         let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
         assert_eq!(
             std::fs::read_dir(delivered_dir).expect("maildir").count(),
@@ -1939,7 +1967,7 @@ mod tests {
             },
         )
         .await;
-        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
+        assert!(responses.iter().any(|r| r.starts_with("250 ")));
         let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
         assert_eq!(
             std::fs::read_dir(delivered_dir).expect("maildir").count(),
@@ -1996,7 +2024,7 @@ mod tests {
             .filter(|r| r.starts_with("552 5.3.4"))
             .count();
         assert_eq!(oversized, 1);
-        assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+        assert!(responses.iter().any(|r| r.starts_with("221 2.0.0 Bye")));
     }
 
     #[tokio::test]
@@ -2011,7 +2039,7 @@ mod tests {
             .filter(|r| r.starts_with("500 5.5.2"))
             .count();
         assert_eq!(line_too_long, 1);
-        assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+        assert!(responses.iter().any(|r| r.starts_with("221 2.0.0 Bye")));
     }
 
     #[tokio::test]
@@ -2026,11 +2054,16 @@ mod tests {
                 .count(),
             1
         );
-        assert!(responses.iter().any(|response| response.starts_with("221 Bye")));
-        assert!(!td
-            .path()
-            .join("mail/example.test/user/Maildir/new")
-            .exists());
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("221 2.0.0 Bye"))
+        );
+        assert!(
+            !td.path()
+                .join("mail/example.test/user/Maildir/new")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -2052,8 +2085,35 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("500 5.5.2 Command unrecognized"))
         );
-        assert!(responses.iter().any(|r| r.starts_with("250 OK")));
-        assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+        assert!(responses.iter().any(|r| r.starts_with("250 ")));
+        assert!(responses.iter().any(|r| r.starts_with("221 2.0.0 Bye")));
+    }
+
+    #[tokio::test]
+    async fn advertised_enhanced_status_codes_are_used_for_command_replies() {
+        let (responses, _td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<missing@example.test>\r\nRSET\r\nVRFY user@example.test\r\nNOOP\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response == "250 ENHANCEDSTATUSCODES\r\n")
+        );
+        for response in responses.iter().filter(|response| {
+            !response.starts_with("250-") && response.as_str() != "250 ENHANCEDSTATUSCODES\r\n"
+        }) {
+            let status = response.split_ascii_whitespace().nth(1).unwrap_or_default();
+            let components = status.split('.').collect::<Vec<_>>();
+            assert_eq!(components.len(), 3, "{response:?}");
+            assert!(
+                components.iter().all(|component| !component.is_empty()
+                    && component.bytes().all(|byte| byte.is_ascii_digit())),
+                "{response:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2071,13 +2131,17 @@ mod tests {
         assert!(
             responses
                 .iter()
-                .any(|response| response.starts_with("250-Hello"))
+                .any(|response| response.starts_with("250-rMail Hello"))
         );
-        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
         assert!(
             responses
                 .iter()
-                .any(|response| response.starts_with("221 Bye"))
+                .any(|response| response.starts_with("250 "))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("221 2.0.0 Bye"))
         );
     }
 
@@ -2110,7 +2174,7 @@ mod tests {
         assert!(
             responses
                 .iter()
-                .any(|response| response.starts_with("221 Bye"))
+                .any(|response| response.starts_with("221 2.0.0 Bye"))
         );
     }
 
@@ -2147,12 +2211,20 @@ mod tests {
             .await
             .expect("commands");
         reader.get_mut().flush().await.expect("flush");
-        let ehlo = read_until(&mut reader, "250 OK").await;
+        let ehlo = read_until(&mut reader, "250 ENHANCEDSTATUSCODES").await;
         assert!(ehlo.contains("STARTTLS"));
         let rejection = read_until(&mut reader, "554 5.5.1").await;
         assert!(rejection.contains("did not wait for STARTTLS reply"));
-        assert!(read_until(&mut reader, "250 OK").await.contains("250 OK"));
-        assert!(read_until(&mut reader, "221 Bye").await.contains("221 Bye"));
+        assert!(
+            read_until(&mut reader, "250 2.0.0")
+                .await
+                .contains("250 2.0.0")
+        );
+        assert!(
+            read_until(&mut reader, "221 2.0.0 Bye")
+                .await
+                .contains("221 2.0.0 Bye")
+        );
         server_task.await.expect("join").expect("server");
         drop(td);
     }
@@ -2231,7 +2303,7 @@ mod tests {
             .expect("EHLO");
         plaintext.get_mut().flush().await.expect("flush");
         assert!(
-            read_until(&mut plaintext, "250 OK")
+            read_until(&mut plaintext, "250 ENHANCEDSTATUSCODES")
                 .await
                 .contains("STARTTLS")
         );
@@ -2243,7 +2315,7 @@ mod tests {
         plaintext.get_mut().flush().await.expect("flush");
         let mut ready = String::new();
         plaintext.read_line(&mut ready).await.expect("ready");
-        assert_eq!(ready, "220 Ready to start TLS\r\n");
+        assert_eq!(ready, "220 2.0.0 Ready to start TLS\r\n");
 
         let connector = TlsConnector::from(Arc::new(client_config));
         let tls_stream = connector
@@ -2265,13 +2337,13 @@ mod tests {
                 .await
                 .contains("Send EHLO before AUTH")
         );
-        let capabilities = read_until(&mut encrypted, "250 OK").await;
+        let capabilities = read_until(&mut encrypted, "250 ENHANCEDSTATUSCODES").await;
         assert!(capabilities.contains("AUTH PLAIN LOGIN SCRAM-SHA-256"));
         assert!(!capabilities.contains("STARTTLS"));
         assert!(
-            read_until(&mut encrypted, "221 Bye")
+            read_until(&mut encrypted, "221 2.0.0 Bye")
                 .await
-                .contains("221 Bye")
+                .contains("221 2.0.0 Bye")
         );
         server_task.await.expect("join").expect("server");
     }
@@ -2342,7 +2414,11 @@ mod tests {
             .await
             .expect("EHLO");
         reader.get_mut().flush().await.expect("flush");
-        assert!(read_until(&mut reader, "250 OK").await.contains("AUTH"));
+        assert!(
+            read_until(&mut reader, "250 ENHANCEDSTATUSCODES")
+                .await
+                .contains("AUTH")
+        );
 
         let bare = "n=user@example.test,r=clientnonce";
         let first = BASE64_ENGINE.encode(format!("n,,{bare}"));
@@ -2385,7 +2461,11 @@ mod tests {
         );
         reader.get_mut().write_all(b"QUIT\r\n").await.expect("QUIT");
         reader.get_mut().flush().await.expect("flush");
-        assert!(read_until(&mut reader, "221 Bye").await.contains("221 Bye"));
+        assert!(
+            read_until(&mut reader, "221 2.0.0 Bye")
+                .await
+                .contains("221 2.0.0 Bye")
+        );
         server_task.await.expect("join").expect("server");
     }
 
@@ -2407,7 +2487,11 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("501 5.7.0 Authentication canceled"))
         );
-        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("250 "))
+        );
         assert!(
             responses
                 .iter()
@@ -2426,7 +2510,11 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("500 5.5.2 AUTH response line too long"))
         );
-        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("250 "))
+        );
         assert!(
             responses
                 .iter()
@@ -2442,6 +2530,6 @@ mod tests {
         );
         let (responses, _td) = run_session(input.into_bytes(), 16 * 1024).await;
         assert!(responses.iter().any(|r| r.starts_with("552 5.3.4")));
-        assert!(responses.iter().any(|r| r.starts_with("221 Bye")));
+        assert!(responses.iter().any(|r| r.starts_with("221 2.0.0 Bye")));
     }
 }

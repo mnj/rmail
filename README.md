@@ -46,7 +46,7 @@ certification results.
 | RFC 4616 | SASL `PLAIN` | 100% | Initial and continuation forms, authzid policy, UTF-8 validation, and shared credential verification are implemented under TLS. |
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Strict SCRAM grammar, stored verifiers, nonce/channel-binding downgrade checks, client proof validation, and server-final data are implemented and integration-tested. |
 | RFC 6531 | `SMTPUTF8` | 95% | UTF-8 envelope/header use is declaration-gated and outbound relay negotiates SMTPUTF8; full IDNA canonicalization and downgrade behavior are not implemented. |
-| RFC 3463 | Enhanced status codes | 70% | Main policy, sequencing, size, scanner, and authentication failures use enhanced codes; some legacy replies still need conversion. |
+| RFC 3463 / RFC 2034 | Enhanced status codes | 100% | `ENHANCEDSTATUSCODES` is advertised and command, transaction, policy, delivery, TLS, and authentication replies carry class-appropriate enhanced codes. |
 | RFC 3848 | Received trace protocol identifiers | 100% | Generated trace fields distinguish SMTP, ESMTP, TLS, and authenticated submission with the appropriate protocol token. |
 | RFC 3461 | Delivery Status Notifications | 0% | `DSN` is not advertised; `NOTIFY` and `ORCPT` are rejected. |
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 0% | Not implemented or advertised. |
