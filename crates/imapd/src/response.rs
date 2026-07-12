@@ -119,9 +119,8 @@ impl Response {
                     output.push_str("\r\n");
                 }
                 Line::Continuation(text) => {
-                    output.push('+');
+                    output.push_str("+ ");
                     if !text.is_empty() {
-                        output.push(' ');
                         output.push_str(&sanitize_component(text));
                     }
                     output.push_str("\r\n");

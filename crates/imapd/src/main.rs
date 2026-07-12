@@ -21,6 +21,10 @@ mod sort;
 mod state;
 mod thread;
 mod tls;
+use commands::authenticate::{
+    ProtocolError as SaslProtocolError, read_response as read_sasl_wire_response,
+    run_password_exchange as run_password_sasl_exchange,
+};
 use mailbox::SelectedMailbox;
 use tls::load_tls_context;
 
@@ -146,64 +150,6 @@ enum BoundedLine {
     Eof,
     Line(Vec<u8>),
     TooLong,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaslProtocolError {
-    Cancelled,
-    InvalidResponse,
-    ResponseTooLarge,
-    Eof,
-}
-
-async fn read_sasl_wire_response(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
-) -> std::result::Result<String, SaslProtocolError> {
-    let line = match read_bounded_line(reader, MAX_SASL_RESPONSE_BYTES)
-        .await
-        .map_err(|_| SaslProtocolError::Eof)?
-    {
-        BoundedLine::Eof => return Err(SaslProtocolError::Eof),
-        BoundedLine::TooLong => return Err(SaslProtocolError::ResponseTooLarge),
-        BoundedLine::Line(line) => line,
-    };
-    let line = std::str::from_utf8(&line)
-        .map_err(|_| SaslProtocolError::InvalidResponse)?
-        .trim_end_matches(['\r', '\n']);
-    if line == "*" {
-        Err(SaslProtocolError::Cancelled)
-    } else {
-        Ok(line.to_string())
-    }
-}
-
-async fn run_password_sasl_exchange(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
-    exchange: &mut dyn auth::SaslExchange,
-    initial: Option<&str>,
-) -> std::result::Result<auth::SaslCredentials, SaslProtocolError> {
-    let mut progress = exchange
-        .start(initial)
-        .map_err(|_| SaslProtocolError::InvalidResponse)?;
-    loop {
-        match progress {
-            auth::SaslProgress::Credentials(credentials) => return Ok(credentials),
-            auth::SaslProgress::Challenge(challenge) => {
-                let w = reader.get_mut();
-                w.write_all(format!("+ {}\r\n", challenge).as_bytes())
-                    .await
-                    .map_err(|_| SaslProtocolError::Eof)?;
-                w.flush().await.map_err(|_| SaslProtocolError::Eof)?;
-                let line = read_sasl_wire_response(reader).await?;
-                progress = exchange
-                    .receive(&line)
-                    .map_err(|_| SaslProtocolError::InvalidResponse)?;
-            }
-            auth::SaslProgress::ScramClientFirst(_)
-            | auth::SaslProgress::ScramClientFinal(_)
-            | auth::SaslProgress::Complete => return Err(SaslProtocolError::InvalidResponse),
-        }
-    }
 }
 
 async fn read_bounded_line(

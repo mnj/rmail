@@ -335,6 +335,7 @@ mod tests {
 }
 use crate::parser::{Command, UidCommand};
 pub(crate) mod append;
+pub(crate) mod authenticate;
 pub(crate) mod basic;
 pub(crate) mod enable;
 pub(crate) mod expunge;
