@@ -18,6 +18,13 @@ pub(crate) enum MailBody {
     #[default]
     SevenBit,
     EightBitMime,
+    BinaryMime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BdatArgs {
+    pub(crate) size: usize,
+    pub(crate) last: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -27,6 +34,7 @@ pub(crate) enum Command<'a> {
     Mail(&'a str),
     Rcpt(&'a str),
     Data,
+    Bdat(&'a str),
     Rset,
     Noop,
     Quit,
@@ -61,6 +69,13 @@ pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Optio
         }
         Command::Data if session.recipients == 0 => {
             Some(b"503 5.5.1 RCPT required before DATA\r\n")
+        }
+        Command::Bdat(_) if !session.extended_smtp => Some(b"503 5.5.1 Send EHLO first\r\n"),
+        Command::Bdat(_) if !session.transaction_active => {
+            Some(b"503 5.5.1 MAIL required before BDAT\r\n")
+        }
+        Command::Bdat(_) if session.recipients == 0 => {
+            Some(b"503 5.5.1 RCPT required before BDAT\r\n")
         }
         Command::Auth(_) if !session.extended_smtp => Some(b"503 5.5.1 Send EHLO before AUTH\r\n"),
         Command::Auth(_) if session.authenticated => Some(b"503 5.5.0 Already authenticated\r\n"),
@@ -101,6 +116,7 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "MAIL" if !args.is_empty() => Command::Mail(args),
         "RCPT" if !args.is_empty() => Command::Rcpt(args),
         "DATA" if args.is_empty() => Command::Data,
+        "BDAT" if !args.is_empty() => Command::Bdat(args),
         "RSET" if args.is_empty() => Command::Rset,
         "NOOP" => Command::Noop,
         "QUIT" if args.is_empty() => Command::Quit,
@@ -108,10 +124,28 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "AUTH" if !args.is_empty() => Command::Auth(args),
         "VRFY" if !args.is_empty() => Command::Vrfy,
         "EXPN" if !args.is_empty() => Command::Expn,
-        "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "RSET" | "QUIT" | "STARTTLS" | "AUTH"
-        | "VRFY" | "EXPN" => Command::BadSyntax,
+        "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT" | "STARTTLS"
+        | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
         _ => Command::Unknown,
     }
+}
+
+pub(crate) fn parse_bdat_args(args: &str) -> Option<BdatArgs> {
+    let mut parts = args.split_ascii_whitespace();
+    let size_text = parts.next()?;
+    if !size_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let size = size_text.parse().ok()?;
+    let last = match parts.next() {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("LAST") => true,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(BdatArgs { size, last })
 }
 
 pub(crate) fn valid_helo_domain(value: &str) -> bool {
@@ -291,6 +325,10 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
             if body.replace(MailBody::EightBitMime).is_some() {
                 return Err(EnvelopeError::Syntax);
             }
+        } else if name.eq_ignore_ascii_case("BODY") && value.eq_ignore_ascii_case("BINARYMIME") {
+            if body.replace(MailBody::BinaryMime).is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
         } else if parameter.eq_ignore_ascii_case("SMTPUTF8") {
             if smtp_utf8 {
                 return Err(EnvelopeError::Syntax);
@@ -339,6 +377,34 @@ pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bdat_requires_a_decimal_size_and_optional_last() {
+        assert_eq!(parse_command("BDAT 42 LAST"), Command::Bdat("42 LAST"));
+        assert_eq!(
+            parse_bdat_args("42 LAST"),
+            Some(BdatArgs {
+                size: 42,
+                last: true
+            })
+        );
+        assert_eq!(
+            parse_bdat_args("0"),
+            Some(BdatArgs {
+                size: 0,
+                last: false
+            })
+        );
+        assert_eq!(parse_bdat_args("-1"), None);
+        assert_eq!(parse_bdat_args("1 LAST extra"), None);
+        assert_eq!(parse_command("BDAT"), Command::BadSyntax);
+    }
+
+    #[test]
+    fn mail_from_accepts_binarymime_body_declaration() {
+        let parsed = parse_mail_from_args("FROM:<sender@example.test> BODY=BINARYMIME").unwrap();
+        assert_eq!(parsed.body, MailBody::BinaryMime);
+    }
 
     #[test]
     fn preflight_enforces_smtp_transaction_and_auth_states() {

@@ -674,7 +674,9 @@ pub fn ensure_outbound_columns<P: AsRef<Path>>(path: P) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_alias, add_mailbox, get_alias_targets, get_catchall, get_mailbox, init_db, set_catchall};
+    use super::{
+        add_alias, add_mailbox, get_alias_targets, get_catchall, get_mailbox, init_db, set_catchall,
+    };
     use rusqlite::Connection;
     use tempfile::tempdir;
 
@@ -710,24 +712,14 @@ mod tests {
                 .address,
             "User@xn--bcher-kva.example"
         );
-        add_alias(
-            &db_path,
-            "team@BÜCHER.example",
-            &["User@BÜCHER.example"],
-        )
-        .unwrap();
+        add_alias(&db_path, "team@BÜCHER.example", &["User@BÜCHER.example"]).unwrap();
         assert_eq!(
             get_alias_targets(&db_path, "team@xn--bcher-kva.example")
                 .unwrap()
                 .unwrap(),
             ["User@xn--bcher-kva.example"]
         );
-        set_catchall(
-            &db_path,
-            "BÜCHER.example",
-            "User@BÜCHER.example",
-        )
-        .unwrap();
+        set_catchall(&db_path, "BÜCHER.example", "User@BÜCHER.example").unwrap();
         assert_eq!(
             get_catchall(&db_path, "xn--bcher-kva.example")
                 .unwrap()

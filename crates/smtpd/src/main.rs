@@ -11,7 +11,7 @@ use rmail_common::{
     net::bind_tcp_listener,
     scanner::{ScanAction, ScanEnvelope},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 mod authenticate;
@@ -381,6 +381,55 @@ async fn read_smtp_data<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+async fn read_exact_chunk<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    size: usize,
+    retain: bool,
+) -> Result<Option<Vec<u8>>> {
+    let read = async {
+        if retain {
+            let mut chunk = vec![0; size];
+            reader.read_exact(&mut chunk).await?;
+            Ok::<_, std::io::Error>(chunk)
+        } else {
+            let mut remaining = size;
+            let mut scratch = [0; 8192];
+            while remaining != 0 {
+                let take = remaining.min(scratch.len());
+                reader.read_exact(&mut scratch[..take]).await?;
+                remaining -= take;
+            }
+            Ok(Vec::new())
+        }
+    };
+    match timeout(DATA_READ_TIMEOUT, read).await {
+        Ok(result) => Ok(Some(result?)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn valid_text_message_form(data: &[u8]) -> bool {
+    let mut line_len = 0usize;
+    let mut index = 0usize;
+    while index < data.len() {
+        match data[index] {
+            b'\r' if data.get(index + 1) == Some(&b'\n') => {
+                if line_len + 2 > MAX_DATA_LINE_BYTES {
+                    return false;
+                }
+                line_len = 0;
+                index += 2;
+            }
+            b'\r' | b'\n' | 0 => return false,
+            _ => {
+                line_len += 1;
+                index += 1;
+            }
+        }
+    }
+    line_len <= MAX_DATA_LINE_BYTES - 2
+}
+
 fn received_header(
     peer: Option<SocketAddr>,
     helo_name: Option<&str>,
@@ -450,6 +499,8 @@ async fn process_stream(
     let mut mail_from_seen = false;
     let mut mail_body = protocol::MailBody::SevenBit;
     let mut smtp_utf8 = false;
+    let mut bdat_buffer = Vec::new();
+    let mut bdat_started = false;
     // track authenticated identity when AUTH is used (local mailbox address)
     let mut authenticated_user: Option<String> = None;
     let mut helo_name: Option<String> = None;
@@ -578,6 +629,8 @@ async fn process_stream(
                     }
                     resp.push_str(&format!("250-SIZE {}\r\n", MAX_MESSAGE_BYTES));
                     resp.push_str("250-8BITMIME\r\n");
+                    resp.push_str("250-CHUNKING\r\n");
+                    resp.push_str("250-BINARYMIME\r\n");
                     resp.push_str("250-PIPELINING\r\n");
                     resp.push_str("250-SMTPUTF8\r\n");
                     resp.push_str("250 ENHANCEDSTATUSCODES\r\n");
@@ -590,6 +643,8 @@ async fn process_stream(
                 mail_from_seen = false;
                 mail_body = protocol::MailBody::SevenBit;
                 smtp_utf8 = false;
+                bdat_buffer.clear();
+                bdat_started = false;
                 rcpts.clear();
             }
             SmtpCommand::Auth(auth_args) => {
@@ -701,6 +756,8 @@ async fn process_stream(
                         smtp_utf8 = parsed.smtp_utf8;
                         mail_from = parsed.sender;
                         mail_from_seen = true;
+                        bdat_buffer.clear();
+                        bdat_started = false;
                         println!("SMTP MAIL FROM peer={:?} parsed={:?}", peer, mail_from);
                     }
                     Err(protocol::EnvelopeError::UnsupportedParameter) => {
@@ -961,7 +1018,7 @@ async fn process_stream(
                     }
                 }
             }
-            SmtpCommand::Data => {
+            SmtpCommand::Data | SmtpCommand::Bdat(_) => {
                 // DATA requires recipients
                 if rcpts.is_empty() {
                     let w = reader.get_mut();
@@ -970,18 +1027,100 @@ async fn process_stream(
                     w.flush().await?;
                     continue;
                 }
-                println!(
-                    "SMTP DATA begin peer={:?} mail_from={:?} rcpts={:?}",
-                    peer, mail_from, rcpts
-                );
-                let w = reader.get_mut();
-                w.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
-                    .await?;
-                w.flush().await?;
+                let incoming = match parsed_command {
+                    SmtpCommand::Data => {
+                        if bdat_started {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"503 5.5.1 DATA not permitted after BDAT\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            continue;
+                        }
+                        if mail_body == protocol::MailBody::BinaryMime {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"503 5.5.1 BODY=BINARYMIME requires BDAT\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            continue;
+                        }
+                        println!(
+                            "SMTP DATA begin peer={peer:?} mail_from={mail_from:?} rcpts={rcpts:?}"
+                        );
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                            .await?;
+                        writer.flush().await?;
+                        read_smtp_data(&mut reader).await?
+                    }
+                    SmtpCommand::Bdat(args) => {
+                        let Some(chunk) = protocol::parse_bdat_args(args) else {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"501 5.5.2 Syntax: BDAT chunk-size [LAST]\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            continue;
+                        };
+                        bdat_started = true;
+                        let retain = bdat_buffer
+                            .len()
+                            .checked_add(chunk.size)
+                            .is_some_and(|total| total <= MAX_MESSAGE_BYTES);
+                        let Some(bytes) = read_exact_chunk(&mut reader, chunk.size, retain).await?
+                        else {
+                            let writer = reader.get_mut();
+                            let _ = writer
+                                .write_all(b"421 4.4.2 Timeout while reading BDAT chunk\r\n")
+                                .await;
+                            let _ = writer.flush().await;
+                            break;
+                        };
+                        if !retain {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"552 5.3.4 Message size exceeds fixed maximum\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            rcpts.clear();
+                            mail_from = None;
+                            mail_from_seen = false;
+                            bdat_buffer.clear();
+                            bdat_started = false;
+                            continue;
+                        }
+                        bdat_buffer.extend_from_slice(&bytes);
+                        if !chunk.last {
+                            let writer = reader.get_mut();
+                            writer
+                                .write_all(b"250 2.0.0 BDAT chunk received\r\n")
+                                .await?;
+                            writer.flush().await?;
+                            continue;
+                        }
+                        DataReadResult::Complete(std::mem::take(&mut bdat_buffer))
+                    }
+                    _ => unreachable!(),
+                };
 
-                let mut data = match read_smtp_data(&mut reader).await? {
+                let mut data = match incoming {
                     DataReadResult::Complete(mut data) => {
-                        if data.contains(&0) {
+                        if bdat_started
+                            && mail_body != protocol::MailBody::BinaryMime
+                            && !valid_text_message_form(&data)
+                        {
+                            let writer = reader.get_mut();
+                            writer.write_all(b"554 5.6.0 BDAT content requires canonical CRLF lines or BODY=BINARYMIME\r\n").await?;
+                            writer.flush().await?;
+                            rcpts.clear();
+                            mail_from = None;
+                            mail_from_seen = false;
+                            bdat_started = false;
+                            continue;
+                        }
+                        if data.contains(&0) && mail_body != protocol::MailBody::BinaryMime {
                             let writer = reader.get_mut();
                             writer
                                 .write_all(b"554 5.6.3 NUL requires BINARYMIME\r\n")
@@ -1385,12 +1524,16 @@ async fn process_stream(
                 mail_from_seen = false;
                 mail_body = protocol::MailBody::SevenBit;
                 smtp_utf8 = false;
+                bdat_buffer.clear();
+                bdat_started = false;
             }
             SmtpCommand::Rset => {
                 mail_from = None;
                 mail_from_seen = false;
                 mail_body = protocol::MailBody::SevenBit;
                 smtp_utf8 = false;
+                bdat_buffer.clear();
+                bdat_started = false;
                 rcpts.clear();
                 let w = reader.get_mut();
                 w.write_all(b"250 2.0.0 Reset state\r\n").await?;
@@ -1824,6 +1967,57 @@ mod tests {
             .expect("maildir")
             .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn bdat_accepts_multiple_binary_chunks_and_data_cannot_mix_with_them() {
+        let first = b"Subject: binary\r\n\r\npart";
+        let second = b"\0two\r\n";
+        let mut commands = format!(
+            "EHLO localhost\r\nMAIL FROM:<> BODY=BINARYMIME\r\nRCPT TO:<user@example.test>\r\nBDAT {}\r\n",
+            first.len()
+        )
+        .into_bytes();
+        commands.extend_from_slice(first);
+        commands.extend_from_slice(format!("BDAT {} LAST\r\n", second.len()).as_bytes());
+        commands.extend_from_slice(second);
+        commands.extend_from_slice(b"QUIT\r\n");
+
+        let (responses, td) = run_session(commands, 16 * 1024).await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.contains("BDAT chunk received"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.contains("Message accepted"))
+        );
+        let delivered_dir = td.path().join("mail/example.test/user/Maildir/new");
+        let path = std::fs::read_dir(delivered_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let delivered = std::fs::read(path).unwrap();
+        assert!(
+            delivered.windows(first.len() + second.len()).any(|window| {
+                window == [first.as_slice(), second.as_slice()].concat().as_slice()
+            })
+        );
+
+        let (mixed, _) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nBDAT 0\r\nDATA\r\nRSET\r\nQUIT\r\n".to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            mixed
+                .iter()
+                .any(|response| response.contains("DATA not permitted after BDAT"))
         );
     }
 

@@ -719,8 +719,8 @@ fn verify_dmarc(
             // envelope-from domain alignment
             if let Some(mf) = mail_from {
                 if let Some(idx) = mf.rfind('@') {
-                    let ef_domain = crate::domain::canonicalize_domain(&mf[idx + 1..])
-                        .unwrap_or_default();
+                    let ef_domain =
+                        crate::domain::canonicalize_domain(&mf[idx + 1..]).unwrap_or_default();
                     if ef_domain == from_domain || ef_domain.ends_with(&format!(".{}", from_domain))
                     {
                         return Ok(Some("pass".to_string()));

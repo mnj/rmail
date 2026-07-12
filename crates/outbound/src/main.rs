@@ -302,37 +302,48 @@ async fn smtp_send_with_reader(
         return Err(anyhow::anyhow!("RCPT TO rejected: {}", code));
     }
 
-    // DATA
-    reader.get_mut().write_all(b"DATA\r\n").await?;
-    reader.get_mut().flush().await?;
-    let (code, _resp) = read_response(&mut *reader).await?;
-    if code != 354 {
-        return Err(anyhow::anyhow!("DATA not accepted: {}", code));
-    }
+    if capabilities.chunking {
+        let command = format!("BDAT {} LAST\r\n", body.len());
+        reader.get_mut().write_all(command.as_bytes()).await?;
+        reader.get_mut().write_all(body).await?;
+        reader.get_mut().flush().await?;
+        let (code, _resp) = read_response(&mut *reader).await?;
+        if code >= 400 {
+            return Err(anyhow::anyhow!("BDAT not accepted: {}", code));
+        }
+    } else {
+        // DATA fallback for servers that do not advertise RFC 3030 CHUNKING.
+        reader.get_mut().write_all(b"DATA\r\n").await?;
+        reader.get_mut().flush().await?;
+        let (code, _resp) = read_response(&mut *reader).await?;
+        if code != 354 {
+            return Err(anyhow::anyhow!("DATA not accepted: {}", code));
+        }
 
-    for segment in body.split_inclusive(|b| *b == b'\n') {
-        let mut line = segment;
-        if line.ends_with(b"\n") {
-            line = &line[..line.len() - 1];
-            if line.ends_with(b"\r") {
+        for segment in body.split_inclusive(|b| *b == b'\n') {
+            let mut line = segment;
+            if line.ends_with(b"\n") {
                 line = &line[..line.len() - 1];
+                if line.ends_with(b"\r") {
+                    line = &line[..line.len() - 1];
+                }
             }
+            if line.starts_with(b".") {
+                reader.get_mut().write_all(b".").await?;
+            }
+            reader.get_mut().write_all(line).await?;
+            reader.get_mut().write_all(b"\r\n").await?;
         }
-        if line.starts_with(b".") {
-            reader.get_mut().write_all(b".").await?;
-        }
-        reader.get_mut().write_all(line).await?;
-        reader.get_mut().write_all(b"\r\n").await?;
-    }
-    reader.get_mut().write_all(b".\r\n").await?;
-    reader.get_mut().flush().await?;
+        reader.get_mut().write_all(b".\r\n").await?;
+        reader.get_mut().flush().await?;
 
-    let (code, _resp) = read_response(&mut *reader).await?;
-    if code >= 400 {
-        return Err(anyhow::anyhow!(
-            "DATA not accepted after sending body: {}",
-            code
-        ));
+        let (code, _resp) = read_response(&mut *reader).await?;
+        if code >= 400 {
+            return Err(anyhow::anyhow!(
+                "DATA not accepted after sending body: {}",
+                code
+            ));
+        }
     }
 
     // QUIT
@@ -356,18 +367,24 @@ fn build_mail_from_command(
     let needs_smtp_utf8 = envelope_from.is_some_and(|sender| !sender.is_ascii())
         || !recipient.is_ascii()
         || body[..header_end].iter().any(|byte| !byte.is_ascii());
-    let needs_8bitmime = body.iter().any(|byte| !byte.is_ascii());
+    let needs_binarymime = requires_binarymime(body);
+    let needs_8bitmime = !needs_binarymime && body.iter().any(|byte| !byte.is_ascii());
     if needs_smtp_utf8 && !capabilities.smtp_utf8 {
         anyhow::bail!("remote server does not support required SMTPUTF8");
     }
     if needs_8bitmime && !capabilities.eight_bit_mime {
         anyhow::bail!("remote server does not support required 8BITMIME");
     }
+    if needs_binarymime && (!capabilities.chunking || !capabilities.binary_mime) {
+        anyhow::bail!("remote server does not support required CHUNKING and BINARYMIME");
+    }
 
     // MAIL FROM
     let mfrom = envelope_from.unwrap_or("");
     let mut mailcmd = format!("MAIL FROM:<{mfrom}>");
-    if needs_8bitmime {
+    if needs_binarymime {
+        mailcmd.push_str(" BODY=BINARYMIME");
+    } else if needs_8bitmime {
         mailcmd.push_str(" BODY=8BITMIME");
     }
     if needs_smtp_utf8 {
@@ -377,11 +394,35 @@ fn build_mail_from_command(
     Ok(mailcmd)
 }
 
+fn requires_binarymime(body: &[u8]) -> bool {
+    let mut line_len = 0usize;
+    let mut index = 0usize;
+    while index < body.len() {
+        match body[index] {
+            b'\r' if body.get(index + 1) == Some(&b'\n') => {
+                if line_len > 998 {
+                    return true;
+                }
+                line_len = 0;
+                index += 2;
+            }
+            b'\r' | b'\n' | 0 => return true,
+            _ => {
+                line_len += 1;
+                index += 1;
+            }
+        }
+    }
+    line_len > 998
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SmtpCapabilities {
     eight_bit_mime: bool,
     smtp_utf8: bool,
     starttls: bool,
+    chunking: bool,
+    binary_mime: bool,
 }
 
 fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
@@ -402,6 +443,10 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.smtp_utf8 = true;
         } else if keyword.eq_ignore_ascii_case("STARTTLS") {
             capabilities.starttls = true;
+        } else if keyword.eq_ignore_ascii_case("CHUNKING") {
+            capabilities.chunking = true;
+        } else if keyword.eq_ignore_ascii_case("BINARYMIME") {
+            capabilities.binary_mime = true;
         }
     }
     capabilities
@@ -596,15 +641,18 @@ async fn deliver_to_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn ehlo_capabilities_are_parsed_by_keyword_not_response_substrings() {
         let capabilities = parse_ehlo_capabilities(
-            "250-mail.example\r\n250-8bitmime\r\n250-SMTPUTF8\r\n250 STARTTLS\r\n",
+            "250-mail.example\r\n250-8bitmime\r\n250-SMTPUTF8\r\n250-CHUNKING\r\n250-BINARYMIME\r\n250 STARTTLS\r\n",
         );
         assert!(capabilities.eight_bit_mime);
         assert!(capabilities.smtp_utf8);
         assert!(capabilities.starttls);
+        assert!(capabilities.chunking);
+        assert!(capabilities.binary_mime);
         assert_eq!(
             parse_ehlo_capabilities("250 mail without STARTTLS support"),
             SmtpCapabilities::default()
@@ -617,6 +665,8 @@ mod tests {
             eight_bit_mime: true,
             smtp_utf8: true,
             starttls: false,
+            chunking: true,
+            binary_mime: true,
         };
         assert_eq!(
             build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
@@ -642,6 +692,25 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(
+            build_mail_from_command(
+                None,
+                "user@example.test",
+                b"Subject: x\r\n\r\nbinary\0body\r\n",
+                &all,
+            )
+            .unwrap(),
+            "MAIL FROM:<> BODY=BINARYMIME\r\n"
+        );
+        assert!(
+            build_mail_from_command(
+                None,
+                "user@example.test",
+                b"Subject: x\r\n\r\nbinary\0body\r\n",
+                &SmtpCapabilities::default(),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -658,5 +727,67 @@ mod tests {
         let overlong = format!("250 {}\r\n", "x".repeat(509));
         let mut overlong = BufReader::new(overlong.as_bytes());
         assert!(read_response(&mut overlong).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chunking_relay_sends_exact_binary_bdat_payload() {
+        let (client, server) = tokio::io::duplex(4096);
+        let body = b"Subject: binary\r\n\r\nzero:\0byte\r\n".to_vec();
+        let expected = body.clone();
+        let server_task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            for expected_command in [
+                "MAIL FROM:<> BODY=BINARYMIME\r\n",
+                "RCPT TO:<user@example.test>\r\n",
+            ] {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                assert_eq!(line, expected_command);
+                server
+                    .get_mut()
+                    .write_all(b"250 2.0.0 OK\r\n")
+                    .await
+                    .unwrap();
+                server.get_mut().flush().await.unwrap();
+            }
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            assert_eq!(line, format!("BDAT {} LAST\r\n", expected.len()));
+            let mut received = vec![0; expected.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            server
+                .get_mut()
+                .write_all(b"250 2.0.0 accepted\r\n")
+                .await
+                .unwrap();
+            server.get_mut().flush().await.unwrap();
+            line.clear();
+            server.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "QUIT\r\n");
+            server
+                .get_mut()
+                .write_all(b"221 2.0.0 bye\r\n")
+                .await
+                .unwrap();
+        });
+        let stream: Box<dyn AsyncStream> = Box::new(client);
+        let mut reader = BufReader::new(stream);
+        smtp_send_with_reader(
+            &mut reader,
+            None,
+            "user@example.test",
+            &body,
+            &SmtpCapabilities {
+                eight_bit_mime: true,
+                smtp_utf8: true,
+                starttls: false,
+                chunking: true,
+                binary_mime: true,
+            },
+        )
+        .await
+        .unwrap();
+        server_task.await.unwrap();
     }
 }

@@ -45,18 +45,19 @@ certification results.
 | RFC 4954 | SMTP AUTH | 95% | Configurable TLS-gated mechanisms, strict grammar, initial responses, bounded continuations, cancellation, state restrictions, and enhanced replies are implemented; external conformance testing remains. |
 | RFC 4616 | SASL `PLAIN` | 100% | Initial and continuation forms, authzid policy, UTF-8 validation, and shared credential verification are implemented under TLS. |
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Strict SCRAM grammar, stored verifiers, nonce/channel-binding downgrade checks, client proof validation, and server-final data are implemented and integration-tested. |
-| RFC 6531 | `SMTPUTF8` | 95% | UTF-8 envelope/header use is declaration-gated and outbound relay negotiates SMTPUTF8; full IDNA canonicalization and downgrade behavior are not implemented. |
+| RFC 6531 | `SMTPUTF8` | 100% | UTF-8 envelope/header use is declaration-gated, outbound relay negotiates and declares SMTPUTF8, and internationalized envelope domains are canonicalized to IDNA A-labels at persistence, routing, DNS, and authentication boundaries. RFC 6531 does not require downgrade support. |
+| RFC 5890 / RFC 5891 | IDNA2008 domain handling | 95% | SMTP envelope domains, mailbox/alias/catchall identities, outbound DNS routes, and SPF/DKIM/DMARC alignment inputs share validated U-label-to-A-label canonicalization with DNS length checks; broad multilingual interoperability corpus testing remains. |
 | RFC 3463 / RFC 2034 | Enhanced status codes | 100% | `ENHANCEDSTATUSCODES` is advertised and command, transaction, policy, delivery, TLS, and authentication replies carry class-appropriate enhanced codes. |
 | RFC 3848 | Received trace protocol identifiers | 100% | Generated trace fields distinguish SMTP, ESMTP, TLS, and authenticated submission with the appropriate protocol token. |
 | RFC 3461 | Delivery Status Notifications | 0% | `DSN` is not advertised; `NOTIFY` and `ORCPT` are rejected. |
-| RFC 3030 | `CHUNKING`/`BINARYMIME` | 0% | Not implemented or advertised. |
+| RFC 3030 | `CHUNKING`/`BINARYMIME` | 95% | Both extensions are advertised together. The receiver supports exact-octet, multi-command BDAT transactions, LAST and zero-length chunks, cumulative SIZE enforcement with stream-preserving drains, DATA/BDAT state exclusion, and BODY=BINARYMIME validation. Relay capability negotiation selects binary-safe BDAT and requires both extensions for binary content; external conformance corpus testing remains. |
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
 | RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
 | RFC 7489 | DMARC policy | 80% | Alignment, policy outcomes, quarantine, and optional rejection are implemented; aggregate/forensic reporting is not implemented. |
 
 SMTP AUTH mechanisms are configured independently with
-`security.smtp_sasl_mechanisms`. OAuth mechanisms, DSN, CHUNKING, BINARYMIME,
-and REQUIRETLS are not currently advertised.
+`security.smtp_sasl_mechanisms`. OAuth mechanisms, DSN, and REQUIRETLS are not
+currently advertised.
 
 ## IMAP standards support
 
