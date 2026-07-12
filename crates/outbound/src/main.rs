@@ -215,20 +215,62 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> anyhow::Result<(u16, String)> {
     let mut full = String::new();
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(anyhow::anyhow!("connection closed by peer"));
-        }
+    let mut expected_code = None;
+    for _ in 0..100 {
+        let line = tokio::time::timeout(Duration::from_secs(60), read_reply_line(reader))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for SMTP reply"))??;
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| anyhow::anyhow!("SMTP reply is not valid ASCII/UTF-8"))?;
         full.push_str(&line);
-        // Look for end of multiline reply ("<code><space>")
-        if line.len() >= 4 {
-            if let Ok(code) = line[0..3].parse::<u16>() {
-                if line.as_bytes()[3] == b' ' {
-                    return Ok((code, full));
-                }
+        let code = line[0..3]
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("invalid SMTP reply code"))?;
+        if !(200..=599).contains(&code) {
+            anyhow::bail!("SMTP reply code is outside the valid range");
+        }
+        if expected_code
+            .replace(code)
+            .is_some_and(|expected| expected != code)
+        {
+            anyhow::bail!("inconsistent SMTP multiline reply codes");
+        }
+        match line.as_bytes()[3] {
+            b' ' => return Ok((code, full)),
+            b'-' => {}
+            _ => anyhow::bail!("invalid SMTP reply separator"),
+        }
+    }
+    anyhow::bail!("SMTP multiline reply has too many lines")
+}
+
+async fn read_reply_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Vec<u8>> {
+    const MAX_REPLY_LINE_BYTES: usize = 512;
+    let mut line = Vec::new();
+    loop {
+        let (consumed, newline) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                anyhow::bail!("connection closed in SMTP reply");
             }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(consumed) > MAX_REPLY_LINE_BYTES {
+                anyhow::bail!("SMTP reply line is too long");
+            }
+            line.extend_from_slice(&available[..consumed]);
+            (consumed, available[..consumed].ends_with(b"\n"))
+        };
+        reader.consume(consumed);
+        if newline {
+            if !line.ends_with(b"\r\n") || line.len() < 6 {
+                anyhow::bail!("malformed SMTP reply line");
+            }
+            return Ok(line);
         }
     }
 }
@@ -238,10 +280,11 @@ async fn smtp_send_with_reader(
     envelope_from: Option<&str>,
     recipient: &str,
     body: &[u8],
+    capabilities: &SmtpCapabilities,
 ) -> anyhow::Result<()> {
+    let mailcmd = build_mail_from_command(envelope_from, recipient, body, capabilities)?;
+
     // MAIL FROM
-    let mfrom = envelope_from.unwrap_or("<>");
-    let mailcmd = format!("MAIL FROM:<{}>\r\n", mfrom);
     reader.get_mut().write_all(mailcmd.as_bytes()).await?;
     reader.get_mut().flush().await?;
     let (code, _resp) = read_response(&mut *reader).await?;
@@ -297,6 +340,70 @@ async fn smtp_send_with_reader(
     let _ = read_response(&mut *reader).await;
 
     Ok(())
+}
+
+fn build_mail_from_command(
+    envelope_from: Option<&str>,
+    recipient: &str,
+    body: &[u8],
+    capabilities: &SmtpCapabilities,
+) -> anyhow::Result<String> {
+    let header_end = body
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(body.len(), |position| position + 4);
+    let needs_smtp_utf8 = envelope_from.is_some_and(|sender| !sender.is_ascii())
+        || !recipient.is_ascii()
+        || body[..header_end].iter().any(|byte| !byte.is_ascii());
+    let needs_8bitmime = body.iter().any(|byte| !byte.is_ascii());
+    if needs_smtp_utf8 && !capabilities.smtp_utf8 {
+        anyhow::bail!("remote server does not support required SMTPUTF8");
+    }
+    if needs_8bitmime && !capabilities.eight_bit_mime {
+        anyhow::bail!("remote server does not support required 8BITMIME");
+    }
+
+    // MAIL FROM
+    let mfrom = envelope_from.unwrap_or("");
+    let mut mailcmd = format!("MAIL FROM:<{mfrom}>");
+    if needs_8bitmime {
+        mailcmd.push_str(" BODY=8BITMIME");
+    }
+    if needs_smtp_utf8 {
+        mailcmd.push_str(" SMTPUTF8");
+    }
+    mailcmd.push_str("\r\n");
+    Ok(mailcmd)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SmtpCapabilities {
+    eight_bit_mime: bool,
+    smtp_utf8: bool,
+    starttls: bool,
+}
+
+fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
+    let mut capabilities = SmtpCapabilities::default();
+    for line in response.lines() {
+        if line.len() < 4 || !line.as_bytes().starts_with(b"250") {
+            continue;
+        }
+        let keyword = line
+            .get(4..)
+            .unwrap_or("")
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("");
+        if keyword.eq_ignore_ascii_case("8BITMIME") {
+            capabilities.eight_bit_mime = true;
+        } else if keyword.eq_ignore_ascii_case("SMTPUTF8") {
+            capabilities.smtp_utf8 = true;
+        } else if keyword.eq_ignore_ascii_case("STARTTLS") {
+            capabilities.starttls = true;
+        }
+    }
+    capabilities
 }
 
 async fn deliver_to_remote(
@@ -411,7 +518,7 @@ async fn deliver_to_remote(
     reader.get_mut().write_all(helo.as_bytes()).await?;
     reader.get_mut().flush().await?;
     let (code, ehlo_resp) = read_response(&mut reader).await?;
-    if code >= 400 {
+    let mut capabilities = if code >= 400 {
         // Try HELO if EHLO failed
         let helo = format!("HELO rmail\r\n");
         reader.get_mut().write_all(helo.as_bytes()).await?;
@@ -420,10 +527,13 @@ async fn deliver_to_remote(
         if code2 >= 400 {
             return Err(anyhow::anyhow!("HELO failed: {}", code2));
         }
-    }
+        SmtpCapabilities::default()
+    } else {
+        parse_ehlo_capabilities(&ehlo_resp)
+    };
 
     // If we did not use implicit TLS and server supports STARTTLS, upgrade
-    if selected_port != 465 && ehlo_resp.to_uppercase().contains("STARTTLS") {
+    if selected_port != 465 && capabilities.starttls {
         reader.get_mut().write_all(b"STARTTLS\r\n").await?;
         reader.get_mut().flush().await?;
         let (code, _resp) = read_response(&mut reader).await?;
@@ -448,7 +558,7 @@ async fn deliver_to_remote(
         let helo = format!("EHLO rmail\r\n");
         reader.get_mut().write_all(helo.as_bytes()).await?;
         reader.get_mut().flush().await?;
-        let (code, _ehlo2) = read_response(&mut reader).await?;
+        let (code, ehlo2) = read_response(&mut reader).await?;
         if code >= 400 {
             let helo = format!("HELO rmail\r\n");
             reader.get_mut().write_all(helo.as_bytes()).await?;
@@ -457,11 +567,82 @@ async fn deliver_to_remote(
             if code2 >= 400 {
                 return Err(anyhow::anyhow!("HELO failed after STARTTLS: {}", code2));
             }
+            capabilities = SmtpCapabilities::default();
+        } else {
+            capabilities = parse_ehlo_capabilities(&ehlo2);
         }
     }
 
     // Send the mail over the established reader (plain or TLS)
-    smtp_send_with_reader(&mut reader, envelope_from, recipient, body).await?;
+    smtp_send_with_reader(&mut reader, envelope_from, recipient, body, &capabilities).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ehlo_capabilities_are_parsed_by_keyword_not_response_substrings() {
+        let capabilities = parse_ehlo_capabilities(
+            "250-mail.example\r\n250-8bitmime\r\n250-SMTPUTF8\r\n250 STARTTLS\r\n",
+        );
+        assert!(capabilities.eight_bit_mime);
+        assert!(capabilities.smtp_utf8);
+        assert!(capabilities.starttls);
+        assert_eq!(
+            parse_ehlo_capabilities("250 mail without STARTTLS support"),
+            SmtpCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn mail_command_handles_null_sender_and_required_content_extensions() {
+        let all = SmtpCapabilities {
+            eight_bit_mime: true,
+            smtp_utf8: true,
+            starttls: false,
+        };
+        assert_eq!(
+            build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
+                .unwrap(),
+            "MAIL FROM:<>\r\n"
+        );
+        assert_eq!(
+            build_mail_from_command(
+                Some("séndér@example.test"),
+                "user@example.test",
+                "Subject: héj\r\n\r\nbody: ø".as_bytes(),
+                &all,
+            )
+            .unwrap(),
+            "MAIL FROM:<séndér@example.test> BODY=8BITMIME SMTPUTF8\r\n"
+        );
+        assert!(
+            build_mail_from_command(
+                None,
+                "user@example.test",
+                b"Subject: x\r\n\r\nbody:\xff",
+                &SmtpCapabilities::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_parser_enforces_crlf_bounds_and_multiline_code_consistency() {
+        let mut valid = BufReader::new(&b"250-mail.example\r\n250-8BITMIME\r\n250 OK\r\n"[..]);
+        let (code, response) = read_response(&mut valid).await.unwrap();
+        assert_eq!(code, 250);
+        assert!(response.contains("8BITMIME"));
+
+        let mut inconsistent = BufReader::new(&b"250-first\r\n251 second\r\n"[..]);
+        assert!(read_response(&mut inconsistent).await.is_err());
+        let mut bare_lf = BufReader::new(&b"250 OK\n"[..]);
+        assert!(read_response(&mut bare_lf).await.is_err());
+        let overlong = format!("250 {}\r\n", "x".repeat(509));
+        let mut overlong = BufReader::new(overlong.as_bytes());
+        assert!(read_response(&mut overlong).await.is_err());
+    }
 }
