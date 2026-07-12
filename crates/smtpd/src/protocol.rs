@@ -295,6 +295,30 @@ pub(crate) fn advertised_sasl_mechanisms(configured: &[String]) -> String {
         .join(" ")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthArgs<'a> {
+    pub(crate) mechanism: &'a str,
+    pub(crate) initial_response: Option<&'a str>,
+}
+
+pub(crate) fn parse_auth_args(args: &str) -> Option<AuthArgs<'_>> {
+    let mut parts = args.split_ascii_whitespace();
+    let mechanism = parts.next()?;
+    let initial_response = parts.next();
+    if parts.next().is_some()
+        || mechanism.is_empty()
+        || !mechanism
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return None;
+    }
+    Some(AuthArgs {
+        mechanism,
+        initial_response,
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BoundedLine {
     Eof,

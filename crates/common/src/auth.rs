@@ -103,6 +103,274 @@ pub async fn authenticate_password(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslCredentials {
+    pub authcid: String,
+    pub authzid: Option<String>,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordSaslProgress {
+    Challenge(&'static str),
+    Credentials(SaslCredentials),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaslExchangeError {
+    InvalidResponse,
+    UnexpectedResponse,
+}
+
+pub trait PasswordSaslExchange: Send {
+    fn start(&mut self, initial: Option<&str>) -> Result<PasswordSaslProgress, SaslExchangeError>;
+    fn receive(&mut self, response: &str) -> Result<PasswordSaslProgress, SaslExchangeError>;
+}
+
+fn decode_sasl_text(response: &str) -> Option<String> {
+    if response == "=" {
+        return Some(String::new());
+    }
+    String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(response)
+            .ok()?,
+    )
+    .ok()
+}
+
+fn plain_credentials(response: &str) -> Option<SaslCredentials> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(response)
+        .ok()?;
+    let mut parts = decoded.split(|byte| *byte == 0);
+    let authzid = parts.next()?;
+    let authcid = parts.next()?;
+    let password = parts.next()?;
+    if parts.next().is_some() || authcid.is_empty() {
+        return None;
+    }
+    Some(SaslCredentials {
+        authcid: String::from_utf8(authcid.to_vec()).ok()?,
+        authzid: if authzid.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(authzid.to_vec()).ok()?)
+        },
+        password: String::from_utf8(password.to_vec()).ok()?,
+    })
+}
+
+#[derive(Default)]
+pub struct PlainExchange {
+    waiting: bool,
+}
+
+impl PasswordSaslExchange for PlainExchange {
+    fn start(&mut self, initial: Option<&str>) -> Result<PasswordSaslProgress, SaslExchangeError> {
+        if self.waiting {
+            return Err(SaslExchangeError::UnexpectedResponse);
+        }
+        match initial {
+            Some(response) => plain_credentials(response)
+                .map(PasswordSaslProgress::Credentials)
+                .ok_or(SaslExchangeError::InvalidResponse),
+            None => {
+                self.waiting = true;
+                Ok(PasswordSaslProgress::Challenge(""))
+            }
+        }
+    }
+
+    fn receive(&mut self, response: &str) -> Result<PasswordSaslProgress, SaslExchangeError> {
+        if !self.waiting {
+            return Err(SaslExchangeError::UnexpectedResponse);
+        }
+        self.waiting = false;
+        plain_credentials(response)
+            .map(PasswordSaslProgress::Credentials)
+            .ok_or(SaslExchangeError::InvalidResponse)
+    }
+}
+
+#[derive(Default)]
+pub struct LoginExchange {
+    state: LoginState,
+    username: Option<String>,
+}
+
+#[derive(Default)]
+enum LoginState {
+    #[default]
+    New,
+    Username,
+    Password,
+    Complete,
+}
+
+impl PasswordSaslExchange for LoginExchange {
+    fn start(&mut self, initial: Option<&str>) -> Result<PasswordSaslProgress, SaslExchangeError> {
+        if !matches!(self.state, LoginState::New) {
+            return Err(SaslExchangeError::UnexpectedResponse);
+        }
+        match initial {
+            Some(response) => {
+                self.username =
+                    Some(decode_sasl_text(response).ok_or(SaslExchangeError::InvalidResponse)?);
+                self.state = LoginState::Password;
+                Ok(PasswordSaslProgress::Challenge("UGFzc3dvcmQ6"))
+            }
+            None => {
+                self.state = LoginState::Username;
+                Ok(PasswordSaslProgress::Challenge("VXNlcm5hbWU6"))
+            }
+        }
+    }
+
+    fn receive(&mut self, response: &str) -> Result<PasswordSaslProgress, SaslExchangeError> {
+        match self.state {
+            LoginState::Username => {
+                self.username =
+                    Some(decode_sasl_text(response).ok_or(SaslExchangeError::InvalidResponse)?);
+                self.state = LoginState::Password;
+                Ok(PasswordSaslProgress::Challenge("UGFzc3dvcmQ6"))
+            }
+            LoginState::Password => {
+                let password =
+                    decode_sasl_text(response).ok_or(SaslExchangeError::InvalidResponse)?;
+                self.state = LoginState::Complete;
+                Ok(PasswordSaslProgress::Credentials(SaslCredentials {
+                    authcid: self
+                        .username
+                        .take()
+                        .ok_or(SaslExchangeError::UnexpectedResponse)?,
+                    authzid: None,
+                    password,
+                }))
+            }
+            LoginState::New | LoginState::Complete => Err(SaslExchangeError::UnexpectedResponse),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScramClientFirst {
+    pub username: String,
+    pub authzid: Option<String>,
+    pub nonce: String,
+    pub bare: String,
+    pub gs2_header: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScramClientFinal {
+    pub without_proof: String,
+    pub proof: String,
+    pub channel_binding: String,
+    pub nonce: String,
+}
+
+fn decode_scram_name(value: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '=' {
+            decoded.push(character);
+            continue;
+        }
+        match (characters.next(), characters.next()) {
+            (Some('2'), Some('C')) => decoded.push(','),
+            (Some('3'), Some('D')) => decoded.push('='),
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn parse_scram_attributes(message: &str) -> Option<Vec<(&str, &str)>> {
+    let mut attributes = Vec::new();
+    for part in message.split(',') {
+        let (name, value) = part.split_once('=')?;
+        if name.len() != 1 || name == "m" || attributes.iter().any(|(seen, _)| *seen == name) {
+            return None;
+        }
+        attributes.push((name, value));
+    }
+    Some(attributes)
+}
+
+pub fn parse_scram_client_first(
+    message: &str,
+    channel_binding_required: bool,
+) -> Option<ScramClientFirst> {
+    let first_comma = message.find(',')?;
+    let second_comma = message[first_comma + 1..].find(',')? + first_comma + 1;
+    let channel_binding_flag = &message[..first_comma];
+    if channel_binding_required {
+        if channel_binding_flag != "p=tls-server-end-point" {
+            return None;
+        }
+    } else if channel_binding_flag != "n" && channel_binding_flag != "y" {
+        return None;
+    }
+    let authzid_field = &message[first_comma + 1..second_comma];
+    let authzid = if authzid_field.is_empty() {
+        None
+    } else {
+        Some(decode_scram_name(authzid_field.strip_prefix("a=")?)?)
+    };
+    let gs2_header = message[..=second_comma].to_string();
+    let bare = message[second_comma + 1..].to_string();
+    let attributes = parse_scram_attributes(&bare)?;
+    let username = decode_scram_name(attributes.iter().find(|(name, _)| *name == "n")?.1)?;
+    let nonce = attributes
+        .iter()
+        .find(|(name, _)| *name == "r")?
+        .1
+        .to_string();
+    if username.is_empty()
+        || nonce.is_empty()
+        || !nonce
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b',')
+    {
+        return None;
+    }
+    Some(ScramClientFirst {
+        username,
+        authzid,
+        nonce,
+        bare,
+        gs2_header,
+    })
+}
+
+pub fn parse_scram_client_final(message: &str) -> Option<ScramClientFinal> {
+    let attributes = parse_scram_attributes(message)?;
+    if attributes.last().map(|(name, _)| *name) != Some("p") {
+        return None;
+    }
+    let proof = attributes.iter().find(|(name, _)| *name == "p")?.1;
+    let channel_binding = attributes.iter().find(|(name, _)| *name == "c")?.1;
+    let nonce = attributes.iter().find(|(name, _)| *name == "r")?.1;
+    if proof.is_empty() || channel_binding.is_empty() || nonce.is_empty() {
+        return None;
+    }
+    let proof_marker = message.rfind(",p=")?;
+    Some(ScramClientFinal {
+        without_proof: message[..proof_marker].to_string(),
+        proof: proof.to_string(),
+        channel_binding: channel_binding.to_string(),
+        nonce: nonce.to_string(),
+    })
+}
+
+pub fn generate_scram_nonce() -> String {
+    let mut bytes = [0u8; 18];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Create a SCRAM-SHA-256 verifier for a plaintext password.
@@ -265,6 +533,53 @@ mod tests {
     fn test_saslprep_basic() {
         // basic ASCII input should be unchanged
         assert_eq!(saslprep("simple"), "simple");
+    }
+
+    #[test]
+    fn password_sasl_exchanges_enforce_strict_state_and_utf8() {
+        let plain_wire =
+            base64::engine::general_purpose::STANDARD.encode(b"\0user@example.test\0password");
+        let mut plain = PlainExchange::default();
+        assert_eq!(
+            plain.start(Some(&plain_wire)).unwrap(),
+            PasswordSaslProgress::Credentials(SaslCredentials {
+                authcid: "user@example.test".to_string(),
+                authzid: None,
+                password: "password".to_string(),
+            })
+        );
+        assert!(plain.receive(&plain_wire).is_err());
+
+        let mut login = LoginExchange::default();
+        assert_eq!(
+            login.start(None).unwrap(),
+            PasswordSaslProgress::Challenge("VXNlcm5hbWU6")
+        );
+        assert_eq!(
+            login.receive("dXNlckBleGFtcGxlLnRlc3Q=").unwrap(),
+            PasswordSaslProgress::Challenge("UGFzc3dvcmQ6")
+        );
+        assert!(matches!(
+            login.receive("cGFzc3dvcmQ=").unwrap(),
+            PasswordSaslProgress::Credentials(_)
+        ));
+        assert!(login.receive("cGFzc3dvcmQ=").is_err());
+        assert!(LoginExchange::default().start(Some("/w==")).is_err());
+    }
+
+    #[test]
+    fn scram_wire_parser_rejects_downgrade_duplicates_and_bad_proof_order() {
+        let first = parse_scram_client_first("n,,n=user=2Cname,r=nonce", false).unwrap();
+        assert_eq!(first.username, "user,name");
+        assert_eq!(first.gs2_header, "n,,");
+        assert!(parse_scram_client_first("p=tls-server-end-point,,n=user,r=n", false).is_none());
+        assert!(parse_scram_client_first("n,,n=user,n=again,r=n", false).is_none());
+        assert!(parse_scram_client_first("n,,m=reserved,n=user,r=n", false).is_none());
+
+        let final_message = parse_scram_client_final("c=biws,r=nonce,p=cHJvb2Y=").unwrap();
+        assert_eq!(final_message.without_proof, "c=biws,r=nonce");
+        assert!(parse_scram_client_final("c=biws,r=n,p=x,x=late").is_none());
+        assert!(parse_scram_client_final("c=biws,r=n,r=again,p=x").is_none());
     }
 
     #[test]

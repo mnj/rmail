@@ -5,10 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use rmail_common::{
-    auth,
     config::{Config, ScannerFailureAction, SecurityConfig},
     maildir, metrics,
     net::bind_tcp_listener,
@@ -17,10 +14,10 @@ use rmail_common::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
+mod authenticate;
 mod protocol;
 mod tls;
 use protocol::{Command as SmtpCommand, parse_command, parse_mail_from_args, parse_rcpt_to_args};
-use rand::RngCore;
 use tls::load_tls_context;
 
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
@@ -48,7 +45,6 @@ const COMMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const AUTH_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(60);
 const DATA_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const STARTTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-const INVALID_CREDENTIALS: &[u8] = b"535 5.7.8 Authentication credentials invalid\r\n";
 
 /// Increment an on-disk counter for delivered messages. Uses an atomic write via a temporary file
 /// so that concurrent processes won't corrupt the counter file. This is intentionally simple and
@@ -317,18 +313,6 @@ fn parse_mail_from_arg(cmd: &str) -> Option<Option<String>> {
     parse_mail_from_args(cmd.strip_prefix("MAIL")?.trim_start()).map(|parsed| parsed.sender)
 }
 
-async fn timed_read_line<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
-    line: &mut String,
-    duration: Duration,
-) -> Result<Option<usize>> {
-    match timeout(duration, reader.read_line(line)).await {
-        Ok(Ok(n)) => Ok(Some(n)),
-        Ok(Err(e)) => Err(e.into()),
-        Err(_) => Ok(None),
-    }
-}
-
 async fn timed_read_until<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     byte: u8,
@@ -569,14 +553,16 @@ async fn process_stream(
                 rcpts.clear();
             }
             SmtpCommand::Auth(auth_args) => {
-                // Simple AUTH implementation supporting PLAIN and LOGIN (only allowed over TLS in production)
-                let auth_cmd = format!("AUTH {}", auth_args);
-                let parts: Vec<&str> = auth_cmd.trim().splitn(3, ' ').collect();
-                let mech = parts
-                    .get(1)
-                    .map(|s| s.to_ascii_uppercase())
-                    .unwrap_or_default();
-                let initial = parts.get(2).map(|s| *s);
+                let Some(parsed_auth) = protocol::parse_auth_args(auth_args) else {
+                    let writer = reader.get_mut();
+                    writer
+                        .write_all(b"501 5.5.4 Invalid AUTH parameters\r\n")
+                        .await?;
+                    writer.flush().await?;
+                    continue;
+                };
+                let mech = parsed_auth.mechanism.to_ascii_uppercase();
+                let initial = parsed_auth.initial_response;
                 println!(
                     "SMTP AUTH attempt peer={:?} encrypted={} mechanism={}",
                     peer, session_encrypted, mech
@@ -617,838 +603,36 @@ async fn process_stream(
                     w.flush().await?;
                     continue;
                 }
-                if mech == "PLAIN" {
-                    if let Some(b64) = initial {
-                        match BASE64_ENGINE.decode(b64) {
-                            Ok(bytes) => {
-                                // PLAIN: [authz] NUL authcid NUL password
-                                let splits: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
-                                let (authcid, password) = if splits.len() >= 3 {
-                                    (
-                                        String::from_utf8_lossy(splits[1]).to_string(),
-                                        String::from_utf8_lossy(splits[2]).to_string(),
-                                    )
-                                } else if splits.len() == 2 {
-                                    (
-                                        String::from_utf8_lossy(splits[0]).to_string(),
-                                        String::from_utf8_lossy(splits[1]).to_string(),
-                                    )
-                                } else {
-                                    ("".to_string(), "".to_string())
-                                };
-                                if let Some(dbp) = db_path.as_ref() {
-                                    let dbp2 = dbp.clone();
-                                    let user_lower = authcid.to_ascii_lowercase();
-                                    let user_for_log = user_lower.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        rmail_common::db::get_mailbox(&dbp2, &user_lower)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(Some(mb))) => {
-                                            if let Some(pw_hash) = mb.password_hash {
-                                                match rmail_common::auth::verify_password(
-                                                    &password, &pw_hash,
-                                                ) {
-                                                    Ok(true) => {
-                                                        authenticated_user =
-                                                            Some(mb.address.to_ascii_lowercase());
-                                                        println!(
-                                                            "SMTP AUTH success peer={:?} user={}",
-                                                            peer, mb.address
-                                                        );
-                                                        let w = reader.get_mut();
-                                                        w.write_all(
-                                                            b"235 Authentication succeeded\r\n",
-                                                        )
-                                                        .await?;
-                                                        w.flush().await?;
-                                                        if let Some(peer_addr) = peer {
-                                                            reset_auth_failures(peer_addr.ip());
-                                                        }
-                                                    }
-                                                    Ok(false) => {
-                                                        println!(
-                                                            "SMTP AUTH bad password peer={:?} user={}",
-                                                            peer, mb.address
-                                                        );
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(INVALID_CREDENTIALS).await?;
-                                                        w.flush().await?;
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("auth verify error: {}", e);
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"451 Temporary error\r\n")
-                                                            .await?;
-                                                        w.flush().await?;
-                                                    }
-                                                }
-                                            } else {
-                                                if let Some(peer_addr) = peer {
-                                                    record_auth_failure(peer_addr.ip());
-                                                }
-                                                let w = reader.get_mut();
-                                                w.write_all(INVALID_CREDENTIALS).await?;
-                                                w.flush().await?;
-                                            }
-                                        }
-                                        Ok(Ok(None)) => {
-                                            println!(
-                                                "SMTP AUTH unknown user peer={:?} authcid={}",
-                                                peer, user_for_log
-                                            );
-                                            if let Some(peer_addr) = peer {
-                                                record_auth_failure(peer_addr.ip());
-                                            }
-                                            let w = reader.get_mut();
-                                            w.write_all(INVALID_CREDENTIALS).await?;
-                                            w.flush().await?;
-                                        }
-                                        Ok(Err(e)) => {
-                                            eprintln!("db error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("db task join error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    }
-                                } else {
-                                    let w = reader.get_mut();
-                                    w.write_all(b"454 TLS not available\r\n").await?;
-                                    w.flush().await?;
-                                }
-                            }
-                            Err(_) => {
-                                let w = reader.get_mut();
-                                w.write_all(b"501 Invalid base64\r\n").await?;
-                                w.flush().await?;
-                            }
-                        }
-                    } else {
-                        // challenge-response not fully implemented: ask for credentials
-                        let w = reader.get_mut();
-                        w.write_all(b"334 \r\n").await?;
-                        w.flush().await?;
-                        let mut resp_line = String::new();
-                        let Some(_) =
-                            timed_read_line(&mut reader, &mut resp_line, AUTH_CONTINUATION_TIMEOUT)
-                                .await?
-                        else {
-                            let w = reader.get_mut();
-                            let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-                            let _ = w.flush().await;
-                            break;
-                        };
-                        let b64 = resp_line.trim();
-                        match base64::engine::general_purpose::STANDARD.decode(b64) {
-                            Ok(bytes) => {
-                                let splits: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
-                                let (authcid, password) = if splits.len() >= 3 {
-                                    (
-                                        String::from_utf8_lossy(splits[1]).to_string(),
-                                        String::from_utf8_lossy(splits[2]).to_string(),
-                                    )
-                                } else if splits.len() == 2 {
-                                    (
-                                        String::from_utf8_lossy(splits[0]).to_string(),
-                                        String::from_utf8_lossy(splits[1]).to_string(),
-                                    )
-                                } else {
-                                    ("".to_string(), "".to_string())
-                                };
-                                if let Some(dbp) = db_path.as_ref() {
-                                    let dbp2 = dbp.clone();
-                                    let user_lower = authcid.to_ascii_lowercase();
-                                    let user_for_log = user_lower.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        rmail_common::db::get_mailbox(&dbp2, &user_lower)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(Some(mb))) => {
-                                            if let Some(pw_hash) = mb.password_hash {
-                                                match rmail_common::auth::verify_password(
-                                                    &password, &pw_hash,
-                                                ) {
-                                                    Ok(true) => {
-                                                        authenticated_user =
-                                                            Some(mb.address.to_ascii_lowercase());
-                                                        println!(
-                                                            "SMTP AUTH success peer={:?} user={}",
-                                                            peer, mb.address
-                                                        );
-                                                        let w = reader.get_mut();
-                                                        w.write_all(
-                                                            b"235 Authentication succeeded\r\n",
-                                                        )
-                                                        .await?;
-                                                        w.flush().await?;
-                                                        if let Some(peer_addr) = peer {
-                                                            reset_auth_failures(peer_addr.ip());
-                                                        }
-                                                    }
-                                                    Ok(false) => {
-                                                        println!(
-                                                            "SMTP AUTH bad password peer={:?} user={}",
-                                                            peer, mb.address
-                                                        );
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(INVALID_CREDENTIALS).await?;
-                                                        w.flush().await?;
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("auth verify error: {}", e);
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"451 Temporary error\r\n")
-                                                            .await?;
-                                                        w.flush().await?;
-                                                    }
-                                                }
-                                            } else {
-                                                if let Some(peer_addr) = peer {
-                                                    record_auth_failure(peer_addr.ip());
-                                                }
-                                                let w = reader.get_mut();
-                                                w.write_all(INVALID_CREDENTIALS).await?;
-                                                w.flush().await?;
-                                            }
-                                        }
-                                        Ok(Ok(None)) => {
-                                            println!(
-                                                "SMTP AUTH unknown user peer={:?} authcid={}",
-                                                peer, user_for_log
-                                            );
-                                            if let Some(peer_addr) = peer {
-                                                record_auth_failure(peer_addr.ip());
-                                            }
-                                            let w = reader.get_mut();
-                                            w.write_all(INVALID_CREDENTIALS).await?;
-                                            w.flush().await?;
-                                        }
-                                        Ok(Err(e)) => {
-                                            eprintln!("db error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("db task join error: {}", e);
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    }
-                                } else {
-                                    let w = reader.get_mut();
-                                    w.write_all(b"454 TLS not available\r\n").await?;
-                                    w.flush().await?;
-                                }
-                            }
-                            Err(_) => {
-                                let w = reader.get_mut();
-                                w.write_all(b"501 Invalid base64\r\n").await?;
-                                w.flush().await?;
-                            }
-                        }
+                if matches!(mech.as_str(), "PLAIN" | "LOGIN") {
+                    let outcome = authenticate::handle_password(
+                        &mut reader,
+                        &mech,
+                        initial,
+                        db_path.as_ref(),
+                        peer,
+                    )
+                    .await;
+                    if outcome.disconnected {
+                        break;
                     }
-                } else if mech == "SCRAM-SHA-256" {
-                    // SCRAM-SHA-256 server-side (RFC 5802 minimal implementation)
-                    // Workflow: client-first-message [base64] -> server-first-message (r=nonce,s=salt,i=iter) -> client-final-message (with proof)
-                    let client_first_msg = if let Some(b64) = initial {
-                        match base64::engine::general_purpose::STANDARD.decode(b64) {
-                            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                            Err(_) => {
-                                let w = reader.get_mut();
-                                w.write_all(b"501 Invalid base64\r\n").await?;
-                                w.flush().await?;
-                                continue;
-                            }
-                        }
-                    } else {
-                        let w = reader.get_mut();
-                        w.write_all(b"334 \r\n").await?;
-                        w.flush().await?;
-                        let mut resp_line = String::new();
-                        let Some(_) =
-                            timed_read_line(&mut reader, &mut resp_line, AUTH_CONTINUATION_TIMEOUT)
-                                .await?
-                        else {
-                            let w = reader.get_mut();
-                            let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-                            let _ = w.flush().await;
-                            break;
-                        };
-                        let b64 = resp_line.trim();
-                        match base64::engine::general_purpose::STANDARD.decode(b64) {
-                            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                            Err(_) => {
-                                let w = reader.get_mut();
-                                w.write_all(b"501 Invalid base64\r\n").await?;
-                                w.flush().await?;
-                                continue;
-                            }
-                        }
-                    };
-
-                    // Extract GS2 header (the part before ",,") and client-first-bare. GS2 header
-                    // indicates whether the client requests channel-binding. We support either the
-                    // common "n,," (no channel binding) or "p=tls-server-end-point,," (server-end-point
-                    // channel binding) when TLS is in use. Other GS2 variants are rejected.
-                    let (gs2_header_owned, client_first_bare) =
-                        if let Some(idx) = client_first_msg.find(",,") {
-                            let gs2_header = client_first_msg[..idx + 2].to_string();
-                            // accept 'n,,' or 'p=tls-server-end-point,,'
-                            if !(gs2_header == "n,,"
-                                || gs2_header.starts_with("p=tls-server-end-point"))
-                            {
-                                let w = reader.get_mut();
-                                w.write_all(b"538 Channel-binding requested but not supported\r\n")
-                                    .await?;
-                                w.flush().await?;
-                                continue;
-                            }
-                            (gs2_header, client_first_msg[idx + 2..].to_string())
-                        } else {
-                            (String::new(), client_first_msg.clone())
-                        };
-
-                    // parse username (n=) and client nonce (r=) from client-first-bare
-                    let mut username = String::new();
-                    let mut client_nonce = String::new();
-                    for part in client_first_bare.split(',') {
-                        if part.starts_with("n=") {
-                            username = part[2..].to_string();
-                        } else if part.starts_with("r=") {
-                            client_nonce = part[2..].to_string();
-                        }
+                    if let Some(user) = outcome.authenticated_user {
+                        println!("SMTP AUTH success peer={peer:?} user={user}");
+                        authenticated_user = Some(user);
                     }
-                    if username.is_empty() || client_nonce.is_empty() {
-                        let w = reader.get_mut();
-                        w.write_all(b"501 Invalid SCRAM client-first message\r\n")
-                            .await?;
-                        w.flush().await?;
-                        continue;
+                    continue;
+                }
+                if mech == "SCRAM-SHA-256" {
+                    let outcome =
+                        authenticate::handle_scram(&mut reader, initial, db_path.as_ref(), peer)
+                            .await;
+                    if outcome.disconnected {
+                        break;
                     }
-
-                    if let Some(dbp) = db_path.as_ref() {
-                        let dbp2 = dbp.clone();
-                        // Apply SASLprep-like normalization to the provided username before lookup.
-                        // This helps with Unicode equivalence and common client encodings.
-                        let user_prep = auth::saslprep(&username);
-                        let user_lower = user_prep.to_ascii_lowercase();
-                        match tokio::task::spawn_blocking(move || {
-                            rmail_common::db::get_mailbox(&dbp2, &user_lower)
-                        })
-                        .await
-                        {
-                            Ok(Ok(Some(mb))) => {
-                                if let Some(scram_json) = mb.scram {
-                                    match rmail_common::auth::parse_scram_verifier(&scram_json) {
-                                        Ok((salt_b64, iter)) => {
-                                            // generate server nonce and compose server-first-message
-                                            let mut rn = [0u8; 18];
-                                            let mut rng = rand::rngs::OsRng;
-                                            rng.fill_bytes(&mut rn);
-                                            let server_nonce =
-                                                base64::engine::general_purpose::STANDARD
-                                                    .encode(&rn);
-                                            let combined_nonce =
-                                                format!("{}{}", client_nonce, server_nonce);
-                                            let server_first_msg = format!(
-                                                "r={},s={},i={}",
-                                                combined_nonce, salt_b64, iter
-                                            );
-
-                                            // send server-first-message (base64)
-                                            let sf_b64 = base64::engine::general_purpose::STANDARD
-                                                .encode(server_first_msg.as_bytes());
-                                            let w = reader.get_mut();
-                                            w.write_all(format!("334 {}\r\n", sf_b64).as_bytes())
-                                                .await?;
-                                            w.flush().await?;
-
-                                            // read client-final-message (base64)
-                                            let mut resp_line = String::new();
-                                            let Some(_) = timed_read_line(
-                                                &mut reader,
-                                                &mut resp_line,
-                                                AUTH_CONTINUATION_TIMEOUT,
-                                            )
-                                            .await?
-                                            else {
-                                                let w = reader.get_mut();
-                                                let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-                                                let _ = w.flush().await;
-                                                break;
-                                            };
-                                            let b64_cf = resp_line.trim();
-                                            let cf_bytes =
-                                                match base64::engine::general_purpose::STANDARD
-                                                    .decode(b64_cf)
-                                                {
-                                                    Ok(b) => b,
-                                                    Err(_) => {
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"501 Invalid base64\r\n")
-                                                            .await?;
-                                                        w.flush().await?;
-                                                        continue;
-                                                    }
-                                                };
-                                            let client_final_msg =
-                                                String::from_utf8_lossy(&cf_bytes).to_string();
-
-                                            // split out the proof (p=) and client-final-without-proof
-                                            if let Some(pos) = client_final_msg.find(",p=") {
-                                                let client_final_wo_proof =
-                                                    client_final_msg[..pos].to_string();
-                                                let client_proof_b64 = &client_final_msg[pos + 3..];
-
-                                                // If channel-binding was requested (gs2 header != "n,,"), verify it now.
-                                                if !gs2_header_owned.is_empty()
-                                                    && !gs2_header_owned.eq("n,,")
-                                                {
-                                                    // Only support tls-server-end-point; ensure TLS is active and we have server endpoint info
-                                                    if !session_encrypted || tls_ctx.is_none() {
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"538 Channel-binding required but TLS not active\r\n").await?;
-                                                        w.flush().await?;
-                                                        continue;
-                                                    }
-                                                    // Extract c= value from client_final_wo_proof
-                                                    let c_b64_opt = client_final_wo_proof
-                                                        .split(',')
-                                                        .find_map(|kv| kv.strip_prefix("c="));
-                                                    if c_b64_opt.is_none() {
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(b"501 Missing c= channel-binding in client-final\r\n").await?;
-                                                        w.flush().await?;
-                                                        continue;
-                                                    }
-                                                    let c_b64 = c_b64_opt.unwrap();
-                                                    // Validate binding: gs2_header + server_end_point should match decoded c=
-                                                    let tctx = tls_ctx.as_ref().unwrap();
-                                                    match rmail_common::auth::verify_tls_server_end_point_binding(&gs2_header_owned, &tctx.server_end_point, c_b64) {
-                                                    Ok(()) => {
-                                                        // ok
-                                                    }
-                                                    Err(_) => {
-                                                        if let Some(peer_addr) = peer { record_auth_failure(peer_addr.ip()); }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(INVALID_CREDENTIALS).await?;
-                                                        w.flush().await?;
-                                                        continue;
-                                                    }
-                                                }
-                                                }
-
-                                                let auth_message = format!(
-                                                    "{},{},{}",
-                                                    client_first_bare,
-                                                    server_first_msg,
-                                                    client_final_wo_proof
-                                                );
-
-                                                match rmail_common::auth::verify_scram_proof(
-                                                    &scram_json,
-                                                    &auth_message,
-                                                    client_proof_b64,
-                                                ) {
-                                                    Ok(server_sig) => {
-                                                        // send server-final-message (v=base64) in a 235 success response
-                                                        let server_final = format!(
-                                                        "v={}",
-                                                        base64::engine::general_purpose::STANDARD
-                                                            .encode(&server_sig)
-                                                    );
-                                                        let sf_b64 =
-                                                        base64::engine::general_purpose::STANDARD
-                                                            .encode(server_final.as_bytes());
-                                                        let w = reader.get_mut();
-                                                        w.write_all(
-                                                            format!("235 {}\r\n", sf_b64)
-                                                                .as_bytes(),
-                                                        )
-                                                        .await?;
-                                                        w.flush().await?;
-                                                        authenticated_user =
-                                                            Some(mb.address.to_ascii_lowercase());
-                                                        if let Some(peer_addr) = peer {
-                                                            reset_auth_failures(peer_addr.ip());
-                                                        }
-                                                    }
-                                                    Err(_) => {
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(INVALID_CREDENTIALS).await?;
-                                                        w.flush().await?;
-                                                    }
-                                                }
-                                            } else {
-                                                let w = reader.get_mut();
-                                                w.write_all(
-                                                    b"501 Invalid SCRAM client-final message\r\n",
-                                                )
-                                                .await?;
-                                                w.flush().await?;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            if let Some(peer_addr) = peer {
-                                                record_auth_failure(peer_addr.ip());
-                                            }
-                                            let w = reader.get_mut();
-                                            w.write_all(b"451 Temporary error\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    }
-                                } else {
-                                    if let Some(peer_addr) = peer {
-                                        record_auth_failure(peer_addr.ip());
-                                    }
-                                    let w = reader.get_mut();
-                                    w.write_all(INVALID_CREDENTIALS).await?;
-                                    w.flush().await?;
-                                }
-                            }
-                            Ok(Ok(None)) => {
-                                if let Some(peer_addr) = peer {
-                                    record_auth_failure(peer_addr.ip());
-                                }
-                                let w = reader.get_mut();
-                                w.write_all(INVALID_CREDENTIALS).await?;
-                                w.flush().await?;
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!("db error: {}", e);
-                                let w = reader.get_mut();
-                                w.write_all(b"451 Temporary error\r\n").await?;
-                                w.flush().await?;
-                            }
-                            Err(e) => {
-                                eprintln!("db task join error: {}", e);
-                                let w = reader.get_mut();
-                                w.write_all(b"451 Temporary error\r\n").await?;
-                                w.flush().await?;
-                            }
-                        }
-                    } else {
-                        let w = reader.get_mut();
-                        w.write_all(b"454 TLS not available\r\n").await?;
-                        w.flush().await?;
+                    if let Some(user) = outcome.authenticated_user {
+                        println!("SMTP AUTH success peer={peer:?} user={user}");
+                        authenticated_user = Some(user);
                     }
-                } else if mech == "LOGIN" {
-                    // LOGIN: two step username/password base64 prompts
-                    if let Some(b64u) = initial {
-                        match base64::engine::general_purpose::STANDARD.decode(b64u) {
-                            Ok(u_bytes) => {
-                                let username = String::from_utf8_lossy(&u_bytes).to_string();
-                                let w = reader.get_mut();
-                                w.write_all(b"334 UGFzc3dvcmQ6\r\n").await?; // "Password:" in base64
-                                w.flush().await?;
-                                let mut pass_line = String::new();
-                                let Some(_) = timed_read_line(
-                                    &mut reader,
-                                    &mut pass_line,
-                                    AUTH_CONTINUATION_TIMEOUT,
-                                )
-                                .await?
-                                else {
-                                    let w = reader.get_mut();
-                                    let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-                                    let _ = w.flush().await;
-                                    break;
-                                };
-                                let b64p = pass_line.trim();
-                                match base64::engine::general_purpose::STANDARD.decode(b64p) {
-                                    Ok(p_bytes) => {
-                                        let password =
-                                            String::from_utf8_lossy(&p_bytes).to_string();
-                                        if let Some(dbp) = db_path.as_ref() {
-                                            let dbp2 = dbp.clone();
-                                            let user_lower = username.to_ascii_lowercase();
-                                            match tokio::task::spawn_blocking(move || {
-                                                rmail_common::db::get_mailbox(&dbp2, &user_lower)
-                                            })
-                                            .await
-                                            {
-                                                Ok(Ok(Some(mb))) => {
-                                                    if let Some(pw_hash) = mb.password_hash {
-                                                        match rmail_common::auth::verify_password(
-                                                            &password, &pw_hash,
-                                                        ) {
-                                                            Ok(true) => {
-                                                                authenticated_user = Some(
-                                                                    mb.address.to_ascii_lowercase(),
-                                                                );
-                                                                let w = reader.get_mut();
-                                                                w.write_all(
-                                                                b"235 Authentication succeeded\r\n",
-                                                            )
-                                                            .await?;
-                                                                w.flush().await?;
-                                                                if let Some(peer_addr) = peer {
-                                                                    reset_auth_failures(
-                                                                        peer_addr.ip(),
-                                                                    );
-                                                                }
-                                                            }
-                                                            Ok(false) => {
-                                                                if let Some(peer_addr) = peer {
-                                                                    record_auth_failure(
-                                                                        peer_addr.ip(),
-                                                                    );
-                                                                }
-                                                                let w = reader.get_mut();
-                                                                w.write_all(INVALID_CREDENTIALS)
-                                                                    .await?;
-                                                                w.flush().await?;
-                                                            }
-                                                            Err(e) => {
-                                                                eprintln!(
-                                                                    "auth verify error: {}",
-                                                                    e
-                                                                );
-                                                                if let Some(peer_addr) = peer {
-                                                                    record_auth_failure(
-                                                                        peer_addr.ip(),
-                                                                    );
-                                                                }
-                                                                let w = reader.get_mut();
-                                                                w.write_all(
-                                                                    b"451 Temporary error\r\n",
-                                                                )
-                                                                .await?;
-                                                                w.flush().await?;
-                                                            }
-                                                        }
-                                                    } else {
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(INVALID_CREDENTIALS).await?;
-                                                        w.flush().await?;
-                                                    }
-                                                }
-                                                Ok(Ok(None)) => {
-                                                    if let Some(peer_addr) = peer {
-                                                        record_auth_failure(peer_addr.ip());
-                                                    }
-                                                    let w = reader.get_mut();
-                                                    w.write_all(INVALID_CREDENTIALS).await?;
-                                                    w.flush().await?;
-                                                }
-                                                Ok(Err(e)) => {
-                                                    eprintln!("db error: {}", e);
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                                    w.flush().await?;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("db task join error: {}", e);
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                                    w.flush().await?;
-                                                }
-                                            }
-                                        } else {
-                                            let w = reader.get_mut();
-                                            w.write_all(b"454 TLS not available\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let w = reader.get_mut();
-                                        w.write_all(b"501 Invalid base64\r\n").await?;
-                                        w.flush().await?;
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                let w = reader.get_mut();
-                                w.write_all(b"501 Invalid base64\r\n").await?;
-                                w.flush().await?;
-                            }
-                        }
-                    } else {
-                        let w = reader.get_mut();
-                        w.write_all(b"334 VXNlcm5hbWU6\r\n").await?; // "Username:" in base64
-                        w.flush().await?;
-                        let mut uline = String::new();
-                        let Some(_) =
-                            timed_read_line(&mut reader, &mut uline, AUTH_CONTINUATION_TIMEOUT)
-                                .await?
-                        else {
-                            let w = reader.get_mut();
-                            let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-                            let _ = w.flush().await;
-                            break;
-                        };
-                        let b64u = uline.trim();
-                        match base64::engine::general_purpose::STANDARD.decode(b64u) {
-                            Ok(u_bytes) => {
-                                let username = String::from_utf8_lossy(&u_bytes).to_string();
-                                let w = reader.get_mut();
-                                w.write_all(b"334 UGFzc3dvcmQ6\r\n").await?; // "Password:" in base64
-                                w.flush().await?;
-                                let mut pass_line = String::new();
-                                let Some(_) = timed_read_line(
-                                    &mut reader,
-                                    &mut pass_line,
-                                    AUTH_CONTINUATION_TIMEOUT,
-                                )
-                                .await?
-                                else {
-                                    let w = reader.get_mut();
-                                    let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-                                    let _ = w.flush().await;
-                                    break;
-                                };
-                                let b64p = pass_line.trim();
-                                match base64::engine::general_purpose::STANDARD.decode(b64p) {
-                                    Ok(p_bytes) => {
-                                        let password =
-                                            String::from_utf8_lossy(&p_bytes).to_string();
-                                        if let Some(dbp) = db_path.as_ref() {
-                                            let dbp2 = dbp.clone();
-                                            let user_lower = username.to_ascii_lowercase();
-                                            match tokio::task::spawn_blocking(move || {
-                                                rmail_common::db::get_mailbox(&dbp2, &user_lower)
-                                            })
-                                            .await
-                                            {
-                                                Ok(Ok(Some(mb))) => {
-                                                    if let Some(pw_hash) = mb.password_hash {
-                                                        match rmail_common::auth::verify_password(
-                                                            &password, &pw_hash,
-                                                        ) {
-                                                            Ok(true) => {
-                                                                authenticated_user = Some(
-                                                                    mb.address.to_ascii_lowercase(),
-                                                                );
-                                                                let w = reader.get_mut();
-                                                                w.write_all(
-                                                                b"235 Authentication succeeded\r\n",
-                                                            )
-                                                            .await?;
-                                                                w.flush().await?;
-                                                                if let Some(peer_addr) = peer {
-                                                                    reset_auth_failures(
-                                                                        peer_addr.ip(),
-                                                                    );
-                                                                }
-                                                            }
-                                                            Ok(false) => {
-                                                                if let Some(peer_addr) = peer {
-                                                                    record_auth_failure(
-                                                                        peer_addr.ip(),
-                                                                    );
-                                                                }
-                                                                let w = reader.get_mut();
-                                                                w.write_all(INVALID_CREDENTIALS)
-                                                                    .await?;
-                                                                w.flush().await?;
-                                                            }
-                                                            Err(e) => {
-                                                                eprintln!(
-                                                                    "auth verify error: {}",
-                                                                    e
-                                                                );
-                                                                if let Some(peer_addr) = peer {
-                                                                    record_auth_failure(
-                                                                        peer_addr.ip(),
-                                                                    );
-                                                                }
-                                                                let w = reader.get_mut();
-                                                                w.write_all(
-                                                                    b"451 Temporary error\r\n",
-                                                                )
-                                                                .await?;
-                                                                w.flush().await?;
-                                                            }
-                                                        }
-                                                    } else {
-                                                        if let Some(peer_addr) = peer {
-                                                            record_auth_failure(peer_addr.ip());
-                                                        }
-                                                        let w = reader.get_mut();
-                                                        w.write_all(INVALID_CREDENTIALS).await?;
-                                                        w.flush().await?;
-                                                    }
-                                                }
-                                                Ok(Ok(None)) => {
-                                                    if let Some(peer_addr) = peer {
-                                                        record_auth_failure(peer_addr.ip());
-                                                    }
-                                                    let w = reader.get_mut();
-                                                    w.write_all(INVALID_CREDENTIALS).await?;
-                                                    w.flush().await?;
-                                                }
-                                                Ok(Err(e)) => {
-                                                    eprintln!("db error: {}", e);
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                                    w.flush().await?;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("db task join error: {}", e);
-                                                    let w = reader.get_mut();
-                                                    w.write_all(b"451 Temporary error\r\n").await?;
-                                                    w.flush().await?;
-                                                }
-                                            }
-                                        } else {
-                                            let w = reader.get_mut();
-                                            w.write_all(b"454 TLS not available\r\n").await?;
-                                            w.flush().await?;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let w = reader.get_mut();
-                                        w.write_all(b"501 Invalid base64\r\n").await?;
-                                        w.flush().await?;
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                let w = reader.get_mut();
-                                w.write_all(b"501 Invalid base64\r\n").await?;
-                                w.flush().await?;
-                            }
-                        }
-                    }
-                } else {
-                    let w = reader.get_mut();
-                    w.write_all(b"504 Unrecognized authentication mechanism\r\n")
-                        .await?;
-                    w.flush().await?;
+                    continue;
                 }
             }
             SmtpCommand::Mail(mail_args) => {
@@ -2174,6 +1358,9 @@ async fn process_stream(
 #[cfg(test)]
 mod tests {
     use super::{MAX_MESSAGE_BYTES, parse_mail_from_arg, process_stream};
+    use crate::protocol;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
     use rmail_common::config::{ScannerFailureAction, SecurityConfig};
     use std::path::Path;
     use std::sync::Arc;
@@ -2198,17 +1385,55 @@ mod tests {
         }
     }
 
+    fn scram_client_final(password: &str, client_first_bare: &str, server_first: &str) -> String {
+        use hmac::Mac;
+        use hmac::digest::KeyInit;
+        use pbkdf2::pbkdf2;
+        use sha2::{Digest, Sha256};
+
+        type HmacSha256 = hmac::Hmac<Sha256>;
+        let attribute = |name: &str| {
+            server_first
+                .split(',')
+                .find_map(|part| part.strip_prefix(name))
+                .expect("SCRAM attribute")
+        };
+        let salt = BASE64_ENGINE.decode(attribute("s=")).expect("salt");
+        let iterations = attribute("i=").parse::<u32>().expect("iterations");
+        let nonce = attribute("r=");
+        let without_proof = format!("c=biws,r={nonce}");
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+        let mut salted_password = [0u8; 32];
+        pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted_password)
+            .expect("derive password");
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();
+        mac.update(b"Client Key");
+        let client_key = mac.finalize().into_bytes();
+        let stored_key = Sha256::digest(&client_key);
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).unwrap();
+        mac.update(auth_message.as_bytes());
+        let signature = mac.finalize().into_bytes();
+        let proof = client_key
+            .iter()
+            .zip(signature.iter())
+            .map(|(left, right)| left ^ right)
+            .collect::<Vec<_>>();
+        format!("{without_proof},p={}", BASE64_ENGINE.encode(proof))
+    }
+
     fn setup_mailbox() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
         let db_path = td.path().join("config.db");
         rmail_common::db::init_db(&db_path).expect("init db");
+        let scram =
+            rmail_common::auth::create_scram_verifier("password", 4096).expect("SCRAM verifier");
         rmail_common::db::add_mailbox(
             &db_path,
             "user@example.test",
             Some("plain:password"),
             None,
-            None,
+            Some(&scram),
         )
         .expect("add mailbox");
         (td, mail_root, db_path)
@@ -2262,6 +1487,45 @@ mod tests {
         }
         server_task.await.expect("join").expect("server");
         (responses, td)
+    }
+
+    async fn run_encrypted_session(input: Vec<u8>, capacity: usize) -> Vec<String> {
+        let (_td, mail_root, db_path) = setup_mailbox();
+        let (client, server) = duplex(capacity);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                mail_root.to_string_lossy().to_string(),
+                None,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+                false,
+                true,
+                Arc::new(SecurityConfig::default()),
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        reader.get_mut().write_all(&input).await.expect("commands");
+        reader.get_mut().flush().await.expect("flush");
+        let mut responses = Vec::new();
+        loop {
+            let mut response = String::new();
+            reader.read_line(&mut response).await.expect("response");
+            if response.is_empty() {
+                break;
+            }
+            let finished = response.starts_with("221 ");
+            responses.push(response);
+            if finished {
+                break;
+            }
+        }
+        server_task.await.expect("join").expect("server");
+        responses
     }
 
     async fn read_clamav_stream<S: AsyncReadExt + Unpin>(stream: &mut S) -> Vec<u8> {
@@ -2511,7 +1775,6 @@ mod tests {
             ));
         let tls_context = Arc::new(super::tls::TlsContext {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
-            server_end_point: vec![0; 32],
         });
         let (client, server) = duplex(16 * 1024);
         let server_task = tokio::spawn(process_stream(
@@ -2542,6 +1805,283 @@ mod tests {
         assert!(read_until(&mut reader, "221 Bye").await.contains("221 Bye"));
         server_task.await.expect("join").expect("server");
         drop(td);
+    }
+
+    #[tokio::test]
+    async fn starttls_completes_real_handshake_and_requires_fresh_ehlo() {
+        use std::io::Cursor;
+        use std::time::SystemTime;
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
+        use tokio_rustls::rustls::{
+            Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
+        };
+
+        struct PinnedCertificate(Vec<u8>);
+        impl ServerCertVerifier for PinnedCertificate {
+            fn verify_server_cert(
+                &self,
+                end_entity: &Certificate,
+                _intermediates: &[Certificate],
+                _server_name: &ServerName,
+                _scts: &mut dyn Iterator<Item = &[u8]>,
+                _ocsp_response: &[u8],
+                _now: SystemTime,
+            ) -> Result<ServerCertVerified, TlsError> {
+                if end_entity.0 == self.0 {
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    Err(TlsError::General(
+                        "STARTTLS test received unexpected certificate".to_string(),
+                    ))
+                }
+            }
+        }
+
+        let (_td, mail_root, db_path) = setup_mailbox();
+        let cert_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/certs/localhost.crt"
+        );
+        let key_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/certs/localhost.key"
+        );
+        let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
+        let certificate_pem = std::fs::read(cert_path).expect("certificate");
+        let certificates =
+            rustls_pemfile::certs(&mut Cursor::new(certificate_pem)).expect("parse certificate");
+        let mut client_config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(PinnedCertificate(certificates[0].clone())));
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(process_stream(
+            Box::new(server),
+            mail_root.to_string_lossy().to_string(),
+            Some(tls_context),
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            false,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+        ));
+        let mut plaintext = BufReader::new(client);
+        let mut greeting = String::new();
+        plaintext.read_line(&mut greeting).await.expect("greeting");
+        plaintext
+            .get_mut()
+            .write_all(b"EHLO localhost\r\n")
+            .await
+            .expect("EHLO");
+        plaintext.get_mut().flush().await.expect("flush");
+        assert!(
+            read_until(&mut plaintext, "250 OK")
+                .await
+                .contains("STARTTLS")
+        );
+        plaintext
+            .get_mut()
+            .write_all(b"STARTTLS\r\n")
+            .await
+            .expect("STARTTLS");
+        plaintext.get_mut().flush().await.expect("flush");
+        let mut ready = String::new();
+        plaintext.read_line(&mut ready).await.expect("ready");
+        assert_eq!(ready, "220 Ready to start TLS\r\n");
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tls_stream = connector
+            .connect(
+                ServerName::try_from("localhost").expect("server name"),
+                plaintext.into_inner(),
+            )
+            .await
+            .expect("TLS handshake");
+        let mut encrypted = BufReader::new(tls_stream);
+        encrypted
+            .get_mut()
+            .write_all(b"AUTH PLAIN =\r\nEHLO localhost\r\nQUIT\r\n")
+            .await
+            .expect("post-TLS commands");
+        encrypted.get_mut().flush().await.expect("flush");
+        assert!(
+            read_until(&mut encrypted, "503 5.5.1")
+                .await
+                .contains("Send EHLO before AUTH")
+        );
+        let capabilities = read_until(&mut encrypted, "250 OK").await;
+        assert!(capabilities.contains("AUTH PLAIN LOGIN SCRAM-SHA-256"));
+        assert!(!capabilities.contains("STARTTLS"));
+        assert!(
+            read_until(&mut encrypted, "221 Bye")
+                .await
+                .contains("221 Bye")
+        );
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn auth_plain_and_login_use_shared_bounded_exchange_handler() {
+        let plain = run_encrypted_session(
+            b"EHLO localhost\r\nAUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\nAUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            plain
+                .iter()
+                .any(|response| response.starts_with("235 2.7.0"))
+        );
+        assert!(
+            plain
+                .iter()
+                .any(|response| response.starts_with("503 5.5.0 Already authenticated"))
+        );
+
+        let login = run_encrypted_session(
+            b"EHLO localhost\r\nAUTH LOGIN\r\ndXNlckBleGFtcGxlLnRlc3Q=\r\ncGFzc3dvcmQ=\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            login
+                .iter()
+                .any(|response| response == "334 VXNlcm5hbWU6\r\n")
+        );
+        assert!(
+            login
+                .iter()
+                .any(|response| response == "334 UGFzc3dvcmQ6\r\n")
+        );
+        assert!(
+            login
+                .iter()
+                .any(|response| response.starts_with("235 2.7.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_scram_sha256_verifies_a_real_client_proof() {
+        let (_td, mail_root, db_path) = setup_mailbox();
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(process_stream(
+            Box::new(server),
+            mail_root.to_string_lossy().to_string(),
+            None,
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+        ));
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        reader
+            .get_mut()
+            .write_all(b"EHLO localhost\r\n")
+            .await
+            .expect("EHLO");
+        reader.get_mut().flush().await.expect("flush");
+        assert!(read_until(&mut reader, "250 OK").await.contains("AUTH"));
+
+        let bare = "n=user@example.test,r=clientnonce";
+        let first = BASE64_ENGINE.encode(format!("n,,{bare}"));
+        reader
+            .get_mut()
+            .write_all(format!("AUTH SCRAM-SHA-256 {first}\r\n").as_bytes())
+            .await
+            .expect("AUTH");
+        reader.get_mut().flush().await.expect("flush");
+        let mut challenge = String::new();
+        reader
+            .read_line(&mut challenge)
+            .await
+            .expect("server first");
+        assert!(challenge.starts_with("334 "), "{challenge:?}");
+        let server_first = String::from_utf8(
+            BASE64_ENGINE
+                .decode(challenge.trim().strip_prefix("334 ").unwrap())
+                .expect("decode server first"),
+        )
+        .expect("UTF-8 server first");
+        let final_message = scram_client_final("password", bare, &server_first);
+        reader
+            .get_mut()
+            .write_all(format!("{}\r\n", BASE64_ENGINE.encode(final_message)).as_bytes())
+            .await
+            .expect("client final");
+        reader.get_mut().flush().await.expect("flush");
+        let mut success = String::new();
+        reader.read_line(&mut success).await.expect("AUTH success");
+        assert!(success.starts_with("235 2.7.0 "));
+        let server_final = success
+            .trim()
+            .strip_prefix("235 2.7.0 ")
+            .expect("server final");
+        assert!(
+            String::from_utf8(BASE64_ENGINE.decode(server_final).unwrap())
+                .unwrap()
+                .starts_with("v=")
+        );
+        reader.get_mut().write_all(b"QUIT\r\n").await.expect("QUIT");
+        reader.get_mut().flush().await.expect("flush");
+        assert!(read_until(&mut reader, "221 Bye").await.contains("221 Bye"));
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn auth_cancellation_and_invalid_parameters_preserve_command_stream() {
+        let responses = run_encrypted_session(
+            b"EHLO localhost\r\nAUTH LOGIN extra extra\r\nAUTH LOGIN\r\n*\r\nNOOP\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("501 5.5.4 Invalid AUTH parameters"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("501 5.7.0 Authentication canceled"))
+        );
+        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("221 "))
+        );
+    }
+
+    #[tokio::test]
+    async fn overlong_auth_continuation_is_drained_before_next_command() {
+        let mut input = b"EHLO localhost\r\nAUTH LOGIN\r\n".to_vec();
+        input.extend(std::iter::repeat_n(b'A', protocol::MAX_AUTH_LINE_BYTES + 1));
+        input.extend_from_slice(b"\r\nNOOP\r\nQUIT\r\n");
+        let responses = run_encrypted_session(input, 32 * 1024).await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("500 5.5.2 AUTH response line too long"))
+        );
+        assert!(responses.iter().any(|response| response == "250 OK\r\n"));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("221 "))
+        );
     }
 
     #[tokio::test]

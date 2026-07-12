@@ -41,10 +41,10 @@ certification results.
 | RFC 1870 | `SIZE` | 100% | The fixed maximum is advertised and declared or received oversized messages are rejected while preserving stream synchronization. |
 | RFC 6152 | `8BITMIME` | 95% | Eight-bit message bodies and `BODY=7BIT`/`BODY=8BITMIME` are supported; exhaustive content corpus validation remains. |
 | RFC 2920 | `PIPELINING` | 100% | Command pipelining is supported with ordered replies and guarded STARTTLS transitions. |
-| RFC 3207 | `STARTTLS` | 90% | TLS upgrade, state reset, timeout, and plaintext-pipelining rejection are implemented; external conformance testing remains. |
-| RFC 4954 | SMTP AUTH | 80% | PLAIN, LOGIN, and SCRAM-SHA-256 are configurable and TLS-gated; the SASL dispatcher/continuation refactor is still in progress. |
-| RFC 4616 | SASL `PLAIN` | 90% | Initial and continuation forms are implemented under TLS; shared bounded exchange handling is still being consolidated. |
-| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 85% | Stored verifiers and proof validation are implemented; SMTP exchange handling still needs the shared SASL state-machine cleanup. |
+| RFC 3207 | `STARTTLS` | 95% | A real TLS upgrade, state reset, fresh EHLO requirement, timeout, and plaintext-pipelining rejection are integration-tested; external conformance testing remains. |
+| RFC 4954 | SMTP AUTH | 95% | Configurable TLS-gated mechanisms, strict grammar, initial responses, bounded continuations, cancellation, state restrictions, and enhanced replies are implemented; external conformance testing remains. |
+| RFC 4616 | SASL `PLAIN` | 100% | Initial and continuation forms, authzid policy, UTF-8 validation, and shared credential verification are implemented under TLS. |
+| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Strict SCRAM grammar, stored verifiers, nonce/channel-binding downgrade checks, client proof validation, and server-final data are implemented and integration-tested. |
 | RFC 6531 | `SMTPUTF8` | 85% | UTF-8 envelope addresses and message bytes are accepted and advertised; internationalized-domain normalization is not exhaustive. |
 | RFC 3463 | Enhanced status codes | 70% | Main policy, sequencing, size, scanner, and authentication failures use enhanced codes; some legacy replies still need conversion. |
 | RFC 3461 | Delivery Status Notifications | 0% | `DSN` is not advertised; `NOTIFY` and `ORCPT` are rejected. |

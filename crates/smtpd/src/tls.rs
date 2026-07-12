@@ -4,7 +4,6 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 
@@ -13,7 +12,6 @@ use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 /// SHA-256 digest of the server certificate DER bytes.
 pub struct TlsContext {
     pub acceptor: TlsAcceptor,
-    pub server_end_point: Vec<u8>,
 }
 
 pub fn load_tls_context(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<TlsContext>> {
@@ -46,11 +44,8 @@ pub fn load_tls_context(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<T
         .context("creating server config")?;
 
     // compute SHA-256 of first certificate's DER bytes for tls-server-end-point channel binding
-    let server_end_point = Sha256::digest(&certs[0]).to_vec();
-
     let ctx = TlsContext {
         acceptor: TlsAcceptor::from(Arc::new(server_config)),
-        server_end_point,
     };
     Ok(Arc::new(ctx))
 }
