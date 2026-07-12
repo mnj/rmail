@@ -5189,78 +5189,6 @@ fn copy_uid_pairs(
     mailbox::copy_uid_pairs(source_set, destination_uids, uidvalidity)
 }
 
-fn fetch_marks_seen(requested: &[String]) -> bool {
-    requested.iter().any(|item| {
-        item == "RFC822"
-            || item == "RFC822.TEXT"
-            || (item.starts_with("BODY[") && item.contains(']'))
-            || (item.starts_with("BINARY[") && item.contains(']'))
-    })
-}
-
-fn apply_implicit_seen(
-    mail_root: &str,
-    sel: &SelectedMailbox,
-    uid: u64,
-    flags: &mut Vec<String>,
-) -> Result<u64> {
-    if sel.read_only || flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")) {
-        return Ok(0);
-    }
-    flags.push("\\Seen".to_string());
-    flags.sort();
-    flags.dedup();
-    rmail_common::imap_state::set_uid_flags(
-        Path::new(mail_root),
-        &sel.domain,
-        &sel.local,
-        &sel.mailbox,
-        uid,
-        flags.clone(),
-    )
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct FetchModifiers {
-    changed_since: Option<u64>,
-    vanished: bool,
-}
-
-fn parse_fetch_modifiers(spec: &str) -> Result<FetchModifiers, &'static str> {
-    let modifier = spec.trim();
-    if modifier.is_empty() {
-        return Ok(FetchModifiers::default());
-    }
-    let upper = modifier.to_ascii_uppercase();
-    if !upper.starts_with("(CHANGEDSINCE") {
-        return Err("Unsupported FETCH modifier");
-    }
-    if !modifier.ends_with(')') {
-        return Err("Malformed FETCH modifiers");
-    }
-    let tokens = modifier[1..modifier.len() - 1]
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    if tokens.len() < 2 || !tokens[0].eq_ignore_ascii_case("CHANGEDSINCE") {
-        return Err("Malformed FETCH modifiers");
-    }
-    let changed_since = tokens[1]
-        .parse::<u64>()
-        .map_err(|_| "Invalid CHANGEDSINCE value")?;
-    let mut vanished = false;
-    for token in &tokens[2..] {
-        if token.eq_ignore_ascii_case("VANISHED") && !vanished {
-            vanished = true;
-        } else {
-            return Err("Unsupported FETCH modifier");
-        }
-    }
-    Ok(FetchModifiers {
-        changed_since: Some(changed_since),
-        vanished,
-    })
-}
-
 fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseError> {
     parser::parse_append_args(args)
 }
@@ -5519,35 +5447,6 @@ async fn authenticate_password(
             message: e.to_string(),
         },
     }
-}
-
-async fn write_fetch_response(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
-    seq: usize,
-    uid: u64,
-    flags: &[String],
-    modseq: u64,
-    internal_date: (i64, i32),
-    save_date: i64,
-    path: std::path::PathBuf,
-    requested: &[String],
-    raw_spec: &str,
-    force_uid: bool,
-) -> Result<()> {
-    mailbox::write_fetch_response(
-        reader,
-        seq,
-        uid,
-        flags,
-        modseq,
-        internal_date,
-        save_date,
-        path,
-        requested,
-        raw_spec,
-        force_uid,
-    )
-    .await
 }
 
 async fn execute_sort(
@@ -7568,128 +7467,32 @@ async fn process_stream_inner(
             }
 
             parser::Command::Fetch => {
-                if authed_mailbox.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO Authentication required\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                // Ensure a mailbox has been selected with SELECT first
-                if selected.is_none() {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let args = args.trim();
-                if let Some(addr) = authed_mailbox.as_ref() {
-                    let mailbox = selected_mailbox_name(&selected).to_string();
+                let outcome = commands::fetch::handle(
+                    &mut reader,
+                    tag,
+                    args,
+                    &mail_root,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                    session_state.feature_enabled("QRESYNC"),
+                )
+                .await?;
+                if outcome.refresh_selected {
+                    let mailbox_name = selected_mailbox_name(&selected).to_string();
                     selected = Some(
                         reload_selected_mailbox_preserving_mode(
-                            &mail_root, addr, &mailbox, &selected,
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
                         )
                         .await?,
                     );
                 }
-                let mut a = args.splitn(2, ' ');
-                let seq_set = a.next().unwrap_or("");
-                let what = a.next().unwrap_or("");
-                let fetch_request = match parser::parse_fetch_request(what) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD Invalid FETCH arguments\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let modifiers = match parse_fetch_modifiers(
-                    fetch_request.modifier_spec.as_deref().unwrap_or(""),
-                ) {
-                    Ok(modifiers) if !modifiers.vanished => modifiers,
-                    Ok(_) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD VANISHED requires UID FETCH\r\n", tag).as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    Err(message) => {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD {}\r\n", tag, message).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let requested = fetch_request.items;
-                let changed_since = modifiers.changed_since;
-                println!(
-                    "IMAP FETCH peer={:?} seq_set={} requested={:?} changed_since={:?}",
-                    peer, seq_set, requested, changed_since
-                );
-                let sel = selected.as_ref().unwrap();
-                let total = sel.msgs.len();
-                let seqs = seqs_from_set_or_saved(seq_set, sel, session_state.saved_search_uids());
-                for seq in seqs {
-                    if seq == 0 || seq > total {
-                        continue;
-                    }
-                    let idx = seq - 1;
-                    let uid = sel.msgs[idx].0;
-                    let mut flags = sel.msgs[idx].2.clone();
-                    let mut modseq = sel.msgs[idx].3;
-                    let internal_date = sel.internal_dates.get(&uid).copied().unwrap_or((0, 0));
-                    let save_date = sel.save_dates.get(&uid).copied().unwrap_or(0);
-                    if changed_since
-                        .map(|threshold| modseq <= threshold)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if fetch_marks_seen(&requested) {
-                        let updated_modseq = apply_implicit_seen(&mail_root, sel, uid, &mut flags)?;
-                        if updated_modseq != 0 {
-                            modseq = updated_modseq;
-                        }
-                    }
-                    let path = sel.msgs[idx].1.clone();
-                    match write_fetch_response(
-                        &mut reader,
-                        seq,
-                        uid,
-                        &flags,
-                        modseq,
-                        internal_date,
-                        save_date,
-                        path,
-                        &requested,
-                        what,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} NO Error reading message\r\n", tag).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            eprintln!("FETCH response error peer={:?}: {}", peer, e);
-                        }
-                    }
-                }
-                let w = reader.get_mut();
-                w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes())
-                    .await?;
-                w.flush().await?;
             }
-
             parser::Command::Copy | parser::Command::Move => {
                 if selected.is_none() {
                     let w = reader.get_mut();
@@ -7809,162 +7612,31 @@ async fn process_stream_inner(
                     .map(|(_, subargs)| subargs.trim_start())
                     .unwrap_or("");
                 if subcmd == "FETCH" {
-                    if selected.is_none() {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD No mailbox selected\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    if let Some(addr) = authed_mailbox.as_ref() {
-                        let mailbox = selected_mailbox_name(&selected).to_string();
+                    let outcome = commands::fetch::handle(
+                        &mut reader,
+                        tag,
+                        subargs,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                        session_state.feature_enabled("QRESYNC"),
+                    )
+                    .await?;
+                    if outcome.refresh_selected {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
                         selected = Some(
                             reload_selected_mailbox_preserving_mode(
-                                &mail_root, addr, &mailbox, &selected,
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
                             )
                             .await?,
                         );
                     }
-                    let mut b = subargs.splitn(2, ' ');
-                    let uid_set = b.next().unwrap_or("");
-                    let what = b.next().unwrap_or("");
-                    let fetch_request = match parser::parse_fetch_request(what) {
-                        Ok(request) => request,
-                        Err(_) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD Invalid UID FETCH arguments\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let modifiers = match parse_fetch_modifiers(
-                        fetch_request.modifier_spec.as_deref().unwrap_or(""),
-                    ) {
-                        Ok(modifiers) => modifiers,
-                        Err(message) => {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} BAD {}\r\n", tag, message).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    if modifiers.vanished && !session_state.feature_enabled("QRESYNC") {
-                        let w = reader.get_mut();
-                        w.write_all(format!("{} BAD QRESYNC is not enabled\r\n", tag).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let requested = fetch_request.items;
-                    let changed_since = modifiers.changed_since;
-                    println!(
-                        "IMAP UID FETCH peer={:?} uid_set={} requested={:?} changed_since={:?}",
-                        peer, uid_set, requested, changed_since
-                    );
-                    let sel = selected.as_ref().unwrap();
-                    if modifiers.vanished {
-                        let changes = rmail_common::imap_state::qresync_changes(
-                            Path::new(&mail_root),
-                            &sel.domain,
-                            &sel.local,
-                            &sel.mailbox,
-                            changed_since.unwrap_or(0),
-                            None,
-                        )?;
-                        let max_uid = changes
-                            .vanished_uids
-                            .iter()
-                            .copied()
-                            .chain(sel.msgs.iter().map(|message| message.0))
-                            .max()
-                            .unwrap_or_else(|| sel.uidnext.saturating_sub(1));
-                        let Some(requested_uids) = parser::SequenceSet::parse(uid_set, max_uid)
-                        else {
-                            let w = reader.get_mut();
-                            w.write_all(format!("{} BAD Invalid UID set\r\n", tag).as_bytes())
-                                .await?;
-                            w.flush().await?;
-                            continue;
-                        };
-                        let vanished = changes
-                            .vanished_uids
-                            .into_iter()
-                            .filter(|uid| requested_uids.contains(*uid))
-                            .collect::<Vec<_>>();
-                        if !vanished.is_empty() {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!(
-                                    "* VANISHED (EARLIER) {}\r\n",
-                                    compress_search_ids(&vanished)
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                        }
-                    }
-                    // Build list of UIDs to return, handling ranges
-                    let uids =
-                        uids_from_set_or_saved(uid_set, sel, session_state.saved_search_uids());
-                    for uid in uids {
-                        if let Some(pos) = sel.msgs.iter().position(|(u, _, _, _)| *u == uid) {
-                            let seq = pos + 1;
-                            let uid = sel.msgs[pos].0;
-                            let mut flags = sel.msgs[pos].2.clone();
-                            let mut modseq = sel.msgs[pos].3;
-                            let internal_date =
-                                sel.internal_dates.get(&uid).copied().unwrap_or((0, 0));
-                            let save_date = sel.save_dates.get(&uid).copied().unwrap_or(0);
-                            if changed_since
-                                .map(|threshold| modseq <= threshold)
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            if fetch_marks_seen(&requested) {
-                                let updated_modseq =
-                                    apply_implicit_seen(&mail_root, sel, uid, &mut flags)?;
-                                if updated_modseq != 0 {
-                                    modseq = updated_modseq;
-                                }
-                            }
-                            let path = sel.msgs[pos].1.clone();
-                            match write_fetch_response(
-                                &mut reader,
-                                seq,
-                                uid,
-                                &flags,
-                                modseq,
-                                internal_date,
-                                save_date,
-                                path,
-                                &requested,
-                                what,
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    let w = reader.get_mut();
-                                    w.write_all(
-                                        format!("{} NO Error reading message\r\n", tag).as_bytes(),
-                                    )
-                                    .await?;
-                                    w.flush().await?;
-                                    eprintln!("UID FETCH response error peer={:?}: {}", peer, e);
-                                }
-                            }
-                        }
-                    }
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} OK UID FETCH completed\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
                 } else if subcmd == "THREAD" {
                     let request = match parser::parse_thread_request(subargs) {
                         Ok(request) => request,

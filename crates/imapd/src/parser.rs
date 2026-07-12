@@ -1396,6 +1396,15 @@ pub(crate) struct FetchRequest {
     pub(crate) modifier_spec: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FetchCommandRequest {
+    pub(crate) message_set: String,
+    pub(crate) items: Vec<String>,
+    pub(crate) raw_items: String,
+    pub(crate) changed_since: Option<u64>,
+    pub(crate) vanished: bool,
+}
+
 fn split_fetch_item_list(spec: &str) -> Result<(&str, &str), ParseError> {
     let spec = spec.trim();
     if !spec.starts_with('(') {
@@ -1557,6 +1566,67 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
         items: out,
         modifier_spec,
     })
+}
+
+pub(crate) fn parse_fetch_command_request(input: &str) -> Result<FetchCommandRequest, ParseError> {
+    let input = input.trim();
+    let split = input
+        .find(char::is_whitespace)
+        .ok_or(ParseError::UnexpectedEnd)?;
+    let message_set = &input[..split];
+    if message_set != "$" {
+        SequenceSet::parse(message_set, 1).ok_or(ParseError::InvalidAtom)?;
+    }
+    let raw_items = input[split..].trim_start();
+    let request = parse_fetch_request(raw_items)?;
+    let item_spec = request
+        .modifier_spec
+        .as_deref()
+        .and_then(|modifier| raw_items.strip_suffix(modifier))
+        .map(str::trim_end)
+        .unwrap_or(raw_items);
+    let (changed_since, vanished) = parse_fetch_modifiers(request.modifier_spec.as_deref())?;
+    Ok(FetchCommandRequest {
+        message_set: message_set.to_string(),
+        items: request.items,
+        raw_items: item_spec.to_string(),
+        changed_since,
+        vanished,
+    })
+}
+
+fn parse_fetch_modifiers(spec: Option<&str>) -> Result<(Option<u64>, bool), ParseError> {
+    let Some(spec) = spec else {
+        return Ok((None, false));
+    };
+    let arguments = parse_imap_args(spec)?;
+    let [ImapArg::List(modifiers)] = arguments.as_slice() else {
+        return Err(ParseError::InvalidAtom);
+    };
+    let mut changed_since = None;
+    let mut vanished = false;
+    let mut index = 0;
+    while index < modifiers.len() {
+        let ImapArg::Atom(name) = &modifiers[index] else {
+            return Err(ParseError::InvalidAtom);
+        };
+        index += 1;
+        if name.eq_ignore_ascii_case("CHANGEDSINCE") && changed_since.is_none() {
+            let Some(ImapArg::Atom(value)) = modifiers.get(index) else {
+                return Err(ParseError::InvalidAtom);
+            };
+            changed_since = Some(value.parse().map_err(|_| ParseError::InvalidAtom)?);
+            index += 1;
+        } else if name.eq_ignore_ascii_case("VANISHED") && !vanished {
+            vanished = true;
+        } else {
+            return Err(ParseError::InvalidAtom);
+        }
+    }
+    if vanished && changed_since.is_none() {
+        return Err(ParseError::InvalidAtom);
+    }
+    Ok((changed_since, vanished))
 }
 
 pub(crate) fn split_fetch_items(spec: &str) -> Vec<&str> {
@@ -2301,6 +2371,30 @@ mod tests {
         ] {
             assert!(parse_fetch_request(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn parses_complete_fetch_command_and_strict_modifiers() {
+        assert_eq!(
+            parse_fetch_command_request(
+                "1:* (UID FLAGS BODY.PEEK[HEADER.FIELDS (From Subject)]) (CHANGEDSINCE 42 VANISHED)"
+            )
+            .unwrap(),
+            FetchCommandRequest {
+                message_set: "1:*".to_string(),
+                items: vec![
+                    "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]".to_string(),
+                    "FLAGS".to_string(),
+                    "UID".to_string(),
+                ],
+                raw_items: "(UID FLAGS BODY.PEEK[HEADER.FIELDS (From Subject)])".to_string(),
+                changed_since: Some(42),
+                vanished: true,
+            }
+        );
+        assert!(parse_fetch_command_request("1 FLAGS (VANISHED)").is_err());
+        assert!(parse_fetch_command_request("1 FLAGS (CHANGEDSINCE nope)").is_err());
+        assert!(parse_fetch_command_request("bogus FLAGS").is_err());
     }
 
     #[test]
