@@ -191,7 +191,15 @@ pub(crate) async fn refresh_selected_mailbox(
                 events.push(MailboxSyncEvent::FetchFlags {
                     seq: *new_seq,
                     uid: *uid,
-                    flags: new_flags.clone(),
+                    flags: {
+                        let mut flags = new_flags.clone();
+                        if refreshed.recent_uids.contains(uid) {
+                            flags.push("\\Recent".to_string());
+                            flags.sort();
+                            flags.dedup();
+                        }
+                        flags
+                    },
                 });
             }
         }

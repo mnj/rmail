@@ -2269,7 +2269,8 @@ mod tests {
         let header = read_until_contains(&mut reader, "A004 OK").await.join("");
         assert!(!header.contains("\\Seen"));
         let body = read_until_contains(&mut reader, "A005 OK").await.join("");
-        assert!(body.contains("FLAGS (\\Seen)"));
+        assert!(body.contains("\\Seen"));
+        assert!(body.contains("\\Recent"));
         let body_modseq = body
             .split("MODSEQ (")
             .nth(1)
@@ -2352,7 +2353,8 @@ mod tests {
         assert!(peek.contains("BINARY[2] NIL"));
         assert!(!peek.contains("\\Seen"));
         let body = read_until_contains(&mut reader, "A006 OK").await.join("");
-        assert!(body.contains("FLAGS (\\Seen)"));
+        assert!(body.contains("\\Seen"));
+        assert!(body.contains("\\Recent"));
         assert!(body.contains("BINARY[1]<0> ~{5}\r\nhello"));
         let _logout = read_until_contains(&mut reader, "A007 OK").await;
         server_task.await.expect("join").expect("server");
@@ -2521,7 +2523,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"DONE\r\nA005 SEARCH RECENT\r\nA006 SEARCH NEW\r\nA007 STATUS INBOX (RECENT)\r\nA008 LOGOUT\r\n",
+                b"DONE\r\nA005 SEARCH RECENT\r\nA006 SEARCH NEW\r\nA007 FETCH 2 FLAGS\r\nA008 STORE 2 +FLAGS (\\Recent)\r\nA009 STATUS INBOX (RECENT)\r\nA010 LOGOUT\r\n",
             )
             .await
             .expect("done logout");
@@ -2540,9 +2542,13 @@ mod tests {
                 .iter()
                 .any(|line| line.trim_end() == "* SEARCH 2")
         );
-        let status = read_until_contains(&mut reader, "A007 OK").await;
+        let fetch = read_until_contains(&mut reader, "A007 OK").await;
+        assert!(fetch.iter().any(|line| line.contains("FLAGS (\\Recent)")));
+        let store = read_until_contains(&mut reader, "A008 OK").await;
+        assert!(store.iter().any(|line| line.contains("FLAGS (\\Recent)")));
+        let status = read_until_contains(&mut reader, "A009 OK").await;
         assert!(status.iter().any(|line| line.contains("(RECENT 0)")));
-        let _logout = read_until_contains(&mut reader, "A008 OK").await;
+        let _logout = read_until_contains(&mut reader, "A010 OK").await;
         server_task.await.expect("join").expect("server");
     }
 

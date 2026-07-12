@@ -161,11 +161,17 @@ pub(crate) async fn handle(
     }
 
     for target in targets {
+        let mut response_flags = target.flags.clone();
+        if selected.recent_uids.contains(&target.uid) {
+            response_flags.push("\\Recent".to_string());
+            response_flags.sort();
+            response_flags.dedup();
+        }
         if let Err(error) = mailbox::write_fetch_response(
             reader,
             target.sequence,
             target.uid,
-            &target.flags,
+            &response_flags,
             target.modseq,
             target.internal_date,
             target.save_date,

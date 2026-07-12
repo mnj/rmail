@@ -38,6 +38,12 @@ pub(crate) async fn handle(
     };
     let mut modified = Vec::new();
     let mut updates = Vec::new();
+    let requested_flags = request
+        .flags
+        .iter()
+        .filter(|flag| !flag.eq_ignore_ascii_case("\\Recent"))
+        .cloned()
+        .collect::<Vec<_>>();
     for (sequence, uid, current_flags, modseq) in targets {
         if request
             .unchanged_since
@@ -49,7 +55,7 @@ pub(crate) async fn handle(
         updates.push((
             sequence,
             uid,
-            apply_operation(current_flags, request.mode, &request.flags),
+            apply_operation(current_flags, request.mode, &requested_flags),
         ));
     }
     let flag_updates = updates
@@ -94,9 +100,15 @@ pub(crate) async fn handle(
     let mut response = Response::new();
     if !request.silent {
         for ((sequence, uid, flags), (_, modseq)) in updates.iter().zip(modseqs.iter()) {
+            let mut response_flags = flags.clone();
+            if selected.recent_uids.contains(uid) {
+                response_flags.push("\\Recent".to_string());
+                response_flags.sort();
+                response_flags.dedup();
+            }
             response = response.data(format!(
                 "{sequence} FETCH (FLAGS ({}) UID {uid} MODSEQ ({modseq}))",
-                flags.join(" ")
+                response_flags.join(" ")
             ));
         }
     }
