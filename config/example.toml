@@ -35,6 +35,7 @@ acme_challenge_dir = "config/acme-challenges"
 [security]
 # PLAIN and LOGIN are advertised only over TLS. SCRAM-SHA-256 remains available pre-TLS.
 imap_sasl_mechanisms = ["PLAIN", "LOGIN", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+smtp_sasl_mechanisms = ["PLAIN", "LOGIN", "SCRAM-SHA-256"]
 scanner_failure_action = "tempfail" # tempfail | accept | reject
 scanner_timeout_ms = 5000
 scanner_max_message_bytes = 10485760

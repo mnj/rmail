@@ -236,4 +236,117 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test]
+    async fn bounded_reader_drains_an_overlong_line_and_preserves_the_next_command() {
+        let input = format!("{}\r\nNOOP\r\n", "x".repeat(32));
+        let mut reader = tokio::io::BufReader::new(input.as_bytes());
+        assert_eq!(
+            read_bounded_line(&mut reader, 16).await.unwrap(),
+            BoundedLine::TooLong
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, 16).await.unwrap(),
+            BoundedLine::Line(b"NOOP\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn sasl_capabilities_are_validated_and_follow_configuration_order() {
+        let configured = vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()];
+        validate_sasl_mechanisms(&configured).unwrap();
+        assert_eq!(
+            advertised_sasl_mechanisms(&configured),
+            "SCRAM-SHA-256 PLAIN"
+        );
+        assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()]).is_err());
+        assert!(validate_sasl_mechanisms(&["PLAIN".to_string(), "plain".to_string()]).is_err());
+    }
+}
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+
+pub(crate) const MAX_COMMAND_LINE_BYTES: usize = 512;
+pub(crate) const MAX_AUTH_LINE_BYTES: usize = 12 * 1024;
+pub(crate) const SMTP_SASL_MECHANISMS: &[&str] = &["PLAIN", "LOGIN", "SCRAM-SHA-256"];
+
+pub(crate) fn validate_sasl_mechanisms(configured: &[String]) -> anyhow::Result<()> {
+    if configured.is_empty() {
+        anyhow::bail!("security.smtp_sasl_mechanisms must not be empty");
+    }
+    let mut seen = Vec::new();
+    for mechanism in configured {
+        let canonical = SMTP_SASL_MECHANISMS
+            .iter()
+            .copied()
+            .find(|supported| supported.eq_ignore_ascii_case(mechanism))
+            .ok_or_else(|| anyhow::anyhow!("unsupported SMTP SASL mechanism {mechanism:?}"))?;
+        if seen.contains(&canonical) {
+            anyhow::bail!("duplicate SMTP SASL mechanism {canonical:?}");
+        }
+        seen.push(canonical);
+    }
+    Ok(())
+}
+
+pub(crate) fn advertised_sasl_mechanisms(configured: &[String]) -> String {
+    configured
+        .iter()
+        .filter_map(|configured| {
+            SMTP_SASL_MECHANISMS
+                .iter()
+                .copied()
+                .find(|supported| supported.eq_ignore_ascii_case(configured))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoundedLine {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
+pub(crate) async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut line = Vec::new();
+    let mut too_long = false;
+    loop {
+        let (consumed, newline) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return if too_long {
+                    Ok(BoundedLine::TooLong)
+                } else if line.is_empty() {
+                    Ok(BoundedLine::Eof)
+                } else {
+                    Ok(BoundedLine::Line(line))
+                };
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if !too_long {
+                if line.len().saturating_add(consumed) > limit {
+                    too_long = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(&available[..consumed]);
+                }
+            }
+            (consumed, available[..consumed].ends_with(b"\n"))
+        };
+        reader.consume(consumed);
+        if newline {
+            return if too_long {
+                Ok(BoundedLine::TooLong)
+            } else {
+                Ok(BoundedLine::Line(line))
+            };
+        }
+    }
 }

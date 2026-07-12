@@ -42,8 +42,8 @@ struct AuthFailInfo {
 static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-const MAX_LINE_LEN: usize = 1000;
 const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_DATA_LINE_BYTES: usize = 1000;
 const COMMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const AUTH_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(60);
 const DATA_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -157,6 +157,8 @@ async fn main() -> Result<()> {
     // DMARC enforcement flag
     let enforce_dmarc = cfg.global.enforce_dmarc.unwrap_or(false);
     let security = Arc::new(cfg.security.clone());
+    protocol::validate_sasl_mechanisms(&security.smtp_sasl_mechanisms)
+        .context("validating security.smtp_sasl_mechanisms")?;
 
     // spawn plain SMTP listeners
     for addr in listen_addrs.iter() {
@@ -362,7 +364,7 @@ async fn read_smtp_data<R: tokio::io::AsyncRead + Unpin>(
             return Ok(DataReadResult::Eof);
         }
 
-        if dline.len() > MAX_LINE_LEN && failure.is_none() {
+        if dline.len() > MAX_DATA_LINE_BYTES && failure.is_none() {
             failure = Some(DataReadResult::LineTooLong);
         }
 
@@ -431,7 +433,6 @@ async fn process_stream(
         tls_ctx.is_some(),
         enforce_dmarc
     );
-    let mut line = String::new();
     if send_greeting {
         let w = reader.get_mut();
         w.write_all(b"220 rMail SMTPD ready\r\n").await?;
@@ -449,32 +450,51 @@ async fn process_stream(
     let mut extended_smtp = false;
 
     loop {
-        line.clear();
-        let Some(n) = timed_read_line(&mut reader, &mut line, COMMAND_IDLE_TIMEOUT).await? else {
-            let w = reader.get_mut();
-            let _ = w.write_all(b"421 4.4.2 Timeout\r\n").await;
-            let _ = w.flush().await;
-            break;
+        let line = match timeout(
+            COMMAND_IDLE_TIMEOUT,
+            protocol::read_bounded_line(&mut reader, protocol::MAX_AUTH_LINE_BYTES),
+        )
+        .await
+        {
+            Err(_) => {
+                let writer = reader.get_mut();
+                let _ = writer.write_all(b"421 4.4.2 Timeout\r\n").await;
+                let _ = writer.flush().await;
+                break;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Ok(Ok(protocol::BoundedLine::Eof)) => break,
+            Ok(Ok(protocol::BoundedLine::TooLong)) => {
+                let writer = reader.get_mut();
+                writer.write_all(b"500 5.5.2 Line too long\r\n").await?;
+                writer.flush().await?;
+                continue;
+            }
+            Ok(Ok(protocol::BoundedLine::Line(line))) => line,
         };
-        if n == 0 {
-            break;
-        }
-
-        // Protect against overly long lines
-        if line.len() > MAX_LINE_LEN {
-            let w = reader.get_mut();
-            w.write_all(b"500 Line too long\r\n").await?;
-            w.flush().await?;
-            // Skip this command and continue reading
-            continue;
-        }
-
-        // Trim CRLF safely
-        let cmd = line.trim_end_matches('\n').trim_end_matches('\r');
+        let cmd = match std::str::from_utf8(&line) {
+            Ok(line) => line.trim_end_matches(['\r', '\n']),
+            Err(_) => {
+                let writer = reader.get_mut();
+                writer
+                    .write_all(b"500 5.5.2 Command is not valid UTF-8\r\n")
+                    .await?;
+                writer.flush().await?;
+                continue;
+            }
+        };
         if cmd.is_empty() {
             continue;
         }
         let parsed_command = parse_command(cmd);
+        if line.len() > protocol::MAX_COMMAND_LINE_BYTES
+            && !matches!(parsed_command, SmtpCommand::Auth(_))
+        {
+            let writer = reader.get_mut();
+            writer.write_all(b"500 5.5.2 Line too long\r\n").await?;
+            writer.flush().await?;
+            continue;
+        }
         let logged_cmd = match parsed_command {
             SmtpCommand::Auth(args) => {
                 let mech = args.split_whitespace().next().unwrap_or("");
@@ -529,7 +549,10 @@ async fn process_stream(
                         resp.push_str("250-STARTTLS\r\n");
                     }
                     if session_encrypted && db_path.is_some() {
-                        resp.push_str("250-AUTH PLAIN LOGIN SCRAM-SHA-256\r\n");
+                        resp.push_str(&format!(
+                            "250-AUTH {}\r\n",
+                            protocol::advertised_sasl_mechanisms(&security.smtp_sasl_mechanisms)
+                        ));
                     }
                     resp.push_str(&format!("250-SIZE {}\r\n", MAX_MESSAGE_BYTES));
                     resp.push_str("250-8BITMIME\r\n");
@@ -556,6 +579,18 @@ async fn process_stream(
                     "SMTP AUTH attempt peer={:?} encrypted={} mechanism={}",
                     peer, session_encrypted, mech
                 );
+                if !security
+                    .smtp_sasl_mechanisms
+                    .iter()
+                    .any(|configured| configured.eq_ignore_ascii_case(&mech))
+                {
+                    let writer = reader.get_mut();
+                    writer
+                        .write_all(b"504 5.5.4 Unrecognized authentication mechanism\r\n")
+                        .await?;
+                    writer.flush().await?;
+                    continue;
+                }
                 // Rate-limiting: block repeated failures per remote IP
                 if let Some(peer_addr) = peer {
                     if let Some(rem) = auth_block_remaining(peer_addr.ip()) {
@@ -2420,12 +2455,19 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("503 5.5.1 Send EHLO before STARTTLS"))
         );
-        assert!(responses.iter().any(|response| response
-            .starts_with("503 5.5.1 AUTH not permitted during a mail transaction")));
-        assert!(responses
-            .iter()
-            .any(|response| response.starts_with("538 5.7.11 Encryption required")));
-        assert!(responses.iter().any(|response| response.starts_with("221 Bye")));
+        assert!(responses.iter().any(|response| {
+            response.starts_with("503 5.5.1 AUTH not permitted during a mail transaction")
+        }));
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("538 5.7.11 Encryption required"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("221 Bye"))
+        );
     }
 
     #[tokio::test]
