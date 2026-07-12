@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use async_compression::tokio::bufread::ZlibDecoder;
 use async_compression::tokio::write::ZlibEncoder;
-use base64::Engine;
+#[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
-use rmail_common::{auth as common_auth, config::Config, net::bind_tcp_listener};
+use rmail_common::{config::Config, net::bind_tcp_listener};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::pin::Pin;
@@ -20,9 +20,6 @@ mod sort;
 mod state;
 mod thread;
 mod tls;
-use commands::authenticate::{
-    ProtocolError as SaslProtocolError, read_response as read_sasl_wire_response,
-};
 use mailbox::SelectedMailbox;
 use tls::load_tls_context;
 
@@ -5125,10 +5122,6 @@ fn parse_scram_attr<'a>(message: &'a str, key: &str) -> Option<&'a str> {
     auth::parse_scram_attr(message, key)
 }
 
-fn generate_scram_nonce() -> String {
-    auth::generate_scram_nonce()
-}
-
 async fn sync_selected_mailbox(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     mail_root: &str,
@@ -5578,332 +5571,31 @@ async fn process_stream_inner(
                     }
                     continue;
                 }
-                let response = if let Some(initial_response) = initial_response {
-                    initial_response
-                } else {
-                    {
-                        let w = reader.get_mut();
-                        w.write_all(b"+ \r\n").await?;
-                        w.flush().await?;
-                    }
-                    match read_sasl_wire_response(&mut reader).await {
-                        Ok(line) => line,
-                        Err(SaslProtocolError::Eof) => return Ok(()),
-                        Err(SaslProtocolError::Cancelled) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD AUTHENTICATE cancelled\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(SaslProtocolError::ResponseTooLarge) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD AUTHENTICATE response too large\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(SaslProtocolError::InvalidResponse) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD Invalid AUTHENTICATE response\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    }
-                };
-                if mechanism == "SCRAM-SHA-256" || mechanism == "SCRAM-SHA-256-PLUS" {
-                    let mut scram_exchange =
-                        auth::ScramExchange::new(mechanism_metadata.channel_binding_required);
-                    let client_first =
-                        match auth::SaslExchange::start(&mut scram_exchange, Some(&response)) {
-                            Ok(auth::SaslProgress::ScramClientFirst(first)) => first,
-                            _ => {
-                                let w = reader.get_mut();
-                                w.write_all(
-                                    format!("{} BAD Invalid SCRAM client-first message\r\n", tag)
-                                        .as_bytes(),
-                                )
-                                .await?;
-                                w.flush().await?;
-                                continue;
-                            }
-                        };
-                    let user_lookup =
-                        common_auth::saslprep(&client_first.username).to_ascii_lowercase();
-                    if client_first.authzid.as_ref().is_some_and(|authzid| {
-                        common_auth::saslprep(authzid).to_ascii_lowercase() != user_lookup
-                    }) {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHORIZATIONFAILED] Authorization identity is not permitted\r\n",
-                                tag
-                            )
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let mailbox = match auth::lookup_mailbox(db_path.as_ref(), &user_lookup).await {
-                        Ok(Some(mailbox)) => mailbox,
-                        Ok(None) => {
-                            if let Some(peer_addr) = peer {
-                                auth::record_auth_failure(peer_addr.ip());
-                            }
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!(
-                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                    tag
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(error) => {
-                            eprintln!("IMAP SCRAM mailbox lookup error peer={peer:?}: {error}");
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let Some(scram_json) = mailbox.scram.as_ref() else {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    };
-                    let (salt_b64, iterations) = match common_auth::parse_scram_verifier(scram_json)
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!(
-                                "IMAP SCRAM verifier parse error peer={:?} mailbox={} err={}",
-                                peer, mailbox.address, e
-                            );
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} NO [UNAVAILABLE] Authentication error\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let combined_nonce =
-                        format!("{}{}", client_first.nonce, generate_scram_nonce());
-                    let server_first =
-                        format!("r={},s={},i={}", combined_nonce, salt_b64, iterations);
-                    let server_first_b64 = BASE64_ENGINE.encode(server_first.as_bytes());
-                    {
-                        let w = reader.get_mut();
-                        w.write_all(format!("+ {}\r\n", server_first_b64).as_bytes())
-                            .await?;
-                        w.flush().await?;
-                    }
-                    let final_line = match read_sasl_wire_response(&mut reader).await {
-                        Ok(line) => line,
-                        Err(SaslProtocolError::Eof) => return Ok(()),
-                        Err(SaslProtocolError::Cancelled) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD AUTHENTICATE cancelled\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(SaslProtocolError::ResponseTooLarge) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD AUTHENTICATE response too large\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                        Err(SaslProtocolError::InvalidResponse) => {
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} BAD Invalid SCRAM client-final response\r\n", tag)
-                                    .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                            continue;
-                        }
-                    };
-                    let client_final =
-                        match auth::SaslExchange::receive(&mut scram_exchange, &final_line) {
-                            Ok(auth::SaslProgress::ScramClientFinal(final_message)) => {
-                                final_message
-                            }
-                            _ => {
-                                let w = reader.get_mut();
-                                w.write_all(
-                                    format!("{} BAD Invalid SCRAM client-final message\r\n", tag)
-                                        .as_bytes(),
-                                )
-                                .await?;
-                                w.flush().await?;
-                                continue;
-                            }
-                        };
-                    let channel_binding_valid = if mechanism_metadata.channel_binding_required {
-                        common_auth::verify_tls_server_end_point_binding(
-                            &client_first.gs2_header,
-                            &tls_ctx
-                                .as_ref()
-                                .expect("checked TLS context")
-                                .server_end_point,
-                            &client_final.channel_binding,
-                        )
-                        .is_ok()
-                    } else {
-                        client_final.channel_binding
-                            == BASE64_ENGINE.encode(client_first.gs2_header.as_bytes())
-                    };
-                    if client_final.nonce != combined_nonce || !channel_binding_valid {
-                        if let Some(peer_addr) = peer {
-                            auth::record_auth_failure(peer_addr.ip());
-                        }
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                tag
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                    let auth_message = format!(
-                        "{},{},{}",
-                        client_first.bare, server_first, client_final.without_proof
-                    );
-                    match common_auth::verify_scram_proof(
-                        scram_json,
-                        &auth_message,
-                        &client_final.proof,
-                    ) {
-                        Ok(server_signature) => {
-                            let server_final =
-                                format!("v={}", BASE64_ENGINE.encode(server_signature));
-                            let server_final_b64 = BASE64_ENGINE.encode(server_final.as_bytes());
-                            {
-                                let w = reader.get_mut();
-                                w.write_all(format!("+ {}\r\n", server_final_b64).as_bytes())
-                                    .await?;
-                                w.flush().await?;
-                            }
-                            auth::ScramExchange::expect_final_acknowledgment(&mut scram_exchange)
-                                .map_err(|_| anyhow!("invalid SCRAM exchange state"))?;
-                            let acknowledgment = match read_sasl_wire_response(&mut reader).await {
-                                Ok(line) => line,
-                                Err(SaslProtocolError::Eof) => return Ok(()),
-                                Err(SaslProtocolError::Cancelled) => {
-                                    let w = reader.get_mut();
-                                    w.write_all(
-                                        format!("{} BAD AUTHENTICATE cancelled\r\n", tag)
-                                            .as_bytes(),
-                                    )
-                                    .await?;
-                                    w.flush().await?;
-                                    continue;
-                                }
-                                Err(_) => {
-                                    let w = reader.get_mut();
-                                    w.write_all(
-                                        format!(
-                                            "{} BAD Invalid SCRAM final acknowledgment\r\n",
-                                            tag
-                                        )
-                                        .as_bytes(),
-                                    )
-                                    .await?;
-                                    w.flush().await?;
-                                    continue;
-                                }
-                            };
-                            if !matches!(
-                                auth::SaslExchange::receive(&mut scram_exchange, &acknowledgment,),
-                                Ok(auth::SaslProgress::Complete)
-                            ) {
-                                let w = reader.get_mut();
-                                w.write_all(
-                                    format!("{} BAD Invalid SCRAM final acknowledgment\r\n", tag)
-                                        .as_bytes(),
-                                )
-                                .await?;
-                                w.flush().await?;
-                                continue;
-                            }
-                            authed_mailbox = Some(mailbox.address.to_ascii_lowercase());
-                            session_state.authenticated_mailbox = authed_mailbox.clone();
-                            if let Some(peer_addr) = peer {
-                                auth::reset_auth_failures(peer_addr.ip());
-                            }
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!("{} OK AUTHENTICATE completed\r\n", tag).as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                        }
-                        Err(e) => {
-                            if let Some(peer_addr) = peer {
-                                auth::record_auth_failure(peer_addr.ip());
-                            }
-                            eprintln!(
-                                "IMAP SCRAM verify error peer={:?} mailbox={} err={}",
-                                peer, mailbox.address, e
-                            );
-                            let w = reader.get_mut();
-                            w.write_all(
-                                format!(
-                                    "{} NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
-                                    tag
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            w.flush().await?;
-                        }
-                    }
-                    continue;
+                let outcome = commands::authenticate::handle_scram(
+                    &mut reader,
+                    tag,
+                    initial_response.as_deref(),
+                    db_path.as_ref(),
+                    peer,
+                    mechanism_metadata.channel_binding_required,
+                    tls_ctx
+                        .as_ref()
+                        .map(|context| context.server_end_point.as_slice()),
+                )
+                .await;
+                if outcome.disconnected {
+                    return Ok(());
+                }
+                if let Some(mailbox) = outcome.authenticated_mailbox {
+                    authed_mailbox = Some(mailbox.clone());
+                    session_state.authenticated_mailbox = Some(mailbox);
+                }
+                if let Some(response) = outcome.response {
+                    let response = response.encode();
+                    log_imap_response(peer, tag, &cmd, &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
                 }
             }
             parser::Command::Noop => {
