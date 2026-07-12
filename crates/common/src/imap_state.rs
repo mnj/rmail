@@ -274,9 +274,25 @@ pub fn create_folder(
     mailbox: &str,
 ) -> Result<()> {
     let name = normalize_mailbox_name(mailbox)?;
-    let conn = open_account(maildir_root, domain, localpart)?;
-    ensure_maildir(&mailbox_dir(maildir_root, domain, localpart, &name)?)?;
-    insert_folder(&conn, &name, &folder_path(&name)?, None, true)
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    if folder_id(&conn, &name)?.is_some() {
+        anyhow::bail!("mailbox already exists");
+    }
+    let directory = mailbox_dir(maildir_root, domain, localpart, &name)?;
+    if directory.exists() {
+        anyhow::bail!("mailbox directory already exists");
+    }
+    ensure_maildir(&directory)?;
+    let guard = FileMutationGuard::created_directory(directory);
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq)
+         VALUES(?1, ?2, NULL, 1, ?3, 1, 1)",
+        params![name, folder_path(&name)?, new_uidvalidity() as i64],
+    )?;
+    tx.commit()?;
+    guard.commit();
+    Ok(())
 }
 
 pub fn delete_folder(
@@ -580,6 +596,9 @@ enum FileMutationRollback {
     Copy {
         destination: PathBuf,
     },
+    CreatedDirectory {
+        path: PathBuf,
+    },
 }
 
 struct FileMutationGuard {
@@ -602,6 +621,12 @@ impl FileMutationGuard {
         }
     }
 
+    fn created_directory(path: PathBuf) -> Self {
+        Self {
+            rollback: Some(FileMutationRollback::CreatedDirectory { path }),
+        }
+    }
+
     fn commit(mut self) {
         self.rollback = None;
     }
@@ -618,6 +643,9 @@ impl Drop for FileMutationGuard {
             }
             Some(FileMutationRollback::Copy { destination }) => {
                 let _ = fs::remove_file(destination);
+            }
+            Some(FileMutationRollback::CreatedDirectory { path }) => {
+                let _ = fs::remove_dir_all(path);
             }
             None => {}
         }
@@ -2229,5 +2257,28 @@ mod tests {
             fs::read(&messages[0].path).unwrap(),
             b"Subject: retained\r\n\r\nbody"
         );
+    }
+
+    #[test]
+    fn mailbox_create_rolls_back_directory_when_database_insert_fails() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_mailbox_create
+             BEFORE INSERT ON folders
+             WHEN NEW.name = 'Projects'
+             BEGIN SELECT RAISE(FAIL, 'injected mailbox create failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(create_folder(td.path(), "example.test", "user", "Projects").is_err());
+        assert!(
+            !mailbox_dir(td.path(), "example.test", "user", "Projects")
+                .unwrap()
+                .exists()
+        );
+        assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
     }
 }

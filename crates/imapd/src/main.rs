@@ -4038,41 +4038,53 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 RENAME Projects \"Renamed\"\r\nA003 LIST \"\" \"*\"\r\nA004 SELECT Renamed\r\nA005 DELETE Renamed\r\nA006 FETCH 1 FLAGS\r\nA007 RENAME INBOX Nope\r\nA008 LOGOUT\r\n",
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CREATE Projects\r\nA003 CREATE Projects trailing\r\nA004 RENAME Projects \"Renamed\"\r\nA005 LIST \"\" \"*\"\r\nA006 SELECT Renamed\r\nA007 DELETE Renamed\r\nA008 FETCH 1 FLAGS\r\nA009 RENAME INBOX Nope\r\nA010 LOGOUT\r\n",
             )
             .await
             .expect("write commands");
         reader.get_mut().flush().await.expect("flush");
 
         let _login = read_until_contains(&mut reader, "A001 OK").await;
-        let rename = read_until_contains(&mut reader, "A002 OK").await;
+        let duplicate = read_until_contains(&mut reader, "A002 NO").await;
+        assert!(
+            duplicate
+                .iter()
+                .any(|line| line.contains("[ALREADYEXISTS]"))
+        );
+        let malformed = read_until_contains(&mut reader, "A003 BAD").await;
+        assert!(
+            malformed
+                .iter()
+                .any(|line| line.contains("Invalid CREATE arguments"))
+        );
+        let rename = read_until_contains(&mut reader, "A004 OK").await;
         assert!(rename.iter().any(|l| l.contains("RENAME completed")));
 
-        let list = read_until_contains(&mut reader, "A003 OK").await;
+        let list = read_until_contains(&mut reader, "A005 OK").await;
         let joined = list.join("");
         assert!(joined.contains("\"Renamed\""));
         assert!(!joined.contains("\"Projects\""));
 
-        let select = read_until_contains(&mut reader, "A004 OK").await;
+        let select = read_until_contains(&mut reader, "A006 OK").await;
         assert!(select.iter().any(|l| l.contains("* 1 EXISTS")));
 
-        let deleted = read_until_contains(&mut reader, "A005 OK").await;
+        let deleted = read_until_contains(&mut reader, "A007 OK").await;
         assert!(deleted.iter().any(|line| line.contains("DELETE completed")));
-        let stale_selection = read_until_contains(&mut reader, "A006 BAD").await;
+        let stale_selection = read_until_contains(&mut reader, "A008 BAD").await;
         assert!(
             stale_selection
                 .iter()
                 .any(|line| line.contains("No mailbox selected"))
         );
 
-        let inbox_rename = read_until_contains(&mut reader, "A007 NO").await;
+        let inbox_rename = read_until_contains(&mut reader, "A009 NO").await;
         assert!(
             inbox_rename
                 .iter()
                 .any(|l| l.contains("cannot rename INBOX"))
         );
 
-        let _logout = read_until_contains(&mut reader, "A008 OK").await;
+        let _logout = read_until_contains(&mut reader, "A010 OK").await;
         server_task.await.expect("join").expect("server");
     }
 
@@ -5262,10 +5274,6 @@ fn parse_store_command_args(input: &str) -> Option<(String, Option<u64>, String,
         op.to_string(),
         flags.trim().to_string(),
     ))
-}
-
-fn split_first_imap_astring(input: &str) -> Option<(String, &str)> {
-    parser::split_first_imap_astring(input)
 }
 
 fn parse_append_args(args: &str) -> Result<parser::AppendRequest, parser::ParseError> {
@@ -7290,8 +7298,18 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
+                let mailbox_argument = match parser::parse_mailbox_argument(args) {
+                    Ok(mailbox) => mailbox,
+                    Err(_) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} BAD Invalid CREATE arguments\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
                 let mailbox_name = match decode_imap_mailbox_arg(
-                    unquote(args.trim()),
+                    &mailbox_argument,
                     session_state.feature_enabled("UTF8=ACCEPT"),
                 ) {
                     Ok(name) => name,
@@ -7306,7 +7324,7 @@ async fn process_stream_inner(
                 let addr = authed_mailbox.as_ref().unwrap();
                 let (local, domain) = address_parts(addr)?;
                 let mail_root_clone = mail_root.clone();
-                tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || {
                     maildir::create_mailbox(
                         Path::new(&mail_root_clone),
                         &domain,
@@ -7314,11 +7332,29 @@ async fn process_stream_inner(
                         &mailbox_name,
                     )
                 })
-                .await??;
-                let w = reader.get_mut();
-                w.write_all(format!("{} OK CREATE completed\r\n", tag).as_bytes())
-                    .await?;
-                w.flush().await?;
+                .await?
+                {
+                    Ok(()) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} OK CREATE completed\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                    }
+                    Err(error) => {
+                        let response_code = if error.to_string().contains("already exists") {
+                            "[ALREADYEXISTS] "
+                        } else {
+                            ""
+                        };
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} NO {}CREATE failed: {}\r\n", tag, response_code, error)
+                                .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                    }
+                }
             }
             parser::Command::Delete => {
                 if authed_mailbox.is_none() {
@@ -7328,8 +7364,18 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
+                let mailbox_argument = match parser::parse_mailbox_argument(args) {
+                    Ok(mailbox) => mailbox,
+                    Err(_) => {
+                        let w = reader.get_mut();
+                        w.write_all(format!("{} BAD Invalid DELETE arguments\r\n", tag).as_bytes())
+                            .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
                 let mailbox_name = match decode_imap_mailbox_arg(
-                    unquote(args.trim()),
+                    &mailbox_argument,
                     session_state.feature_enabled("UTF8=ACCEPT"),
                 ) {
                     Ok(name) => name,
@@ -7368,9 +7414,17 @@ async fn process_stream_inner(
                         w.flush().await?;
                     }
                     Err(e) => {
+                        let response_code = if e.to_string().contains("does not exist") {
+                            "[NONEXISTENT] "
+                        } else {
+                            ""
+                        };
                         let w = reader.get_mut();
-                        w.write_all(format!("{} NO DELETE failed: {}\r\n", tag, e).as_bytes())
-                            .await?;
+                        w.write_all(
+                            format!("{} NO {}DELETE failed: {}\r\n", tag, response_code, e)
+                                .as_bytes(),
+                        )
+                        .await?;
                         w.flush().await?;
                     }
                 }
@@ -7383,20 +7437,19 @@ async fn process_stream_inner(
                     w.flush().await?;
                     continue;
                 }
-                let Some((source_mailbox, rest)) = split_first_imap_astring(args) else {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid RENAME arguments\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                };
-                let Some((destination_mailbox, _)) = split_first_imap_astring(rest) else {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Invalid RENAME arguments\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                };
+                let (source_mailbox, destination_mailbox) =
+                    match parser::parse_rename_arguments(args) {
+                        Ok(mailboxes) => mailboxes,
+                        Err(_) => {
+                            let w = reader.get_mut();
+                            w.write_all(
+                                format!("{} BAD Invalid RENAME arguments\r\n", tag).as_bytes(),
+                            )
+                            .await?;
+                            w.flush().await?;
+                            continue;
+                        }
+                    };
                 let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
                 let (source_mailbox, destination_mailbox) = match (
                     decode_imap_mailbox_arg(&source_mailbox, utf8_accept),

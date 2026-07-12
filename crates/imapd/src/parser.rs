@@ -207,6 +207,34 @@ pub(crate) fn parse_login_args(input: &str) -> Result<(String, String), ParseErr
     }
 }
 
+pub(crate) fn parse_mailbox_argument(input: &str) -> Result<String, ParseError> {
+    let arguments = parse_imap_args(input)?;
+    let [mailbox] = arguments.as_slice() else {
+        return Err(ParseError::TrailingData);
+    };
+    mailbox
+        .as_text()
+        .map(str::to_string)
+        .ok_or(ParseError::InvalidAtom)
+}
+
+pub(crate) fn parse_rename_arguments(input: &str) -> Result<(String, String), ParseError> {
+    let arguments = parse_imap_args(input)?;
+    let [source, destination] = arguments.as_slice() else {
+        return Err(ParseError::TrailingData);
+    };
+    Ok((
+        source
+            .as_text()
+            .map(str::to_string)
+            .ok_or(ParseError::InvalidAtom)?,
+        destination
+            .as_text()
+            .map(str::to_string)
+            .ok_or(ParseError::InvalidAtom)?,
+    ))
+}
+
 pub(crate) fn parse_authenticate_args(input: &str) -> Result<(String, Option<String>), ParseError> {
     let args = parse_imap_args(input)?;
     match args.as_slice() {
@@ -1584,33 +1612,6 @@ pub(crate) fn parse_store_items(spec: &str) -> Vec<String> {
     normalize_fetch_items(spec)
 }
 
-pub(crate) fn split_first_imap_astring(input: &str) -> Option<(String, &str)> {
-    let input = input.trim_start();
-    if input.is_empty() {
-        return None;
-    }
-    if let Some(rest) = input.strip_prefix('"') {
-        let mut value = String::new();
-        let mut escaped = false;
-        for (idx, ch) in rest.char_indices() {
-            if escaped {
-                value.push(ch);
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                return Some((value, &rest[idx + 1..]));
-            } else {
-                value.push(ch);
-            }
-        }
-        None
-    } else {
-        let end = input.find(char::is_whitespace).unwrap_or(input.len());
-        Some((input[..end].to_string(), &input[end..]))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppendRequest {
     pub(crate) mailbox: String,
@@ -1988,6 +1989,17 @@ mod tests {
             parse_login_args(r#""user@example.test" "pa\"ss\\word""#).expect("login args");
         assert_eq!(user, "user@example.test");
         assert_eq!(password, "pa\"ss\\word");
+
+        assert_eq!(
+            parse_mailbox_argument(r#""Project Mail""#),
+            Ok("Project Mail".to_string())
+        );
+        assert!(parse_mailbox_argument("Projects trailing").is_err());
+        assert_eq!(
+            parse_rename_arguments(r#""Old Name" "New Name""#),
+            Ok(("Old Name".to_string(), "New Name".to_string()))
+        );
+        assert!(parse_rename_arguments("Old New trailing").is_err());
     }
 
     #[test]
