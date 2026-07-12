@@ -381,21 +381,33 @@ async fn read_smtp_data<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-fn received_header(peer: Option<SocketAddr>, helo_name: Option<&str>, encrypted: bool) -> Vec<u8> {
-    let peer_name = peer
-        .map(|p| p.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+fn received_header(
+    peer: Option<SocketAddr>,
+    helo_name: Option<&str>,
+    extended_smtp: bool,
+    encrypted: bool,
+    authenticated: bool,
+) -> Vec<u8> {
     let helo = helo_name.unwrap_or("unknown");
-    let tls = if encrypted {
-        "with ESMTPS"
+    let protocol = if encrypted && authenticated {
+        "ESMTPSA"
+    } else if encrypted {
+        "ESMTPS"
+    } else if authenticated {
+        "ESMTPA"
+    } else if extended_smtp {
+        "ESMTP"
     } else {
-        "with ESMTP"
+        "SMTP"
     };
     let timestamp = chrono_like_utc_timestamp();
-    format!(
-        "Received: from {} ([{}]) by rMail SMTPD {} id {}; {}\r\n",
-        helo, peer_name, tls, "local", timestamp
-    )
+    match peer {
+        Some(peer) => format!(
+            "Received: from {helo} ([{}]) by rMail SMTPD with {protocol}; {timestamp}\r\n",
+            peer.ip()
+        ),
+        None => format!("Received: from {helo} by rMail SMTPD with {protocol}; {timestamp}\r\n"),
+    }
     .into_bytes()
 }
 
@@ -989,8 +1001,13 @@ async fn process_stream(
                             mail_from_seen = false;
                             continue;
                         }
-                        let mut traced =
-                            received_header(peer, helo_name.as_deref(), session_encrypted);
+                        let mut traced = received_header(
+                            peer,
+                            helo_name.as_deref(),
+                            extended_smtp,
+                            session_encrypted,
+                            authenticated_user.is_some(),
+                        );
                         traced.append(&mut data);
                         traced
                     }
@@ -1465,7 +1482,7 @@ async fn process_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MESSAGE_BYTES, parse_mail_from_arg, process_stream};
+    use super::{MAX_MESSAGE_BYTES, parse_mail_from_arg, process_stream, received_header};
     use crate::protocol;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
@@ -1682,6 +1699,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn received_trace_identifies_smtp_transport_and_authentication_phase() {
+        let smtp = String::from_utf8(received_header(None, Some("client"), false, false, false))
+            .unwrap();
+        assert!(smtp.contains(" with SMTP;"));
+        let submission =
+            String::from_utf8(received_header(None, Some("client"), true, true, true)).unwrap();
+        assert!(submission.contains(" with ESMTPSA;"));
+        assert!(!submission.contains(" id local"));
+    }
+
     #[tokio::test]
     async fn smtp_data_preserves_non_utf8_bytes() {
         let (responses, td) = run_session(
@@ -1700,7 +1728,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let body = std::fs::read(&entries[0]).expect("read message");
         assert!(
-            body.starts_with(b"Received: from localhost ([unknown]) by rMail SMTPD with ESMTP")
+            body.starts_with(b"Received: from localhost by rMail SMTPD with ESMTP;")
         );
         assert!(body.windows(8).any(|w| w == b"binary:\xff"));
         assert!(Path::new(&entries[0]).exists());

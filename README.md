@@ -3,7 +3,7 @@ This is not a serious project, just testing smaller AI models, and how far they 
 
 # rMail
 
-rMail — inbound-only SMTP and IMAP servers in Rust.
+rMail - SMTP, authenticated submission, outbound relay, and IMAP servers in Rust.
 
 Repository layout:
 - crates/common — shared utilities and config parsing
@@ -36,17 +36,18 @@ certification results.
 
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
-| RFC 5321 | SMTP transport and transactions | 90% | Core greeting, envelope, DATA, reset, sequencing, relay policy, limits, and recovery are implemented; exhaustive address grammar and external conformance testing remain. |
+| RFC 5321 | SMTP transport and transactions | 95% | Strict command/reply framing, path grammar, Postmaster handling, DATA transparency, sequencing, limits, one-reply transaction behavior, and relay policy are implemented; multi-destination storage is not yet one cross-backend atomic commit and external conformance testing remains. |
 | RFC 1869 | ESMTP framework | 95% | EHLO negotiation and extension parameters are implemented; no external conformance certification. |
 | RFC 1870 | `SIZE` | 100% | The fixed maximum is advertised and declared or received oversized messages are rejected while preserving stream synchronization. |
-| RFC 6152 | `8BITMIME` | 95% | Eight-bit message bodies and `BODY=7BIT`/`BODY=8BITMIME` are supported; exhaustive content corpus validation remains. |
+| RFC 6152 | `8BITMIME` | 100% | BODY declarations are parsed and retained, undeclared 8-bit content is rejected after safe DATA draining, and outbound relay negotiates and declares 8BITMIME. |
 | RFC 2920 | `PIPELINING` | 100% | Command pipelining is supported with ordered replies and guarded STARTTLS transitions. |
 | RFC 3207 | `STARTTLS` | 95% | A real TLS upgrade, state reset, fresh EHLO requirement, timeout, and plaintext-pipelining rejection are integration-tested; external conformance testing remains. |
 | RFC 4954 | SMTP AUTH | 95% | Configurable TLS-gated mechanisms, strict grammar, initial responses, bounded continuations, cancellation, state restrictions, and enhanced replies are implemented; external conformance testing remains. |
 | RFC 4616 | SASL `PLAIN` | 100% | Initial and continuation forms, authzid policy, UTF-8 validation, and shared credential verification are implemented under TLS. |
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Strict SCRAM grammar, stored verifiers, nonce/channel-binding downgrade checks, client proof validation, and server-final data are implemented and integration-tested. |
-| RFC 6531 | `SMTPUTF8` | 85% | UTF-8 envelope addresses and message bytes are accepted and advertised; internationalized-domain normalization is not exhaustive. |
+| RFC 6531 | `SMTPUTF8` | 95% | UTF-8 envelope/header use is declaration-gated and outbound relay negotiates SMTPUTF8; full IDNA canonicalization and downgrade behavior are not implemented. |
 | RFC 3463 | Enhanced status codes | 70% | Main policy, sequencing, size, scanner, and authentication failures use enhanced codes; some legacy replies still need conversion. |
+| RFC 3848 | Received trace protocol identifiers | 100% | Generated trace fields distinguish SMTP, ESMTP, TLS, and authenticated submission with the appropriate protocol token. |
 | RFC 3461 | Delivery Status Notifications | 0% | `DSN` is not advertised; `NOTIFY` and `ORCPT` are rejected. |
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 0% | Not implemented or advertised. |
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
