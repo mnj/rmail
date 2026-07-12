@@ -41,7 +41,7 @@ or conformance-validation gaps.
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
 | RFC 3501 | IMAP4rev1 core | 95% | No formal protocol test-suite certification or exhaustive live-client matrix yet. |
-| RFC 2595 | IMAP `STARTTLS` and `LOGINDISABLED` | 95% | Successful TLS is integration-tested through the transport boundary, but not yet against an external conformance harness. |
+| RFC 2595 | IMAP `STARTTLS` and `LOGINDISABLED` | 95% | A real TLS upgrade and resumed IMAP session are integration-tested, but not yet against an external conformance harness. |
 | RFC 2177 | `IDLE` | 100% | Implemented with mailbox synchronization, keepalives, fragmented `DONE`, and bounded input. |
 | RFC 2342 | `NAMESPACE` | 100% | Complete for rMail's single personal Maildir namespace. |
 | RFC 2971 | `ID` | 100% | Includes strict argument and size validation. |

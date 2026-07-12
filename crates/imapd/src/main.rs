@@ -1,13 +1,9 @@
 use anyhow::{Context, Result, anyhow};
-use async_compression::tokio::bufread::ZlibDecoder;
-use async_compression::tokio::write::ZlibEncoder;
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use rmail_common::{config::Config, net::bind_tcp_listener};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -20,126 +16,15 @@ mod sort;
 mod state;
 mod thread;
 mod tls;
+mod transport;
 use mailbox::SelectedMailbox;
 use tls::load_tls_context;
+use transport::{AsyncStream, RawStream, SwitchableStream};
 
 const MAX_APPEND_LITERAL_BYTES: usize = 100 * 1024 * 1024;
 const MAX_PREAUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTHENTICATED_LINE_BYTES: usize = 64 * 1024;
 const MAX_SASL_RESPONSE_BYTES: usize = 64 * 1024;
-
-// Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
-// so that boxed trait objects can be used with tokio::io::BufReader.
-trait RawStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> RawStream for T {}
-
-trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
-    fn enable_deflate(&mut self) -> std::io::Result<()>;
-    fn compression_active(&self) -> bool;
-}
-
-enum SwitchableState {
-    Raw(Box<dyn RawStream + Send + 'static>),
-    Deflate {
-        reader: ZlibDecoder<BufReader<tokio::io::ReadHalf<Box<dyn RawStream + Send + 'static>>>>,
-        writer: ZlibEncoder<tokio::io::WriteHalf<Box<dyn RawStream + Send + 'static>>>,
-    },
-    Transition,
-}
-
-struct SwitchableStream {
-    state: SwitchableState,
-}
-
-impl SwitchableStream {
-    fn new(stream: Box<dyn RawStream + Send + 'static>) -> Self {
-        Self {
-            state: SwitchableState::Raw(stream),
-        }
-    }
-}
-
-impl AsyncStream for SwitchableStream {
-    fn enable_deflate(&mut self) -> std::io::Result<()> {
-        let state = std::mem::replace(&mut self.state, SwitchableState::Transition);
-        match state {
-            SwitchableState::Raw(stream) => {
-                let (read, write) = tokio::io::split(stream);
-                self.state = SwitchableState::Deflate {
-                    reader: ZlibDecoder::new(BufReader::new(read)),
-                    writer: ZlibEncoder::new(write),
-                };
-                Ok(())
-            }
-            other => {
-                self.state = other;
-                Err(std::io::Error::new(
-                    ErrorKind::AlreadyExists,
-                    "compression already active",
-                ))
-            }
-        }
-    }
-
-    fn compression_active(&self) -> bool {
-        matches!(self.state, SwitchableState::Deflate { .. })
-    }
-}
-
-impl tokio::io::AsyncRead for SwitchableStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut self.state {
-            SwitchableState::Raw(stream) => Pin::new(stream).poll_read(cx, buf),
-            SwitchableState::Deflate { reader, .. } => Pin::new(reader).poll_read(cx, buf),
-            SwitchableState::Transition => Poll::Ready(Err(std::io::Error::other(
-                "compression transition in progress",
-            ))),
-        }
-    }
-}
-
-impl tokio::io::AsyncWrite for SwitchableStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match &mut self.state {
-            SwitchableState::Raw(stream) => Pin::new(stream).poll_write(cx, buf),
-            SwitchableState::Deflate { writer, .. } => Pin::new(writer).poll_write(cx, buf),
-            SwitchableState::Transition => Poll::Ready(Err(std::io::Error::other(
-                "compression transition in progress",
-            ))),
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        match &mut self.state {
-            SwitchableState::Raw(stream) => Pin::new(stream).poll_flush(cx),
-            SwitchableState::Deflate { writer, .. } => Pin::new(writer).poll_flush(cx),
-            SwitchableState::Transition => Poll::Ready(Err(std::io::Error::other(
-                "compression transition in progress",
-            ))),
-        }
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut self.state {
-            SwitchableState::Raw(stream) => Pin::new(stream).poll_shutdown(cx),
-            SwitchableState::Deflate { writer, .. } => Pin::new(writer).poll_shutdown(cx),
-            SwitchableState::Transition => Poll::Ready(Err(std::io::Error::other(
-                "compression transition in progress",
-            ))),
-        }
-    }
-}
 
 enum BoundedLine {
     Eof,
@@ -818,6 +703,116 @@ mod tests {
         let noop = read_until_contains(&mut reader, "A002 OK").await.join("");
         assert!(noop.contains("NOOP completed"));
         let _logout = read_until_contains(&mut reader, "A003 OK").await;
+        server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn starttls_completes_real_handshake_and_resumes_imap_over_tls() {
+        use std::io::Cursor;
+        use std::time::SystemTime;
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
+        use tokio_rustls::rustls::{
+            Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
+        };
+
+        struct PinnedCertificate(Vec<u8>);
+
+        impl ServerCertVerifier for PinnedCertificate {
+            fn verify_server_cert(
+                &self,
+                end_entity: &Certificate,
+                _intermediates: &[Certificate],
+                _server_name: &ServerName,
+                _scts: &mut dyn Iterator<Item = &[u8]>,
+                _ocsp_response: &[u8],
+                _now: SystemTime,
+            ) -> Result<ServerCertVerified, TlsError> {
+                if end_entity.0 == self.0 {
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    Err(TlsError::General(
+                        "STARTTLS test received an unexpected certificate".to_string(),
+                    ))
+                }
+            }
+        }
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let cert_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/certs/localhost.crt"
+        );
+        let key_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/certs/localhost.key"
+        );
+        let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
+        let cert_pem = std::fs::read(cert_path).expect("read certificate");
+        let certificates = rustls_pemfile::certs(&mut Cursor::new(cert_pem)).expect("parse cert");
+        let mut client_config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(PinnedCertificate(certificates[0].clone())));
+
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(process_stream(
+            Box::new(server),
+            td.path().to_string_lossy().to_string(),
+            Some(tls_context),
+            None,
+            None,
+            false,
+        ));
+        let mut plaintext = BufReader::new(client);
+        let mut greeting = String::new();
+        plaintext.read_line(&mut greeting).await.expect("greeting");
+        let mut capabilities = String::new();
+        plaintext
+            .read_line(&mut capabilities)
+            .await
+            .expect("capabilities");
+        assert!(capabilities.contains("STARTTLS"));
+        plaintext
+            .get_mut()
+            .write_all(b"A001 STARTTLS\r\n")
+            .await
+            .expect("STARTTLS");
+        plaintext.get_mut().flush().await.expect("flush");
+        let mut starttls_reply = String::new();
+        plaintext
+            .read_line(&mut starttls_reply)
+            .await
+            .expect("STARTTLS reply");
+        assert!(starttls_reply.contains("A001 OK Begin TLS negotiation now"));
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tls_stream = connector
+            .connect(
+                ServerName::try_from("localhost").expect("server name"),
+                plaintext.into_inner(),
+            )
+            .await
+            .expect("TLS handshake");
+        let mut encrypted = BufReader::new(tls_stream);
+        encrypted
+            .get_mut()
+            .write_all(b"A002 CAPABILITY\r\nA003 LOGOUT\r\n")
+            .await
+            .expect("encrypted commands");
+        encrypted.get_mut().flush().await.expect("flush");
+        let post_tls = read_until_contains(&mut encrypted, "A002 OK")
+            .await
+            .join("");
+        assert!(post_tls.contains("IMAP4rev1"));
+        assert!(!post_tls.contains("STARTTLS"));
+        let logout = read_until_contains(&mut encrypted, "A003 OK")
+            .await
+            .join("");
+        assert!(logout.contains("LOGOUT completed"));
         server_task.await.expect("join").expect("server");
     }
 
@@ -5580,48 +5575,7 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Compress => {
-                if !args.eq_ignore_ascii_case("DEFLATE") {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!("{} NO Unsupported compression mechanism\r\n", tag).as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if reader.get_ref().compression_active() {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} NO [COMPRESSIONACTIVE] DEFLATE compression already enabled\r\n",
-                            tag
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if !reader.buffer().is_empty() {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} BAD Client did not wait for COMPRESS reply before sending more data\r\n",
-                            tag
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                {
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} OK Begin compression\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    w.enable_deflate()?;
-                }
+                transport::enable_deflate(&mut reader, tag, args).await?;
             }
             parser::Command::Login => {
                 let authenticated_capabilities = response::capability_tokens_with_policy(
@@ -6018,41 +5972,16 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::StartTls => {
-                if tls_ctx.is_none() {
-                    println!("IMAP STARTTLS unavailable peer={:?}", peer);
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} NO TLS not available\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if !reader.buffer().is_empty() {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} BAD Client did not wait for STARTTLS reply before sending more data\r\n",
-                            tag
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                let w = reader.get_mut();
-                w.write_all(format!("{} OK Begin TLS negotiation now\r\n", tag).as_bytes())
-                    .await?;
-                w.flush().await?;
                 println!("IMAP STARTTLS begin peer={:?}", peer);
-                // perform TLS handshake and continue inside TLS context
-                let inner = reader.into_inner();
-                match tls_ctx.clone().unwrap().acceptor.accept(inner).await {
-                    Ok(tls_stream) => {
+                match transport::start_tls(reader, tag, tls_ctx.clone()).await {
+                    Ok(transport::StartTlsOutcome::Rejected(returned_reader)) => {
+                        reader = returned_reader;
+                        continue;
+                    }
+                    Ok(transport::StartTlsOutcome::Upgraded(tls_stream)) => {
                         println!("IMAP STARTTLS handshake success peer={:?}", peer);
-                        // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
-                        // Pass the same tls_ctx along and mark the session as encrypted.
                         let fut = Box::pin(process_stream_inner(
-                            Box::new(tls_stream),
+                            tls_stream,
                             mail_root,
                             tls_ctx.clone(),
                             db_path.clone(),
@@ -6063,9 +5992,9 @@ async fn process_stream_inner(
                         ));
                         return fut.await;
                     }
-                    Err(e) => {
-                        eprintln!("IMAP STARTTLS handshake failed peer={:?}: {}", peer, e);
-                        return Err(anyhow::anyhow!("TLS accept failed: {}", e));
+                    Err(error) => {
+                        eprintln!("IMAP STARTTLS handshake failed peer={:?}: {error}", peer);
+                        return Err(error);
                     }
                 }
             }
