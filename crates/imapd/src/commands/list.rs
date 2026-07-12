@@ -98,10 +98,19 @@ pub(crate) fn handle(
         }
         response = response.data(data);
         if !request.returns.status.is_empty() {
+            let recent = match rmail_common::imap_state::recent_count(
+                mail_root,
+                &domain,
+                &local,
+                &summary.folder.name,
+            ) {
+                Ok(recent) => recent,
+                Err(error) => return unavailable(tag, command_name, error),
+            };
             response = response.data(format!(
                 "STATUS {} ({})",
                 mailbox::quote_wire_mailbox_name(&summary.folder.name, utf8_accept),
-                status_values(summary, &request.returns.status).join(" ")
+                status_values(summary, recent, &request.returns.status).join(" ")
             ));
         }
     }

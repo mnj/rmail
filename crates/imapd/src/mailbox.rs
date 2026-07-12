@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::AsyncStream;
@@ -21,6 +21,7 @@ pub(crate) struct SelectedMailbox {
     pub(crate) internal_dates: HashMap<u64, (i64, i32)>,
     pub(crate) save_dates: HashMap<u64, i64>,
     pub(crate) sizes: HashMap<u64, u64>,
+    pub(crate) recent_uids: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub(crate) enum MailboxSyncEvent {
         uid: u64,
         flags: Vec<String>,
     },
+    Recent(usize),
 }
 
 impl MailboxSyncEvent {
@@ -56,6 +58,7 @@ impl MailboxSyncEvent {
                     uid
                 )
             }
+            MailboxSyncEvent::Recent(count) => format!("* {count} RECENT\r\n"),
         }
     }
 }
@@ -109,6 +112,7 @@ pub(crate) async fn load_selected_mailbox(
             internal_dates,
             save_dates,
             sizes,
+            recent_uids: HashSet::new(),
         })
     })
     .await
@@ -126,6 +130,22 @@ pub(crate) async fn refresh_selected_mailbox(
     let address = format!("{}@{}", selected.local, selected.domain);
     let mut refreshed = load_selected_mailbox(mail_root, &address, &selected.mailbox).await?;
     refreshed.read_only = selected.read_only;
+    refreshed.recent_uids = selected.recent_uids.clone();
+    refreshed.recent_uids.extend(
+        claim_recent_uids(
+            mail_root,
+            &refreshed.domain,
+            &refreshed.local,
+            &refreshed.mailbox,
+        )
+        .await?,
+    );
+    refreshed.recent_uids.retain(|uid| {
+        refreshed
+            .msgs
+            .iter()
+            .any(|(message_uid, _, _, _)| message_uid == uid)
+    });
     let old_by_uid = selected
         .msgs
         .iter()
@@ -161,6 +181,9 @@ pub(crate) async fn refresh_selected_mailbox(
     if refreshed.msgs.len() != selected.msgs.len() {
         events.push(MailboxSyncEvent::Exists(refreshed.msgs.len()));
     }
+    if refreshed.recent_uids.len() != selected.recent_uids.len() {
+        events.push(MailboxSyncEvent::Recent(refreshed.recent_uids.len()));
+    }
 
     for (uid, (new_seq, new_flags)) in &new_by_uid {
         if let Some((_old_seq, old_flags)) = old_by_uid.get(uid) {
@@ -175,6 +198,23 @@ pub(crate) async fn refresh_selected_mailbox(
     }
 
     Ok((refreshed, events))
+}
+
+pub(crate) async fn claim_recent_uids(
+    mail_root: &str,
+    domain: &str,
+    local: &str,
+    mailbox: &str,
+) -> Result<Vec<u64>> {
+    let root = mail_root.to_string();
+    let domain = domain.to_string();
+    let local = local.to_string();
+    let mailbox = mailbox.to_string();
+    tokio::task::spawn_blocking(move || {
+        rmail_common::imap_state::claim_recent_uids(Path::new(&root), &domain, &local, &mailbox)
+    })
+    .await
+    .map_err(|error| anyhow!("task join error: {error}"))?
 }
 
 pub(crate) fn address_parts(address: &str) -> Result<(String, String)> {

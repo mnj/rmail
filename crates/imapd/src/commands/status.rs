@@ -36,7 +36,12 @@ pub(crate) fn handle(
             Err(error) => return unavailable(tag, error),
         };
 
-    let values = status_values(&summary, &request.items);
+    let recent =
+        match rmail_common::imap_state::recent_count(mail_root, &domain, &local, &mailbox_name) {
+            Ok(recent) => recent,
+            Err(error) => return unavailable(tag, error),
+        };
+    let values = status_values(&summary, recent, &request.items);
     let mut completion = StatusLine::tagged(tag, Status::Ok, "STATUS completed");
     if selected_mailbox.is_some_and(|selected| selected.eq_ignore_ascii_case(&summary.folder.name))
     {
@@ -53,6 +58,7 @@ pub(crate) fn handle(
 
 pub(crate) fn status_values(
     summary: &rmail_common::imap_state::FolderSummary,
+    recent: usize,
     items: &[parser::StatusItem],
 ) -> Vec<String> {
     let mut values = Vec::new();
@@ -70,7 +76,7 @@ pub(crate) fn status_values(
         values.push(format!("UNSEEN {}", summary.unseen));
     }
     if requested(parser::StatusItem::Recent) {
-        values.push("RECENT 0".to_string());
+        values.push(format!("RECENT {recent}"));
     }
     if requested(parser::StatusItem::HighestModSeq) {
         values.push(format!("HIGHESTMODSEQ {}", summary.folder.highest_modseq));

@@ -1,6 +1,6 @@
 use crate::maildir::{STANDARD_FOLDERS, ensure_maildir, mailbox_dir, normalize_mailbox_name};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -508,8 +508,8 @@ pub fn claim_recent_uids(
 ) -> Result<Vec<u64>> {
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
-    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
     let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
     let uids = {
         let mut statement = tx.prepare(
@@ -1286,10 +1286,11 @@ pub fn append_message_with_internal_date(
 ) -> Result<(u64, u64)> {
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
-    if folder_id(&conn, &name)?.is_none() {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if folder_id(&tx, &name)?.is_none() {
         anyhow::bail!("destination mailbox does not exist");
     }
-    reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
 
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
     ensure_maildir(&dir)?;
@@ -1312,7 +1313,6 @@ pub fn append_message_with_internal_date(
     tmp_guard.commit();
     let new_guard = FileMutationGuard::copied(new_path);
 
-    let tx = conn.transaction()?;
     let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
     let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
     let uid = allocatable_uid(i64::try_from(folder.uidnext).unwrap_or(i64::MAX))?;

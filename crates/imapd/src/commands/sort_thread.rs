@@ -192,6 +192,7 @@ mod tests {
             internal_dates: Default::default(),
             save_dates: Default::default(),
             sizes: Default::default(),
+            recent_uids: Default::default(),
         }
     }
 

@@ -96,10 +96,14 @@ fn execute(
     let now = chrono::Utc::now().timestamp();
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
         let data = std::fs::read(path)?;
+        let mut effective_flags = flags.clone();
+        if selected.recent_uids.contains(uid) {
+            effective_flags.push("\\Recent".to_string());
+        }
         let message = parser::SearchMessage {
             seq: index + 1,
             uid: *uid,
-            flags,
+            flags: &effective_flags,
             internal_date: selected
                 .internal_dates
                 .get(uid)
@@ -217,6 +221,7 @@ mod tests {
             internal_dates: Default::default(),
             save_dates: Default::default(),
             sizes: Default::default(),
+            recent_uids: Default::default(),
         };
         let outcome = handle(
             "A1",

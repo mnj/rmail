@@ -2488,6 +2488,7 @@ mod tests {
         reader.get_mut().flush().await.expect("flush");
         let noop = read_until_contains(&mut reader, "A003 OK").await;
         assert!(noop.iter().any(|line| line.trim_end() == "* 1 EXISTS"));
+        assert!(!noop.iter().any(|line| line.contains(" RECENT")));
 
         reader
             .get_mut()
@@ -2497,15 +2498,13 @@ mod tests {
         reader.get_mut().flush().await.expect("flush");
         let idle_start = read_until_contains(&mut reader, "+ idling").await;
         assert!(idle_start.iter().any(|line| line.contains("+ idling")));
-        rmail_common::imap_state::append_message(
-            mail_root.as_path(),
-            "example.test",
-            "user",
-            "INBOX",
+        let inbox =
+            rmail_common::imap_state::account_maildir(mail_root.as_path(), "example.test", "user");
+        std::fs::write(
+            inbox.join("new").join("external-idle-delivery"),
             b"From: b@example.test\r\nSubject: idle sync\r\n\r\nhello",
-            vec![],
         )
-        .expect("append second message");
+        .expect("write external delivery");
         let exists = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             read_until_contains(&mut reader, "* 2 EXISTS"),
@@ -2513,15 +2512,37 @@ mod tests {
         .await
         .expect("idle exists timeout");
         assert!(exists.iter().any(|line| line.trim_end() == "* 2 EXISTS"));
+        let recent = if exists.iter().any(|line| line.trim_end() == "* 1 RECENT") {
+            exists
+        } else {
+            read_until_contains(&mut reader, "* 1 RECENT").await
+        };
+        assert!(recent.iter().any(|line| line.trim_end() == "* 1 RECENT"));
         reader
             .get_mut()
-            .write_all(b"DONE\r\nA005 LOGOUT\r\n")
+            .write_all(
+                b"DONE\r\nA005 SEARCH RECENT\r\nA006 SEARCH NEW\r\nA007 STATUS INBOX (RECENT)\r\nA008 LOGOUT\r\n",
+            )
             .await
             .expect("done logout");
         reader.get_mut().flush().await.expect("flush");
         let idle_done = read_until_contains(&mut reader, "A004 OK").await;
         assert!(idle_done.iter().any(|line| line.contains("IDLE completed")));
-        let _logout = read_until_contains(&mut reader, "A005 OK").await;
+        let search_recent = read_until_contains(&mut reader, "A005 OK").await;
+        assert!(
+            search_recent
+                .iter()
+                .any(|line| line.trim_end() == "* SEARCH 2")
+        );
+        let search_new = read_until_contains(&mut reader, "A006 OK").await;
+        assert!(
+            search_new
+                .iter()
+                .any(|line| line.trim_end() == "* SEARCH 2")
+        );
+        let status = read_until_contains(&mut reader, "A007 OK").await;
+        assert!(status.iter().any(|line| line.contains("(RECENT 0)")));
+        let _logout = read_until_contains(&mut reader, "A008 OK").await;
         server_task.await.expect("join").expect("server");
     }
 

@@ -64,6 +64,17 @@ pub(crate) async fn handle(
     };
     let read_only = command_name == "EXAMINE";
     selected.read_only = read_only;
+    selected.recent_uids = match mailbox::claim_recent_uids(
+        mail_root,
+        &selected.domain,
+        &selected.local,
+        &selected.mailbox,
+    )
+    .await
+    {
+        Ok(uids) => uids.into_iter().collect(),
+        Err(error) => return failure(unavailable(tag, command_name, error)),
+    };
     let condstore_requested = request.condstore || condstore_enabled;
     let qresync_changes = if let Some(qresync) = request.qresync.as_ref() {
         if qresync.uidvalidity == selected.uidvalidity {
@@ -98,7 +109,7 @@ pub(crate) async fn handle(
     };
     response = response
         .data(format!("{} EXISTS", selected.msgs.len()))
-        .data("0 RECENT")
+        .data(format!("{} RECENT", selected.recent_uids.len()))
         .status(
             StatusLine::untagged(Status::Ok, "UIDs valid")
                 .with_code(format!("UIDVALIDITY {}", selected.uidvalidity)),
