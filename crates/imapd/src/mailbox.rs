@@ -395,6 +395,21 @@ fn is_whole_message_literal(item: &str) -> bool {
     (upper.starts_with("BODY[") || upper.starts_with("BODY.PEEK[")) && close == open + 1
 }
 
+fn is_top_level_text_literal(item: &str) -> bool {
+    if item == "RFC822.TEXT" {
+        return true;
+    }
+    let upper = item.to_ascii_uppercase();
+    (upper.starts_with("BODY[TEXT]") || upper.starts_with("BODY.PEEK[TEXT]"))
+        && !upper.contains("HEADER.FIELDS")
+}
+
+fn is_header_only_literal(item: &str) -> bool {
+    item == "RFC822.HEADER"
+        || item.to_ascii_uppercase().starts_with("BODY[HEADER")
+        || item.to_ascii_uppercase().starts_with("BODY.PEEK[HEADER")
+}
+
 async fn stream_file_range<W: AsyncWrite + Unpin>(
     writer: &mut W,
     path: &Path,
@@ -492,11 +507,23 @@ fn read_message_header(path: &Path) -> std::io::Result<Vec<u8>> {
             out.truncate(pos + 4);
             break;
         }
+        if let Some(pos) = out.windows(2).position(|w| w == b"\n\n") {
+            out.truncate(pos + 2);
+            break;
+        }
         if out.len() > 256 * 1024 {
             break;
         }
     }
     Ok(out)
+}
+
+fn header_body_offset(header: &[u8]) -> usize {
+    if header.ends_with(b"\r\n\r\n") || header.ends_with(b"\n\n") {
+        header.len()
+    } else {
+        0
+    }
 }
 
 pub(crate) fn header_value(data: &[u8], field: &str) -> Option<String> {
@@ -994,9 +1021,15 @@ pub(crate) async fn write_fetch_response(
     let has_whole_message_literal = literal_items
         .iter()
         .any(|item| is_whole_message_literal(item));
-    let has_parsed_literal = literal_items
-        .iter()
-        .any(|item| !is_whole_message_literal(item));
+    let has_parsed_literal = literal_items.iter().any(|item| {
+        !is_whole_message_literal(item)
+            && !is_top_level_text_literal(item)
+            && !is_header_only_literal(item)
+    });
+    let needs_header_data = include_envelope
+        || literal_items
+            .iter()
+            .any(|item| is_top_level_text_literal(item) || is_header_only_literal(item));
     let need_data = include_size
         || !literal_items.is_empty()
         || !binary_size_items.is_empty()
@@ -1004,7 +1037,13 @@ pub(crate) async fn write_fetch_response(
         || include_bodystructure;
     let internal_date =
         include_internaldate.then(|| format_internal_date(internal_date.0, internal_date.1));
-    let metadata_len = if include_size || include_bodystructure || has_whole_message_literal {
+    let metadata_len = if include_size
+        || include_bodystructure
+        || has_whole_message_literal
+        || literal_items
+            .iter()
+            .any(|item| is_top_level_text_literal(item))
+    {
         Some(
             tokio::task::spawn_blocking({
                 let path = path.clone();
@@ -1023,7 +1062,7 @@ pub(crate) async fn write_fetch_response(
             })
             .await??,
         )
-    } else if include_envelope {
+    } else if needs_header_data {
         Some(
             tokio::task::spawn_blocking({
                 let path = path.clone();
@@ -1129,6 +1168,28 @@ pub(crate) async fn write_fetch_response(
             stream_file_range(w, &path, offset as u64, literal_len).await?;
             continue;
         }
+        if is_top_level_text_literal(item) {
+            let file_len = metadata_len.unwrap_or(0);
+            let body_offset = header_body_offset(&data).min(file_len);
+            let body_len = file_len.saturating_sub(body_offset);
+            let (relative_offset, literal_len) = match partial {
+                Some((offset, count)) if offset < body_len => {
+                    (offset, count.min(body_len - offset))
+                }
+                Some((offset, _)) => (offset.min(body_len), 0),
+                None => (0, body_len),
+            };
+            w.write_all(format!("{} {{{}}}\r\n", response_name, literal_len).as_bytes())
+                .await?;
+            stream_file_range(
+                w,
+                &path,
+                (body_offset + relative_offset) as u64,
+                literal_len,
+            )
+            .await?;
+            continue;
+        }
         let literal = if item.starts_with("BINARY[") || item.starts_with("BINARY.PEEK[") {
             extract_binary_section(&data, item)
                 .map(|decoded| apply_partial_range(&decoded, partial))
@@ -1175,7 +1236,8 @@ pub(crate) async fn write_fetch_response(
 mod tests {
     use super::{
         FETCH_STREAM_CHUNK_BYTES, bodystructure_response, extract_binary_section,
-        extract_mime_section, is_whole_message_literal, stream_file_range,
+        extract_mime_section, header_body_offset, is_header_only_literal,
+        is_top_level_text_literal, is_whole_message_literal, stream_file_range,
     };
 
     const EMBEDDED_MESSAGE: &[u8] = b"From: outer@example.test\r\n\
@@ -1252,6 +1314,14 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         assert!(!is_whole_message_literal("BODY[TEXT]"));
         assert!(!is_whole_message_literal("BODY[1]"));
         assert!(!is_whole_message_literal("BINARY[]"));
+        assert!(is_top_level_text_literal("RFC822.TEXT"));
+        assert!(is_top_level_text_literal("BODY.PEEK[TEXT]<123.456>"));
+        assert!(!is_top_level_text_literal("BODY[1.TEXT]"));
+        assert!(is_header_only_literal("RFC822.HEADER"));
+        assert!(is_header_only_literal("BODY[HEADER.FIELDS (FROM)]"));
+        assert_eq!(header_body_offset(b"Subject: x\r\n\r\n"), 14);
+        assert_eq!(header_body_offset(b"Subject: x\n\n"), 12);
+        assert_eq!(header_body_offset(b"malformed without separator"), 0);
     }
 
     #[tokio::test]
