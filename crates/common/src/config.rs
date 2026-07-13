@@ -6,6 +6,9 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Global {
     pub mail_root: String,
+    /// Durable SMTP tracking retention and pruning limits.
+    #[serde(default)]
+    pub tracking: TrackingConfig,
     /// Process-wide TCP listener behavior. Explicit listen address arrays still
     /// choose IPv4-only, IPv6-only, or combined listeners per service.
     #[serde(default)]
@@ -50,6 +53,44 @@ pub struct Global {
     pub acme_challenge_dir: Option<String>,
     /// If true, enforce DMARC policies (reject/quarantine) at SMTP time for inbound mail
     pub enforce_dmarc: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct TrackingConfig {
+    /// Remove events older than this many days; zero disables age pruning.
+    #[serde(default = "default_tracking_retention_days")]
+    pub retention_days: u32,
+    /// Retain at most this many events; zero disables count pruning.
+    #[serde(default = "default_tracking_max_events")]
+    pub max_events: u64,
+    #[serde(default = "default_tracking_prune_interval_seconds")]
+    pub prune_interval_seconds: u64,
+    #[serde(default = "default_tracking_prune_batch_size")]
+    pub prune_batch_size: u32,
+}
+
+impl Default for TrackingConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_tracking_retention_days(),
+            max_events: default_tracking_max_events(),
+            prune_interval_seconds: default_tracking_prune_interval_seconds(),
+            prune_batch_size: default_tracking_prune_batch_size(),
+        }
+    }
+}
+
+fn default_tracking_retention_days() -> u32 {
+    30
+}
+fn default_tracking_max_events() -> u64 {
+    2_000_000
+}
+fn default_tracking_prune_interval_seconds() -> u64 {
+    3_600
+}
+fn default_tracking_prune_batch_size() -> u32 {
+    10_000
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]

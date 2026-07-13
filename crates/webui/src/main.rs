@@ -2221,6 +2221,7 @@ async fn main() -> Result<()> {
         // fallback default settings
         Config {
             global: rmail_common::config::Global {
+                tracking: rmail_common::config::TrackingConfig::default(),
                 mail_root: "mail".into(),
                 tcp_listener: rmail_common::net::TcpListenerConfig::default(),
                 listeners: rmail_common::config::ListenerEndpoints::default(),

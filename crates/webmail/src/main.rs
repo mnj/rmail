@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
     let cfg_path = env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| Config {
         global: rmail_common::config::Global {
+            tracking: rmail_common::config::TrackingConfig::default(),
             mail_root: "mail".to_string(),
             tcp_listener: rmail_common::net::TcpListenerConfig::default(),
             listeners: rmail_common::config::ListenerEndpoints::default(),

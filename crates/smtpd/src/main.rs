@@ -344,8 +344,12 @@ async fn main() -> Result<()> {
     rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "smtpd")
         .context("redirecting logs")?;
     let tracking = Arc::new(
-        TrackingHub::start(std::path::Path::new(&mail_root), "smtpd")
-            .context("starting SMTP tracking hub")?,
+        TrackingHub::start_with_config(
+            std::path::Path::new(&mail_root),
+            "smtpd",
+            cfg.global.tracking,
+        )
+        .context("starting SMTP tracking hub")?,
     );
     TRACKING_HUB
         .set(tracking)

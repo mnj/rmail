@@ -72,7 +72,8 @@ Then edit both files:
 
 Important:
 
-- `rmail_outbound` reads `RMAIL_MAIL_ROOT`; it does not read the TOML file directly
+- `rmail_outbound` reads `RMAIL_MAIL_ROOT` for spool placement and, when `RMAIL_CONFIG` is set,
+  reads the shared tracking-retention policy from the TOML file
 - `rmail_web` currently binds to `127.0.0.1` by default, which is a safer default for admin access
 - port 25 listeners use MTA policy; port 587 and implicit-TLS port 465 use submission policy
 - submission requires TLS, authentication, and an envelope sender matching the authenticated mailbox
@@ -122,6 +123,27 @@ connections with a five-second acquisition/busy timeout. Idle connections are re
 minutes; inactive database pools are evicted after fifteen minutes, and at most 1,024 mailbox
 database pools are retained. This bounds file descriptors and prevents concurrent IMAP, SMTP, and
 admin requests from creating a new connection for every command.
+
+## Live SMTP watch and message tracking
+
+`rmail_smtpd` and `rmail_outbound` publish protocol events over Unix datagram sockets beneath the
+mail root. Events are also stored in `_tracking/events.sqlite`; watch mode consumes the IPC feed
+directly and does not tail text logs.
+
+```bash
+sudo rmail_ctl watch
+sudo rmail_ctl watch --plain
+sudo rmail_ctl track message-19abc123
+```
+
+The full-screen SSH-friendly view shows active inbound/outbound connections, reverse-DNS names,
+SMTP phases and commands, reply codes, message IDs, and cumulative RX/TX bytes. `--plain` provides
+a streaming format for pipes and minimal terminals. AUTH payloads and message bodies are not
+recorded.
+
+Durable history is bounded through `[global.tracking]`: `retention_days` and `max_events` set the
+age and count limits, while `prune_interval_seconds` and `prune_batch_size` control incremental
+cleanup. Setting either retention limit to zero disables that individual limit.
 
 Outbound transport security:
 

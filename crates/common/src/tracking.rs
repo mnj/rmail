@@ -1,3 +1,4 @@
+use crate::config::TrackingConfig;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,15 @@ pub struct TrackingHub {
 impl TrackingHub {
     #[cfg(unix)]
     pub fn start(mail_root: &Path, service: &str) -> Result<Self> {
+        Self::start_with_config(mail_root, service, TrackingConfig::default())
+    }
+
+    #[cfg(unix)]
+    pub fn start_with_config(
+        mail_root: &Path,
+        service: &str,
+        config: TrackingConfig,
+    ) -> Result<Self> {
         use std::os::unix::net::UnixDatagram;
 
         let db_path = tracking_db_path(mail_root);
@@ -146,7 +156,7 @@ impl TrackingHub {
                         return;
                     }
                 };
-                run_event_loop(connection, socket, receiver, &watch_dir);
+                run_event_loop(connection, socket, receiver, &watch_dir, config);
                 let _ = std::fs::remove_file(socket_path);
             })
             .context("spawning event publisher")?;
@@ -172,9 +182,15 @@ fn run_event_loop(
     socket: std::os::unix::net::UnixDatagram,
     receiver: mpsc::Receiver<TrackingEvent>,
     watch_dir: &Path,
+    config: TrackingConfig,
 ) {
     let mut subscribers = HashSet::<PathBuf>::new();
     let mut subscribe_buffer = [0_u8; 4096];
+    if let Err(error) = prune_tracking_events(&connection, config, true) {
+        eprintln!("failed to prune tracking events at startup: {error}");
+    }
+    let prune_interval = Duration::from_secs(config.prune_interval_seconds.max(60));
+    let mut next_prune = std::time::Instant::now() + prune_interval;
     loop {
         loop {
             match socket.recv(&mut subscribe_buffer) {
@@ -206,6 +222,12 @@ fn run_event_loop(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
+        }
+        if std::time::Instant::now() >= next_prune {
+            if let Err(error) = prune_tracking_events(&connection, config, false) {
+                eprintln!("failed to prune tracking events: {error}");
+            }
+            next_prune = std::time::Instant::now() + prune_interval;
         }
     }
 }
@@ -242,9 +264,48 @@ fn open_tracking_db(path: &Path) -> Result<Connection> {
            bytes_out INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS events_message_id ON events(message_id, id);
-         CREATE INDEX IF NOT EXISTS events_connection_id ON events(connection_id, id);",
+         CREATE INDEX IF NOT EXISTS events_connection_id ON events(connection_id, id);
+         CREATE INDEX IF NOT EXISTS events_timestamp ON events(timestamp_ms, id);",
     )?;
     Ok(connection)
+}
+
+fn prune_tracking_events(
+    connection: &Connection,
+    config: TrackingConfig,
+    startup: bool,
+) -> Result<usize> {
+    let batch = i64::from(config.prune_batch_size.max(1));
+    let passes = if startup { 100 } else { 1 };
+    let mut removed = 0;
+    for _ in 0..passes {
+        let mut pass_removed = 0;
+        if config.retention_days != 0 {
+            let cutoff = now_millis().saturating_sub(
+                i64::from(config.retention_days).saturating_mul(24 * 60 * 60 * 1_000),
+            );
+            pass_removed += connection.execute(
+                "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE timestamp_ms < ?1 ORDER BY id LIMIT ?2)",
+                params![cutoff, batch],
+            )?;
+        }
+        if config.max_events != 0 {
+            let count: i64 =
+                connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+            let excess = count.saturating_sub(i64::try_from(config.max_events).unwrap_or(i64::MAX));
+            if excess > 0 {
+                pass_removed += connection.execute(
+                    "DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id LIMIT ?1)",
+                    [excess.min(batch)],
+                )?;
+            }
+        }
+        removed += pass_removed;
+        if pass_removed == 0 {
+            break;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(unix)]
@@ -380,5 +441,64 @@ mod tests {
         let event = event.sanitize();
 
         assert!(event.detail.unwrap().len() <= MAX_EVENT_DETAIL_BYTES);
+    }
+
+    #[test]
+    fn retention_prunes_old_and_excess_events_in_bounded_batches() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temporary.path().join("_tracking")).unwrap();
+        let connection = open_tracking_db(&tracking_db_path(temporary.path())).unwrap();
+        let insert = |timestamp_ms: i64| {
+            connection.execute(
+                "INSERT INTO events(timestamp_ms, service, connection_id, direction, kind, phase, bytes_in, bytes_out)
+                 VALUES(?1, 'smtpd', 'connection', 'inbound', 'reply', 'smtp_reply', 0, 0)",
+                [timestamp_ms],
+            ).unwrap();
+        };
+        insert(now_millis() - 3 * 24 * 60 * 60 * 1_000);
+        insert(now_millis() - 2 * 24 * 60 * 60 * 1_000);
+        insert(now_millis());
+        let age_config = TrackingConfig {
+            retention_days: 1,
+            max_events: 0,
+            prune_interval_seconds: 60,
+            prune_batch_size: 1,
+        };
+        assert_eq!(
+            prune_tracking_events(&connection, age_config, false).unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            prune_tracking_events(&connection, age_config, true).unwrap(),
+            1
+        );
+
+        for _ in 0..5 {
+            insert(now_millis());
+        }
+        let count_config = TrackingConfig {
+            retention_days: 0,
+            max_events: 2,
+            prune_interval_seconds: 60,
+            prune_batch_size: 2,
+        };
+        assert_eq!(
+            prune_tracking_events(&connection, count_config, true).unwrap(),
+            4
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }

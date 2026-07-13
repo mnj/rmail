@@ -215,7 +215,20 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&inflight_dir).await?;
     tokio::fs::create_dir_all(&sent_dir).await?;
     tokio::fs::create_dir_all(&failed_dir).await?;
-    let tracking = Arc::new(TrackingHub::start(&base, "outbound")?);
+    let tracking_config = match std::env::var("RMAIL_CONFIG") {
+        Ok(path) => {
+            rmail_common::config::Config::from_file(&path)
+                .with_context(|| format!("loading tracking configuration from {path}"))?
+                .global
+                .tracking
+        }
+        Err(_) => rmail_common::config::TrackingConfig::default(),
+    };
+    let tracking = Arc::new(TrackingHub::start_with_config(
+        &base,
+        "outbound",
+        tracking_config,
+    )?);
 
     let recovered = tokio::task::spawn_blocking({
         let maildrop_dir = maildrop_dir.clone();

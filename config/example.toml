@@ -37,6 +37,13 @@ imaps = ["[::]:993"]
 admin = ["127.0.0.1:8080"]
 webmail = ["127.0.0.1:8081"]
 
+[global.tracking]
+# Durable protocol/message history used by `rmail_ctl watch` and `track`.
+retention_days = 30
+max_events = 2000000
+prune_interval_seconds = 3600
+prune_batch_size = 10000
+
 [security]
 # Resource-exhaustion controls shared by SMTP, SMTPS, and submission listeners.
 smtp_max_concurrent_sessions = 1000
