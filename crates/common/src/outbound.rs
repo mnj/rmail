@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct QueueControl {
+    #[serde(default = "new_message_tracking_id")]
+    pub tracking_id: String,
     pub attempts: u32,
     pub max_attempts: u32,
     pub priority: i32,
@@ -21,11 +23,16 @@ pub struct QueueControl {
 
 impl QueueControl {
     pub fn new(max_attempts: u32, priority: i32) -> Self {
+        Self::new_with_tracking_id(max_attempts, priority, new_message_tracking_id())
+    }
+
+    pub fn new_with_tracking_id(max_attempts: u32, priority: i32, tracking_id: String) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         QueueControl {
+            tracking_id,
             attempts: 0,
             max_attempts,
             priority,
@@ -38,6 +45,7 @@ impl QueueControl {
     }
     pub fn default_with_timestamp(ts: i64) -> Self {
         QueueControl {
+            tracking_id: new_message_tracking_id(),
             attempts: 0,
             max_attempts: 5,
             priority: 0,
@@ -48,6 +56,10 @@ impl QueueControl {
             created_at: ts,
         }
     }
+}
+
+fn new_message_tracking_id() -> String {
+    crate::tracking::new_tracking_id("message")
 }
 
 pub fn control_path_for_eml(eml_path: &Path) -> PathBuf {
@@ -76,9 +88,10 @@ pub fn queue_outbound(
     )
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueOptions {
     pub require_tls: bool,
+    pub tracking_id: Option<String>,
 }
 
 pub fn queue_outbound_with_options(
@@ -137,7 +150,11 @@ pub fn queue_outbound_with_options(
 
     // Write and sync the sidecar before publishing the message. The message rename is the
     // commit marker: a queue reader never sees an `.eml` without its control record.
-    let control = QueueControl::new(5, 0);
+    let control = QueueControl::new_with_tracking_id(
+        5,
+        0,
+        options.tracking_id.unwrap_or_else(new_message_tracking_id),
+    );
     let control_json = serde_json::to_string(&control)?;
     let tmp_json = control_path_for_eml(&tmp_path);
     let mut control_file = File::create(&tmp_json)?;
@@ -195,7 +212,10 @@ mod tests {
             "to@example.test",
             b"Subject: secure\r\n\r\nbody\r\n",
             Some("from@example.test"),
-            QueueOptions { require_tls: true },
+            QueueOptions {
+                require_tls: true,
+                tracking_id: None,
+            },
         )
         .unwrap();
         let data = std::fs::read_to_string(queued).unwrap();

@@ -17,6 +17,7 @@ use rmail_common::{
     net::bind_tcp_listener_with_config,
     runtime::GracefulShutdown,
     scanner::{ScanAction, ScanEnvelope},
+    tracking::{TrackingEvent, TrackingHub, new_tracking_id},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
@@ -51,6 +52,19 @@ static SUBMISSION_MESSAGES: Lazy<Mutex<HashMap<String, VecDeque<Instant>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CONNECTION_ATTEMPTS: Lazy<Mutex<HashMap<IpAddr, VecDeque<Instant>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static TRACKING_HUB: once_cell::sync::OnceCell<Arc<TrackingHub>> = once_cell::sync::OnceCell::new();
+
+#[derive(Clone)]
+struct ConnectionTrace {
+    id: String,
+    local_addr: Option<SocketAddr>,
+}
+
+fn emit_tracking(event: TrackingEvent) {
+    if let Some(hub) = TRACKING_HUB.get() {
+        let _ = hub.emit(event);
+    }
+}
 
 const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DATA_LINE_BYTES: usize = 1000;
@@ -186,6 +200,13 @@ async fn main() -> Result<()> {
     let mail_root = cfg.global.mail_root.clone();
     rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "smtpd")
         .context("redirecting logs")?;
+    let tracking = Arc::new(
+        TrackingHub::start(std::path::Path::new(&mail_root), "smtpd")
+            .context("starting SMTP tracking hub")?,
+    );
+    TRACKING_HUB
+        .set(tracking)
+        .map_err(|_| anyhow::anyhow!("SMTP tracking hub was already initialized"))?;
     rmail_common::metrics::persist_prometheus_snapshot(std::path::Path::new(&mail_root), "smtpd")
         .context("initializing metrics snapshot")?;
     // SQLite DB is the authoritative source for mailboxes and catchalls
@@ -374,6 +395,15 @@ async fn run_plain_listener(
             peer,
             tls_ctx.is_some()
         );
+        let trace = ConnectionTrace {
+            id: new_tracking_id("smtp-conn"),
+            local_addr: stream.local_addr().ok(),
+        };
+        let mut connected =
+            TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "connected");
+        connected.peer_addr = Some(peer.to_string());
+        connected.local_addr = trace.local_addr.map(|address| address.to_string());
+        emit_tracking(connected);
         let mail_root = mail_root.clone();
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
@@ -411,6 +441,7 @@ async fn run_plain_listener(
                 true,
                 security,
                 service,
+                Some(trace),
             )
             .await
             {
@@ -446,6 +477,16 @@ async fn run_smtps_listener(
             accepted = listener.accept() => accepted?,
         };
         println!("Accepted SMTPS TCP connection on {} from {}", addr, peer);
+        let trace = ConnectionTrace {
+            id: new_tracking_id("smtp-conn"),
+            local_addr: stream.local_addr().ok(),
+        };
+        let mut connected =
+            TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "connected");
+        connected.peer_addr = Some(peer.to_string());
+        connected.local_addr = trace.local_addr.map(|address| address.to_string());
+        connected.detail = Some("implicit TLS listener".to_string());
+        emit_tracking(connected);
         let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
@@ -486,6 +527,7 @@ async fn run_smtps_listener(
                         true,
                         security,
                         service,
+                        Some(trace),
                     )
                     .await
                     {
@@ -668,9 +710,16 @@ async fn process_stream(
     send_greeting: bool,
     security: Arc<SecurityConfig>,
     service: SmtpService,
+    trace: Option<ConnectionTrace>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let implicit_tls = session_encrypted;
+    let trace = trace.unwrap_or_else(|| ConnectionTrace {
+        id: new_tracking_id("smtp-conn"),
+        local_addr: None,
+    });
+    let mut tracking_message_id: Option<String> = None;
+    let mut tracked_bytes_in = 0_u64;
     println!(
         "Starting SMTP session peer={:?} encrypted={} tls_configured={} enforce_dmarc={}",
         peer,
@@ -781,6 +830,27 @@ async fn process_stream(
             }
             _ => cmd.to_string(),
         };
+        if matches!(parsed_command, SmtpCommand::Mail(_)) {
+            tracking_message_id = Some(new_tracking_id("message"));
+        }
+        tracked_bytes_in = tracked_bytes_in.saturating_add(line.len() as u64);
+        let mut command_event = TrackingEvent::new(
+            "smtpd",
+            &trace.id,
+            "inbound",
+            "command",
+            logged_cmd
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or("unknown")
+                .to_ascii_lowercase(),
+        );
+        command_event.message_id = tracking_message_id.clone();
+        command_event.peer_addr = peer.map(|address| address.to_string());
+        command_event.local_addr = trace.local_addr.map(|address| address.to_string());
+        command_event.detail = Some(logged_cmd.clone());
+        command_event.bytes_in = tracked_bytes_in;
+        emit_tracking(command_event);
         println!(
             "SMTP peer={:?} encrypted={} cmd={:?} authed={:?} mail_from={:?} rcpt_count={}",
             peer,
@@ -893,6 +963,7 @@ async fn process_stream(
                 bdat_buffer.clear();
                 bdat_started = false;
                 rcpts.clear();
+                tracking_message_id = None;
             }
             SmtpCommand::Auth(auth_args) => {
                 let Some(parsed_auth) = protocol::parse_auth_args(auth_args) else {
@@ -1493,6 +1564,20 @@ async fn process_stream(
                 let mut data = bytes::Bytes::from(data);
 
                 let mut scanner_quarantine = false;
+                tracked_bytes_in = tracked_bytes_in.saturating_add(data.len() as u64);
+                let mut content_event = TrackingEvent::new(
+                    "smtpd",
+                    &trace.id,
+                    "inbound",
+                    "message",
+                    "content_received",
+                );
+                content_event.message_id = tracking_message_id.clone();
+                content_event.peer_addr = peer.map(|address| address.to_string());
+                content_event.local_addr = trace.local_addr.map(|address| address.to_string());
+                content_event.detail = Some(format!("{} recipients", rcpts.len()));
+                content_event.bytes_in = tracked_bytes_in;
+                emit_tracking(content_event);
                 if service == SmtpService::Submission
                     && security.submission_require_from_alignment
                     && !authenticated_user.as_deref().is_some_and(|user| {
@@ -1751,8 +1836,10 @@ async fn process_stream(
                                     let mr2 = mr.clone();
                                     let rcpt_c = rcpt.clone();
                                     let envelope = mail_from.clone();
-                                    let queue_options =
-                                        rmail_common::outbound::QueueOptions { require_tls };
+                                    let queue_options = rmail_common::outbound::QueueOptions {
+                                        require_tls,
+                                        tracking_id: tracking_message_id.clone(),
+                                    };
                                     let data_c = data.clone();
                                     match tokio::task::spawn_blocking(move || {
                                         rmail_common::outbound::queue_outbound_with_options(
@@ -1792,6 +1879,20 @@ async fn process_stream(
                     // Finalize DATA response based on per-recipient outcomes
                     let w = reader.get_mut();
                     if any_accepted {
+                        let mut accepted_event = TrackingEvent::new(
+                            "smtpd", &trace.id, "inbound", "message", "accepted",
+                        );
+                        accepted_event.message_id = tracking_message_id.clone();
+                        accepted_event.peer_addr = peer.map(|address| address.to_string());
+                        accepted_event.local_addr =
+                            trace.local_addr.map(|address| address.to_string());
+                        accepted_event.detail = Some(format!(
+                            "accepted recipients={} partial_failures={any_rejected}",
+                            rcpts.len()
+                        ));
+                        accepted_event.smtp_code = Some(250);
+                        accepted_event.bytes_in = tracked_bytes_in;
+                        emit_tracking(accepted_event);
                         metrics::inc_smtp_message_received(
                             peer,
                             implicit_tls,
@@ -1840,6 +1941,7 @@ async fn process_stream(
                 require_tls = false;
                 bdat_buffer.clear();
                 bdat_started = false;
+                tracking_message_id = None;
             }
             SmtpCommand::Rset => {
                 mail_from = None;
@@ -1850,6 +1952,7 @@ async fn process_stream(
                 bdat_buffer.clear();
                 bdat_started = false;
                 rcpts.clear();
+                tracking_message_id = None;
                 let w = reader.get_mut();
                 w.write_all(b"250 2.0.0 Reset state\r\n").await?;
                 w.flush().await?;
@@ -1915,6 +2018,7 @@ async fn process_stream(
                                 false,
                                 security.clone(),
                                 service,
+                                Some(trace.clone()),
                             ));
                             return fut.await;
                         }
@@ -1955,6 +2059,13 @@ async fn process_stream(
         "SMTP session peer={:?} encrypted={} closed",
         peer, session_encrypted
     );
+    let mut disconnected =
+        TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "disconnected");
+    disconnected.message_id = tracking_message_id;
+    disconnected.peer_addr = peer.map(|address| address.to_string());
+    disconnected.local_addr = trace.local_addr.map(|address| address.to_string());
+    disconnected.bytes_in = tracked_bytes_in;
+    emit_tracking(disconnected);
     Ok(())
 }
 
@@ -2091,6 +2202,7 @@ mod tests {
                 true,
                 Arc::new(security),
                 service,
+                None,
             )
             .await
         });
@@ -2264,6 +2376,7 @@ mod tests {
                 true,
                 Arc::new(SecurityConfig::default()),
                 SmtpService::Mta,
+                None,
             )
             .await
         });
@@ -2861,6 +2974,7 @@ mod tests {
             true,
             Arc::new(SecurityConfig::default()),
             SmtpService::Mta,
+            None,
         ));
         let mut reader = BufReader::new(client);
         let mut greeting = String::new();
@@ -2953,6 +3067,7 @@ mod tests {
             true,
             Arc::new(SecurityConfig::default()),
             SmtpService::Mta,
+            None,
         ));
         let mut plaintext = BufReader::new(client);
         let mut greeting = String::new();
@@ -3066,6 +3181,7 @@ mod tests {
             true,
             Arc::new(SecurityConfig::default()),
             SmtpService::Mta,
+            None,
         ));
         let mut reader = BufReader::new(client);
         let mut greeting = String::new();
