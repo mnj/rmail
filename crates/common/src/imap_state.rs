@@ -88,7 +88,10 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             subscribed INTEGER NOT NULL,
             uidvalidity INTEGER NOT NULL,
             uidnext INTEGER NOT NULL,
-            highest_modseq INTEGER NOT NULL DEFAULT 1
+            highest_modseq INTEGER NOT NULL DEFAULT 1,
+            new_generation INTEGER NOT NULL DEFAULT 0,
+            cur_generation INTEGER NOT NULL DEFAULT 0,
+            reconcile_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages(
             id INTEGER PRIMARY KEY,
@@ -130,6 +133,24 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "folders",
         "highest_modseq",
         "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "folders",
+        "new_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "folders",
+        "cur_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "folders",
+        "reconcile_count",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "messages", "save_date", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute(
@@ -1450,6 +1471,16 @@ fn reconcile_folder(
     let folder_id = folder_id(conn, name)?.context("missing folder")?;
     let dir = mailbox_dir(maildir_root, domain, localpart, name)?;
     ensure_maildir(&dir)?;
+    let new_generation = directory_generation(&dir.join("new"))?;
+    let cur_generation = directory_generation(&dir.join("cur"))?;
+    let stored_generations = conn.query_row(
+        "SELECT new_generation, cur_generation FROM folders WHERE id = ?1",
+        params![folder_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    if stored_generations == (new_generation, cur_generation) {
+        return Ok(());
+    }
     let mut disk = Vec::new();
     for subdir in ["new", "cur"] {
         let subpath = dir.join(subdir);
@@ -1538,7 +1569,33 @@ fn reconcile_folder(
             )?;
         }
     }
+    let new_generation = directory_generation(&dir.join("new"))?;
+    let cur_generation = directory_generation(&dir.join("cur"))?;
+    conn.execute(
+        "UPDATE folders
+         SET new_generation = ?1, cur_generation = ?2, reconcile_count = reconcile_count + 1
+         WHERE id = ?3",
+        params![new_generation, cur_generation, folder_id],
+    )?;
     Ok(())
+}
+
+fn directory_generation(path: &Path) -> Result<i64> {
+    use std::hash::{Hash, Hasher};
+
+    let metadata = fs::metadata(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    metadata.len().hash(&mut hasher);
+    metadata.modified()?.hash(&mut hasher);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.mtime().hash(&mut hasher);
+        metadata.mtime_nsec().hash(&mut hasher);
+        metadata.ctime().hash(&mut hasher);
+        metadata.ctime_nsec().hash(&mut hasher);
+    }
+    Ok(hasher.finish() as i64)
 }
 
 fn list_messages_for_folder(
@@ -1623,6 +1680,48 @@ mod tests {
         assert_eq!(folders.len(), STANDARD_FOLDERS.len());
         assert!(folders.iter().any(|f| f.name == "INBOX"));
         assert!(state_db_path(td.path(), "example.test", "user").is_file());
+    }
+
+    #[test]
+    fn unchanged_maildirs_are_served_without_reconciliation_scans() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let scan_count = || {
+            let connection =
+                Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+            connection
+                .query_row(
+                    "SELECT reconcile_count FROM folders WHERE name = 'INBOX'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap()
+        };
+
+        load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(scan_count(), 1);
+        load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        folder_summary(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(scan_count(), 1);
+
+        let inbox = mailbox_dir(td.path(), "example.test", "user", "INBOX").unwrap();
+        let external = write_msg(&inbox, "external", b"Subject: new\r\n\r\nbody");
+        assert_eq!(
+            load_folder(td.path(), "example.test", "user", "INBOX")
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        assert_eq!(scan_count(), 2);
+        fs::remove_file(external).unwrap();
+        assert!(
+            load_folder(td.path(), "example.test", "user", "INBOX")
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert_eq!(scan_count(), 3);
     }
 
     #[test]
