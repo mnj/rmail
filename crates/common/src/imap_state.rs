@@ -1362,6 +1362,98 @@ pub fn append_message_with_internal_date(
     Ok((folder.uidvalidity, uid))
 }
 
+/// Allocate a unique path for streaming an IMAP APPEND literal without holding
+/// the complete message in memory. The path is inside the account Maildir tmp
+/// directory and is not visible as a delivered message.
+pub fn append_staging_path(maildir_root: &Path, domain: &str, localpart: &str) -> Result<PathBuf> {
+    let directory = account_maildir(maildir_root, domain, localpart).join("tmp");
+    fs::create_dir_all(&directory)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(directory.join(format!(
+        ".append-stage.{}.{}.{}",
+        now,
+        std::process::id(),
+        rand::random::<u64>()
+    )))
+}
+
+/// Atomically publish a fully written APPEND staging file and index it in the
+/// destination mailbox. The staging file must have been allocated by
+/// [`append_staging_path`] for the same account.
+pub fn publish_staged_append(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    staged_path: &Path,
+    flags: Vec<String>,
+    internal_date: Option<(i64, i32)>,
+) -> Result<(u64, u64)> {
+    let expected_parent = account_maildir(maildir_root, domain, localpart).join("tmp");
+    let valid_stage = staged_path.parent() == Some(expected_parent.as_path())
+        && staged_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".append-stage."));
+    if !valid_stage {
+        anyhow::bail!("invalid APPEND staging path");
+    }
+    let metadata = fs::symlink_metadata(staged_path).context("reading APPEND staging file")?;
+    if !metadata.is_file() {
+        anyhow::bail!("APPEND staging path is not a regular file");
+    }
+
+    let name = normalize_mailbox_name(mailbox)?;
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if folder_id(&tx, &name)?.is_none() {
+        anyhow::bail!("destination mailbox does not exist");
+    }
+    reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
+
+    let directory = mailbox_dir(maildir_root, domain, localpart, &name)?;
+    ensure_maildir(&directory)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let (internaldate, internaldate_tz) = internal_date.unwrap_or((now.as_secs() as i64, 0));
+    let filename = format!(
+        "{}.{}.{}.append",
+        now.as_nanos(),
+        std::process::id(),
+        rand::random::<u64>()
+    );
+    set_file_mtime(staged_path, internaldate)?;
+    let new_path = directory.join("new").join(&filename);
+    fs::rename(staged_path, &new_path)?;
+    let new_guard = FileMutationGuard::copied(new_path);
+
+    let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
+    let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
+    let uid = allocatable_uid(i64::try_from(folder.uidnext).unwrap_or(i64::MAX))?;
+    let modseq = next_modseq(&tx, folder_id)?;
+    tx.execute(
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
+         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            folder_id,
+            filename,
+            uid as i64,
+            flags_to_text(&flags)?,
+            metadata.len() as i64,
+            internaldate,
+            internaldate_tz,
+            now.as_secs() as i64,
+            modseq as i64
+        ],
+    )?;
+    tx.execute(
+        "UPDATE folders SET uidnext = ?1 WHERE id = ?2",
+        params![uid.saturating_add(1) as i64, folder_id],
+    )?;
+    tx.commit()?;
+    new_guard.commit();
+    Ok((folder.uidvalidity, uid))
+}
+
 #[cfg(unix)]
 fn set_file_mtime(path: &Path, timestamp: i64) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -2621,5 +2713,34 @@ mod tests {
                 .exists()
         );
         assert!(!folder_exists(td.path(), "example.test", "user", "Projects").unwrap());
+    }
+
+    #[test]
+    fn staged_append_is_published_without_rewriting_message_bytes() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let staged = append_staging_path(td.path(), "example.test", "user").unwrap();
+        let message = b"Subject: staged\r\n\r\n\0binary\xffbody";
+        fs::write(&staged, message).unwrap();
+
+        let (uidvalidity, uid) = publish_staged_append(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            &staged,
+            vec!["\\Seen".to_string()],
+            Some((1_700_000_000, 60)),
+        )
+        .unwrap();
+
+        assert!(!staged.exists());
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(uidvalidity, folder.uidvalidity);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].uid, uid);
+        assert_eq!(messages[0].size, message.len() as u64);
+        assert_eq!(messages[0].flags, vec!["\\Seen"]);
+        assert_eq!(fs::read(&messages[0].path).unwrap(), message);
     }
 }
