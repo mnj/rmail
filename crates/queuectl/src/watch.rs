@@ -458,4 +458,31 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].connection_id, "two");
     }
+
+    #[test]
+    fn watcher_receives_events_from_both_smtp_services() {
+        let temporary = tempfile::tempdir().unwrap();
+        let smtpd = rmail_common::tracking::TrackingHub::start(temporary.path(), "smtpd").unwrap();
+        let outbound =
+            rmail_common::tracking::TrackingHub::start(temporary.path(), "outbound").unwrap();
+        let mut feed = EventFeed::connect(temporary.path()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        smtpd.emit(event("inbound-test", "mail", 1));
+        let mut outgoing = event("outbound-test", "rcpt", 2);
+        outgoing.service = "outbound".into();
+        outgoing.direction = "outbound".into();
+        outbound.emit(outgoing);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut services = HashSet::new();
+        while services.len() < 2 && std::time::Instant::now() < deadline {
+            if let Some(event) = feed.receive().unwrap() {
+                services.insert(event.service);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(services, HashSet::from(["smtpd".into(), "outbound".into()]));
+    }
 }
