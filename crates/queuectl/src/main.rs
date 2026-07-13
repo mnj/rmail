@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-mod watch;
+use rmail_queuectl::watch;
 
 /// rmail_queuectl: inspect and manage the on-disk outbound queue (queue/inflight/sent/failed)
 #[derive(Parser)]

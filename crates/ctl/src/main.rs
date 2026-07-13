@@ -100,6 +100,27 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Watch live inbound and outbound SMTP activity
+    Watch {
+        /// Mail root (defaults to RMAIL_MAIL_ROOT or ./mail)
+        #[arg(long)]
+        mail_root: Option<String>,
+        /// Print a stream instead of opening the full-screen interface
+        #[arg(long)]
+        plain: bool,
+        /// Number of durable events to load initially
+        #[arg(long, default_value_t = 250)]
+        history: usize,
+    },
+    /// Show durable tracking events for a message ID
+    Track {
+        message_id: String,
+        /// Mail root (defaults to RMAIL_MAIL_ROOT or ./mail)
+        #[arg(long)]
+        mail_root: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -230,6 +251,33 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("No db_path configured; SQLite DB is required");
                 std::process::exit(1);
+            }
+        }
+        Commands::Watch {
+            mail_root,
+            plain,
+            history,
+        } => {
+            let root = mail_root
+                .or_else(|| std::env::var("RMAIL_MAIL_ROOT").ok())
+                .unwrap_or_else(|| "./mail".into());
+            #[cfg(unix)]
+            rmail_queuectl::watch::run(Path::new(&root), plain, history)?;
+            #[cfg(not(unix))]
+            anyhow::bail!("watch requires Unix-domain sockets");
+        }
+        Commands::Track {
+            message_id,
+            mail_root,
+            limit,
+        } => {
+            let root = mail_root
+                .or_else(|| std::env::var("RMAIL_MAIL_ROOT").ok())
+                .unwrap_or_else(|| "./mail".into());
+            for event in
+                rmail_common::tracking::recent_events(Path::new(&root), limit, Some(&message_id))?
+            {
+                println!("{}", serde_json::to_string(&event)?);
             }
         }
         Commands::SendDmarcReports { config } => {
