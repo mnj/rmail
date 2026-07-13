@@ -106,6 +106,11 @@ fn execute_sort(
             internal_date,
             in_saved_result: saved_uids.binary_search(uid).is_ok(),
             now,
+            size: selected
+                .sizes
+                .get(uid)
+                .copied()
+                .unwrap_or(data.len() as u64) as usize,
             data: &data,
         };
         if parser::search_matches(&request.search, &message, selected.msgs.len()) {
@@ -143,6 +148,11 @@ fn execute_thread(
             internal_date,
             in_saved_result: saved_uids.binary_search(uid).is_ok(),
             now,
+            size: selected
+                .sizes
+                .get(uid)
+                .copied()
+                .unwrap_or(data.len() as u64) as usize,
             data: &data,
         };
         if parser::search_matches(&request.search, &search_message, selected.msgs.len()) {

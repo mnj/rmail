@@ -94,8 +94,13 @@ fn execute(
 ) -> anyhow::Result<Vec<(u64, u64)>> {
     let mut matches = Vec::new();
     let now = chrono::Utc::now().timestamp();
+    let needs_data = parser::search_requires_message_data(criterion);
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
-        let data = std::fs::read(path)?;
+        let data = if needs_data {
+            std::fs::read(path)?
+        } else {
+            Vec::new()
+        };
         let mut effective_flags = flags.clone();
         if selected.recent_uids.contains(uid) {
             effective_flags.push("\\Recent".to_string());
@@ -111,6 +116,7 @@ fn execute(
                 .unwrap_or(0),
             in_saved_result: saved_search_uids.binary_search(uid).is_ok(),
             now,
+            size: selected.sizes.get(uid).copied().unwrap_or(0) as usize,
             data: &data,
         };
         if parser::search_matches(criterion, &message, selected.msgs.len()) {
@@ -236,6 +242,39 @@ mod tests {
         assert_eq!(
             outcome.response.encode(),
             "A1 NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n"
+        );
+    }
+
+    #[test]
+    fn metadata_searches_do_not_open_message_files() {
+        let missing = std::path::PathBuf::from("/definitely/missing/rmail-message.eml");
+        let selected = SelectedMailbox {
+            domain: "example.test".to_string(),
+            local: "user".to_string(),
+            mailbox: "INBOX".to_string(),
+            uidvalidity: 1,
+            uidnext: 8,
+            highest_modseq: 1,
+            read_only: false,
+            msgs: vec![(7, missing, vec!["\\Seen".to_string()], 1)],
+            internal_dates: [(7, (1_700_000_000, 0))].into(),
+            save_dates: Default::default(),
+            sizes: [(7, 12_345)].into(),
+            recent_uids: Default::default(),
+        };
+
+        let criterion = parser::SearchCriterion::And(vec![
+            parser::SearchCriterion::Seen,
+            parser::SearchCriterion::Larger(10_000),
+        ]);
+        assert_eq!(execute(&selected, &criterion, &[]).unwrap(), vec![(1, 7)]);
+        assert!(
+            execute(
+                &selected,
+                &parser::SearchCriterion::Text("body".to_string()),
+                &[]
+            )
+            .is_err()
         );
     }
 }

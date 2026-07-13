@@ -843,7 +843,25 @@ pub(crate) struct SearchMessage<'a> {
     pub(crate) internal_date: i64,
     pub(crate) in_saved_result: bool,
     pub(crate) now: i64,
+    pub(crate) size: usize,
     pub(crate) data: &'a [u8],
+}
+
+pub(crate) fn search_requires_message_data(criterion: &SearchCriterion) -> bool {
+    match criterion {
+        SearchCriterion::SentSince(_)
+        | SearchCriterion::SentBefore(_)
+        | SearchCriterion::SentOn(_)
+        | SearchCriterion::Header(_, _)
+        | SearchCriterion::Body(_)
+        | SearchCriterion::Text(_) => true,
+        SearchCriterion::Not(inner) => search_requires_message_data(inner),
+        SearchCriterion::Or(left, right) => {
+            search_requires_message_data(left) || search_requires_message_data(right)
+        }
+        SearchCriterion::And(items) => items.iter().any(search_requires_message_data),
+        _ => false,
+    }
 }
 
 pub(crate) fn tokenize_search(input: &str) -> Result<Vec<String>, ()> {
@@ -1354,8 +1372,8 @@ pub(crate) fn search_matches(
         SearchCriterion::SentOn(date) => message_sent_date(msg.data)
             .map(|msg_date| msg_date == *date)
             .unwrap_or(false),
-        SearchCriterion::Larger(size) => msg.data.len() > *size,
-        SearchCriterion::Smaller(size) => msg.data.len() < *size,
+        SearchCriterion::Larger(size) => msg.size > *size,
+        SearchCriterion::Smaller(size) => msg.size < *size,
         SearchCriterion::Header(name, value) => crate::mailbox::header_value(msg.data, name)
             .map(|header| header.to_lowercase().contains(&value.to_lowercase()))
             .unwrap_or(false),
