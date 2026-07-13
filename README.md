@@ -105,3 +105,6 @@ or conformance-validation gaps.
 
 IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, `PREVIEW`,
 and `SNIPPET` are not currently advertised.
+
+Repeatable storage and queue performance workloads are documented in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
