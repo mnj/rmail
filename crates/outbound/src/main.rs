@@ -114,6 +114,48 @@ struct SmtpConnection {
     reader: BufReader<Box<dyn AsyncStream>>,
     capabilities: SmtpCapabilities,
     encrypted: bool,
+    connection_id: String,
+    peer_addr: Option<String>,
+    local_addr: Option<String>,
+}
+
+struct DeliveryTrace<'a> {
+    hub: &'a TrackingHub,
+    connection_id: &'a str,
+    message_id: &'a str,
+    peer_addr: Option<String>,
+    local_addr: Option<String>,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+impl DeliveryTrace<'_> {
+    fn emit(&self, kind: &str, phase: &str, detail: Option<String>, code: Option<u16>) {
+        let mut event = TrackingEvent::new("outbound", self.connection_id, "outbound", kind, phase);
+        event.message_id = Some(self.message_id.to_string());
+        event.peer_addr = self.peer_addr.clone();
+        event.local_addr = self.local_addr.clone();
+        event.detail = detail;
+        event.smtp_code = code;
+        event.bytes_in = self.bytes_in;
+        event.bytes_out = self.bytes_out;
+        self.hub.emit(event);
+    }
+
+    fn command(&mut self, phase: &str, command: &str, bytes: usize) {
+        self.bytes_out = self.bytes_out.saturating_add(bytes as u64);
+        self.emit("command", phase, Some(command.trim_end().to_string()), None);
+    }
+
+    fn reply(&mut self, phase: &str, code: u16, response: &str) {
+        self.bytes_in = self.bytes_in.saturating_add(response.len() as u64);
+        self.emit(
+            "reply",
+            phase,
+            Some(response.trim().to_string()),
+            Some(code),
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -410,7 +452,15 @@ async fn process_claim(
         return;
     }
 
-    match process_file(&inflight_eml, &base, &connections).await {
+    match process_file(
+        &inflight_eml,
+        &base,
+        &connections,
+        &tracking,
+        &control.tracking_id,
+    )
+    .await
+    {
         Ok(()) => {
             emit("delivery", "delivered", Some(fname.clone()), Some(250));
             let destination = sent_dir.join(&fname);
@@ -488,9 +538,11 @@ async fn process_file(
     path: &Path,
     base: &Path,
     connections: &ConnectionPool,
+    tracking: &TrackingHub,
+    tracking_id: &str,
 ) -> anyhow::Result<()> {
     let message = inspect_queued_message(path).await?;
-    deliver_to_remote(base, path, message, connections).await
+    deliver_to_remote(base, path, message, connections, tracking, tracking_id).await
 }
 
 async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
@@ -1009,6 +1061,7 @@ async fn smtp_send_with_reader(
         &requirements,
         false,
         capabilities,
+        None,
     )
     .await?;
 
@@ -1065,6 +1118,7 @@ async fn smtp_send_file_with_reader(
     envelope_from: Option<&str>,
     recipient: &str,
     capabilities: &SmtpCapabilities,
+    mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
     smtp_begin_transaction(
         reader,
@@ -1073,13 +1127,21 @@ async fn smtp_send_file_with_reader(
         &message.requirements,
         message.require_tls,
         capabilities,
+        trace.as_deref_mut(),
     )
     .await?;
 
     if capabilities.chunking {
-        stream_bdat_file(reader, message_path, message.body_offset, message.body_len).await
+        stream_bdat_file(
+            reader,
+            message_path,
+            message.body_offset,
+            message.body_len,
+            trace,
+        )
+        .await
     } else {
-        stream_data_file(reader, message_path, message.body_offset).await
+        stream_data_file(reader, message_path, message.body_offset, trace).await
     }
 }
 
@@ -1090,6 +1152,7 @@ async fn smtp_begin_transaction(
     requirements: &MessageRequirements,
     require_tls: bool,
     capabilities: &SmtpCapabilities,
+    mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
     let mailcmd = build_mail_from_command_for_requirements(
         envelope_from,
@@ -1099,16 +1162,28 @@ async fn smtp_begin_transaction(
     )?;
 
     reader.get_mut().write_all(mailcmd.as_bytes()).await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.command("mail", &mailcmd, mailcmd.len());
+    }
     reader.get_mut().flush().await?;
     let (code, resp) = read_response(&mut *reader).await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.reply("mail", code, &resp);
+    }
     if code / 100 != 2 {
         return Err(rejected("MAIL FROM", code, resp));
     }
 
     let rcptcmd = format!("RCPT TO:<{}>\r\n", recipient);
     reader.get_mut().write_all(rcptcmd.as_bytes()).await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.command("rcpt", &rcptcmd, rcptcmd.len());
+    }
     reader.get_mut().flush().await?;
     let (code, resp) = read_response(&mut *reader).await?;
+    if let Some(trace) = trace {
+        trace.reply("rcpt", code, &resp);
+    }
     if code / 100 != 2 {
         return Err(rejected("RCPT TO", code, resp));
     }
@@ -1130,6 +1205,7 @@ async fn stream_bdat_file(
     message_path: &Path,
     body_offset: u64,
     body_len: u64,
+    mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
     let mut file = open_message_body(message_path, body_offset).await?;
     let mut remaining = body_len;
@@ -1143,12 +1219,21 @@ async fn stream_bdat_file(
             format!("BDAT {chunk_len}\r\n")
         };
         reader.get_mut().write_all(command.as_bytes()).await?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.command("bdat", &command, command.len());
+        }
         if chunk_len != 0 {
             file.read_exact(&mut buffer[..chunk_len]).await?;
             reader.get_mut().write_all(&buffer[..chunk_len]).await?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.bytes_out = trace.bytes_out.saturating_add(chunk_len as u64);
+            }
         }
         reader.get_mut().flush().await?;
         let (code, response) = read_response(&mut *reader).await?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.reply("bdat", code, &response);
+        }
         if code / 100 != 2 {
             return Err(rejected("BDAT", code, response));
         }
@@ -1163,12 +1248,19 @@ async fn stream_data_file(
     reader: &mut BufReader<Box<dyn AsyncStream>>,
     message_path: &Path,
     body_offset: u64,
+    mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
     let file = open_message_body(message_path, body_offset).await?;
     let mut body = BufReader::new(file);
     reader.get_mut().write_all(b"DATA\r\n").await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.command("data", "DATA", 6);
+    }
     reader.get_mut().flush().await?;
     let (code, response) = read_response(&mut *reader).await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.reply("data", code, &response);
+    }
     if code != 354 {
         return Err(rejected("DATA", code, response));
     }
@@ -1190,13 +1282,25 @@ async fn stream_data_file(
         };
         if line.starts_with(b".") {
             reader.get_mut().write_all(b".").await?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.bytes_out += 1;
+            }
         }
         reader.get_mut().write_all(line).await?;
         reader.get_mut().write_all(b"\r\n").await?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.bytes_out = trace.bytes_out.saturating_add((line.len() + 2) as u64);
+        }
     }
     reader.get_mut().write_all(b".\r\n").await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.bytes_out = trace.bytes_out.saturating_add(3);
+    }
     reader.get_mut().flush().await?;
     let (code, response) = read_response(&mut *reader).await?;
+    if let Some(trace) = trace {
+        trace.reply("data_complete", code, &response);
+    }
     if code / 100 != 2 {
         return Err(rejected("DATA body", code, response));
     }
@@ -1672,6 +1776,8 @@ async fn deliver_to_remote(
     message_path: &Path,
     message: QueuedMessage,
     connections: &ConnectionPool,
+    tracking: &TrackingHub,
+    tracking_id: &str,
 ) -> anyhow::Result<()> {
     let recipient = rmail_common::domain::canonicalize_mailbox_address(&message.envelope_to)
         .context("canonicalizing recipient IDN")?;
@@ -1789,7 +1895,17 @@ async fn deliver_to_remote(
         };
         let connection = match connections.take(&key).await {
             Some(mut connection) if !transport_tls_required || connection.encrypted => {
-                match smtp_noop(&mut connection).await {
+                let pooled_connection_id = connection.connection_id.clone();
+                let mut noop_trace = DeliveryTrace {
+                    hub: tracking,
+                    connection_id: &pooled_connection_id,
+                    message_id: tracking_id,
+                    peer_addr: connection.peer_addr.clone(),
+                    local_addr: connection.local_addr.clone(),
+                    bytes_in: 0,
+                    bytes_out: 0,
+                };
+                match smtp_noop(&mut connection, Some(&mut noop_trace)).await {
                     Ok(()) => Ok(connection),
                     Err(error) => {
                         eprintln!(
@@ -1802,6 +1918,8 @@ async fn deliver_to_remote(
                             key.port,
                             transport_tls_required,
                             message.require_tls,
+                            tracking,
+                            tracking_id,
                         )
                         .await
                     }
@@ -1814,6 +1932,8 @@ async fn deliver_to_remote(
                     key.port,
                     transport_tls_required,
                     message.require_tls,
+                    tracking,
+                    tracking_id,
                 )
                 .await
             }
@@ -1825,21 +1945,45 @@ async fn deliver_to_remote(
                 continue;
             }
         };
+        let mut trace = DeliveryTrace {
+            hub: tracking,
+            connection_id: &connection.connection_id,
+            message_id: tracking_id,
+            peer_addr: connection.peer_addr.clone(),
+            local_addr: connection.local_addr.clone(),
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        trace.emit(
+            "transaction",
+            "transaction_started",
+            Some(format!("{}:{}", key.host, key.port)),
+            None,
+        );
+        let capabilities = connection.capabilities;
         match smtp_send_file_with_reader(
             &mut connection.reader,
             message_path,
             &message,
             envelope_from.as_deref(),
             &recipient,
-            &connection.capabilities,
+            &capabilities,
+            Some(&mut trace),
         )
         .await
         {
             Ok(()) => {
+                trace.emit(
+                    "transaction",
+                    "delivered",
+                    Some(recipient.clone()),
+                    Some(250),
+                );
                 connections.recycle(key, connection).await;
                 return Ok(());
             }
             Err(error) => {
+                trace.emit("transaction", "failed", Some(error.to_string()), None);
                 // A definitive 5xx/policy failure applies to the recipient and
                 // must not be hidden by trying a lower-priority MX. Transient
                 // replies and transport failures should fall through to the
@@ -1894,10 +2038,19 @@ async fn deliver_to_remote(
     Err(error)
 }
 
-async fn smtp_noop(connection: &mut SmtpConnection) -> anyhow::Result<()> {
+async fn smtp_noop(
+    connection: &mut SmtpConnection,
+    mut trace: Option<&mut DeliveryTrace<'_>>,
+) -> anyhow::Result<()> {
     connection.reader.get_mut().write_all(b"NOOP\r\n").await?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.command("noop", "NOOP", 6);
+    }
     connection.reader.get_mut().flush().await?;
     let (code, response) = read_response(&mut connection.reader).await?;
+    if let Some(trace) = trace {
+        trace.reply("noop", code, &response);
+    }
     if code / 100 != 2 {
         return Err(rejected("NOOP", code, response));
     }
@@ -1910,8 +2063,28 @@ async fn establish_smtp_connection(
     port: u16,
     require_encryption: bool,
     requiretls_message: bool,
+    tracking: &TrackingHub,
+    tracking_id: &str,
 ) -> anyhow::Result<SmtpConnection> {
     let stream = connect_host_with_fallback(resolver, host, port).await?;
+    let peer_addr = stream.peer_addr().ok().map(|address| address.to_string());
+    let local_addr = stream.local_addr().ok().map(|address| address.to_string());
+    let connection_id = new_tracking_id("smtp-out");
+    let mut trace = DeliveryTrace {
+        hub: tracking,
+        connection_id: &connection_id,
+        message_id: tracking_id,
+        peer_addr: peer_addr.clone(),
+        local_addr: local_addr.clone(),
+        bytes_in: 0,
+        bytes_out: 0,
+    };
+    trace.emit(
+        "connection",
+        "connected",
+        Some(format!("{host}:{port}")),
+        None,
+    );
     let mut encrypted = port == 465;
     let boxed_stream: Box<dyn AsyncStream> = if encrypted {
         let native = NativeTlsConnector::builder()
@@ -1928,17 +2101,22 @@ async fn establish_smtp_connection(
     let mut reader = BufReader::new(boxed_stream);
 
     let (code, banner) = read_response(&mut reader).await?;
+    trace.reply("greeting", code, &banner);
     if code != 220 {
         return Err(rejected("connection greeting", code, banner));
     }
 
     reader.get_mut().write_all(b"EHLO rmail\r\n").await?;
+    trace.command("ehlo", "EHLO rmail", 12);
     reader.get_mut().flush().await?;
     let (code, ehlo_response) = read_response(&mut reader).await?;
+    trace.reply("ehlo", code, &ehlo_response);
     let mut capabilities = if code != 250 {
         reader.get_mut().write_all(b"HELO rmail\r\n").await?;
+        trace.command("helo", "HELO rmail", 12);
         reader.get_mut().flush().await?;
         let (code, response) = read_response(&mut reader).await?;
+        trace.reply("helo", code, &response);
         if code != 250 {
             return Err(rejected("HELO", code, response));
         }
@@ -1949,8 +2127,10 @@ async fn establish_smtp_connection(
 
     if port != 465 && capabilities.starttls {
         reader.get_mut().write_all(b"STARTTLS\r\n").await?;
+        trace.command("starttls", "STARTTLS", 10);
         reader.get_mut().flush().await?;
         let (code, response) = read_response(&mut reader).await?;
+        trace.reply("starttls", code, &response);
         if code != 220 {
             return Err(rejected("STARTTLS", code, response));
         }
@@ -1964,14 +2144,19 @@ async fn establish_smtp_connection(
             .context("TLS connect failed")?;
         reader = BufReader::new(Box::new(tls_stream));
         encrypted = true;
+        trace.emit("tls", "encrypted", Some(host.to_string()), None);
 
         reader.get_mut().write_all(b"EHLO rmail\r\n").await?;
+        trace.command("ehlo", "EHLO rmail", 12);
         reader.get_mut().flush().await?;
         let (code, ehlo_response) = read_response(&mut reader).await?;
+        trace.reply("ehlo", code, &ehlo_response);
         if code != 250 {
             reader.get_mut().write_all(b"HELO rmail\r\n").await?;
+            trace.command("helo", "HELO rmail", 12);
             reader.get_mut().flush().await?;
             let (code, response) = read_response(&mut reader).await?;
+            trace.reply("helo", code, &response);
             if code != 250 {
                 return Err(rejected("HELO after STARTTLS", code, response));
             }
@@ -1995,6 +2180,9 @@ async fn establish_smtp_connection(
         reader,
         capabilities,
         encrypted,
+        connection_id,
+        peer_addr,
+        local_addr,
     })
 }
 
@@ -2374,6 +2562,7 @@ mod tests {
                 binary_mime: true,
                 require_tls: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2394,6 +2583,9 @@ mod tests {
                 reader: BufReader::new(Box::new(first_client)),
                 capabilities: SmtpCapabilities::default(),
                 encrypted: false,
+                connection_id: "first".into(),
+                peer_addr: None,
+                local_addr: None,
             },
         )
         .await;
@@ -2404,6 +2596,9 @@ mod tests {
                 reader: BufReader::new(Box::new(second_client)),
                 capabilities: SmtpCapabilities::default(),
                 encrypted: false,
+                connection_id: "second".into(),
+                peer_addr: None,
+                local_addr: None,
             },
         )
         .await;
@@ -2418,6 +2613,42 @@ mod tests {
         );
         assert!(pool.take(&key).await.is_some());
         assert!(pool.take(&key).await.is_none());
+    }
+
+    #[test]
+    fn delivery_trace_persists_protocol_steps_and_cumulative_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let hub = TrackingHub::start(temporary.path(), "outbound").unwrap();
+        let mut trace = DeliveryTrace {
+            hub: &hub,
+            connection_id: "smtp-out-test",
+            message_id: "message-test",
+            peer_addr: Some("192.0.2.25:25".into()),
+            local_addr: Some("192.0.2.10:40000".into()),
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        trace.command("mail", "MAIL FROM:<sender@example.test>\r\n", 33);
+        trace.reply("mail", 250, "250 2.1.0 accepted\r\n");
+        drop(trace);
+        drop(hub);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let events = loop {
+            let events =
+                rmail_common::tracking::recent_events(temporary.path(), 10, Some("message-test"))
+                    .unwrap();
+            if events.len() == 2 || std::time::Instant::now() >= deadline {
+                break events;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "command");
+        assert_eq!(events[0].bytes_out, 33);
+        assert_eq!(events[1].smtp_code, Some(250));
+        assert_eq!(events[1].bytes_in, 20);
+        assert_eq!(events[1].bytes_out, 33);
     }
 
     #[tokio::test]
