@@ -1,6 +1,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use native_tls::TlsConnector as NativeTlsConnector;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,31 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + ?Sized> As
 
 const MAX_QUEUE_METADATA_BYTES: usize = 64 * 1024;
 const BDAT_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_MTA_STS_POLICY_BYTES: usize = 64 * 1024;
+const MAX_MTA_STS_CACHE_ENTRIES: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MtaStsMode {
+    Enforce,
+    Testing,
+    None,
+}
+
+#[derive(Debug, Clone)]
+struct MtaStsPolicy {
+    mode: MtaStsMode,
+    mx: Vec<String>,
+    max_age: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMtaStsPolicy {
+    policy: MtaStsPolicy,
+    expires: Instant,
+}
+
+static MTA_STS_CACHE: Lazy<Mutex<HashMap<String, CachedMtaStsPolicy>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MessageRequirements {
@@ -39,6 +65,7 @@ struct QueuedMessage {
     body_offset: u64,
     body_len: u64,
     requirements: MessageRequirements,
+    require_tls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,6 +77,7 @@ struct DestinationKey {
 struct SmtpConnection {
     reader: BufReader<Box<dyn AsyncStream>>,
     capabilities: SmtpCapabilities,
+    encrypted: bool,
 }
 
 #[derive(Clone)]
@@ -375,7 +403,7 @@ async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
     if body_offset > file_len {
         anyhow::bail!("queued message metadata extends beyond the file");
     }
-    let (envelope_from, envelope_to) = parse_queue_metadata(&metadata)?;
+    let (envelope_from, envelope_to, require_tls) = parse_queue_metadata(&metadata)?;
     let body_len = file_len - body_offset;
     let requirements =
         scan_message_requirements(path, body_offset, envelope_from.as_deref(), &envelope_to)
@@ -386,6 +414,7 @@ async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
         body_offset,
         body_len,
         requirements,
+        require_tls,
     })
 }
 
@@ -423,11 +452,12 @@ async fn read_queue_metadata(reader: &mut BufReader<File>) -> anyhow::Result<Vec
     }
 }
 
-fn parse_queue_metadata(metadata: &[u8]) -> anyhow::Result<(Option<String>, String)> {
+fn parse_queue_metadata(metadata: &[u8]) -> anyhow::Result<(Option<String>, String, bool)> {
     let metadata =
         std::str::from_utf8(metadata).context("queued message metadata is not valid UTF-8")?;
     let mut envelope_from = None;
     let mut envelope_to = None;
+    let mut require_tls = false;
     for raw_line in metadata.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
@@ -454,11 +484,16 @@ fn parse_queue_metadata(metadata: &[u8]) -> anyhow::Result<(Option<String>, Stri
                 anyhow::bail!("queued message envelope recipient is empty");
             }
             envelope_to = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("X-RMail-Require-TLS:") {
+            if require_tls || !value.trim().eq_ignore_ascii_case("yes") {
+                anyhow::bail!("invalid or duplicate REQUIRETLS queue metadata");
+            }
+            require_tls = true;
         }
     }
     let envelope_to = envelope_to
         .ok_or_else(|| anyhow::anyhow!("no envelope recipient found in queued message"))?;
-    Ok((envelope_from, envelope_to))
+    Ok((envelope_from, envelope_to, require_tls))
 }
 
 struct MessageAnalyzer {
@@ -871,6 +906,7 @@ async fn smtp_send_with_reader(
         envelope_from,
         recipient,
         &requirements,
+        false,
         capabilities,
     )
     .await?;
@@ -934,6 +970,7 @@ async fn smtp_send_file_with_reader(
         envelope_from,
         recipient,
         &message.requirements,
+        message.require_tls,
         capabilities,
     )
     .await?;
@@ -950,10 +987,15 @@ async fn smtp_begin_transaction(
     envelope_from: Option<&str>,
     recipient: &str,
     requirements: &MessageRequirements,
+    require_tls: bool,
     capabilities: &SmtpCapabilities,
 ) -> anyhow::Result<()> {
-    let mailcmd =
-        build_mail_from_command_for_requirements(envelope_from, requirements, capabilities)?;
+    let mailcmd = build_mail_from_command_for_requirements(
+        envelope_from,
+        requirements,
+        require_tls,
+        capabilities,
+    )?;
 
     reader.get_mut().write_all(mailcmd.as_bytes()).await?;
     reader.get_mut().flush().await?;
@@ -1099,7 +1141,7 @@ fn build_mail_from_command(
     capabilities: &SmtpCapabilities,
 ) -> anyhow::Result<String> {
     let requirements = requirements_for_bytes(envelope_from, recipient, body);
-    build_mail_from_command_for_requirements(envelope_from, &requirements, capabilities)
+    build_mail_from_command_for_requirements(envelope_from, &requirements, false, capabilities)
 }
 
 #[cfg(test)]
@@ -1126,6 +1168,7 @@ fn requirements_for_bytes(
 fn build_mail_from_command_for_requirements(
     envelope_from: Option<&str>,
     requirements: &MessageRequirements,
+    require_tls: bool,
     capabilities: &SmtpCapabilities,
 ) -> anyhow::Result<String> {
     if requirements.smtp_utf8 && !capabilities.smtp_utf8 {
@@ -1136,6 +1179,12 @@ fn build_mail_from_command_for_requirements(
     }
     if requirements.binary_mime && (!capabilities.chunking || !capabilities.binary_mime) {
         anyhow::bail!("remote server does not support required CHUNKING and BINARYMIME");
+    }
+    if require_tls && !capabilities.require_tls {
+        return Err(permanent_delivery_error(
+            "remote server does not advertise REQUIRETLS",
+            Some("5.7.30"),
+        ));
     }
 
     let mfrom = envelope_from.unwrap_or("");
@@ -1148,6 +1197,9 @@ fn build_mail_from_command_for_requirements(
     if requirements.smtp_utf8 {
         mailcmd.push_str(" SMTPUTF8");
     }
+    if require_tls {
+        mailcmd.push_str(" REQUIRETLS");
+    }
     mailcmd.push_str("\r\n");
     Ok(mailcmd)
 }
@@ -1159,6 +1211,7 @@ struct SmtpCapabilities {
     starttls: bool,
     chunking: bool,
     binary_mime: bool,
+    require_tls: bool,
 }
 
 fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
@@ -1183,9 +1236,334 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.chunking = true;
         } else if keyword.eq_ignore_ascii_case("BINARYMIME") {
             capabilities.binary_mime = true;
+        } else if keyword.eq_ignore_ascii_case("REQUIRETLS") {
+            capabilities.require_tls = true;
         }
     }
     capabilities
+}
+
+fn parse_mta_sts_dns_id(records: &[String]) -> Option<String> {
+    let mut ids = records.iter().filter_map(|record| {
+        let mut version = false;
+        let mut id = None;
+        for field in record.split(';').map(str::trim) {
+            if field.eq_ignore_ascii_case("v=STSv1") {
+                version = true;
+            } else if let Some((name, value)) = field.split_once('=')
+                && name.eq_ignore_ascii_case("id")
+                && !value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                id = Some(value.to_string());
+            }
+        }
+        version.then_some(id).flatten()
+    });
+    let id = ids.next()?;
+    ids.next().is_none().then_some(id)
+}
+
+fn parse_mta_sts_policy(text: &str) -> anyhow::Result<MtaStsPolicy> {
+    let mut version = None;
+    let mut mode = None;
+    let mut mx = Vec::new();
+    let mut max_age = None;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid MTA-STS policy line"))?;
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "version" if version.is_none() => version = Some(value.to_string()),
+            "mode" if mode.is_none() => {
+                mode = Some(match value.to_ascii_lowercase().as_str() {
+                    "enforce" => MtaStsMode::Enforce,
+                    "testing" => MtaStsMode::Testing,
+                    "none" => MtaStsMode::None,
+                    _ => anyhow::bail!("invalid MTA-STS mode"),
+                });
+            }
+            "mx" => {
+                let raw_pattern = value.trim_end_matches('.').to_ascii_lowercase();
+                let wildcard = raw_pattern.starts_with("*.");
+                let suffix = raw_pattern.strip_prefix("*.").unwrap_or(&raw_pattern);
+                if raw_pattern.is_empty() || suffix.contains('*') {
+                    anyhow::bail!("invalid MTA-STS MX pattern");
+                }
+                let suffix = rmail_common::domain::canonicalize_domain(suffix)?;
+                mx.push(if wildcard {
+                    format!("*.{suffix}")
+                } else {
+                    suffix
+                });
+            }
+            "max_age" if max_age.is_none() => {
+                max_age = Some(Duration::from_secs(value.parse::<u64>()?));
+            }
+            _ => {}
+        }
+    }
+    if version.as_deref() != Some("STSv1") {
+        anyhow::bail!("unsupported MTA-STS policy version");
+    }
+    let mode = mode.ok_or_else(|| anyhow::anyhow!("MTA-STS policy has no mode"))?;
+    let max_age = max_age.ok_or_else(|| anyhow::anyhow!("MTA-STS policy has no max_age"))?;
+    if mode != MtaStsMode::None && mx.is_empty() {
+        anyhow::bail!("MTA-STS enforce/testing policy has no MX patterns");
+    }
+    Ok(MtaStsPolicy { mode, mx, max_age })
+}
+
+fn mta_sts_matches_mx(policy: &MtaStsPolicy, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    policy.mx.iter().any(|pattern| {
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            host.strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
+        } else {
+            host == *pattern
+        }
+    })
+}
+
+async fn mta_sts_policy_for_domain(
+    resolver: &TokioAsyncResolver,
+    domain: &str,
+) -> Option<MtaStsPolicy> {
+    let now = Instant::now();
+    if let Some(cached) = MTA_STS_CACHE.lock().await.get(domain).cloned()
+        && cached.expires > now
+    {
+        return Some(cached.policy);
+    }
+    let lookup = resolver
+        .txt_lookup(format!("_mta-sts.{domain}"))
+        .await
+        .ok()?;
+    let records = lookup
+        .iter()
+        .map(|record| {
+            record
+                .txt_data()
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .map(char::from)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let _id = parse_mta_sts_dns_id(&records)?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?
+        .get(format!("https://mta-sts.{domain}/.well-known/mta-sts.txt"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"))
+        })
+    {
+        return None;
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MTA_STS_POLICY_BYTES as u64)
+    {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    if bytes.len() > MAX_MTA_STS_POLICY_BYTES {
+        return None;
+    }
+    let policy = parse_mta_sts_policy(std::str::from_utf8(&bytes).ok()?).ok()?;
+    let mut cache = MTA_STS_CACHE.lock().await;
+    cache.retain(|_, entry| entry.expires > now);
+    if cache.len() >= MAX_MTA_STS_CACHE_ENTRIES
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires)
+            .map(|(domain, _)| domain.clone())
+    {
+        cache.remove(&oldest);
+    }
+    let expires = now.checked_add(policy.max_age).unwrap_or(now);
+    cache.insert(
+        domain.to_string(),
+        CachedMtaStsPolicy {
+            policy: policy.clone(),
+            expires,
+        },
+    );
+    Some(policy)
+}
+
+async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> Vec<String> {
+    let Ok(lookup) = resolver.txt_lookup(format!("_smtp._tls.{domain}")).await else {
+        return Vec::new();
+    };
+    let valid_records = lookup
+        .iter()
+        .filter_map(|record| {
+            let value = record
+                .txt_data()
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .map(char::from)
+                .collect::<String>();
+            let mut valid_version = false;
+            let mut recipients = Vec::new();
+            for field in value.split(';').map(str::trim) {
+                if field.eq_ignore_ascii_case("v=TLSRPTv1") {
+                    valid_version = true;
+                } else if let Some((name, addresses)) = field.split_once('=')
+                    && name.eq_ignore_ascii_case("rua")
+                {
+                    recipients.extend(addresses.split(',').filter_map(|uri| {
+                        uri.trim()
+                            .strip_prefix("mailto:")
+                            .map(str::trim)
+                            .filter(|address| !address.is_empty())
+                            .and_then(|address| {
+                                rmail_common::domain::canonicalize_mailbox_address(address).ok()
+                            })
+                    }));
+                }
+            }
+            valid_version.then_some(recipients)
+        })
+        .collect::<Vec<_>>();
+    if valid_records.len() != 1 {
+        return Vec::new();
+    }
+    let candidates = valid_records.into_iter().flatten().take(10);
+    let mut authorized = Vec::new();
+    for recipient in candidates {
+        let Some((_, report_domain)) = recipient.rsplit_once('@') else {
+            continue;
+        };
+        if report_domain.eq_ignore_ascii_case(domain) {
+            authorized.push(recipient);
+            continue;
+        }
+        let authorization_name = format!("{domain}._report._smtp._tls.{report_domain}");
+        let permitted = resolver
+            .txt_lookup(authorization_name)
+            .await
+            .ok()
+            .is_some_and(|records| {
+                records.iter().any(|record| {
+                    let value = record
+                        .txt_data()
+                        .iter()
+                        .flat_map(|part| part.iter().copied())
+                        .map(char::from)
+                        .collect::<String>();
+                    value
+                        .split(';')
+                        .map(str::trim)
+                        .any(|field| field.eq_ignore_ascii_case("v=TLSRPTv1"))
+                })
+            });
+        if permitted {
+            authorized.push(recipient);
+        }
+    }
+    authorized
+}
+
+async fn queue_tls_failure_report(
+    mail_root: &Path,
+    resolver: &TokioAsyncResolver,
+    domain: &str,
+    mx_host: Option<&str>,
+    policy_type: &str,
+    diagnostic: &str,
+) {
+    let recipients = tls_report_recipients(resolver, domain).await;
+    if recipients.is_empty() {
+        return;
+    }
+    let (report_id, encoded) =
+        build_tls_failure_report_json(domain, mx_host, policy_type, diagnostic, Utc::now());
+    for recipient in recipients {
+        let mut message = format!(
+            "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\nTo: <{recipient}>\r\nSubject: Report Domain: {domain} Submitter: rMail Report-ID: {report_id}\r\nAuto-Submitted: auto-generated\r\nMIME-Version: 1.0\r\nContent-Type: application/tlsrpt+json\r\n\r\n"
+        )
+        .into_bytes();
+        message.extend_from_slice(&encoded);
+        message.extend_from_slice(b"\r\n");
+        let mail_root = mail_root.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            rmail_common::outbound::queue_outbound(&mail_root, &recipient, &message, None)
+        })
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("failed to queue TLS-RPT report: {error}"),
+            Err(error) => eprintln!("failed to join TLS-RPT queue operation: {error}"),
+        }
+    }
+}
+
+fn build_tls_failure_report_json(
+    domain: &str,
+    mx_host: Option<&str>,
+    policy_type: &str,
+    diagnostic: &str,
+    now: chrono::DateTime<Utc>,
+) -> (String, Vec<u8>) {
+    let report_id = format!("{}-{}", now.timestamp(), std::process::id());
+    let report = serde_json::json!({
+        "organization-name": "rMail",
+        "date-range": {
+            "start-datetime": now.to_rfc3339(),
+            "end-datetime": now.to_rfc3339()
+        },
+        "contact-info": "postmaster@localhost",
+        "report-id": report_id,
+        "policies": [{
+            "policy": {
+                "policy-type": policy_type,
+                "policy-string": [],
+                "policy-domain": domain,
+                "mx-host": mx_host.into_iter().collect::<Vec<_>>()
+            },
+            "summary": { "total-successful-session-count": 0, "total-failure-session-count": 1 },
+            "failure-details": [{
+                "result-type": if diagnostic.contains("does not offer STARTTLS") {
+                    "starttls-not-supported"
+                } else if diagnostic.to_ascii_lowercase().contains("certificate") {
+                    "certificate-not-trusted"
+                } else {
+                    "validation-failure"
+                },
+                "receiving-mx-hostname": mx_host.unwrap_or(domain),
+                "failed-session-count": 1,
+                "additional-information": diagnostic
+            }]
+        }]
+    });
+    (
+        report_id,
+        serde_json::to_vec_pretty(&report).unwrap_or_default(),
+    )
 }
 
 async fn deliver_to_remote(
@@ -1274,6 +1652,40 @@ async fn deliver_to_remote(
         targets.push((domain.to_string(), None));
     }
 
+    let mta_sts_policy = mta_sts_policy_for_domain(&resolver, domain).await;
+    let mta_sts_enforced = mta_sts_policy
+        .as_ref()
+        .is_some_and(|policy| policy.mode == MtaStsMode::Enforce);
+    if let Some(policy) = mta_sts_policy.as_ref()
+        && policy.mode != MtaStsMode::None
+    {
+        let mismatched = targets
+            .iter()
+            .filter(|(host, _)| !mta_sts_matches_mx(policy, host))
+            .map(|(host, _)| host.clone())
+            .collect::<Vec<_>>();
+        if policy.mode == MtaStsMode::Enforce {
+            targets.retain(|(host, _)| mta_sts_matches_mx(policy, host));
+            if targets.is_empty() {
+                let diagnostic = format!(
+                    "no recipient MX matches the active MTA-STS policy (rejected: {})",
+                    mismatched.join(", ")
+                );
+                if envelope_from.is_some() {
+                    queue_tls_failure_report(base, &resolver, domain, None, "sts", &diagnostic)
+                        .await;
+                }
+                anyhow::bail!(diagnostic);
+            }
+        } else if !mismatched.is_empty() {
+            eprintln!(
+                "MTA-STS testing policy mismatch for {domain}: {}",
+                mismatched.join(", ")
+            );
+        }
+    }
+    let transport_tls_required = message.require_tls || mta_sts_enforced;
+
     // Reuse an idle session for the selected destination when possible. Each
     // connection stays owned by one delivery task at a time, while the worker's
     // task limit bounds simultaneous connections and transactions.
@@ -1285,17 +1697,33 @@ async fn deliver_to_remote(
             port,
         };
         let connection = match connections.take(&key).await {
-            Some(mut connection) => match smtp_noop(&mut connection).await {
-                Ok(()) => Ok(connection),
-                Err(error) => {
-                    eprintln!(
-                        "discarding stale SMTP session for {}:{}: {}",
-                        key.host, key.port, error
-                    );
-                    establish_smtp_connection(&key.host, key.port).await
+            Some(mut connection) if !transport_tls_required || connection.encrypted => {
+                match smtp_noop(&mut connection).await {
+                    Ok(()) => Ok(connection),
+                    Err(error) => {
+                        eprintln!(
+                            "discarding stale SMTP session for {}:{}: {}",
+                            key.host, key.port, error
+                        );
+                        establish_smtp_connection(
+                            &key.host,
+                            key.port,
+                            transport_tls_required,
+                            message.require_tls,
+                        )
+                        .await
+                    }
                 }
-            },
-            None => establish_smtp_connection(&key.host, key.port).await,
+            }
+            Some(_) | None => {
+                establish_smtp_connection(
+                    &key.host,
+                    key.port,
+                    transport_tls_required,
+                    message.require_tls,
+                )
+                .await
+            }
         };
         let mut connection = match connection {
             Ok(connection) => connection,
@@ -1331,6 +1759,21 @@ async fn deliver_to_remote(
                     .chain()
                     .any(|cause| cause.downcast_ref::<PermanentDeliveryError>().is_some());
                 if permanent_reply || permanent_policy {
+                    if transport_tls_required && envelope_from.is_some() {
+                        queue_tls_failure_report(
+                            base,
+                            &resolver,
+                            domain,
+                            Some(&key.host),
+                            if mta_sts_enforced {
+                                "sts"
+                            } else {
+                                "no-policy-found"
+                            },
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
                     return Err(error);
                 }
                 last_delivery_error = Some(error);
@@ -1338,8 +1781,24 @@ async fn deliver_to_remote(
         }
     }
 
-    Err(last_delivery_error
-        .unwrap_or_else(|| anyhow::anyhow!("failed to connect to any MX/A host")))
+    let error = last_delivery_error
+        .unwrap_or_else(|| anyhow::anyhow!("failed to connect to any MX/A host"));
+    if transport_tls_required && envelope_from.is_some() {
+        queue_tls_failure_report(
+            base,
+            &resolver,
+            domain,
+            None,
+            if mta_sts_enforced {
+                "sts"
+            } else {
+                "no-policy-found"
+            },
+            &error.to_string(),
+        )
+        .await;
+    }
+    Err(error)
 }
 
 async fn smtp_noop(connection: &mut SmtpConnection) -> anyhow::Result<()> {
@@ -1352,9 +1811,15 @@ async fn smtp_noop(connection: &mut SmtpConnection) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn establish_smtp_connection(host: &str, port: u16) -> anyhow::Result<SmtpConnection> {
+async fn establish_smtp_connection(
+    host: &str,
+    port: u16,
+    require_encryption: bool,
+    requiretls_message: bool,
+) -> anyhow::Result<SmtpConnection> {
     let stream = connect_host_with_fallback(host, port).await?;
-    let boxed_stream: Box<dyn AsyncStream> = if port == 465 {
+    let mut encrypted = port == 465;
+    let boxed_stream: Box<dyn AsyncStream> = if encrypted {
         let native = NativeTlsConnector::builder()
             .build()
             .context("building native TLS connector")?;
@@ -1404,6 +1869,7 @@ async fn establish_smtp_connection(host: &str, port: u16) -> anyhow::Result<Smtp
             .await
             .context("TLS connect failed")?;
         reader = BufReader::new(Box::new(tls_stream));
+        encrypted = true;
 
         reader.get_mut().write_all(b"EHLO rmail\r\n").await?;
         reader.get_mut().flush().await?;
@@ -1421,9 +1887,20 @@ async fn establish_smtp_connection(host: &str, port: u16) -> anyhow::Result<Smtp
         }
     }
 
+    if require_encryption && !encrypted {
+        if requiretls_message {
+            return Err(permanent_delivery_error(
+                format!("remote host {host} does not offer STARTTLS required by REQUIRETLS"),
+                Some("5.7.30"),
+            ));
+        }
+        anyhow::bail!("remote host {host} does not offer STARTTLS required by MTA-STS");
+    }
+
     Ok(SmtpConnection {
         reader,
         capabilities,
+        encrypted,
     })
 }
 
@@ -1543,6 +2020,7 @@ mod tests {
             starttls: false,
             chunking: true,
             binary_mime: true,
+            require_tls: true,
         };
         assert_eq!(
             build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
@@ -1586,6 +2064,77 @@ mod tests {
                 &SmtpCapabilities::default(),
             )
             .is_err()
+        );
+        let requiretls = build_mail_from_command_for_requirements(
+            Some("sender@example.test"),
+            &MessageRequirements::default(),
+            true,
+            &all,
+        )
+        .unwrap();
+        assert_eq!(requiretls, "MAIL FROM:<sender@example.test> REQUIRETLS\r\n");
+        let unsupported = build_mail_from_command_for_requirements(
+            Some("sender@example.test"),
+            &MessageRequirements::default(),
+            true,
+            &SmtpCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(
+            unsupported
+                .downcast_ref::<PermanentDeliveryError>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mta_sts_policy_parser_and_mx_matching_are_strict() {
+        let policy = parse_mta_sts_policy(
+            "version: STSv1\r\nmode: enforce\r\nmx: mx.example.test\r\nmx: *.mail.example.test\r\nmax_age: 86400\r\n",
+        )
+        .unwrap();
+        assert_eq!(policy.mode, MtaStsMode::Enforce);
+        assert!(mta_sts_matches_mx(&policy, "mx.example.test."));
+        assert!(mta_sts_matches_mx(&policy, "a.mail.example.test"));
+        assert!(!mta_sts_matches_mx(&policy, "mail.example.test"));
+        assert!(!mta_sts_matches_mx(&policy, "evilmail.example.test"));
+        assert!(parse_mta_sts_policy("version: STSv1\nmode: enforce\nmax_age: 1\n").is_err());
+        assert!(parse_mta_sts_policy("version: STSv2\nmode: none\nmax_age: 1\n").is_err());
+    }
+
+    #[test]
+    fn mta_sts_dns_record_requires_one_valid_policy_id() {
+        assert_eq!(
+            parse_mta_sts_dns_id(&["v=STSv1; id=20260713".to_string()]),
+            Some("20260713".to_string())
+        );
+        assert_eq!(
+            parse_mta_sts_dns_id(&["v=STSv1; id=one".to_string(), "v=STSv1; id=two".to_string()]),
+            None
+        );
+        assert_eq!(parse_mta_sts_dns_id(&["v=other; id=x".to_string()]), None);
+    }
+
+    #[test]
+    fn tls_failure_report_has_rfc8460_shape() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let (report_id, encoded) = build_tls_failure_report_json(
+            "example.test",
+            Some("mx.example.test"),
+            "sts",
+            "certificate validation failed",
+            now,
+        );
+        assert!(report_id.starts_with("1700000000-"));
+        let report: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(report["policies"][0]["policy"]["policy-type"], "sts");
+        assert_eq!(
+            report["policies"][0]["failure-details"][0]["result-type"],
+            "certificate-not-trusted"
+        );
+        assert_eq!(
+            report["policies"][0]["summary"]["total-failure-session-count"],
+            1
         );
     }
 
@@ -1703,6 +2252,7 @@ mod tests {
                 starttls: false,
                 chunking: true,
                 binary_mime: true,
+                require_tls: false,
             },
         )
         .await
@@ -1723,6 +2273,7 @@ mod tests {
             SmtpConnection {
                 reader: BufReader::new(Box::new(first_client)),
                 capabilities: SmtpCapabilities::default(),
+                encrypted: false,
             },
         )
         .await;
@@ -1732,6 +2283,7 @@ mod tests {
             SmtpConnection {
                 reader: BufReader::new(Box::new(second_client)),
                 capabilities: SmtpCapabilities::default(),
+                encrypted: false,
             },
         )
         .await;
@@ -1803,6 +2355,7 @@ mod tests {
                 starttls: false,
                 chunking: true,
                 binary_mime: true,
+                require_tls: false,
             },
         )
         .await

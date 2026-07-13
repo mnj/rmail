@@ -4,6 +4,7 @@ pub(crate) struct MailFromArgs {
     pub(crate) declared_size: Option<usize>,
     pub(crate) body: MailBody,
     pub(crate) smtp_utf8: bool,
+    pub(crate) require_tls: bool,
     pub(crate) has_esmtp_parameters: bool,
 }
 
@@ -309,6 +310,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut declared_size = None;
     let mut body = None;
     let mut smtp_utf8 = false;
+    let mut require_tls = false;
     for parameter in params.split_whitespace() {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
@@ -333,6 +335,11 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
                 return Err(EnvelopeError::Syntax);
             }
             smtp_utf8 = true;
+        } else if parameter.eq_ignore_ascii_case("REQUIRETLS") {
+            if require_tls {
+                return Err(EnvelopeError::Syntax);
+            }
+            require_tls = true;
         } else {
             return Err(EnvelopeError::UnsupportedParameter);
         }
@@ -351,6 +358,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
         declared_size,
         body: body.unwrap_or_default(),
         smtp_utf8,
+        require_tls,
         has_esmtp_parameters: !params.is_empty(),
     })
 }
@@ -403,6 +411,17 @@ mod tests {
     fn mail_from_accepts_binarymime_body_declaration() {
         let parsed = parse_mail_from_args("FROM:<sender@example.test> BODY=BINARYMIME").unwrap();
         assert_eq!(parsed.body, MailBody::BinaryMime);
+    }
+
+    #[test]
+    fn mail_from_accepts_requiretls_once_without_a_value() {
+        let parsed = parse_mail_from_args("FROM:<sender@example.test> REQUIRETLS").unwrap();
+        assert!(parsed.require_tls);
+        assert!(parse_mail_from_args("FROM:<sender@example.test> REQUIRETLS REQUIRETLS").is_err());
+        assert_eq!(
+            parse_mail_from_args("FROM:<sender@example.test> REQUIRETLS=yes"),
+            Err(EnvelopeError::UnsupportedParameter)
+        );
     }
 
     #[test]
@@ -463,6 +482,7 @@ mod tests {
                 declared_size: Some(42),
                 body: MailBody::EightBitMime,
                 smtp_utf8: true,
+                require_tls: false,
                 has_esmtp_parameters: true,
             })
         );
@@ -504,6 +524,7 @@ mod tests {
                 declared_size: Some(42),
                 body: MailBody::EightBitMime,
                 smtp_utf8: false,
+                require_tls: false,
                 has_esmtp_parameters: true,
             })
         );

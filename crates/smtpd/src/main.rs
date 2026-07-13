@@ -656,6 +656,7 @@ async fn process_stream(
     let mut mail_from_seen = false;
     let mut mail_body = protocol::MailBody::SevenBit;
     let mut smtp_utf8 = false;
+    let mut require_tls = false;
     let mut bdat_buffer = Vec::new();
     let mut bdat_started = false;
     // track authenticated identity when AUTH is used (local mailbox address)
@@ -837,6 +838,7 @@ async fn process_stream(
                     resp.push_str("250-BINARYMIME\r\n");
                     resp.push_str("250-PIPELINING\r\n");
                     resp.push_str("250-SMTPUTF8\r\n");
+                    resp.push_str("250-REQUIRETLS\r\n");
                     resp.push_str("250 ENHANCEDSTATUSCODES\r\n");
                 }
                 let w = reader.get_mut();
@@ -847,6 +849,7 @@ async fn process_stream(
                 mail_from_seen = false;
                 mail_body = protocol::MailBody::SevenBit;
                 smtp_utf8 = false;
+                require_tls = false;
                 bdat_buffer.clear();
                 bdat_started = false;
                 rcpts.clear();
@@ -958,6 +961,7 @@ async fn process_stream(
                         }
                         mail_body = parsed.body;
                         smtp_utf8 = parsed.smtp_utf8;
+                        require_tls = parsed.require_tls;
                         mail_from = parsed.sender;
                         if service == SmtpService::Submission {
                             let sender_matches_identity =
@@ -1691,13 +1695,16 @@ async fn process_stream(
                                     let mr2 = mr.clone();
                                     let rcpt_c = rcpt.clone();
                                     let envelope = mail_from.clone();
+                                    let queue_options =
+                                        rmail_common::outbound::QueueOptions { require_tls };
                                     let data_c = data.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        rmail_common::outbound::queue_outbound(
+                                        rmail_common::outbound::queue_outbound_with_options(
                                             &mr2,
                                             &rcpt_c,
                                             &data_c,
                                             envelope.as_deref(),
+                                            queue_options,
                                         )
                                     })
                                     .await
@@ -1768,6 +1775,7 @@ async fn process_stream(
                 mail_from_seen = false;
                 mail_body = protocol::MailBody::SevenBit;
                 smtp_utf8 = false;
+                require_tls = false;
                 bdat_buffer.clear();
                 bdat_started = false;
             }
@@ -1776,6 +1784,7 @@ async fn process_stream(
                 mail_from_seen = false;
                 mail_body = protocol::MailBody::SevenBit;
                 smtp_utf8 = false;
+                require_tls = false;
                 bdat_buffer.clear();
                 bdat_started = false;
                 rcpts.clear();
@@ -2634,6 +2643,11 @@ mod tests {
             responses
                 .iter()
                 .any(|response| response == "250 ENHANCEDSTATUSCODES\r\n")
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response == "250-REQUIRETLS\r\n")
         );
         for response in responses.iter().filter(|response| {
             !response.starts_with("250-") && response.as_str() != "250 ENHANCEDSTATUSCODES\r\n"

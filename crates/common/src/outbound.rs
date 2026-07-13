@@ -67,6 +67,27 @@ pub fn queue_outbound(
     data: &[u8],
     envelope_from: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
+    queue_outbound_with_options(
+        maildir_root,
+        recipient,
+        data,
+        envelope_from,
+        QueueOptions::default(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueOptions {
+    pub require_tls: bool,
+}
+
+pub fn queue_outbound_with_options(
+    maildir_root: &Path,
+    recipient: &str,
+    data: &[u8],
+    envelope_from: Option<&str>,
+    options: QueueOptions,
+) -> anyhow::Result<PathBuf> {
     let recipient = crate::domain::canonicalize_mailbox_address(recipient)?;
     let envelope_from = envelope_from
         .map(crate::domain::canonicalize_mailbox_address)
@@ -103,6 +124,9 @@ pub fn queue_outbound(
     if let Some(env) = envelope_from.as_deref() {
         write!(f, "X-RMail-Envelope-From: {env}\r\n")?;
     }
+    if options.require_tls {
+        write!(f, "X-RMail-Require-TLS: yes\r\n")?;
+    }
     write!(f, "X-RMail-Envelope-To: {recipient}\r\n\r\n")?;
 
     // write the original message bytes unchanged
@@ -132,7 +156,7 @@ pub fn queue_outbound(
 
 #[cfg(test)]
 mod tests {
-    use super::{control_path_for_eml, queue_outbound};
+    use super::{QueueOptions, control_path_for_eml, queue_outbound, queue_outbound_with_options};
     use std::path::Path;
 
     #[test]
@@ -160,5 +184,22 @@ mod tests {
         ));
         assert!(data.contains("X-RMail-Envelope-From: from@xn--bcher-kva.example"));
         assert!(data.contains("X-RMail-Envelope-To: to@xn--bcher-kva.example"));
+    }
+
+    #[test]
+    fn requiretls_is_persisted_in_private_queue_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let queued = queue_outbound_with_options(
+            temp.path(),
+            "to@example.test",
+            b"Subject: secure\r\n\r\nbody\r\n",
+            Some("from@example.test"),
+            QueueOptions { require_tls: true },
+        )
+        .unwrap();
+        let data = std::fs::read_to_string(queued).unwrap();
+        assert!(data.starts_with(
+            "X-RMail-Envelope-From: from@example.test\r\nX-RMail-Require-TLS: yes\r\nX-RMail-Envelope-To: to@example.test\r\n\r\n"
+        ));
     }
 }
