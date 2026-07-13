@@ -2481,6 +2481,8 @@ mod tests {
             "{ready}"
         );
         assert!(ready.contains("\"queue\":{\"status\":\"ok\"}"), "{ready}");
+        assert!(ready.contains("\"checks\":"), "{ready}");
+        assert!(!ready.contains("\"components\":"), "{ready}");
     }
 
     #[tokio::test]

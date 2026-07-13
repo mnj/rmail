@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronRight, Database, Gauge, Mail, Menu, Network, Plus, RefreshCw, RotateCcw, Route, Send, Server, Shield, Trash2, Users, X, Zap } from 'lucide-react';
+import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronRight, Database, Gauge, HardDrive, Mail, Menu, Network, Plus, RefreshCw, RotateCcw, Route, Send, Server, Settings, Shield, Trash2, Users, X, Zap } from 'lucide-react';
 import './style.css';
 
 type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
@@ -20,17 +20,25 @@ type Overview = {
 type QueueItem = { name: string; control?: { attempts?: number; priority?: number; next_try?: number | null; last_error?: string | null } };
 type DmarcRow = { domain: string; events: number };
 type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[] };
+type ReadinessCheck = { status: 'ok' | 'error' | 'skipped'; error?: string };
+type Readiness = { ready: boolean; checks: Record<string, ReadinessCheck> };
 
 const numberFmt = new Intl.NumberFormat();
 const formatBytes = (value: number) => value >= 1024 * 1024 * 1024 ? `${(value / (1024 * 1024 * 1024)).toFixed(1)} GiB` : value >= 1024 * 1024 ? `${(value / (1024 * 1024)).toFixed(1)} MiB` : `${Math.ceil(value / 1024)} KiB`;
-type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'observability';
+type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'observability' | 'system';
 const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; description: string; icon: React.ElementType }> = {
   overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'System health, storage activity, and delivery pressure at a glance.', icon: Gauge },
   accounts: { path: '/accounts', label: 'Accounts', eyebrow: 'Identity & storage', description: 'Provision mailboxes and inspect account storage and authentication state.', icon: Users },
   routing: { path: '/routing', label: 'Routing', eyebrow: 'Mail flow', description: 'Manage aliases, catchalls, and domain-level recipient routing.', icon: Network },
   delivery: { path: '/delivery', label: 'Delivery', eyebrow: 'Outbound operations', description: 'Inspect queue pressure, recover messages, and review DMARC activity.', icon: Send },
   observability: { path: '/observability', label: 'Observability', eyebrow: 'Diagnostics', description: 'Review daemon telemetry and live operational logs.', icon: Activity },
+  system: { path: '/system', label: 'System', eyebrow: 'Services & dependencies', description: 'Inspect service readiness, storage, DNS, TLS, and filtering dependencies.', icon: Settings },
 };
+const navGroups: { label: string; pages: Page[] }[] = [
+  { label: 'Workspace', pages: ['overview'] },
+  { label: 'Mail management', pages: ['accounts', 'routing', 'delivery'] },
+  { label: 'Operations', pages: ['observability', 'system'] },
+];
 
 function pageFromPath(path: string): Page {
   return (Object.entries(pageMeta).find(([, value]) => value.path === path)?.[0] as Page | undefined) || 'overview';
@@ -46,6 +54,13 @@ async function text(url: string): Promise<string> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} returned ${res.status}`);
   return res.text();
+}
+
+async function readinessApi(): Promise<Readiness> {
+  const res = await fetch('/readyz');
+  const report = await res.json() as Readiness;
+  if (!report.checks) throw new Error('/readyz returned an invalid readiness report');
+  return report;
 }
 
 function Kpi({ label, value, detail, icon: Icon }: { label: string; value: string; detail: string; icon: React.ElementType }) {
@@ -68,6 +83,7 @@ function App() {
   const [metrics, setMetrics] = useState<string[]>([]);
   const [dmarc, setDmarc] = useState<DmarcRow[]>([]);
   const [routing, setRouting] = useState<Routing>({ aliases: [], catchalls: [] });
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [logComponent, setLogComponent] = useState('smtpd');
   const [logs, setLogs] = useState('');
   const [target, setTarget] = useState('');
@@ -102,6 +118,7 @@ function App() {
       text(`/logs?component=${component}&lines=180`).then((raw) => setLogs(raw || 'No log lines available.')).catch(capture),
       api<Routing>('/api/routing').then(setRouting).catch(capture),
       api<DmarcRow[]>('/dmarc').then(setDmarc).catch(() => setDmarc([])),
+      readinessApi().then(setReadiness).catch(capture),
     ]);
     if (failures.length) setError(`Some admin endpoints are unavailable: ${failures.slice(0, 2).join(', ')}`);
     setLoading(false);
@@ -198,8 +215,7 @@ function App() {
       <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span>Admin console</span></div></div>
         <button className="closeNav" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X size={20} /></button>
-        <div className="navLabel">Workspace</div>
-        <nav>{(Object.entries(pageMeta) as [Page, typeof pageMeta[Page]][]).map(([key, item]) => { const Icon = item.icon; return <a key={key} href={item.path} className={page === key ? 'active' : ''} onClick={(event) => { event.preventDefault(); navigate(key); }}><Icon size={18} /><span>{item.label}</span><ChevronRight size={15} /></a>; })}</nav>
+        <nav>{navGroups.map((group) => <div className="navGroup" key={group.label}><div className="navLabel">{group.label}</div>{group.pages.map((key) => { const item = pageMeta[key]; const Icon = item.icon; return <a key={key} href={item.path} className={page === key ? 'active' : ''} onClick={(event) => { event.preventDefault(); navigate(key); }}><Icon size={18} /><span>{item.label}</span><ChevronRight size={15} /></a>; })}</div>)}</nav>
         <div className="health"><HealthIcon size={18} /><div><strong>{health.label}</strong><span>{health.detail}</span></div></div>
       </aside>
       <section className="content">
@@ -287,6 +303,24 @@ function App() {
           <div className="panelHead"><h2>Daemon Logs</h2><div className="tabs">{['smtpd', 'imapd', 'outbound', 'web'].map((name) => <button key={name} className={name === logComponent ? 'active' : ''} onClick={() => setLogComponent(name)}>{name}</button>)}</div></div>
           <pre>{logs}</pre>
         </article>
+        <section className="systemPage" hidden={page !== 'system'}>
+          <div className="systemHero">
+            <div><span className={`statusDot ${readiness?.ready ? 'ok' : 'error'}`} /><strong>{readiness?.ready ? 'All required dependencies ready' : 'System needs attention'}</strong><p>Readiness is evaluated by the admin daemon against the live storage, network, and security configuration.</p></div>
+            <button className="button" onClick={() => refresh()}><RefreshCw size={16} />Run checks</button>
+          </div>
+          <div className="serviceGrid">
+            {Object.entries(readiness?.checks || {}).map(([name, check]) => <article className="serviceCard" key={name}>
+              <div className={`serviceIcon ${check.status}`}><Server size={18} /></div>
+              <div><span>{name.replaceAll('_', ' ')}</span><strong>{check.status === 'ok' ? 'Operational' : check.status === 'skipped' ? 'Not configured' : 'Unavailable'}</strong><p>{check.error || (check.status === 'ok' ? 'Live check completed successfully.' : check.status === 'skipped' ? 'Optional dependency is disabled.' : 'The readiness probe reported a failure.')}</p></div>
+              <span className={`statusBadge ${check.status}`}>{check.status}</span>
+            </article>)}
+            {!readiness && <div className="empty">Waiting for readiness data.</div>}
+          </div>
+          <div className="grid systemDetails">
+            <article className="panel"><div className="panelHead"><h2>Managed services</h2><Settings size={18} /></div><div className="serviceList">{['SMTP ingress', 'IMAP access', 'Outbound delivery', 'Admin web', 'Webmail'].map((name, index) => <div key={name}><span className="serviceGlyph">{index === 0 ? <Mail size={16} /> : index === 1 ? <Database size={16} /> : index === 2 ? <Send size={16} /> : <Server size={16} />}</span><div><strong>{name}</strong><small>Managed through the shared rMail configuration</small></div><span className="pill">Configured</span></div>)}</div></article>
+            <article className="panel"><div className="panelHead"><h2>Operator endpoints</h2><HardDrive size={18} /></div><div className="endpointList"><div><code>/healthz</code><span>Process liveness</span></div><div><code>/readyz</code><span>Dependency readiness</span></div><div><code>/metrics</code><span>Prometheus telemetry</span></div><div><code>/logs</code><span>Daemon diagnostics</span></div></div></article>
+          </div>
+        </section>
         <footer><Database size={15} /> API-backed admin UI served by rMail web daemon.</footer>
       </section>
     </main>

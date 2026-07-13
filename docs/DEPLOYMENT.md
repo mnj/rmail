@@ -205,7 +205,9 @@ probe paths at the reverse proxy or firewall because readiness details are inten
 operators.
 
 The admin console uses dedicated browser routes for its main operating areas: `/` (overview),
-`/accounts`, `/routing`, `/delivery`, and `/observability`. These routes are served through the same
+`/accounts`, `/routing`, `/delivery`, `/observability`, and `/system`. Navigation is grouped into
+mail-management and operations areas; the system page exposes live readiness for the storage, DNS,
+TLS, and filtering dependencies used by all rMail services. These routes are served through the same
 single-page frontend, so a reverse proxy should pass unknown non-API paths to `rmail_web` rather than
 returning its own 404 page.
 
