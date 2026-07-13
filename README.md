@@ -105,8 +105,9 @@ or conformance-validation gaps.
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
 | RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
 
-IMAP4rev2 (RFC 9051), OAuth mechanisms, and `SNIPPET` are not currently
-advertised. RFC 3502 `MULTIAPPEND` provides atomic streamed batch appends and
+IMAP4rev2 (RFC 9051) and OAuth mechanisms are not currently advertised. The
+deprecated draft `SNIPPET=FUZZY` dialect is available as a compatibility alias
+for RFC 8970 previews. RFC 3502 `MULTIAPPEND` provides atomic streamed batch appends and
 ordered `APPENDUID` sets. RFC 8970 `PREVIEW`, including its `LAZY` priority
 modifier, is supported.
 

@@ -1521,6 +1521,23 @@ fn validate_body_fetch_item(item: &str) -> bool {
     valid_numeric_section(path) && suffix.is_none_or(|value| !value.is_empty())
 }
 
+fn validate_snippet_fetch_item(item: &str) -> bool {
+    if item == "SNIPPET" {
+        return true;
+    }
+    let Some(modifiers) = item
+        .strip_prefix("SNIPPET (")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let modifiers = modifiers.split_ascii_whitespace().collect::<Vec<_>>();
+    !modifiers.is_empty()
+        && modifiers
+            .iter()
+            .all(|modifier| matches!(*modifier, "FUZZY" | "LAZY=FUZZY"))
+}
+
 pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError> {
     let (inner, remainder) = split_fetch_item_list(spec)?;
     if inner.trim().is_empty() {
@@ -1535,7 +1552,7 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
     while index < raw_items.len() {
         let mut item = raw_items[index].to_uppercase();
         index += 1;
-        if item == "PREVIEW"
+        if matches!(item.as_str(), "PREVIEW" | "SNIPPET")
             && raw_items
                 .get(index)
                 .is_some_and(|next| next.starts_with('('))
@@ -1560,6 +1577,7 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
             "FLAGS" | "INTERNALDATE" | "RFC822" | "RFC822.HEADER" | "RFC822.SIZE"
             | "RFC822.TEXT" | "ENVELOPE" | "BODY" | "BODYSTRUCTURE" | "UID" | "MODSEQ"
             | "SAVEDATE" | "PREVIEW" | "PREVIEW (LAZY)" => out.push(item),
+            _ if validate_snippet_fetch_item(&item) => out.push(item),
             _ if validate_body_fetch_item(&item) => out.push(item),
             _ => return Err(ParseError::InvalidAtom),
         }
@@ -2416,6 +2434,12 @@ mod tests {
             parse_fetch_request("(UID PREVIEW (LAZY))").unwrap().items,
             vec!["PREVIEW (LAZY)".to_string(), "UID".to_string()]
         );
+        assert_eq!(
+            parse_fetch_request("(UID SNIPPET (LAZY=FUZZY))")
+                .unwrap()
+                .items,
+            vec!["SNIPPET (LAZY=FUZZY)".to_string(), "UID".to_string()]
+        );
         for invalid in [
             "()",
             "(ALL UID)",
@@ -2429,6 +2453,7 @@ mod tests {
             "(BINARY.SIZE[1]<0.2>)",
             "(BINARY[1.TEXT])",
             "(PREVIEW (FAST))",
+            "(SNIPPET (EXACT))",
             "(UID) trailing",
             "(UID",
         ] {

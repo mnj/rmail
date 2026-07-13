@@ -231,6 +231,7 @@ pub(crate) fn capability_tokens_with_policy(
             "STATUS=SIZE",
             "SAVEDATE",
             "PREVIEW",
+            "SNIPPET=FUZZY",
             "BINARY",
             "UTF8=ACCEPT",
             "COMPRESS=DEFLATE",

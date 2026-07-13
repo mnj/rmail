@@ -2000,6 +2000,7 @@ mod tests {
                 "STATUS=SIZE",
                 "SAVEDATE",
                 "PREVIEW",
+                "SNIPPET=FUZZY",
                 "BINARY",
                 "UTF8=ACCEPT",
                 "COMPRESS=DEFLATE",

@@ -978,6 +978,10 @@ fn generate_preview(data: &[u8]) -> String {
         .collect()
 }
 
+fn generate_snippet(data: &[u8]) -> String {
+    generate_preview(data).chars().take(100).collect()
+}
+
 fn extract_binary_section(data: &[u8], item: &str) -> Option<Vec<u8>> {
     let section = parse_body_section(item)?;
     let root = parse_mime_tree(data);
@@ -1088,6 +1092,7 @@ pub(crate) async fn write_fetch_response(
         .filter(|item| {
             matches!(item.as_str(), "RFC822" | "RFC822.HEADER" | "RFC822.TEXT")
                 || item.starts_with("PREVIEW")
+                || item.starts_with("SNIPPET")
                 || item.starts_with("BODY[")
                 || item.starts_with("BODY.PEEK[")
                 || item.starts_with("BINARY[")
@@ -1236,10 +1241,20 @@ pub(crate) async fn write_fetch_response(
             body_section_response_name(item).unwrap_or_else(|| (*item).clone())
         } else if item.starts_with("PREVIEW") {
             "PREVIEW".to_string()
+        } else if item.starts_with("SNIPPET") {
+            "SNIPPET".to_string()
         } else {
             (*item).clone()
         };
         let partial = partial_fetch_range(fetch_inner_spec(item));
+        if item.starts_with("SNIPPET") {
+            let snippet = generate_snippet(&data);
+            w.write_all(format!("SNIPPET (FUZZY {{{}}}\r\n", snippet.len()).as_bytes())
+                .await?;
+            w.write_all(snippet.as_bytes()).await?;
+            w.write_all(b")").await?;
+            continue;
+        }
         if is_whole_message_literal(item) {
             let file_len = metadata_len.unwrap_or(0);
             let (offset, literal_len) = match partial {
@@ -1324,9 +1339,9 @@ pub(crate) async fn write_fetch_response(
 mod tests {
     use super::{
         FETCH_STREAM_CHUNK_BYTES, bodystructure_response, extract_binary_section,
-        extract_mime_section, generate_preview, header_body_offset, is_header_only_literal,
-        is_top_level_text_literal, is_whole_message_literal, stream_file_range,
-        write_fetch_response,
+        extract_mime_section, generate_preview, generate_snippet, header_body_offset,
+        is_header_only_literal, is_top_level_text_literal, is_whole_message_literal,
+        stream_file_range, write_fetch_response,
     };
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -1431,6 +1446,14 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         assert_eq!(generate_preview(message), "Hello & world");
     }
 
+    #[test]
+    fn legacy_fuzzy_snippet_uses_the_draft_character_limit() {
+        let message = format!("Content-Type: text/plain\r\n\r\n{}", "å".repeat(150));
+        let snippet = generate_snippet(message.as_bytes());
+        assert_eq!(snippet.chars().count(), 100);
+        assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
+    }
+
     #[tokio::test]
     async fn preview_fetch_uses_unmodified_attribute_name_for_lazy_requests() {
         let dir = tempfile::tempdir().unwrap();
@@ -1465,6 +1488,43 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         assert_eq!(
             response,
             "* 1 FETCH (UID 9 PREVIEW {13}\r\nHello preview\r\n)\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snippet_fetch_returns_the_selected_fuzzy_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message.eml");
+        tokio::fs::write(&path, b"Content-Type: text/plain\r\n\r\nHello snippet")
+            .await
+            .unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let stream: Box<dyn crate::AsyncStream + Send + 'static> =
+            Box::new(crate::transport::SwitchableStream::new(Box::new(server)));
+        let mut reader = BufReader::new(stream);
+
+        write_fetch_response(
+            &mut reader,
+            2,
+            10,
+            &[],
+            1,
+            (0, 0),
+            0,
+            path,
+            &["SNIPPET (LAZY=FUZZY)".to_string(), "UID".to_string()],
+            "(SNIPPET (LAZY=FUZZY) UID)",
+            false,
+        )
+        .await
+        .unwrap();
+        drop(reader);
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            "* 2 FETCH (UID 10 SNIPPET (FUZZY {13}\r\nHello snippet)\r\n)\r\n"
         );
     }
 
