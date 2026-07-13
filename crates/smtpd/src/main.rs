@@ -1452,6 +1452,23 @@ async fn process_stream(
                 };
 
                 let mut scanner_quarantine = false;
+                if service == SmtpService::Submission
+                    && security.submission_require_from_alignment
+                    && !authenticated_user.as_deref().is_some_and(|user| {
+                        rmail_common::mail_auth::submission_from_matches(&data, user)
+                    })
+                {
+                    let writer = reader.get_mut();
+                    writer
+                        .write_all(b"553 5.7.1 From address not owned by authenticated user\r\n")
+                        .await?;
+                    writer.flush().await?;
+                    rcpts.clear();
+                    mail_from = None;
+                    mail_from_seen = false;
+                    bdat_started = false;
+                    continue;
+                }
                 if security.scanners_enabled() {
                     let envelope = ScanEnvelope {
                         mail_from: mail_from.clone(),
@@ -2093,6 +2110,56 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("250 2.1.0 Sender OK"))
         );
+    }
+
+    #[tokio::test]
+    async fn submission_option_enforces_visible_from_for_data_and_bdat() {
+        let security = SecurityConfig {
+            submission_require_from_alignment: true,
+            ..SecurityConfig::default()
+        };
+        let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+        let transaction = "MAIL FROM:<user@example.test>\r\nRCPT TO:<user@example.test>\r\n";
+
+        let data_input = format!(
+            "EHLO localhost\r\n{auth}{transaction}DATA\r\nFrom: Other <other@example.test>\r\nSubject: forged\r\n\r\nbody\r\n.\r\n{transaction}DATA\r\nFrom: User <user@example.test>\r\nSubject: aligned\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+        );
+        let (data_responses, _) = run_session_with_policy(
+            data_input.into_bytes(),
+            16 * 1024,
+            security.clone(),
+            true,
+            SmtpService::Submission,
+        )
+        .await;
+        assert!(data_responses.iter().any(|line| {
+            line.starts_with("553 5.7.1 From address not owned by authenticated user")
+        }));
+        assert!(
+            data_responses
+                .iter()
+                .any(|line| line.starts_with("250 2.0.0 Message accepted"))
+        );
+
+        let message = b"From: Other <other@example.test>\r\nSubject: forged\r\n\r\nbody\r\n";
+        let mut bdat_input = format!(
+            "EHLO localhost\r\n{auth}{transaction}BDAT {} LAST\r\n",
+            message.len()
+        )
+        .into_bytes();
+        bdat_input.extend_from_slice(message);
+        bdat_input.extend_from_slice(b"QUIT\r\n");
+        let (bdat_responses, _) = run_session_with_policy(
+            bdat_input,
+            16 * 1024,
+            security,
+            true,
+            SmtpService::Submission,
+        )
+        .await;
+        assert!(bdat_responses.iter().any(|line| {
+            line.starts_with("553 5.7.1 From address not owned by authenticated user")
+        }));
     }
 
     #[tokio::test]

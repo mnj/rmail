@@ -41,6 +41,8 @@ smtp_max_commands_per_minute = 120
 smtp_max_recipients = 100
 submission_max_recipients = 50
 submission_max_messages_per_minute = 30
+# Require the authenticated mailbox in every visible From address.
+submission_require_from_alignment = false
 # PLAIN and LOGIN are advertised only over TLS. SCRAM-SHA-256 remains available pre-TLS.
 imap_sasl_mechanisms = ["PLAIN", "LOGIN", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
 smtp_sasl_mechanisms = ["PLAIN", "LOGIN", "SCRAM-SHA-256"]

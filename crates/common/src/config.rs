@@ -71,6 +71,9 @@ pub struct SecurityConfig {
     pub submission_max_recipients: usize,
     #[serde(default = "default_submission_max_messages_per_minute")]
     pub submission_max_messages_per_minute: usize,
+    /// Require every RFC 5322 From mailbox on authenticated submission to match the login.
+    #[serde(default)]
+    pub submission_require_from_alignment: bool,
     #[serde(default = "default_imap_sasl_mechanisms")]
     pub imap_sasl_mechanisms: Vec<String>,
     #[serde(default = "default_smtp_sasl_mechanisms")]
@@ -104,6 +107,7 @@ impl Default for SecurityConfig {
             smtp_max_recipients: default_smtp_max_recipients(),
             submission_max_recipients: default_submission_max_recipients(),
             submission_max_messages_per_minute: default_submission_max_messages_per_minute(),
+            submission_require_from_alignment: false,
             imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             smtp_sasl_mechanisms: default_smtp_sasl_mechanisms(),
             scanner_failure_action: default_scanner_failure_action(),
@@ -221,6 +225,7 @@ mod tests {
         assert_eq!(cfg.security.smtp_max_recipients, 100);
         assert_eq!(cfg.security.submission_max_recipients, 50);
         assert_eq!(cfg.security.submission_max_messages_per_minute, 30);
+        assert!(!cfg.security.submission_require_from_alignment);
         assert!(!cfg.security.clamav_enabled);
         assert_eq!(
             cfg.security.imap_sasl_mechanisms,
@@ -244,6 +249,7 @@ mail_root = "mail"
 [security]
 imap_sasl_mechanisms = ["SCRAM-SHA-256"]
 smtp_sasl_mechanisms = ["SCRAM-SHA-256"]
+submission_require_from_alignment = true
 scanner_failure_action = "reject"
 scanner_timeout_ms = 42
 scanner_max_message_bytes = 99
@@ -264,6 +270,7 @@ rspamd_reject_actions = ["reject"]
         assert_eq!(cfg.security.imap_sasl_mechanisms, ["SCRAM-SHA-256"]);
         assert_eq!(cfg.security.smtp_sasl_mechanisms, ["SCRAM-SHA-256"]);
         assert_eq!(cfg.security.scanner_max_message_bytes, 99);
+        assert!(cfg.security.submission_require_from_alignment);
         assert!(cfg.security.scanners_enabled());
     }
 }

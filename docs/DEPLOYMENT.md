@@ -85,6 +85,7 @@ SMTP resource limits are configured in the `[security]` section:
 - `smtp_max_recipients` — recipients per port-25 transaction (default: `100`)
 - `submission_max_recipients` — recipients per authenticated submission transaction (default: `50`)
 - `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
+- `submission_require_from_alignment` — when `true`, every parsed RFC 5322 `From` mailbox on authenticated submission must equal the authenticated mailbox; missing, malformed, or mismatched author fields are rejected (default: `false`)
 
 ## DKIM signing and inbound authentication
 

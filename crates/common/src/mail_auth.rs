@@ -36,6 +36,23 @@ pub async fn dns_health_check() -> Result<()> {
     Ok(())
 }
 
+/// Return true when a message has at least one RFC 5322 From mailbox and all
+/// parsed From mailboxes match the authenticated submission identity.
+pub fn submission_from_matches(data: &[u8], authenticated_user: &str) -> bool {
+    let Ok(authenticated_user) = crate::domain::canonicalize_mailbox_address(authenticated_user)
+    else {
+        return false;
+    };
+    let Some(message) = AuthenticatedMessage::parse(data) else {
+        return false;
+    };
+    !message.from.is_empty()
+        && message.from.iter().all(|from| {
+            crate::domain::canonicalize_mailbox_address(from)
+                .is_ok_and(|from| from.eq_ignore_ascii_case(&authenticated_user))
+        })
+}
+
 /// Verify DKIM, ARC, SPF and DMARC using the system's asynchronous DNS resolver.
 ///
 /// The message is borrowed throughout verification; callers do not need to clone
@@ -325,5 +342,21 @@ mod tests {
             mail_auth::DkimOutput::pass(),
         ];
         assert_eq!(aggregate_dkim(&outputs).as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn submission_from_alignment_uses_parsed_mailboxes() {
+        assert!(submission_from_matches(
+            b"From: Display Name <User@B\xC3\x9CCHER.example>\r\nSubject: test\r\n\r\nbody",
+            "user@xn--bcher-kva.example"
+        ));
+        assert!(!submission_from_matches(
+            b"From: user@example.test, other@example.test\r\n\r\nbody",
+            "user@example.test"
+        ));
+        assert!(!submission_from_matches(
+            b"Subject: missing author\r\n\r\nbody",
+            "user@example.test"
+        ));
     }
 }
