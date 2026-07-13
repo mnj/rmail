@@ -895,6 +895,89 @@ fn decode_transfer_encoding(part: &MimeNode) -> Option<Vec<u8>> {
     }
 }
 
+fn preview_text_part<'a>(node: &'a MimeNode, wanted_subtype: &str) -> Option<&'a MimeNode> {
+    let (typ, subtype, _) = content_type_parts(&node.header);
+    if typ == "TEXT" && subtype == wanted_subtype {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| preview_text_part(child, wanted_subtype))
+        .or_else(|| {
+            node.embedded
+                .as_deref()
+                .and_then(|child| preview_text_part(child, wanted_subtype))
+        })
+}
+
+fn strip_html_markup(input: &str) -> String {
+    let mut input = input.to_string();
+    for tag in ["head", "style", "script", "noscript"] {
+        input = remove_html_block(&input, tag);
+    }
+    let mut output = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                output.push(' ');
+            }
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn remove_html_block(input: &str, tag: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    let opening = format!("<{tag}");
+    let closing = format!("</{tag}>");
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(start) = lower.find(&opening) else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..start]);
+        let Some(end) = lower[start..].find(&closing) else {
+            break;
+        };
+        rest = &rest[start + end + closing.len()..];
+    }
+    output
+}
+
+fn generate_preview(data: &[u8]) -> String {
+    let root = parse_mime_tree(data);
+    let (part, html) = preview_text_part(&root, "PLAIN")
+        .map(|part| (part, false))
+        .or_else(|| preview_text_part(&root, "HTML").map(|part| (part, true)))
+        .unwrap_or((&root, false));
+    let decoded = decode_transfer_encoding(part).unwrap_or_default();
+    let text = String::from_utf8_lossy(&decoded);
+    let text = if html {
+        strip_html_markup(&text)
+    } else {
+        text.into_owned()
+    };
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 fn extract_binary_section(data: &[u8], item: &str) -> Option<Vec<u8>> {
     let section = parse_body_section(item)?;
     let root = parse_mime_tree(data);
@@ -1004,6 +1087,7 @@ pub(crate) async fn write_fetch_response(
         .iter()
         .filter(|item| {
             matches!(item.as_str(), "RFC822" | "RFC822.HEADER" | "RFC822.TEXT")
+                || item.starts_with("PREVIEW")
                 || item.starts_with("BODY[")
                 || item.starts_with("BODY.PEEK[")
                 || item.starts_with("BINARY[")
@@ -1150,6 +1234,8 @@ pub(crate) async fn write_fetch_response(
             header_section_response_name(item).unwrap_or_else(|| (*item).clone())
         } else if item.starts_with("BODY[") || item.starts_with("BODY.PEEK[") {
             body_section_response_name(item).unwrap_or_else(|| (*item).clone())
+        } else if item.starts_with("PREVIEW") {
+            "PREVIEW".to_string()
         } else {
             (*item).clone()
         };
@@ -1190,7 +1276,9 @@ pub(crate) async fn write_fetch_response(
             .await?;
             continue;
         }
-        let literal = if item.starts_with("BINARY[") || item.starts_with("BINARY.PEEK[") {
+        let literal = if item.starts_with("PREVIEW") {
+            Some(generate_preview(&data).into_bytes())
+        } else if item.starts_with("BINARY[") || item.starts_with("BINARY.PEEK[") {
             extract_binary_section(&data, item)
                 .map(|decoded| apply_partial_range(&decoded, partial))
         } else if *item == "RFC822.HEADER" {
@@ -1236,9 +1324,11 @@ pub(crate) async fn write_fetch_response(
 mod tests {
     use super::{
         FETCH_STREAM_CHUNK_BYTES, bodystructure_response, extract_binary_section,
-        extract_mime_section, header_body_offset, is_header_only_literal,
+        extract_mime_section, generate_preview, header_body_offset, is_header_only_literal,
         is_top_level_text_literal, is_whole_message_literal, stream_file_range,
+        write_fetch_response,
     };
+    use tokio::io::{AsyncReadExt, BufReader};
 
     const EMBEDDED_MESSAGE: &[u8] = b"From: outer@example.test\r\n\
 Content-Type: multipart/mixed; boundary=outer\r\n\r\n\
@@ -1322,6 +1412,60 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         assert_eq!(header_body_offset(b"Subject: x\r\n\r\n"), 14);
         assert_eq!(header_body_offset(b"Subject: x\n\n"), 12);
         assert_eq!(header_body_offset(b"malformed without separator"), 0);
+    }
+
+    #[test]
+    fn preview_prefers_plain_text_decodes_and_limits_characters() {
+        let message = b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20  world\r\n--x\r\nContent-Type: text/html\r\n\r\n<b>ignored</b>\r\n--x--\r\n";
+        assert_eq!(generate_preview(message), "Hello world");
+
+        let long = format!("Content-Type: text/plain\r\n\r\n{}", "å".repeat(300));
+        let preview = generate_preview(long.as_bytes());
+        assert_eq!(preview.chars().count(), 200);
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn preview_strips_html_when_plain_text_is_unavailable() {
+        let message = b"Content-Type: text/html\r\n\r\n<head><style>secret css</style></head><p>Hello &amp; <strong>world</strong></p><script>secret script</script>";
+        assert_eq!(generate_preview(message), "Hello & world");
+    }
+
+    #[tokio::test]
+    async fn preview_fetch_uses_unmodified_attribute_name_for_lazy_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message.eml");
+        tokio::fs::write(&path, b"Content-Type: text/plain\r\n\r\nHello preview")
+            .await
+            .unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let stream: Box<dyn crate::AsyncStream + Send + 'static> =
+            Box::new(crate::transport::SwitchableStream::new(Box::new(server)));
+        let mut reader = BufReader::new(stream);
+
+        write_fetch_response(
+            &mut reader,
+            1,
+            9,
+            &[],
+            1,
+            (0, 0),
+            0,
+            path,
+            &["PREVIEW (LAZY)".to_string(), "UID".to_string()],
+            "(PREVIEW (LAZY) UID)",
+            false,
+        )
+        .await
+        .unwrap();
+        drop(reader);
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            "* 1 FETCH (UID 9 PREVIEW {13}\r\nHello preview\r\n)\r\n"
+        );
     }
 
     #[tokio::test]

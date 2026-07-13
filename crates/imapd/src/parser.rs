@@ -1531,7 +1531,19 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
     if raw_items.is_empty() {
         return Err(ParseError::InvalidAtom);
     }
-    for item in raw_items.into_iter().map(|s| s.to_uppercase()) {
+    let mut index = 0;
+    while index < raw_items.len() {
+        let mut item = raw_items[index].to_uppercase();
+        index += 1;
+        if item == "PREVIEW"
+            && raw_items
+                .get(index)
+                .is_some_and(|next| next.starts_with('('))
+        {
+            item.push(' ');
+            item.push_str(&raw_items[index].to_uppercase());
+            index += 1;
+        }
         match item.as_str() {
             "ALL" => {
                 if !out.is_empty() || !inner.eq_ignore_ascii_case("ALL") {
@@ -1547,7 +1559,7 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
             ),
             "FLAGS" | "INTERNALDATE" | "RFC822" | "RFC822.HEADER" | "RFC822.SIZE"
             | "RFC822.TEXT" | "ENVELOPE" | "BODY" | "BODYSTRUCTURE" | "UID" | "MODSEQ"
-            | "SAVEDATE" => out.push(item),
+            | "SAVEDATE" | "PREVIEW" | "PREVIEW (LAZY)" => out.push(item),
             _ if validate_body_fetch_item(&item) => out.push(item),
             _ => return Err(ParseError::InvalidAtom),
         }
@@ -2382,6 +2394,10 @@ mod tests {
 
         let full = parse_fetch_request("FULL").unwrap();
         assert!(full.items.contains(&"BODY".to_string()));
+        assert_eq!(
+            parse_fetch_request("(UID PREVIEW (LAZY))").unwrap().items,
+            vec!["PREVIEW (LAZY)".to_string(), "UID".to_string()]
+        );
         for invalid in [
             "()",
             "(ALL UID)",
@@ -2394,6 +2410,7 @@ mod tests {
             "(BODY[HEADER.FIELDS ()])",
             "(BINARY.SIZE[1]<0.2>)",
             "(BINARY[1.TEXT])",
+            "(PREVIEW (FAST))",
             "(UID) trailing",
             "(UID",
         ] {

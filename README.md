@@ -103,8 +103,9 @@ or conformance-validation gaps.
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
 | RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
 
-IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, `PREVIEW`,
-and `SNIPPET` are not currently advertised.
+IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, and `SNIPPET` are not
+currently advertised. RFC 8970 `PREVIEW`, including its `LAZY` priority
+modifier, is supported.
 
 Repeatable storage and queue performance workloads are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,

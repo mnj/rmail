@@ -1998,6 +1998,7 @@ mod tests {
                 "WITHIN",
                 "STATUS=SIZE",
                 "SAVEDATE",
+                "PREVIEW",
                 "BINARY",
                 "UTF8=ACCEPT",
                 "COMPRESS=DEFLATE",

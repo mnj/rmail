@@ -229,6 +229,7 @@ pub(crate) fn capability_tokens_with_policy(
             "WITHIN",
             "STATUS=SIZE",
             "SAVEDATE",
+            "PREVIEW",
             "BINARY",
             "UTF8=ACCEPT",
             "COMPRESS=DEFLATE",
