@@ -7,4 +7,5 @@ edition = "2024"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 rmail_common = { path = "../common" }
+rmail_queue_manager = { path = "../queue-manager" }
 serde_json = "1.0"

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ pub fn next_backoff_seconds(attempts: u32) -> i64 {
     } else {
         attempts.saturating_sub(1)
     };
-    let mul = 2i64.pow(exp);
+    let mul = 2i64.checked_pow(exp).unwrap_or(i64::MAX);
     base.saturating_mul(mul)
 }
 
@@ -115,9 +115,11 @@ fn list_queue_entries(maildrop_dir: &Path) -> Result<Vec<QueueEntry>> {
                 }
             };
             let envelope_to = read_envelope_to(&p).ok().flatten();
-            let domain = envelope_to
-                .as_ref()
-                .and_then(|r| r.rfind('@').and_then(|i| Some(r[i + 1..].to_lowercase())));
+            let domain = envelope_to.as_ref().and_then(|recipient| {
+                recipient
+                    .rfind('@')
+                    .map(|index| recipient[index + 1..].to_lowercase())
+            });
 
             out.push(QueueEntry {
                 filename,
@@ -151,15 +153,314 @@ fn count_inflight_by_domain(maildrop_dir: &Path) -> Result<HashMap<String, usize
             .unwrap_or(false)
         {
             let to = read_envelope_to(&p).ok().flatten();
-            if let Some(t) = to {
-                if let Some(at) = t.rfind('@') {
-                    let dom = t[at + 1..].to_lowercase();
-                    *counts.entry(dom).or_insert(0) += 1;
-                }
+            if let Some(t) = to
+                && let Some(at) = t.rfind('@')
+            {
+                let dom = t[at + 1..].to_lowercase();
+                *counts.entry(dom).or_insert(0) += 1;
             }
         }
     }
     Ok(counts)
+}
+
+/// Move a message and its control sidecar between spool directories.
+///
+/// The sidecar is moved first and rolled back if the message rename fails. This
+/// makes the `.eml` file the commit marker: queue readers never observe a
+/// message in the destination before its existing control data is there.
+fn move_pair(
+    eml_src: &Path,
+    json_src: Option<&Path>,
+    eml_dst: &Path,
+    allow_existing_destination_sidecar: bool,
+) -> Result<PathBuf> {
+    let destination_dir = eml_dst
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("destination message has no parent directory"))?;
+    fs::create_dir_all(destination_dir)?;
+    let json_dst = rmail_common::outbound::control_path_for_eml(eml_dst);
+    if eml_dst.exists() {
+        anyhow::bail!("destination message already exists: {:?}", eml_dst);
+    }
+    if json_src.is_some() && json_dst.exists() {
+        anyhow::bail!("destination control sidecar already exists: {:?}", json_dst);
+    }
+
+    enum SidecarMove {
+        Moved,
+        Created,
+        AlreadyPresent,
+    }
+
+    let sidecar_move = match json_src {
+        Some(src) => {
+            fs::rename(src, &json_dst)
+                .with_context(|| format!("moving control sidecar {:?} to {:?}", src, json_dst))?;
+            SidecarMove::Moved
+        }
+        None if json_dst.exists() && allow_existing_destination_sidecar => {
+            SidecarMove::AlreadyPresent
+        }
+        None if json_dst.exists() => {
+            anyhow::bail!("destination control sidecar already exists: {:?}", json_dst);
+        }
+        None => {
+            let encoded = serde_json::to_vec(&QueueControl::new(5, 0))?;
+            fs::write(&json_dst, encoded)
+                .with_context(|| format!("creating control sidecar {:?}", json_dst))?;
+            SidecarMove::Created
+        }
+    };
+
+    if let Err(error) = fs::rename(eml_src, eml_dst) {
+        match sidecar_move {
+            SidecarMove::Moved => {
+                if let Some(src) = json_src {
+                    let _ = fs::rename(&json_dst, src);
+                }
+            }
+            SidecarMove::Created => {
+                let _ = fs::remove_file(&json_dst);
+            }
+            SidecarMove::AlreadyPresent => {}
+        }
+        return Err(error)
+            .with_context(|| format!("moving message {:?} to {:?}", eml_src, eml_dst));
+    }
+    Ok(json_dst)
+}
+
+/// Move a message and its queue-control sidecar as one recoverable spool transition.
+///
+/// The sidecar is committed at the destination before the message. If the process
+/// stops between the two renames, recovery can complete or roll back the transition
+/// without losing the control record.
+pub fn move_message_and_control(eml_src: &Path, eml_dst: &Path) -> Result<PathBuf> {
+    let json_src = find_json_for_eml(eml_src);
+    move_pair(eml_src, json_src.as_deref(), eml_dst, false)
+}
+
+/// Atomically replace a queue-control sidecar after syncing its contents.
+///
+/// A worker writes the updated retry state before changing spool locations. A
+/// crash can therefore leave either the old valid JSON or the complete new JSON,
+/// never a partially written control record.
+pub fn write_control_atomic(path: &Path, control: &QueueControl) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("control sidecar has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("control sidecar has an invalid filename"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), nonce));
+    let encoded = serde_json::to_vec(control)?;
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Complete queue publications interrupted after their sidecar was published.
+///
+/// A producer writes both files in `tmp`, moves the sidecar to `queue`, then
+/// moves the message as the commit marker. Only the middle state is safe to
+/// recover here: it has a synced destination sidecar and an intact temp message.
+fn recover_pending_queue_publications(tmp_dir: &Path, queue_dir: &Path) -> Result<usize> {
+    let entries = match fs::read_dir(tmp_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(0),
+    };
+    let mut recovered = 0;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let temporary_eml = entry.path();
+        if temporary_eml
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("eml")
+        {
+            continue;
+        }
+        let Some(filename) = temporary_eml.file_name() else {
+            continue;
+        };
+        let queue_eml = queue_dir.join(filename);
+        let queue_json = rmail_common::outbound::control_path_for_eml(&queue_eml);
+        let temporary_json = rmail_common::outbound::control_path_for_eml(&temporary_eml);
+        if !queue_eml.exists() && queue_json.exists() && !temporary_json.exists() {
+            fs::rename(&temporary_eml, &queue_eml).with_context(|| {
+                format!(
+                    "completing interrupted queue publication {:?} to {:?}",
+                    temporary_eml, queue_eml
+                )
+            })?;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+/// Complete a sidecar-first transition when the destination contains only its
+/// `.eml.json` sidecar and exactly one other spool contains the message file.
+///
+/// This covers terminal moves (`inflight` -> `sent`/`failed`), administrative
+/// queuectl moves, and failed -> dead-letter cleanup. The inflight destination
+/// itself is intentionally left to its dedicated claim recovery below.
+fn recover_sidecar_only_destinations(
+    destinations: &[PathBuf],
+    all_spools: &[PathBuf],
+) -> Result<usize> {
+    let mut recovered = 0;
+    for destination_dir in destinations {
+        let entries = match fs::read_dir(destination_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let sidecar = entry.path();
+            let Some(name) = sidecar.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(eml_name) = name.strip_suffix(".eml.json") else {
+                continue;
+            };
+            let eml_name = format!("{eml_name}.eml");
+            let destination_eml = destination_dir.join(&eml_name);
+            if destination_eml.exists() {
+                continue;
+            }
+            let sources = all_spools
+                .iter()
+                .filter(|source_dir| *source_dir != destination_dir)
+                .map(|source_dir| source_dir.join(&eml_name))
+                .filter(|source_eml| source_eml.exists())
+                .collect::<Vec<_>>();
+            if sources.len() != 1 {
+                continue;
+            }
+            let source_eml = &sources[0];
+            // A second sidecar would be an ambiguous, externally-corrupted
+            // state. Leave it untouched for operator inspection rather than
+            // picking one record and overwriting the other.
+            if find_json_for_eml(source_eml).is_some() {
+                continue;
+            }
+            move_pair(source_eml, None, &destination_eml, true)?;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+/// Recover interrupted queue publications and messages left in `inflight` by a
+/// terminated worker.
+///
+/// This is intended to run once during worker startup, before claims begin. It
+/// recognizes which destination already has a control sidecar, then completes
+/// that specific transition rather than guessing that every inflight message
+/// should return to `queue`.
+pub fn recover_abandoned_inflight(maildrop_dir: &Path) -> Result<usize> {
+    let queue_dir = maildrop_dir.join("queue");
+    let inflight_dir = maildrop_dir.join("inflight");
+    let tmp_dir = maildrop_dir.join("tmp");
+    let outbound_root = maildrop_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("./outbound"));
+    let sent_dir = outbound_root.join("sent");
+    let failed_dir = outbound_root.join("failed");
+    let dead_dir = outbound_root.join("dead");
+    fs::create_dir_all(&queue_dir)?;
+    fs::create_dir_all(&inflight_dir)?;
+    let mut recovered = recover_pending_queue_publications(&tmp_dir, &queue_dir)?;
+    let all_spools = vec![
+        tmp_dir.clone(),
+        queue_dir.clone(),
+        inflight_dir.clone(),
+        sent_dir.clone(),
+        failed_dir.clone(),
+        dead_dir.clone(),
+    ];
+    recovered += recover_sidecar_only_destinations(
+        &[
+            queue_dir.clone(),
+            sent_dir.clone(),
+            failed_dir.clone(),
+            dead_dir,
+        ],
+        &all_spools,
+    )?;
+
+    // Repair an interrupted queue -> inflight claim (sidecar moved first).
+    for entry in fs::read_dir(&inflight_dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".eml.json") {
+            continue;
+        }
+        let eml_name = name.strip_suffix(".json").unwrap();
+        let queue_eml = queue_dir.join(eml_name);
+        let queue_json = queue_dir.join(name);
+        let inflight_eml = inflight_dir.join(eml_name);
+        if queue_eml.exists() && !queue_json.exists() && !inflight_eml.exists() {
+            fs::rename(&path, &queue_json)?;
+        }
+    }
+
+    for entry in fs::read_dir(&inflight_dir)?.filter_map(|entry| entry.ok()) {
+        let eml_src = entry.path();
+        if eml_src.extension().and_then(|ext| ext.to_str()) != Some("eml") {
+            continue;
+        }
+        let filename = eml_src.file_name().unwrap();
+        let queue_eml = queue_dir.join(filename);
+        if queue_eml.exists() {
+            continue;
+        }
+        let json_src = find_json_for_eml(&eml_src);
+        let sent_eml = sent_dir.join(filename);
+        let failed_eml = failed_dir.join(filename);
+        if sent_eml.exists() || failed_eml.exists() {
+            anyhow::bail!(
+                "inconsistent spool state for {:?}: message exists in inflight and a terminal spool",
+                eml_src
+            );
+        }
+
+        // The following state means the source sidecar was already moved, but
+        // the message rename did not happen. Finish that intended transition.
+        let destinations = [&sent_eml, &failed_eml, &queue_eml];
+        let mut completed = false;
+        if json_src.is_none() {
+            for destination in destinations {
+                let destination_json = rmail_common::outbound::control_path_for_eml(destination);
+                if destination_json.exists() && !destination.exists() {
+                    move_pair(&eml_src, None, destination, true)?;
+                    recovered += 1;
+                    completed = true;
+                    break;
+                }
+            }
+        }
+        if completed {
+            continue;
+        }
+
+        // No destination sidecar exists, so this is a normal abandoned delivery.
+        // Preserve an inflight control record if present, otherwise create one.
+        move_pair(&eml_src, json_src.as_deref(), &queue_eml, false)?;
+        recovered += 1;
+    }
+    Ok(recovered)
 }
 
 /// Claim an eligible message respecting per-destination concurrency limits.
@@ -210,28 +511,10 @@ pub fn claim_one_with_limit(
         // determine json src (if any) and destination name
         let json_src_opt = ent.json_path.clone();
 
-        // attempt to rename eml
-        if let Err(_) = fs::rename(&eml_src, &eml_dst) {
-            continue; // contention
-        }
-
-        // handle json
-        let inflight_json_dst = if let Some(json_src) = &json_src_opt {
-            let dst = inflight_dir.join(json_src.file_name().unwrap());
-            match fs::rename(json_src, &dst) {
-                Ok(_) => dst,
-                Err(e) => {
-                    // revert eml move
-                    let _ = fs::rename(&eml_dst, &eml_src);
-                    eprintln!("failed to move json to inflight: {}", e);
-                    continue;
-                }
-            }
-        } else {
-            // create default control json next to inflight eml
-            let dst = rmail_common::outbound::control_path_for_eml(&eml_dst);
-            let _ = fs::write(&dst, serde_json::to_string(&QueueControl::new(5, 0))?);
-            dst
+        let inflight_json_dst = match move_pair(&eml_src, json_src_opt.as_deref(), &eml_dst, false)
+        {
+            Ok(path) => path,
+            Err(_) => continue, // contention or an incomplete competing claim
         };
 
         // increment inflight count for domain
@@ -357,13 +640,9 @@ pub fn dead_letter_cleanup(maildrop_dir: &Path, older_than_secs: i64) -> Result<
         };
         if age >= older_than_secs {
             let dst_eml = dead_dir.join(p.file_name().unwrap());
-            if let Err(e) = fs::rename(&p, &dst_eml) {
+            if let Err(e) = move_message_and_control(&p, &dst_eml) {
                 eprintln!("failed to move failed eml to dead: {}", e);
                 continue;
-            }
-            if let Some(jp) = json_path {
-                let dst_json = dead_dir.join(jp.file_name().unwrap());
-                let _ = fs::rename(&jp, &dst_json);
             }
             moved += 1;
         }
@@ -383,6 +662,7 @@ mod tests {
         assert_eq!(next_backoff_seconds(1), 60);
         assert_eq!(next_backoff_seconds(2), 120);
         assert_eq!(next_backoff_seconds(5), 960);
+        assert_eq!(next_backoff_seconds(u32::MAX), i64::MAX);
     }
 
     #[test]
@@ -421,6 +701,47 @@ mod tests {
     }
 
     #[test]
+    fn claim_limit_allows_parallel_destinations() -> Result<()> {
+        let td = tempdir()?;
+        let maildrop = td.path().join("outbound/maildrop");
+        let queue = maildrop.join("queue");
+        fs::create_dir_all(&queue)?;
+
+        for (filename, recipient) in [
+            ("first.eml", "one@alpha.example"),
+            ("second.eml", "two@alpha.example"),
+            ("third.eml", "three@beta.example"),
+        ] {
+            let eml = queue.join(filename);
+            fs::write(
+                &eml,
+                format!("X-RMail-Envelope-To: {recipient}\r\n\r\nbody").as_bytes(),
+            )?;
+            fs::write(
+                rmail_common::outbound::control_path_for_eml(&eml),
+                serde_json::to_vec(&QueueControl::new(5, 0))?,
+            )?;
+        }
+
+        let first = claim_one_with_limit(&maildrop, 1)?.unwrap().0;
+        let second = claim_one_with_limit(&maildrop, 1)?.unwrap().0;
+        let first_domain = read_envelope_to(&first)?
+            .unwrap()
+            .split('@')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let second_domain = read_envelope_to(&second)?
+            .unwrap()
+            .split('@')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        assert_ne!(first_domain, second_domain);
+        Ok(())
+    }
+
+    #[test]
     fn test_dead_letter_cleanup_moves_old() -> Result<()> {
         let td = tempdir()?;
         let outbound = td.path().join("outbound");
@@ -448,6 +769,164 @@ mod tests {
         let dead_dir = outbound.join("dead");
         assert!(dead_dir.join(filename).exists());
         assert!(rmail_common::outbound::control_path_for_eml(&dead_dir.join(filename)).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_abandoned_inflight_message_and_control() -> Result<()> {
+        let td = tempdir()?;
+        let maildrop = td.path().join("maildrop");
+        let inflight = maildrop.join("inflight");
+        fs::create_dir_all(&inflight)?;
+        let eml = inflight.join("abandoned.eml");
+        fs::write(&eml, b"X-RMail-Envelope-To: user@example.com\n\nbody")?;
+        let json = rmail_common::outbound::control_path_for_eml(&eml);
+        let mut control = QueueControl::new(7, 3);
+        control.attempts = 2;
+        fs::write(&json, serde_json::to_vec(&control)?)?;
+
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 1);
+        let queued = maildrop.join("queue/abandoned.eml");
+        let recovered: QueueControl = serde_json::from_slice(&fs::read(
+            rmail_common::outbound::control_path_for_eml(&queued),
+        )?)?;
+        assert!(queued.exists());
+        assert_eq!(recovered.attempts, 2);
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn repairs_claim_interrupted_after_sidecar_move() -> Result<()> {
+        let td = tempdir()?;
+        let maildrop = td.path().join("maildrop");
+        let queue = maildrop.join("queue");
+        let inflight = maildrop.join("inflight");
+        fs::create_dir_all(&queue)?;
+        fs::create_dir_all(&inflight)?;
+        fs::write(queue.join("partial.eml"), b"body")?;
+        let stranded = inflight.join("partial.eml.json");
+        fs::write(&stranded, serde_json::to_vec(&QueueControl::new(5, 0))?)?;
+
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 0);
+        assert!(!stranded.exists());
+        assert!(queue.join("partial.eml.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_retry_interrupted_after_sidecar_move_without_resetting_control() -> Result<()> {
+        let td = tempdir()?;
+        let maildrop = td.path().join("maildrop");
+        let queue = maildrop.join("queue");
+        let inflight = maildrop.join("inflight");
+        fs::create_dir_all(&queue)?;
+        fs::create_dir_all(&inflight)?;
+        let inflight_eml = inflight.join("retry.eml");
+        fs::write(
+            &inflight_eml,
+            b"X-RMail-Envelope-To: user@example.com\r\n\r\nbody",
+        )?;
+        let mut control = QueueControl::new(7, 2);
+        control.attempts = 4;
+        control.next_try = Some(123_456);
+        fs::write(
+            rmail_common::outbound::control_path_for_eml(&queue.join("retry.eml")),
+            serde_json::to_vec(&control)?,
+        )?;
+
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 1);
+        assert!(!inflight_eml.exists());
+        let recovered: QueueControl = serde_json::from_slice(&fs::read(
+            rmail_common::outbound::control_path_for_eml(&queue.join("retry.eml")),
+        )?)?;
+        assert_eq!(recovered.attempts, 4);
+        assert_eq!(recovered.next_try, Some(123_456));
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_success_transition_by_finishing_sent_move() -> Result<()> {
+        let td = tempdir()?;
+        let outbound = td.path().join("outbound");
+        let maildrop = outbound.join("maildrop");
+        let inflight = maildrop.join("inflight");
+        let sent = outbound.join("sent");
+        fs::create_dir_all(&inflight)?;
+        fs::create_dir_all(&sent)?;
+        let inflight_eml = inflight.join("accepted.eml");
+        fs::write(
+            &inflight_eml,
+            b"X-RMail-Envelope-To: user@example.com\r\n\r\nbody",
+        )?;
+        let mut control = QueueControl::new(5, 0);
+        control.attempts = 1;
+        fs::write(
+            rmail_common::outbound::control_path_for_eml(&sent.join("accepted.eml")),
+            serde_json::to_vec(&control)?,
+        )?;
+
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 1);
+        assert!(!inflight_eml.exists());
+        let sent_eml = sent.join("accepted.eml");
+        assert!(sent_eml.exists());
+        let recovered: QueueControl = serde_json::from_slice(&fs::read(
+            rmail_common::outbound::control_path_for_eml(&sent_eml),
+        )?)?;
+        assert_eq!(recovered.attempts, 1);
+        assert!(!maildrop.join("queue/accepted.eml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_queue_publication_after_sidecar_commit() -> Result<()> {
+        let td = tempdir()?;
+        let maildrop = td.path().join("maildrop");
+        let tmp = maildrop.join("tmp");
+        let queue = maildrop.join("queue");
+        fs::create_dir_all(&tmp)?;
+        fs::create_dir_all(&queue)?;
+        let temporary_eml = tmp.join("published.eml");
+        fs::write(
+            &temporary_eml,
+            b"X-RMail-Envelope-To: user@example.com\r\n\r\nbody",
+        )?;
+        let control = QueueControl::new(5, 0);
+        fs::write(
+            rmail_common::outbound::control_path_for_eml(&queue.join("published.eml")),
+            serde_json::to_vec(&control)?,
+        )?;
+
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 1);
+        assert!(!temporary_eml.exists());
+        assert!(queue.join("published.eml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_dead_letter_transition_after_sidecar_move() -> Result<()> {
+        let td = tempdir()?;
+        let outbound = td.path().join("outbound");
+        let maildrop = outbound.join("maildrop");
+        let failed = outbound.join("failed");
+        let dead = outbound.join("dead");
+        fs::create_dir_all(&failed)?;
+        fs::create_dir_all(&dead)?;
+        let failed_eml = failed.join("expired.eml");
+        fs::write(
+            &failed_eml,
+            b"X-RMail-Envelope-To: user@example.com\r\n\r\nbody",
+        )?;
+        let mut control = QueueControl::new(5, 0);
+        control.attempts = 5;
+        fs::write(
+            rmail_common::outbound::control_path_for_eml(&dead.join("expired.eml")),
+            serde_json::to_vec(&control)?,
+        )?;
+
+        assert_eq!(recover_abandoned_inflight(&maildrop)?, 1);
+        assert!(!failed_eml.exists());
+        assert!(dead.join("expired.eml").exists());
         Ok(())
     }
 }

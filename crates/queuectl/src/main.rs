@@ -267,7 +267,7 @@ fn write_control(path: &PathBuf, ctrl: &QueueControl) -> Result<()> {
 fn move_with_json(
     src_eml: &PathBuf,
     dst_dir: &PathBuf,
-    json_opt: &Option<PathBuf>,
+    _json_opt: &Option<PathBuf>,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
     fs::create_dir_all(dst_dir)?;
     let fname = src_eml
@@ -276,15 +276,8 @@ fn move_with_json(
         .ok_or_else(|| anyhow::anyhow!("invalid filename"))?
         .to_string();
     let dst_eml = dst_dir.join(&fname);
-    fs::rename(src_eml, &dst_eml)?;
-    let dst_json = if let Some(jp) = json_opt {
-        let dstj = dst_dir.join(jp.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        fs::rename(jp, &dstj).ok();
-        Some(dstj)
-    } else {
-        None
-    };
-    Ok((dst_eml, dst_json))
+    let dst_json = rmail_queue_manager::move_message_and_control(src_eml, &dst_eml)?;
+    Ok((dst_eml, Some(dst_json)))
 }
 
 fn matches_pattern(name: &str, pattern: &str) -> bool {

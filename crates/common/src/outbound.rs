@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
@@ -11,6 +12,10 @@ pub struct QueueControl {
     pub priority: i32,
     pub next_try: Option<i64>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_smtp_code: Option<u16>,
+    #[serde(default)]
+    pub last_enhanced_status: Option<String>,
     pub created_at: i64,
 }
 
@@ -26,6 +31,8 @@ impl QueueControl {
             priority,
             next_try: None,
             last_error: None,
+            last_smtp_code: None,
+            last_enhanced_status: None,
             created_at: now,
         }
     }
@@ -36,6 +43,8 @@ impl QueueControl {
             priority: 0,
             next_try: None,
             last_error: None,
+            last_smtp_code: None,
+            last_enhanced_status: None,
             created_at: ts,
         }
     }
@@ -62,6 +71,13 @@ pub fn queue_outbound(
     let envelope_from = envelope_from
         .map(crate::domain::canonicalize_mailbox_address)
         .transpose()?;
+    if recipient.contains(['\r', '\n'])
+        || envelope_from
+            .as_deref()
+            .is_some_and(|sender| sender.contains(['\r', '\n']))
+    {
+        anyhow::bail!("envelope addresses must not contain line breaks");
+    }
     let outbound_dir = maildir_root.join("outbound").join("maildrop");
     let tmp_dir = outbound_dir.join("tmp");
     let queue_dir = outbound_dir.join("queue");
@@ -83,26 +99,34 @@ pub fn queue_outbound(
     let mut f = File::create(&tmp_path)?;
 
     // Persist envelope metadata as an internal header so the outbound worker can reconstruct the SMTP envelope.
+    // These headers are a spool format, not RFC 5322 headers, and are stripped by the delivery worker.
     if let Some(env) = envelope_from.as_deref() {
-        writeln!(f, "X-RMail-Envelope-From: {}", env)?;
+        write!(f, "X-RMail-Envelope-From: {env}\r\n")?;
     }
-    writeln!(f, "X-RMail-Envelope-To: {}", recipient)?;
-    writeln!(f)?; // blank line separates metadata from RFC822 message
+    write!(f, "X-RMail-Envelope-To: {recipient}\r\n\r\n")?;
 
     // write the original message bytes unchanged
     f.write_all(data)?;
     // ensure data is flushed to disk before moving
     f.sync_all()?;
 
-    // write control JSON to tmp and then move to queue dir
+    // Write and sync the sidecar before publishing the message. The message rename is the
+    // commit marker: a queue reader never sees an `.eml` without its control record.
     let control = QueueControl::new(5, 0);
     let control_json = serde_json::to_string(&control)?;
     let tmp_json = control_path_for_eml(&tmp_path);
-    fs::write(&tmp_json, control_json.as_bytes())?;
+    let mut control_file = File::create(&tmp_json)?;
+    control_file.write_all(control_json.as_bytes())?;
+    control_file.sync_all()?;
 
-    fs::rename(&tmp_path, &final_path)?;
     let final_json = control_path_for_eml(&final_path);
     fs::rename(&tmp_json, &final_json)?;
+    if let Err(error) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::rename(&final_json, &tmp_json);
+        return Err(error).context("publishing queued message");
+    }
+    // Persist directory entries as well as file contents before acknowledging the queue write.
+    File::open(&queue_dir)?.sync_all()?;
     Ok(final_path)
 }
 
@@ -131,6 +155,9 @@ mod tests {
         )
         .unwrap();
         let data = std::fs::read_to_string(queued).unwrap();
+        assert!(data.starts_with(
+            "X-RMail-Envelope-From: from@xn--bcher-kva.example\r\nX-RMail-Envelope-To: to@xn--bcher-kva.example\r\n\r\n"
+        ));
         assert!(data.contains("X-RMail-Envelope-From: from@xn--bcher-kva.example"));
         assert!(data.contains("X-RMail-Envelope-To: to@xn--bcher-kva.example"));
     }

@@ -75,6 +75,13 @@ Important:
 - `rmail_outbound` reads `RMAIL_MAIL_ROOT`; it does not read the TOML file directly
 - `rmail_web` currently binds to `127.0.0.1` by default, which is a safer default for admin access
 
+Optional outbound-worker tuning in `/etc/default/rmail`:
+
+- `RMAIL_OUTBOUND_CONCURRENCY` — maximum simultaneous delivery tasks (default: `20`)
+- `RMAIL_PER_DEST_LIMIT` — maximum simultaneous deliveries for one recipient domain (default: `5`)
+- `RMAIL_IDLE_CONNECTIONS_PER_DEST` — reusable idle SMTP sessions retained for one MX host (default: `2`)
+- `RMAIL_MAX_IDLE_CONNECTIONS` — total reusable idle SMTP sessions (default: outbound concurrency)
+
 ### 5. Install systemd units
 
 ```bash
