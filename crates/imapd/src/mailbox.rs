@@ -769,19 +769,17 @@ fn locate_mime_part<'a>(root: &'a MimeNode, path: &[usize]) -> Option<&'a MimeNo
     Some(current)
 }
 
-fn extract_mime_section(data: &[u8], literal_name: &str) -> Vec<u8> {
-    let Some(section) = parse_body_section(literal_name) else {
-        return data.to_vec();
-    };
+pub(crate) fn extract_catenate_section(data: &[u8], section: &str) -> Option<Vec<u8>> {
+    let section = section.trim().to_ascii_uppercase();
     if section.is_empty() {
-        return data.to_vec();
+        return Some(data.to_vec());
     }
     let root = parse_mime_tree(data);
     if section == "TEXT" {
-        return root.body;
+        return Some(root.body);
     }
     if section == "HEADER" || section == "MIME" {
-        return root.header;
+        return Some(root.header);
     }
 
     let mut path = Vec::new();
@@ -794,24 +792,31 @@ fn extract_mime_section(data: &[u8], literal_name: &str) -> Vec<u8> {
             break;
         }
     }
-    let Some(part) = locate_mime_part(&root, &path) else {
-        return Vec::new();
-    };
+    let part = locate_mime_part(&root, &path)?;
     match suffix {
-        Some("MIME") => part.header.clone(),
-        Some("HEADER") => part
-            .embedded
-            .as_deref()
-            .map(|embedded| embedded.header.clone())
-            .unwrap_or_else(|| part.header.clone()),
-        Some("TEXT") => part
-            .embedded
-            .as_deref()
-            .map(|embedded| embedded.body.clone())
-            .unwrap_or_else(|| part.body.clone()),
-        Some(_) => Vec::new(),
-        None => part.body.clone(),
+        Some("MIME") => Some(part.header.clone()),
+        Some("HEADER") => Some(
+            part.embedded
+                .as_deref()
+                .map(|embedded| embedded.header.clone())
+                .unwrap_or_else(|| part.header.clone()),
+        ),
+        Some("TEXT") => Some(
+            part.embedded
+                .as_deref()
+                .map(|embedded| embedded.body.clone())
+                .unwrap_or_else(|| part.body.clone()),
+        ),
+        Some(_) => None,
+        None => Some(part.body.clone()),
     }
+}
+
+fn extract_mime_section(data: &[u8], literal_name: &str) -> Vec<u8> {
+    let Some(section) = parse_body_section(literal_name) else {
+        return data.to_vec();
+    };
+    extract_catenate_section(data, &section).unwrap_or_default()
 }
 
 fn decode_quoted_printable(input: &[u8]) -> Option<Vec<u8>> {

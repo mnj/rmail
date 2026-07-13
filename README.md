@@ -94,7 +94,7 @@ or conformance-validation gaps.
 | RFC 6855 | `UTF8=ACCEPT` | 85% | UTF-8 mailbox/message operation is implemented; `UTF8=ONLY` is not advertised or implemented. |
 | RFC 3516 | `BINARY` | 95% | Binary FETCH sections and sizes are implemented; exhaustive MIME corpus validation remains. |
 | RFC 4466 | Collected extension grammar | 95% | Extension argument/response forms used by advertised capabilities are implemented. |
-| RFC 4469 | `CATENATE` | 0% | Not implemented or advertised. |
+| RFC 4469 | `CATENATE` | 100% | Streaming `TEXT`, relative same-session message/section `URL`, URL literals, `BADURL`, `TOOBIG`, and `APPENDUID` are implemented. |
 | RFC 2088 / RFC 7888 | `LITERAL+` / `LITERAL-` | 100% | Synchronizing and bounded non-synchronizing literals are implemented. |
 | RFC 4978 | `COMPRESS=DEFLATE` | 100% | Compression negotiation and post-negotiation command transport are implemented. |
 | RFC 4959 | SASL initial response | 100% | Initial, empty, continuation, and cancellation responses are supported. |
@@ -102,5 +102,5 @@ or conformance-validation gaps.
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
 | RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
 
-IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, `CATENATE`, `PREVIEW`,
+IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, `PREVIEW`,
 and `SNIPPET` are not currently advertised.

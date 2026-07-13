@@ -992,8 +992,12 @@ async fn process_stream_inner(
                     &mail_root,
                     authed_mailbox.as_ref().unwrap(),
                     session_state.feature_enabled("UTF8=ACCEPT"),
+                    selected.as_ref().map(|mailbox| mailbox.mailbox.as_str()),
                 )
                 .await?;
+                if outcome.close_connection {
+                    break;
+                }
                 if let Some(mailbox_name) = outcome.appended_mailbox
                     && selected.as_ref().is_some_and(|selected_mailbox| {
                         selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
@@ -1673,6 +1677,18 @@ mod tests {
         out
     }
 
+    async fn read_until_contains_bounded<R>(reader: &mut R, needle: &str) -> Vec<String>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_until_contains(reader, needle),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for IMAP response containing {needle:?}"))
+    }
+
     async fn run_scripted_fixture(reader: &mut BufReader<tokio::io::DuplexStream>, fixture: &str) {
         let mut command_response = Vec::new();
         for raw_line in fixture.lines() {
@@ -1898,6 +1914,7 @@ mod tests {
                 "LITERAL+",
                 "LITERAL-",
                 "UIDPLUS",
+                "CATENATE",
                 "NAMESPACE",
                 "SPECIAL-USE",
                 "LIST-EXTENDED",
@@ -3969,8 +3986,8 @@ mod tests {
             .await
             .expect("write login select");
         reader.get_mut().flush().await.expect("flush");
-        let _login = read_until_contains(&mut reader, "A001 OK").await;
-        let select = read_until_contains(&mut reader, "A002 OK").await;
+        let _login = read_until_contains_bounded(&mut reader, "A001 OK").await;
+        let select = read_until_contains_bounded(&mut reader, "A002 OK").await;
         assert!(select.iter().any(|line| line.contains("* 0 EXISTS")));
 
         rmail_common::imap_state::append_message(
@@ -3988,7 +4005,7 @@ mod tests {
             .await
             .expect("write noop");
         reader.get_mut().flush().await.expect("flush");
-        let noop = read_until_contains(&mut reader, "A003 OK").await;
+        let noop = read_until_contains_bounded(&mut reader, "A003 OK").await;
         assert!(noop.iter().any(|line| line.trim_end() == "* 1 EXISTS"));
         assert!(!noop.iter().any(|line| line.contains(" RECENT")));
 
@@ -3998,7 +4015,7 @@ mod tests {
             .await
             .expect("write idle");
         reader.get_mut().flush().await.expect("flush");
-        let idle_start = read_until_contains(&mut reader, "+ idling").await;
+        let idle_start = read_until_contains_bounded(&mut reader, "+ idling").await;
         assert!(idle_start.iter().any(|line| line.contains("+ idling")));
         let inbox =
             rmail_common::imap_state::account_maildir(mail_root.as_path(), "example.test", "user");
@@ -4009,7 +4026,7 @@ mod tests {
         .expect("write external delivery");
         let exists = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            read_until_contains(&mut reader, "* 2 EXISTS"),
+            read_until_contains_bounded(&mut reader, "* 2 EXISTS"),
         )
         .await
         .expect("idle exists timeout");
@@ -4017,7 +4034,7 @@ mod tests {
         let recent = if exists.iter().any(|line| line.trim_end() == "* 1 RECENT") {
             exists
         } else {
-            read_until_contains(&mut reader, "* 1 RECENT").await
+            read_until_contains_bounded(&mut reader, "* 1 RECENT").await
         };
         assert!(recent.iter().any(|line| line.trim_end() == "* 1 RECENT"));
         reader
@@ -4028,28 +4045,32 @@ mod tests {
             .await
             .expect("done logout");
         reader.get_mut().flush().await.expect("flush");
-        let idle_done = read_until_contains(&mut reader, "A004 OK").await;
+        let idle_done = read_until_contains_bounded(&mut reader, "A004 OK").await;
         assert!(idle_done.iter().any(|line| line.contains("IDLE completed")));
-        let search_recent = read_until_contains(&mut reader, "A005 OK").await;
+        let search_recent = read_until_contains_bounded(&mut reader, "A005 OK").await;
         assert!(
             search_recent
                 .iter()
                 .any(|line| line.trim_end() == "* SEARCH 2")
         );
-        let search_new = read_until_contains(&mut reader, "A006 OK").await;
+        let search_new = read_until_contains_bounded(&mut reader, "A006 OK").await;
         assert!(
             search_new
                 .iter()
                 .any(|line| line.trim_end() == "* SEARCH 2")
         );
-        let fetch = read_until_contains(&mut reader, "A007 OK").await;
+        let fetch = read_until_contains_bounded(&mut reader, "A007 OK").await;
         assert!(fetch.iter().any(|line| line.contains("FLAGS (\\Recent)")));
-        let store = read_until_contains(&mut reader, "A008 OK").await;
+        let store = read_until_contains_bounded(&mut reader, "A008 OK").await;
         assert!(store.iter().any(|line| line.contains("FLAGS (\\Recent)")));
-        let status = read_until_contains(&mut reader, "A009 OK").await;
+        let status = read_until_contains_bounded(&mut reader, "A009 OK").await;
         assert!(status.iter().any(|line| line.contains("(RECENT 0)")));
-        let _logout = read_until_contains(&mut reader, "A010 OK").await;
-        server_task.await.expect("join").expect("server");
+        let _logout = read_until_contains_bounded(&mut reader, "A010 OK").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server join timeout")
+            .expect("join")
+            .expect("server");
     }
 
     #[tokio::test]
@@ -5304,6 +5325,146 @@ mod tests {
         assert!(
             !rmail_common::imap_state::folder_exists(&mail_root, "example.test", "user", "Missing")
                 .expect("missing folder check")
+        );
+    }
+
+    #[tokio::test]
+    async fn catenate_appends_text_and_same_session_url_sections_atomically() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+
+        let server_mail_root = mail_root.clone();
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                server_mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        assert!(!capability.contains("CATENATE"));
+
+        let source = b"Subject: source\r\nX-Test: yes\r\n\r\nsource body\r\n";
+        let prefix = b"Subject: composed\r\n\r\nprefix ";
+        let suffix = b" suffix\r\n";
+        let mut commands = Vec::new();
+        commands.extend_from_slice(b"A001 LOGIN \"user@example.test\" \"password\"\r\n");
+        commands
+            .extend_from_slice(format!("A002 APPEND INBOX {{{}+}}\r\n", source.len()).as_bytes());
+        commands.extend_from_slice(source);
+        commands.extend_from_slice(b"\r\n");
+        commands.extend_from_slice(
+            format!(
+                "A003 APPEND Sent (\\Seen) CATENATE (TEXT {{{}+}}\r\n",
+                prefix.len()
+            )
+            .as_bytes(),
+        );
+        commands.extend_from_slice(prefix);
+        commands.extend_from_slice(
+            format!(
+                " URL \"/INBOX/;UID=1/;section=TEXT\" TEXT {{{}+}}\r\n",
+                suffix.len()
+            )
+            .as_bytes(),
+        );
+        commands.extend_from_slice(suffix);
+        let literal_url = b"/INBOX/;UID=1";
+        commands.extend_from_slice(
+            format!(
+                ")\r\nA004 APPEND Sent CATENATE (URL {{{}+}}\r\n",
+                literal_url.len()
+            )
+            .as_bytes(),
+        );
+        commands.extend_from_slice(literal_url);
+        commands.extend_from_slice(b")\r\nA005 APPEND Sent CATENATE (URL \"/INBOX/;UID=999\")\r\n");
+        reader.get_mut().write_all(&commands).await.expect("write");
+        reader.get_mut().flush().await.expect("flush");
+
+        let login = read_until_contains(&mut reader, "A001 OK").await.join("");
+        assert!(login.contains("CATENATE"));
+        let source_append = read_until_contains(&mut reader, "A002 OK").await;
+        assert!(source_append.iter().any(|line| line.contains("APPENDUID")));
+        let catenate = read_until_contains(&mut reader, "A003 OK").await;
+        assert!(catenate.iter().any(|line| line.contains("APPENDUID")));
+        assert!(!catenate.iter().any(|line| line.starts_with("+ ")));
+        let literal_url_append = read_until_contains(&mut reader, "A004 OK").await;
+        assert!(
+            literal_url_append
+                .iter()
+                .any(|line| line.contains("APPENDUID"))
+        );
+        let bad_url = read_until_contains(&mut reader, "A005 NO").await.join("");
+        assert!(bad_url.contains("BADURL \"/INBOX/;UID=999\""));
+        reader
+            .get_mut()
+            .write_all(
+                format!("A006 APPEND Sent CATENATE (TEXT {{{}}}\r\n", suffix.len()).as_bytes(),
+            )
+            .await
+            .expect("write synchronizing CATENATE");
+        reader.get_mut().flush().await.expect("flush sync marker");
+        let mut continuation = String::new();
+        reader
+            .read_line(&mut continuation)
+            .await
+            .expect("CATENATE continuation");
+        assert!(continuation.starts_with("+ "));
+        reader
+            .get_mut()
+            .write_all(suffix)
+            .await
+            .expect("write sync text");
+        reader
+            .get_mut()
+            .write_all(b")\r\nA007 LOGOUT\r\n")
+            .await
+            .expect("finish commands");
+        reader.get_mut().flush().await.expect("flush finish");
+        let sync_append = read_until_contains(&mut reader, "A006 OK").await;
+        assert!(sync_append.iter().any(|line| line.contains("APPENDUID")));
+        let _logout = read_until_contains(&mut reader, "A007 OK").await;
+        server_task.await.expect("join").expect("server");
+
+        let (_, sent) =
+            rmail_common::imap_state::load_folder(&mail_root, "example.test", "user", "Sent")
+                .expect("load Sent");
+        assert_eq!(sent.len(), 3);
+        let mut expected = prefix.to_vec();
+        expected.extend_from_slice(b"source body\r\n");
+        expected.extend_from_slice(suffix);
+        assert_eq!(
+            std::fs::read(&sent[0].path).expect("read CATENATE result"),
+            expected
+        );
+        assert!(sent[0].flags.iter().any(|flag| flag == "\\SEEN"));
+        assert_eq!(
+            std::fs::read(&sent[1].path).expect("read literal-URL result"),
+            source
+        );
+        assert_eq!(
+            std::fs::read(&sent[2].path).expect("read sync TEXT result"),
+            suffix
         );
     }
 
