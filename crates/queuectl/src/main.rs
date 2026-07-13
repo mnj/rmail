@@ -10,6 +10,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+mod watch;
+
 /// rmail_queuectl: inspect and manage the on-disk outbound queue (queue/inflight/sent/failed)
 #[derive(Parser)]
 #[command(name = "rmail_queuectl")]
@@ -81,6 +84,21 @@ enum Commands {
         #[command(subcommand)]
         action: AliasAction,
     },
+    /// Watch live inbound and outbound SMTP activity
+    Watch {
+        /// Print events as a stream instead of opening the full-screen interface
+        #[arg(long)]
+        plain: bool,
+        /// Number of recent durable events to load at startup
+        #[arg(long, default_value_t = 250)]
+        history: usize,
+    },
+    /// Show the durable event history for a message ID
+    Track {
+        message_id: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -127,6 +145,15 @@ fn main() -> Result<()> {
             AliasAction::Remove { address } => cmd_alias_remove(&root, &address)?,
             AliasAction::List {} => cmd_alias_list(&root)?,
         },
+        #[cfg(unix)]
+        Some(Commands::Watch { plain, history }) => watch::run(&root, plain, history)?,
+        #[cfg(not(unix))]
+        Some(Commands::Watch { .. }) => anyhow::bail!("watch requires Unix-domain sockets"),
+        Some(Commands::Track { message_id, limit }) => {
+            for event in rmail_common::tracking::recent_events(&root, limit, Some(&message_id))? {
+                println!("{}", serde_json::to_string(&event)?);
+            }
+        }
     }
     Ok(())
 }
