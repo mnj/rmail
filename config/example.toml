@@ -1,24 +1,6 @@
 # Example rMail configuration (TOML)
 [global]
 mail_root = "mail"
-# Plain SMTP listeners, typically port 25 for inbound MX traffic
-listen_addrs = ["0.0.0.0:25", "[::]:25"]
-# Optional explicit SMTPS listeners; if unset, smtps_port binds wildcard v4+v6
-smtps_listen_addrs = ["0.0.0.0:465", "[::]:465"]
-smtps_port = 465
-submission_port = 587
-submission_listen_addrs = ["0.0.0.0:587", "[::]:587"]
-# Optional explicit IMAPS listeners; if unset, imaps_port binds wildcard v4 only
-imaps_listen_addrs = ["0.0.0.0:993", "[::]:993"]
-imaps_port = 993
-# Optional explicit IMAP listeners; if unset, imap_port binds wildcard v4 only
-imap_listen_addrs = ["0.0.0.0:143", "[::]:143"]
-imap_port = 143
-# Web UI defaults to localhost unless explicitly set; dual-stack localhost is supported
-web_listen_addrs = ["127.0.0.1:8080", "[::1]:8080"]
-web_port = 8080
-webmail_listen_addrs = ["127.0.0.1:8081", "[::1]:8081"]
-webmail_port = 8081
 # Set this to a long random value in production.
 # webmail_session_secret = "replace-with-at-least-32-random-bytes"
 tls_cert = "config/certs/localhost.crt"
@@ -32,6 +14,28 @@ web_admin_password_hash = "argon2$PLACEHOLDER"
 db_path = "config/rmail.db"
 # directory used to serve ACME http-01 challenges (used by automated cert managers)
 acme_challenge_dir = "config/acme-challenges"
+
+[global.tcp_listener]
+# SO_REUSEADDR is always enabled for clean restarts. Enable reuse_port only
+# when intentionally running multiple processes on the same sockets.
+reuse_port = false
+backlog = 1024
+# false makes each [::]:port wildcard below accept both IPv6 and IPv4.
+ipv6_only = false
+
+[global.listeners]
+# Address lists may bind exact interfaces independently, for example:
+#   IPv4 only: smtp = ["192.0.2.10:25"]
+#   IPv6 only: smtp = ["[2001:db8::10]:25"]
+#   Separate IPv4+IPv6 sockets: set ipv6_only=true and list both addresses.
+# The active example uses one wildcard dual-stack socket.
+smtp = ["[::]:25"]
+submission = ["[::]:587"]
+smtps = ["[::]:465"]
+imap = ["[::]:143"]
+imaps = ["[::]:993"]
+admin = ["127.0.0.1:8080"]
+webmail = ["127.0.0.1:8081"]
 
 [security]
 # Resource-exhaustion controls shared by SMTP, SMTPS, and submission listeners.

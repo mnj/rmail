@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
-use rmail_common::{auth, config::Config, db, imap_state, net::bind_tcp_listener};
+use rmail_common::{
+    auth, config::Config, db, imap_state, net::bind_tcp_listener_with_config,
+    runtime::GracefulShutdown,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -10,11 +13,12 @@ use std::{
     env, fs,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    task::JoinSet,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -115,6 +119,8 @@ async fn main() -> Result<()> {
     let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| Config {
         global: rmail_common::config::Global {
             mail_root: "mail".to_string(),
+            tcp_listener: rmail_common::net::TcpListenerConfig::default(),
+            listeners: rmail_common::config::ListenerEndpoints::default(),
             listen_addrs: None,
             smtps_listen_addrs: None,
             smtps_port: None,
@@ -167,22 +173,31 @@ async fn main() -> Result<()> {
         static_dir,
         session_secret,
     });
-    let port = cfg.global.webmail_port.unwrap_or(8081);
-    let bind_addrs = cfg
-        .global
-        .webmail_listen_addrs
-        .clone()
-        .unwrap_or_else(|| vec![format!("127.0.0.1:{}", port)]);
+    let bind_addrs = cfg.global.webmail_listeners();
+    let listener_config = cfg.global.tcp_listener.clone();
+    let shutdown = GracefulShutdown::new();
+    let mut listeners = JoinSet::new();
     for addr in bind_addrs {
-        let listener = bind_tcp_listener(&addr)?;
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
         println!("rMail webmail listening on {}", addr);
         let state = state.clone();
-        tokio::spawn(async move {
+        let listener_shutdown = shutdown.clone();
+        listeners.spawn(async move {
+            let mut shutdown_signal = listener_shutdown.subscribe();
             loop {
-                match listener.accept().await {
+                if *shutdown_signal.borrow() {
+                    break;
+                }
+                let accepted = tokio::select! {
+                    _ = shutdown_signal.changed() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                match accepted {
                     Ok((stream, _)) => {
                         let state = state.clone();
+                        let session = listener_shutdown.start_session();
                         tokio::spawn(async move {
+                            let _session = session;
                             if let Err(err) = handle_connection(stream, state).await {
                                 eprintln!("webmail connection error: {err:#}");
                             }
@@ -196,9 +211,21 @@ async fn main() -> Result<()> {
             }
         });
     }
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    rmail_common::runtime::wait_for_shutdown_signal().await?;
+    println!("Webmail shutdown requested; draining active requests");
+    shutdown.request();
+    while let Some(result) = listeners.join_next().await {
+        if let Err(error) = result {
+            eprintln!("webmail listener task failed during shutdown: {error}");
+        }
     }
+    if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
+        eprintln!(
+            "webmail shutdown drain timed out with {} active requests",
+            shutdown.active_sessions()
+        );
+    }
+    Ok(())
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {

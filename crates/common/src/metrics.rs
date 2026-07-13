@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,6 +20,7 @@ pub static SPF_FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DMARC_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DMARC_QUARANTINE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DMARC_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SMTP_MESSAGES_RECEIVED: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 pub fn inc_deliveries() {
     DELIVERIES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -68,6 +70,25 @@ pub fn inc_dmarc_quarantine() {
 }
 pub fn inc_dmarc_reject() {
     DMARC_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_smtp_message_received(
+    peer: Option<SocketAddr>,
+    implicit_tls: bool,
+    encrypted: bool,
+    extended_smtp: bool,
+) {
+    let ip_index = usize::from(peer.is_some_and(|address| address.is_ipv6()));
+    let transport_index = if implicit_tls {
+        2
+    } else if encrypted {
+        1
+    } else {
+        0
+    };
+    let protocol_index = usize::from(extended_smtp);
+    SMTP_MESSAGES_RECEIVED[ip_index * 6 + transport_index * 2 + protocol_index]
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn gather_prometheus() -> String {
@@ -121,6 +142,21 @@ pub fn gather_prometheus() -> String {
         "rmail_bytes_received_total {}\n",
         BYTES_RECEIVED_TOTAL.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP rmail_smtp_messages_received_total Accepted SMTP messages by IP version, transport, and greeting protocol\n");
+    out.push_str("# TYPE rmail_smtp_messages_received_total counter\n");
+    for (ip_index, ip_version) in ["4", "6"].iter().enumerate() {
+        for (transport_index, transport) in ["plain", "starttls", "implicit_tls"].iter().enumerate()
+        {
+            for (protocol_index, protocol) in ["smtp", "esmtp"].iter().enumerate() {
+                let value = SMTP_MESSAGES_RECEIVED
+                    [ip_index * 6 + transport_index * 2 + protocol_index]
+                    .load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "rmail_smtp_messages_received_total{{ip_version=\"{ip_version}\",transport=\"{transport}\",protocol=\"{protocol}\"}} {value}\n"
+                ));
+            }
+        }
+    }
     out.push_str("# HELP rmail_auth_failures_total Total authentication failures recorded\n");
     out.push_str("# TYPE rmail_auth_failures_total counter\n");
     out.push_str(&format!(
@@ -179,4 +215,22 @@ pub fn persist_prometheus_snapshot(mail_root: &Path, component: &str) -> anyhow:
     }
     std::fs::write(path, gather_prometheus())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gather_prometheus, inc_smtp_message_received};
+
+    #[test]
+    fn smtp_message_metrics_include_ip_transport_and_protocol_dimensions() {
+        inc_smtp_message_received(Some("[2001:db8::1]:25".parse().unwrap()), false, true, true);
+        let metrics = gather_prometheus();
+
+        assert!(metrics.contains(
+            "rmail_smtp_messages_received_total{ip_version=\"6\",transport=\"starttls\",protocol=\"esmtp\"} 1"
+        ));
+        assert!(metrics.contains(
+            "rmail_smtp_messages_received_total{ip_version=\"4\",transport=\"plain\",protocol=\"smtp\"} 0"
+        ));
+    }
 }

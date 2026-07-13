@@ -1,3 +1,4 @@
+use crate::net::TcpListenerConfig;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -5,6 +6,15 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Global {
     pub mail_root: String,
+    /// Process-wide TCP listener behavior. Explicit listen address arrays still
+    /// choose IPv4-only, IPv6-only, or combined listeners per service.
+    #[serde(default)]
+    pub tcp_listener: TcpListenerConfig,
+    /// Preferred listener configuration. Each service is a list of complete
+    /// socket addresses, such as `["[::]:25"]` or
+    /// `["0.0.0.0:25", "[::]:25"]`.
+    #[serde(default)]
+    pub listeners: ListenerEndpoints,
     /// Plain SMTP bind addresses, e.g. ["0.0.0.0:25", "[::]:25"]
     pub listen_addrs: Option<Vec<String>>,
     /// Implicit TLS SMTP bind addresses; if unset, smtps_port binds wildcard v4+v6
@@ -40,6 +50,84 @@ pub struct Global {
     pub acme_challenge_dir: Option<String>,
     /// If true, enforce DMARC policies (reject/quarantine) at SMTP time for inbound mail
     pub enforce_dmarc: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct ListenerEndpoints {
+    pub smtp: Option<Vec<String>>,
+    pub submission: Option<Vec<String>>,
+    pub smtps: Option<Vec<String>>,
+    pub imap: Option<Vec<String>>,
+    pub imaps: Option<Vec<String>>,
+    pub admin: Option<Vec<String>>,
+    pub webmail: Option<Vec<String>>,
+}
+
+impl Global {
+    pub fn smtp_listeners(&self) -> Vec<String> {
+        self.listeners
+            .smtp
+            .clone()
+            .or_else(|| self.listen_addrs.clone())
+            .unwrap_or_else(|| vec!["127.0.0.1:2525".to_string(), "[::1]:2525".to_string()])
+    }
+
+    pub fn submission_listeners(&self) -> Vec<String> {
+        if let Some(addresses) = self.listeners.submission.clone() {
+            return addresses;
+        }
+        self.submission_port.map_or_else(Vec::new, |port| {
+            self.submission_listen_addrs
+                .clone()
+                .unwrap_or_else(|| vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")])
+        })
+    }
+
+    pub fn smtps_listeners(&self) -> Vec<String> {
+        if let Some(addresses) = self.listeners.smtps.clone() {
+            return addresses;
+        }
+        self.smtps_port.map_or_else(Vec::new, |port| {
+            self.smtps_listen_addrs
+                .clone()
+                .unwrap_or_else(|| vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")])
+        })
+    }
+
+    pub fn imap_listeners(&self) -> Vec<String> {
+        self.listeners
+            .imap
+            .clone()
+            .or_else(|| self.imap_listen_addrs.clone())
+            .unwrap_or_else(|| vec![format!("0.0.0.0:{}", self.imap_port.unwrap_or(143))])
+    }
+
+    pub fn imaps_listeners(&self) -> Vec<String> {
+        if let Some(addresses) = self.listeners.imaps.clone() {
+            return addresses;
+        }
+        self.imaps_port.map_or_else(Vec::new, |port| {
+            self.imaps_listen_addrs
+                .clone()
+                .unwrap_or_else(|| vec![format!("0.0.0.0:{port}")])
+        })
+    }
+
+    pub fn admin_listeners(&self) -> Vec<String> {
+        self.listeners
+            .admin
+            .clone()
+            .or_else(|| self.web_listen_addrs.clone())
+            .unwrap_or_else(|| vec![format!("127.0.0.1:{}", self.web_port.unwrap_or(8080))])
+    }
+
+    pub fn webmail_listeners(&self) -> Vec<String> {
+        self.listeners
+            .webmail
+            .clone()
+            .or_else(|| self.webmail_listen_addrs.clone())
+            .unwrap_or_else(|| vec![format!("127.0.0.1:{}", self.webmail_port.unwrap_or(8081))])
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -272,5 +360,69 @@ rspamd_reject_actions = ["reject"]
         assert_eq!(cfg.security.scanner_max_message_bytes, 99);
         assert!(cfg.security.submission_require_from_alignment);
         assert!(cfg.security.scanners_enabled());
+    }
+
+    #[test]
+    fn unified_listener_table_supports_concise_dual_stack_configuration() {
+        let cfg: Config = toml::from_str(
+            r#"
+[global]
+mail_root = "mail"
+
+[global.tcp_listener]
+ipv6_only = false
+reuse_port = true
+backlog = 256
+
+[global.listeners]
+smtp = ["[::]:25"]
+submission = ["127.0.0.1:587"]
+imap = ["[::1]:143"]
+imaps = []
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(cfg.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(cfg.global.submission_listeners(), ["127.0.0.1:587"]);
+        assert_eq!(cfg.global.imap_listeners(), ["[::1]:143"]);
+        assert!(cfg.global.imaps_listeners().is_empty());
+        assert!(!cfg.global.tcp_listener.ipv6_only);
+        assert!(cfg.global.tcp_listener.reuse_port);
+        assert_eq!(cfg.global.tcp_listener.backlog, 256);
+    }
+
+    #[test]
+    fn legacy_listener_fields_remain_compatible() {
+        let cfg: Config = toml::from_str(
+            r#"
+[global]
+mail_root = "mail"
+listen_addrs = ["127.0.0.1:2525"]
+submission_port = 2587
+imap_port = 1143
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(cfg.global.smtp_listeners(), ["127.0.0.1:2525"]);
+        assert_eq!(
+            cfg.global.submission_listeners(),
+            ["0.0.0.0:2587", "[::]:2587"]
+        );
+        assert_eq!(cfg.global.imap_listeners(), ["0.0.0.0:1143"]);
+    }
+
+    #[test]
+    fn distributed_example_configs_parse() {
+        let example: Config =
+            toml::from_str(include_str!("../../../config/example.toml")).expect("example config");
+        let test: Config =
+            toml::from_str(include_str!("../../../config/test.toml")).expect("test config");
+
+        assert_eq!(example.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(example.global.imap_listeners(), ["[::]:143"]);
+        assert_eq!(test.global.smtp_listeners().len(), 2);
+        assert_eq!(test.global.tcp_listener.backlog, 128);
     }
 }

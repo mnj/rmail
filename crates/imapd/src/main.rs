@@ -7,11 +7,13 @@
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
-use rmail_common::{config::Config, net::bind_tcp_listener};
+use rmail_common::{config::Config, net::bind_tcp_listener_with_config, runtime::GracefulShutdown};
 use std::io::ErrorKind;
 use std::path::Path;
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::task::JoinSet;
 
 mod auth;
 mod commands;
@@ -212,6 +214,8 @@ async fn main() -> Result<()> {
 
     // SQLite DB is the authoritative source for mailboxes/catchalls
     let db_path = cfg.global.db_path.clone();
+    let shutdown = GracefulShutdown::new();
+    let mut listeners = JoinSet::new();
     if db_path.is_none() {
         eprintln!("No db_path configured; SQLite DB is required");
         std::process::exit(1);
@@ -232,15 +236,12 @@ async fn main() -> Result<()> {
 
     let db_path = cfg.global.db_path.clone();
     // Plain IMAP listener (supports STARTTLS if tls_context present)
-    let imap_port = cfg.global.imap_port.unwrap_or(143);
-    let imap_addrs = cfg
-        .global
-        .imap_listen_addrs
-        .clone()
-        .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imap_port)]);
+    let imap_addrs = cfg.global.imap_listeners();
+    let imaps_addrs = cfg.global.imaps_listeners();
+    let listener_config = cfg.global.tcp_listener.clone();
     let mut listener_count = 0usize;
     for addr in imap_addrs {
-        let listener = bind_tcp_listener(&addr)
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)
             .with_context(|| format!("starting IMAP plain listener on {addr}"))?;
         println!("rMail IMAPD listening on {}", addr);
         listener_count += 1;
@@ -248,7 +249,8 @@ async fn main() -> Result<()> {
         let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
-        tokio::spawn(async move {
+        let listener_shutdown = shutdown.clone();
+        listeners.spawn(async move {
             if let Err(e) = run_plain_listener(
                 addr,
                 listener,
@@ -256,6 +258,7 @@ async fn main() -> Result<()> {
                 acceptor_clone,
                 db_clone,
                 auth_policy,
+                listener_shutdown,
             )
             .await
             {
@@ -266,38 +269,33 @@ async fn main() -> Result<()> {
 
     // IMAPS (implicit TLS) listener
     if let Some(ctx) = tls_context.clone() {
-        if let Some(imaps_port) = cfg.global.imaps_port {
-            let imaps_addrs = cfg
-                .global
-                .imaps_listen_addrs
-                .clone()
-                .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imaps_port)]);
-            for addr in imaps_addrs {
-                let listener = bind_tcp_listener(&addr)
-                    .with_context(|| format!("starting IMAPS listener on {addr}"))?;
-                println!("rMail IMAPD (IMAPS) listening on {}", addr);
-                listener_count += 1;
-                let mail_root_clone = mail_root.clone();
-                let ctx_clone = ctx.clone();
-                let db_clone = db_path.clone();
-                let auth_policy = auth_policy.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = run_imaps_listener(
-                        addr,
-                        listener,
-                        ctx_clone,
-                        mail_root_clone,
-                        db_clone,
-                        auth_policy,
-                    )
-                    .await
-                    {
-                        eprintln!("IMAPS listener failed: {}", e);
-                    }
-                });
-            }
+        for addr in imaps_addrs {
+            let listener = bind_tcp_listener_with_config(&addr, &listener_config)
+                .with_context(|| format!("starting IMAPS listener on {addr}"))?;
+            println!("rMail IMAPD (IMAPS) listening on {}", addr);
+            listener_count += 1;
+            let mail_root_clone = mail_root.clone();
+            let ctx_clone = ctx.clone();
+            let db_clone = db_path.clone();
+            let auth_policy = auth_policy.clone();
+            let listener_shutdown = shutdown.clone();
+            listeners.spawn(async move {
+                if let Err(e) = run_imaps_listener(
+                    addr,
+                    listener,
+                    ctx_clone,
+                    mail_root_clone,
+                    db_clone,
+                    auth_policy,
+                    listener_shutdown,
+                )
+                .await
+                {
+                    eprintln!("IMAPS listener failed: {}", e);
+                }
+            });
         }
-    } else if cfg.global.imaps_port.is_some() || cfg.global.imaps_listen_addrs.is_some() {
+    } else if !imaps_addrs.is_empty() {
         eprintln!("IMAPS listener not started because TLS certificate/key could not be loaded");
     }
 
@@ -305,10 +303,21 @@ async fn main() -> Result<()> {
         return Err(anyhow!("no IMAP listeners were started"));
     }
 
-    // keep running
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    rmail_common::runtime::wait_for_shutdown_signal().await?;
+    println!("IMAP shutdown requested; draining listeners and active sessions");
+    shutdown.request();
+    while let Some(result) = listeners.join_next().await {
+        if let Err(error) = result {
+            eprintln!("IMAP listener task failed during shutdown: {error}");
+        }
     }
+    if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
+        eprintln!(
+            "IMAP shutdown drain timed out with {} active sessions",
+            shutdown.active_sessions()
+        );
+    }
+    Ok(())
 }
 
 async fn run_plain_listener(
@@ -318,9 +327,20 @@ async fn run_plain_listener(
     tls_ctx: Option<Arc<tls::TlsContext>>,
     db_path: Option<String>,
     auth_policy: Arc<auth::AuthPolicy>,
+    shutdown: GracefulShutdown,
 ) -> Result<()> {
+    let mut shutdown_signal = shutdown.subscribe();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        if *shutdown_signal.borrow() {
+            return Ok(());
+        }
+        let (stream, peer) = tokio::select! {
+            changed = shutdown_signal.changed() => {
+                changed.context("waiting for IMAP shutdown signal")?;
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         println!(
             "Accepted IMAP plaintext connection on {} from {} (starttls_available={})",
             addr,
@@ -331,7 +351,9 @@ async fn run_plain_listener(
         let acceptor = tls_ctx.clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
+        let session = shutdown.start_session();
         tokio::spawn(async move {
+            let _session = session;
             if let Err(e) = process_stream_with_policy(
                 Box::new(stream),
                 mail_root,
@@ -356,15 +378,28 @@ async fn run_imaps_listener(
     mail_root: String,
     db_path: Option<String>,
     auth_policy: Arc<auth::AuthPolicy>,
+    shutdown: GracefulShutdown,
 ) -> Result<()> {
+    let mut shutdown_signal = shutdown.subscribe();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        if *shutdown_signal.borrow() {
+            return Ok(());
+        }
+        let (stream, peer) = tokio::select! {
+            changed = shutdown_signal.changed() => {
+                changed.context("waiting for IMAPS shutdown signal")?;
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
         let ctx = ctx.clone();
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
+        let session = shutdown.start_session();
         tokio::spawn(async move {
+            let _session = session;
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     if let Err(e) = process_stream_with_policy(

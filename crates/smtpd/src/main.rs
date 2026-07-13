@@ -14,11 +14,13 @@ use std::{
 use rmail_common::{
     config::{Config, ScannerFailureAction, SecurityConfig},
     maildir, metrics,
-    net::bind_tcp_listener,
+    net::bind_tcp_listener_with_config,
+    runtime::GracefulShutdown,
     scanner::{ScanAction, ScanEnvelope},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 mod authenticate;
@@ -213,11 +215,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    let listen_addrs = if let Some(addrs) = &cfg.global.listen_addrs {
-        addrs.clone()
-    } else {
-        vec!["127.0.0.1:2525".to_string(), "[::1]:2525".to_string()]
-    };
+    let listen_addrs = cfg.global.smtp_listeners();
+    let smtps_addrs = cfg.global.smtps_listeners();
+    let submission_addrs = cfg.global.submission_listeners();
+    let listener_config = cfg.global.tcp_listener.clone();
 
     // DMARC enforcement flag
     let enforce_dmarc = cfg.global.enforce_dmarc.unwrap_or(false);
@@ -225,19 +226,24 @@ async fn main() -> Result<()> {
     protocol::validate_sasl_mechanisms(&security.smtp_sasl_mechanisms)
         .context("validating security.smtp_sasl_mechanisms")?;
     let session_limit = Arc::new(Semaphore::new(security.smtp_max_concurrent_sessions.max(1)));
+    let shutdown = GracefulShutdown::new();
+    let mut listeners = JoinSet::new();
 
     // spawn plain SMTP listeners
-    for addr in listen_addrs.iter() {
-        let addr = addr.clone();
+    for addr in listen_addrs {
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)
+            .with_context(|| format!("starting SMTP listener on {addr}"))?;
         let mail_root_clone = mail_root.clone();
         let acceptor_clone = tls_context.clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
         let security = security.clone();
         let session_limit = session_limit.clone();
-        tokio::spawn(async move {
+        let listener_shutdown = shutdown.clone();
+        listeners.spawn(async move {
             if let Err(e) = run_plain_listener(
-                &addr,
+                addr.clone(),
+                listener,
                 mail_root_clone,
                 acceptor_clone,
                 db_clone,
@@ -245,6 +251,7 @@ async fn main() -> Result<()> {
                 security,
                 session_limit,
                 SmtpService::Mta,
+                listener_shutdown,
             )
             .await
             {
@@ -255,83 +262,90 @@ async fn main() -> Result<()> {
 
     // spawn SMTPS listener (implicit TLS) if configured
     if let Some(s_ctx) = tls_context.clone() {
-        if let Some(port) = cfg.global.smtps_port {
-            let smtps_addrs = cfg
-                .global
-                .smtps_listen_addrs
-                .clone()
-                .unwrap_or_else(|| vec![format!("0.0.0.0:{}", port), format!("[::]:{}", port)]);
-
-            for addr in smtps_addrs {
-                let mail_root_clone = mail_root.clone();
-                let ctx_clone = s_ctx.clone();
-                let db_clone = db_path.clone();
-                let enforce = enforce_dmarc;
-                let security = security.clone();
-                let session_limit = session_limit.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = run_smtps_listener(
-                        &addr,
-                        ctx_clone,
-                        mail_root_clone,
-                        db_clone,
-                        enforce,
-                        security,
-                        session_limit,
-                        SmtpService::Submission,
-                    )
-                    .await
-                    {
-                        eprintln!("SMTPS {} failed: {}", addr, e);
-                    }
-                });
-            }
+        for addr in smtps_addrs {
+            let listener = bind_tcp_listener_with_config(&addr, &listener_config)
+                .with_context(|| format!("starting SMTPS listener on {addr}"))?;
+            let mail_root_clone = mail_root.clone();
+            let ctx_clone = s_ctx.clone();
+            let db_clone = db_path.clone();
+            let enforce = enforce_dmarc;
+            let security = security.clone();
+            let session_limit = session_limit.clone();
+            let listener_shutdown = shutdown.clone();
+            listeners.spawn(async move {
+                if let Err(e) = run_smtps_listener(
+                    addr.clone(),
+                    listener,
+                    ctx_clone,
+                    mail_root_clone,
+                    db_clone,
+                    enforce,
+                    security,
+                    session_limit,
+                    SmtpService::Submission,
+                    listener_shutdown,
+                )
+                .await
+                {
+                    eprintln!("SMTPS {} failed: {}", addr, e);
+                }
+            });
         }
-    } else {
+    } else if !smtps_addrs.is_empty() {
         println!("TLS not configured; SMTPS disabled (implicit TLS)");
     }
 
     // RFC 6409 message submission: STARTTLS and authentication are enforced by
     // the session policy before any MAIL transaction is accepted.
-    if let Some(port) = cfg.global.submission_port {
-        let addrs = cfg
-            .global
-            .submission_listen_addrs
-            .clone()
-            .unwrap_or_else(|| vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")]);
-        for addr in addrs {
-            let mail_root = mail_root.clone();
-            let tls_ctx = tls_context.clone();
-            let db_path = db_path.clone();
-            let security = security.clone();
-            let session_limit = session_limit.clone();
-            tokio::spawn(async move {
-                if let Err(error) = run_plain_listener(
-                    &addr,
-                    mail_root,
-                    tls_ctx,
-                    db_path,
-                    false,
-                    security,
-                    session_limit,
-                    SmtpService::Submission,
-                )
-                .await
-                {
-                    eprintln!("Submission listener {addr} failed: {error}");
-                }
-            });
-        }
+    for addr in submission_addrs {
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)
+            .with_context(|| format!("starting submission listener on {addr}"))?;
+        let mail_root = mail_root.clone();
+        let tls_ctx = tls_context.clone();
+        let db_path = db_path.clone();
+        let security = security.clone();
+        let session_limit = session_limit.clone();
+        let listener_shutdown = shutdown.clone();
+        listeners.spawn(async move {
+            if let Err(error) = run_plain_listener(
+                addr.clone(),
+                listener,
+                mail_root,
+                tls_ctx,
+                db_path,
+                false,
+                security,
+                session_limit,
+                SmtpService::Submission,
+                listener_shutdown,
+            )
+            .await
+            {
+                eprintln!("Submission listener {addr} failed: {error}");
+            }
+        });
     }
 
-    // keep running
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    rmail_common::runtime::wait_for_shutdown_signal().await?;
+    println!("SMTP shutdown requested; draining listeners and active sessions");
+    shutdown.request();
+    while let Some(result) = listeners.join_next().await {
+        if let Err(error) = result {
+            eprintln!("SMTP listener task failed during shutdown: {error}");
+        }
     }
+    if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
+        eprintln!(
+            "SMTP shutdown drain timed out with {} active sessions",
+            shutdown.active_sessions()
+        );
+    }
+    Ok(())
 }
 
 async fn run_plain_listener(
-    addr: &str,
+    addr: String,
+    listener: tokio::net::TcpListener,
     mail_root: String,
     tls_ctx: Option<Arc<tls::TlsContext>>,
     db_path: Option<String>,
@@ -339,11 +353,21 @@ async fn run_plain_listener(
     security: Arc<SecurityConfig>,
     session_limit: Arc<Semaphore>,
     service: SmtpService,
+    shutdown: GracefulShutdown,
 ) -> Result<()> {
-    let listener = bind_tcp_listener(addr)?;
     println!("rMail SMTPD listening on {}", addr);
+    let mut shutdown_signal = shutdown.subscribe();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        if *shutdown_signal.borrow() {
+            return Ok(());
+        }
+        let (stream, peer) = tokio::select! {
+            changed = shutdown_signal.changed() => {
+                changed.context("waiting for SMTP shutdown signal")?;
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         println!(
             "Accepted SMTP plaintext connection on {} from {} (starttls_available={})",
             addr,
@@ -372,7 +396,9 @@ async fn run_plain_listener(
                 continue;
             }
         };
+        let session = shutdown.start_session();
         tokio::spawn(async move {
+            let _session = session;
             let _permit = permit;
             if let Err(e) = process_stream(
                 Box::new(stream),
@@ -395,7 +421,8 @@ async fn run_plain_listener(
 }
 
 async fn run_smtps_listener(
-    addr: &str,
+    addr: String,
+    listener: tokio::net::TcpListener,
     ctx: Arc<tls::TlsContext>,
     mail_root: String,
     db_path: Option<String>,
@@ -403,11 +430,21 @@ async fn run_smtps_listener(
     security: Arc<SecurityConfig>,
     session_limit: Arc<Semaphore>,
     service: SmtpService,
+    shutdown: GracefulShutdown,
 ) -> Result<()> {
-    let listener = bind_tcp_listener(addr)?;
     println!("rMail SMTPS listening on {}", addr);
+    let mut shutdown_signal = shutdown.subscribe();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        if *shutdown_signal.borrow() {
+            return Ok(());
+        }
+        let (stream, peer) = tokio::select! {
+            changed = shutdown_signal.changed() => {
+                changed.context("waiting for SMTPS shutdown signal")?;
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         println!("Accepted SMTPS TCP connection on {} from {}", addr, peer);
         let ctx = ctx.clone();
         let mail_root = mail_root.clone();
@@ -431,7 +468,9 @@ async fn run_smtps_listener(
                 continue;
             }
         };
+        let session = shutdown.start_session();
         tokio::spawn(async move {
+            let _session = session;
             let _permit = permit;
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
@@ -631,6 +670,7 @@ async fn process_stream(
     service: SmtpService,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
+    let implicit_tls = session_encrypted;
     println!(
         "Starting SMTP session peer={:?} encrypted={} tls_configured={} enforce_dmarc={}",
         peer,
@@ -1752,6 +1792,12 @@ async fn process_stream(
                     // Finalize DATA response based on per-recipient outcomes
                     let w = reader.get_mut();
                     if any_accepted {
+                        metrics::inc_smtp_message_received(
+                            peer,
+                            implicit_tls,
+                            session_encrypted,
+                            extended_smtp,
+                        );
                         if service == SmtpService::Submission
                             && let Some(user) = authenticated_user.as_deref()
                         {

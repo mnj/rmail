@@ -11,8 +11,9 @@ use base64::Engine;
 use rand::rngs::OsRng;
 use rmail_common::auth;
 use rmail_common::config::Config;
-use rmail_common::net::bind_tcp_listener;
+use rmail_common::net::bind_tcp_listener_with_config;
 use rmail_common::outbound::QueueControl;
+use rmail_common::runtime::GracefulShutdown;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 #[derive(Serialize)]
@@ -2220,6 +2222,8 @@ async fn main() -> Result<()> {
         Config {
             global: rmail_common::config::Global {
                 mail_root: "mail".into(),
+                tcp_listener: rmail_common::net::TcpListenerConfig::default(),
+                listeners: rmail_common::config::ListenerEndpoints::default(),
                 listen_addrs: None,
                 smtps_listen_addrs: None,
                 smtps_port: None,
@@ -2246,7 +2250,7 @@ async fn main() -> Result<()> {
             security: rmail_common::config::SecurityConfig::default(),
         }
     });
-    let mail_root = PathBuf::from(cfg.global.mail_root);
+    let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "web").context("redirecting logs")?;
     let admin_user = cfg.global.web_admin_user.clone();
     let admin_hash = cfg.global.web_admin_password_hash.clone();
@@ -2258,14 +2262,12 @@ async fn main() -> Result<()> {
         security: cfg.security.clone(),
         check_dns: true,
     };
-    let port = cfg.global.web_port.unwrap_or(8080);
-    let bind_addrs = cfg
-        .global
-        .web_listen_addrs
-        .clone()
-        .unwrap_or_else(|| vec![format!("127.0.0.1:{}", port)]);
+    let bind_addrs = cfg.global.admin_listeners();
+    let listener_config = cfg.global.tcp_listener.clone();
+    let shutdown = GracefulShutdown::new();
+    let mut listeners = JoinSet::new();
     for addr in bind_addrs {
-        let listener = bind_tcp_listener(&addr)?;
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
         println!("rMail web UI listening on {}", addr);
         let mr = mail_root.clone();
         let admin_user = admin_user.clone();
@@ -2273,14 +2275,22 @@ async fn main() -> Result<()> {
         let db_path = db_path.clone();
         let acme_dir = acme_dir.clone();
         let readiness = readiness.clone();
-        tokio::spawn(async move {
+        let listener_shutdown = shutdown.clone();
+        listeners.spawn(async move {
+            let mut shutdown_signal = listener_shutdown.subscribe();
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
+                if *shutdown_signal.borrow() {
+                    break;
+                }
+                let (stream, _) = tokio::select! {
+                    _ = shutdown_signal.changed() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(value) => value,
+                        Err(e) => {
                         eprintln!("web listener {} accept error: {}", addr, e);
                         break;
-                    }
+                        }
+                    },
                 };
                 let mr = mr.clone();
                 let admin_user = admin_user.clone();
@@ -2288,7 +2298,9 @@ async fn main() -> Result<()> {
                 let db_path = db_path.clone();
                 let acme_dir = acme_dir.clone();
                 let readiness = readiness.clone();
+                let session = listener_shutdown.start_session();
                 tokio::spawn(async move {
+                    let _session = session;
                     handle_connection(
                         stream, mr, admin_user, admin_hash, db_path, acme_dir, readiness,
                     )
@@ -2297,9 +2309,21 @@ async fn main() -> Result<()> {
             }
         });
     }
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    rmail_common::runtime::wait_for_shutdown_signal().await?;
+    println!("Web admin shutdown requested; draining active requests");
+    shutdown.request();
+    while let Some(result) = listeners.join_next().await {
+        if let Err(error) = result {
+            eprintln!("web listener task failed during shutdown: {error}");
+        }
     }
+    if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
+        eprintln!(
+            "web shutdown drain timed out with {} active requests",
+            shutdown.active_sessions()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

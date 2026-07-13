@@ -200,6 +200,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut deliveries = JoinSet::new();
+    let shutdown_signal = rmail_common::runtime::wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
     let connections = ConnectionPool::new(max_idle_per_destination, max_idle_connections);
     let mut next_metrics = Instant::now();
     let mut next_dead_letter_cleanup = Instant::now() + Duration::from_secs(60);
@@ -246,12 +248,22 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if deliveries.is_empty() {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                signal = &mut shutdown_signal => {
+                    signal?;
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
             continue;
         }
 
         let next_maintenance = next_metrics.min(next_dead_letter_cleanup);
         tokio::select! {
+            signal = &mut shutdown_signal => {
+                signal?;
+                break;
+            }
             completed = deliveries.join_next() => {
                 if let Some(Err(error)) = completed {
                     eprintln!("outbound delivery task failed to join: {error}");
@@ -260,6 +272,29 @@ async fn main() -> anyhow::Result<()> {
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_maintenance)) => {}
         }
     }
+
+    println!(
+        "outbound shutdown requested; draining {} active deliveries",
+        deliveries.len()
+    );
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(completed) = deliveries.join_next().await {
+            if let Err(error) = completed {
+                eprintln!("outbound delivery task failed during shutdown: {error}");
+            }
+        }
+    })
+    .await
+    .is_ok();
+    if !drained {
+        eprintln!(
+            "outbound shutdown drain timed out with {} recoverable inflight deliveries",
+            deliveries.len()
+        );
+        deliveries.abort_all();
+        while deliveries.join_next().await.is_some() {}
+    }
+    Ok(())
 }
 
 fn positive_env(name: &str, default: usize) -> usize {

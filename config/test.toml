@@ -1,18 +1,6 @@
 # Test config for running rMail services on non-privileged ports
 [global]
 mail_root = "mail_test"
-listen_addrs = ["127.0.0.1:2525", "[::1]:2525"]
-smtps_listen_addrs = ["127.0.0.1:2465", "[::1]:2465"]
-smtps_port = 2465
-submission_port = 2587
-imaps_listen_addrs = ["127.0.0.1:1993", "[::1]:1993"]
-imaps_port = 1993
-imap_listen_addrs = ["127.0.0.1:1143", "[::1]:1143"]
-imap_port = 1143
-web_listen_addrs = ["127.0.0.1:18080"]
-webmail_listen_addrs = ["127.0.0.1:18081"]
-webmail_port = 18081
-web_port = 18080
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "debug"
@@ -23,6 +11,20 @@ web_admin_password_hash = "plain:password"
 db_path = "config/rmail_test.db"
 # ACME challenge dir for local testing (empty by default)
 acme_challenge_dir = "config/acme-challenges"
+
+[global.tcp_listener]
+reuse_port = false
+backlog = 128
+ipv6_only = true
+
+[global.listeners]
+smtp = ["127.0.0.1:2525", "[::1]:2525"]
+smtps = ["127.0.0.1:2465", "[::1]:2465"]
+submission = ["127.0.0.1:2587", "[::1]:2587"]
+imap = ["127.0.0.1:1143", "[::1]:1143"]
+imaps = ["127.0.0.1:1993", "[::1]:1993"]
+admin = ["127.0.0.1:18080"]
+webmail = ["127.0.0.1:18081"]
 
 # Experimental: enable DANE/TLSA verification for outbound deliveries via environment variable
 # RMAIL_ENABLE_DANE=1  (set to 0 or false to disable)
