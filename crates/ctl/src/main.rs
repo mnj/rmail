@@ -515,8 +515,9 @@ async fn main() -> Result<()> {
             if let Some(parent) = Path::new(&out_key).parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&fullchain, &out_cert)?;
-            fs::copy(&privkey, &out_key)?;
+            validate_tls_bundle(&fullchain, &privkey, &cfg.global.tls)?;
+            atomic_copy(&fullchain, Path::new(&out_cert))?;
+            atomic_copy(&privkey, Path::new(&out_key))?;
             println!(
                 "Obtained cert for {} -> {} / {}",
                 primary_domain, out_cert, out_key
@@ -586,8 +587,9 @@ async fn main() -> Result<()> {
             if let Some(parent) = Path::new(&out_key).parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&fullchain, &out_cert)?;
-            fs::copy(&privkey, &out_key)?;
+            validate_tls_bundle(&fullchain, &privkey, &cfg.global.tls)?;
+            atomic_copy(&fullchain, Path::new(&out_cert))?;
+            atomic_copy(&privkey, Path::new(&out_key))?;
             println!(
                 "Renewed cert for {} -> {} / {}",
                 primary_domain, out_cert, out_key
@@ -604,6 +606,47 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_tls_bundle(
+    certificate: &Path,
+    private_key: &Path,
+    policy: &rmail_common::config::TlsPolicy,
+) -> Result<()> {
+    let material = rmail_common::tls::load_server_tls_material(
+        certificate.to_string_lossy().as_ref(),
+        private_key.to_string_lossy().as_ref(),
+        policy.ocsp_response.as_deref(),
+    )?;
+    rmail_common::tls::build_server_config(material, policy)?;
+    Ok(())
+}
+
+fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("destination has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let filename = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("destination filename is not valid UTF-8"))?;
+    let temporary = parent.join(format!(
+        ".{filename}.rmail-rotate.{}.{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<()> {
+        fs::copy(source, &temporary)?;
+        fs::File::open(&temporary)?.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn selected_units(opts: &ServiceCommandOptions, reverse: bool) -> Result<Vec<&'static str>> {
@@ -691,7 +734,9 @@ fn run_systemctl(action: &str, unit: &str, dry_run: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceCommandOptions, normalize_unit_name, selected_units};
+    use std::fs;
+
+    use super::{ServiceCommandOptions, atomic_copy, normalize_unit_name, selected_units};
 
     #[test]
     fn normalizes_service_short_names() {
@@ -712,5 +757,23 @@ mod tests {
         let units = selected_units(&opts, true).unwrap();
         assert_eq!(units.first().copied(), Some("rmail_outbound.service"));
         assert_eq!(units.last().copied(), Some("rmail_smtpd.service"));
+    }
+
+    #[test]
+    fn atomic_copy_replaces_destination_without_leaving_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.pem");
+        let destination = directory.path().join("destination.pem");
+        fs::write(&source, b"new bundle").unwrap();
+        fs::write(&destination, b"old bundle").unwrap();
+
+        atomic_copy(&source, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new bundle");
+        let names = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
     }
 }

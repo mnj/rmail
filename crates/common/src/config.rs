@@ -64,6 +64,8 @@ pub struct TlsPolicy {
     /// Rustls cipher-suite names. Empty uses the safe Rustls defaults.
     #[serde(default)]
     pub cipher_suites: Vec<String>,
+    /// DER-encoded OCSP response to staple with the configured certificate.
+    pub ocsp_response: Option<String>,
     /// Keep admin web and webmail on HTTP when a reverse proxy terminates TLS.
     #[serde(default)]
     pub web_http_only: bool,
@@ -74,6 +76,7 @@ impl Default for TlsPolicy {
         Self {
             minimum_version: TlsMinimumVersion::Tls12,
             cipher_suites: Vec::new(),
+            ocsp_response: None,
             web_http_only: false,
         }
     }
@@ -401,6 +404,19 @@ mod tests {
         assert!(!cfg.security.scanners_enabled());
         assert_eq!(cfg.global.tls.minimum_version, TlsMinimumVersion::Tls12);
         assert!(cfg.global.tls.cipher_suites.is_empty());
+        assert!(cfg.global.tls.ocsp_response.is_none());
+    }
+
+    #[test]
+    fn tls_policy_parses_ocsp_response_path() {
+        let cfg: Config = toml::from_str(
+            "[global]\nmail_root = \"mail\"\n[global.tls]\nocsp_response = \"/run/rmail/ocsp.der\"\n",
+        )
+        .expect("config");
+        assert_eq!(
+            cfg.global.tls.ocsp_response.as_deref(),
+            Some("/run/rmail/ocsp.der")
+        );
     }
 
     #[test]

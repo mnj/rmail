@@ -212,10 +212,10 @@ fn spawn_tls_reloader(
         while signal.recv().await.is_some() {
             match reload_tls_context(&sender, &cert_path, &key_path, &policy) {
                 Ok(()) => {
-                    println!("IMAP TLS certificate and policy reloaded");
+                    println!("IMAP TLS certificate, key, OCSP response, and policy reloaded");
                 }
                 Err(error) => {
-                    eprintln!("IMAP TLS reload failed; keeping current context: {error}");
+                    eprintln!("IMAP TLS reload failed; keeping current TLS bundle: {error}");
                 }
             }
         }

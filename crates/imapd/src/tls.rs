@@ -1,13 +1,8 @@
-use anyhow::Context;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
-use rmail_common::config::{TlsMinimumVersion, TlsPolicy};
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rmail_common::config::TlsPolicy;
 use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig, SupportedCipherSuite};
 
 #[allow(dead_code)]
 pub struct TlsContext {
@@ -25,46 +20,13 @@ pub fn load_tls_context_with_policy(
     key_path: &str,
     policy: &TlsPolicy,
 ) -> anyhow::Result<Arc<TlsContext>> {
-    let cert_file = File::open(cert_path).context("opening cert file")?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs = certs(&mut cert_reader).context("reading certs")?;
-    if certs.is_empty() {
-        return Err(anyhow::anyhow!("no certificates found in cert file"));
-    }
-    let certs_wrapped = certs.iter().cloned().map(Certificate).collect::<Vec<_>>();
-
-    let key_file = File::open(key_path).context("opening key file")?;
-    let mut key_reader = BufReader::new(key_file);
-    let mut keys = pkcs8_private_keys(&mut key_reader).context("reading pkcs8 keys")?;
-    if keys.is_empty() {
-        // try RSA keys
-        let key_file = File::open(key_path).context("reopening key file for rsa")?;
-        let mut key_reader = BufReader::new(key_file);
-        keys = rsa_private_keys(&mut key_reader).context("reading rsa keys")?;
-    }
-    if keys.is_empty() {
-        return Err(anyhow::anyhow!("no private keys found in key file"));
-    }
-    let key = PrivateKey(keys.remove(0));
-
-    let cipher_suites = cipher_suites(policy)?;
-    let versions = match policy.minimum_version {
-        TlsMinimumVersion::Tls12 => vec![
-            &tokio_rustls::rustls::version::TLS13,
-            &tokio_rustls::rustls::version::TLS12,
-        ],
-        TlsMinimumVersion::Tls13 => vec![&tokio_rustls::rustls::version::TLS13],
-    };
-    let server_config = ServerConfig::builder()
-        .with_cipher_suites(&cipher_suites)
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&versions)
-        .context("configuring TLS versions and cipher suites")?
-        .with_no_client_auth()
-        .with_single_cert(certs_wrapped.clone(), key)
-        .context("creating server config")?;
-
-    let server_end_point = Sha256::digest(&certs[0]).to_vec();
+    let material = rmail_common::tls::load_server_tls_material(
+        cert_path,
+        key_path,
+        policy.ocsp_response.as_deref(),
+    )?;
+    let server_end_point = Sha256::digest(&material.leaf_der).to_vec();
+    let server_config = rmail_common::tls::build_server_config(material, policy)?;
 
     let ctx = TlsContext {
         acceptor: TlsAcceptor::from(Arc::new(server_config)),
@@ -84,40 +46,25 @@ pub fn reload_tls_context(
     Ok(())
 }
 
-fn cipher_suites(policy: &TlsPolicy) -> anyhow::Result<Vec<SupportedCipherSuite>> {
-    if policy.cipher_suites.is_empty() {
-        return Ok(tokio_rustls::rustls::DEFAULT_CIPHER_SUITES.to_vec());
-    }
-    policy
-        .cipher_suites
-        .iter()
-        .map(|name| {
-            tokio_rustls::rustls::ALL_CIPHER_SUITES
-                .iter()
-                .copied()
-                .find(|suite| format!("{:?}", suite.suite()) == *name)
-                .ok_or_else(|| anyhow::anyhow!("unsupported TLS cipher suite {name:?}"))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmail_common::config::TlsMinimumVersion;
+    use std::io::Cursor;
+    use std::time::SystemTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
+    use tokio_rustls::rustls::{
+        Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
+    };
 
     #[test]
     fn policy_rejects_unknown_and_version_incompatible_suites() {
         let unknown = TlsPolicy {
             minimum_version: TlsMinimumVersion::Tls12,
             cipher_suites: vec!["TLS_FAKE_SUITE".into()],
-            web_http_only: false,
-        };
-        assert!(cipher_suites(&unknown).is_err());
-
-        let tls12_only = TlsPolicy {
-            minimum_version: TlsMinimumVersion::Tls13,
-            cipher_suites: vec!["TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".into()],
-            web_http_only: false,
+            ..TlsPolicy::default()
         };
         let cert_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -127,6 +74,13 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../config/certs/localhost.key"
         );
+        assert!(load_tls_context_with_policy(cert_path, key_path, &unknown).is_err());
+
+        let tls12_only = TlsPolicy {
+            minimum_version: TlsMinimumVersion::Tls13,
+            cipher_suites: vec!["TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".into()],
+            ..TlsPolicy::default()
+        };
         let error = load_tls_context_with_policy(cert_path, key_path, &tls12_only)
             .err()
             .unwrap();
@@ -156,7 +110,86 @@ mod tests {
         );
         assert!(Arc::ptr_eq(receiver.borrow().as_ref().unwrap(), &initial));
 
+        let missing_ocsp = TlsPolicy {
+            ocsp_response: Some("/missing/ocsp.der".to_string()),
+            ..TlsPolicy::default()
+        };
+        assert!(reload_tls_context(&sender, cert_path, key_path, &missing_ocsp).is_err());
+        assert!(Arc::ptr_eq(receiver.borrow().as_ref().unwrap(), &initial));
+
         reload_tls_context(&sender, cert_path, key_path, &TlsPolicy::default()).unwrap();
         assert!(!Arc::ptr_eq(receiver.borrow().as_ref().unwrap(), &initial));
+    }
+
+    struct PinnedCertificateAndOcsp {
+        certificate: Vec<u8>,
+        ocsp: Vec<u8>,
+    }
+
+    impl ServerCertVerifier for PinnedCertificateAndOcsp {
+        fn verify_server_cert(
+            &self,
+            end_entity: &Certificate,
+            _intermediates: &[Certificate],
+            _server_name: &ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            ocsp_response: &[u8],
+            _now: SystemTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            if end_entity.0 == self.certificate && ocsp_response == self.ocsp {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(TlsError::General(
+                    "unexpected certificate or OCSP staple".to_string(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_ocsp_response_is_stapled_in_handshake() {
+        let cert_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/certs/localhost.crt"
+        );
+        let key_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/certs/localhost.key"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let ocsp_path = temp.path().join("ocsp.der");
+        let ocsp = b"test DER OCSP response".to_vec();
+        std::fs::write(&ocsp_path, &ocsp).unwrap();
+        let policy = TlsPolicy {
+            ocsp_response: Some(ocsp_path.to_string_lossy().into_owned()),
+            ..TlsPolicy::default()
+        };
+        let server = load_tls_context_with_policy(cert_path, key_path, &policy).unwrap();
+        let certificates =
+            rustls_pemfile::certs(&mut Cursor::new(std::fs::read(cert_path).unwrap())).unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(PinnedCertificateAndOcsp {
+                certificate: certificates[0].clone(),
+                ocsp,
+            }));
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let (client_io, server_io) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut stream = server.acceptor.accept(server_io).await.unwrap();
+            stream.write_all(b"ok").await.unwrap();
+        });
+        let mut client = connector
+            .connect(ServerName::try_from("localhost").unwrap(), client_io)
+            .await
+            .unwrap();
+        let mut bytes = [0; 2];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ok");
+        server_task.await.unwrap();
     }
 }

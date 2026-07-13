@@ -20,6 +20,9 @@ minimum_version = "1.2"
 # Empty uses Rustls safe defaults. To pin suites, use Rustls names such as:
 # cipher_suites = ["TLS13_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
 cipher_suites = []
+# Optional DER OCSP response produced by the certificate issuer/ACME client.
+# It is loaded and swapped atomically with the certificate on SIGHUP.
+# ocsp_response = "/etc/rmail/tls/ocsp.der"
 # Set true when a reverse proxy terminates HTTPS for both web services.
 web_http_only = false
 

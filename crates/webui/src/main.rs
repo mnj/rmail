@@ -88,6 +88,7 @@ struct OverviewSummary {
 struct ReadinessConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    tls_policy: rmail_common::config::TlsPolicy,
     security: rmail_common::config::SecurityConfig,
     check_dns: bool,
 }
@@ -147,7 +148,11 @@ async fn readiness_report(
     } else {
         None
     };
-    let certificates = probe_certificates(config.tls_cert.as_deref(), config.tls_key.as_deref());
+    let certificates = probe_certificates(
+        config.tls_cert.as_deref(),
+        config.tls_key.as_deref(),
+        &config.tls_policy,
+    );
     let dns = if config.check_dns {
         Some(
             timeout(
@@ -226,37 +231,23 @@ fn probe_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn probe_certificates(cert: Option<&str>, key: Option<&str>) -> Result<()> {
+fn probe_certificates(
+    cert: Option<&str>,
+    key: Option<&str>,
+    policy: &rmail_common::config::TlsPolicy,
+) -> Result<()> {
     match (cert, key) {
         (None, None) => Ok(()),
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!("TLS certificate and key must both be configured")
         }
         (Some(cert), Some(key)) => {
-            let certificate_bytes = std::fs::read(cert).context("reading TLS certificate")?;
-            let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
-                .context("parsing TLS certificate PEM")?;
-            if certificates.is_empty() {
-                anyhow::bail!("TLS certificate PEM contains no certificates");
-            }
-            let key_bytes = std::fs::read(key).context("reading TLS private key")?;
-            let mut reader = key_bytes.as_slice();
-            let has_private_key = loop {
-                match rustls_pemfile::read_one(&mut reader)
-                    .context("parsing TLS private key PEM")?
-                {
-                    Some(
-                        rustls_pemfile::Item::RSAKey(_)
-                        | rustls_pemfile::Item::PKCS8Key(_)
-                        | rustls_pemfile::Item::ECKey(_),
-                    ) => break true,
-                    Some(_) => {}
-                    None => break false,
-                }
-            };
-            if !has_private_key {
-                anyhow::bail!("TLS private key PEM contains no supported private key");
-            }
+            let material = rmail_common::tls::load_server_tls_material(
+                cert,
+                key,
+                policy.ocsp_response.as_deref(),
+            )?;
+            rmail_common::tls::build_server_config(material, policy)?;
             Ok(())
         }
     }
@@ -2301,6 +2292,7 @@ async fn main() -> Result<()> {
     let readiness = ReadinessConfig {
         tls_cert: cfg.global.tls_cert.clone(),
         tls_key: cfg.global.tls_key.clone(),
+        tls_policy: cfg.global.tls.clone(),
         security: cfg.security.clone(),
         check_dns: true,
     };

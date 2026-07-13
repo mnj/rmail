@@ -238,10 +238,10 @@ fn spawn_tls_reloader(
         while signal.recv().await.is_some() {
             match reload_tls_context(&sender, &cert_path, &key_path, &policy) {
                 Ok(()) => {
-                    println!("SMTP TLS certificate and policy reloaded");
+                    println!("SMTP TLS certificate, key, OCSP response, and policy reloaded");
                 }
                 Err(error) => {
-                    eprintln!("SMTP TLS reload failed; keeping current context: {error}");
+                    eprintln!("SMTP TLS reload failed; keeping current TLS bundle: {error}");
                 }
             }
         }

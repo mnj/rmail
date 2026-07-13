@@ -173,6 +173,10 @@ Rustls safe defaults or set to an allow-list of Rustls cipher-suite names. Unkno
 set incompatible with the selected protocol versions, partial cert/key configuration, and invalid
 replacement certificates fail validation.
 
+Set `ocsp_response` to a DER-encoded OCSP response file to staple it on every TLS service. The file
+must be non-empty and no larger than 1 MiB. SMTP, IMAP, admin web, and webmail load the same
+certificate, private key, policy, and optional OCSP response.
+
 When `tls_cert` and `tls_key` are configured, SMTP, IMAP, admin web, and webmail share those
 credentials and the web services serve HTTPS. Set `web_http_only = true` when a reverse proxy
 terminates TLS; this affects only admin web and webmail and leaves mail-protocol TLS enabled.
@@ -181,12 +185,20 @@ Without configured credentials, the web services remain available over HTTP.
 `systemctl reload rmail_smtpd rmail_imapd rmail_web rmail_webmail` sends SIGHUP. Each daemon parses and validates the
 replacement certificate, private key, version policy, and cipher policy before atomically swapping
 the context used by new connections. Existing TLS sessions continue uninterrupted; a failed reload
-keeps the previous context. OCSP stapling is not currently served by the Rustls listeners.
+keeps the previous context. Validation also requires a configured OCSP response to remain readable
+and structurally usable.
+
+`rmail_ctl obtain-cert` and `rmail_ctl renew` validate the certificate/key bundle before installing
+each file with a same-filesystem atomic rename, then reload the services. When OCSP stapling is
+configured, the renewal hook must fetch the response for the renewed certificate, write it to a
+temporary file, and atomically rename it to `ocsp_response` before reloading. This ordering prevents
+new connections from observing a partially written certificate or staple. The built-in renewal
+command does not fetch an OCSP response itself.
 
 Health probes are exposed by `rmail_web` without authentication so an orchestrator can use them:
 
 - `GET /healthz` (also `/health`) is a process-liveness check and returns `200` while the HTTP service is responsive.
-- `GET /readyz` (also `/ready`) returns JSON and `200` only when every configured dependency is ready. It verifies queue writability, SQLite access, asynchronous DNS resolution, TLS certificate/private-key PEM parsing, and connectivity to enabled ClamAV and Rspamd services. Unconfigured optional dependencies are reported as `skipped`; failures return `503` with per-component details.
+- `GET /readyz` (also `/ready`) returns JSON and `200` only when every configured dependency is ready. It verifies queue writability, SQLite access, asynchronous DNS resolution, the complete TLS certificate/key/policy/OCSP bundle, and connectivity to enabled ClamAV and Rspamd services. Unconfigured optional dependencies are reported as `skipped`; failures return `503` with per-component details.
 
 The web listener binds to loopback by default. If it is exposed on a public address, restrict these
 probe paths at the reverse proxy or firewall because readiness details are intentionally useful to
