@@ -107,4 +107,5 @@ IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, `PREVIEW`,
 and `SNIPPET` are not currently advertised.
 
 Repeatable storage and queue performance workloads are documented in
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,
+and outbound queue-drain workloads.
