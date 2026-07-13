@@ -128,6 +128,15 @@ Outbound transport security:
 - MTA-STS policies are discovered through `_mta-sts.<domain>` TXT records, fetched over authenticated HTTPS, cached for `max_age`, and enforced against MX names and TLS certificate validation
 - TLS failures are reported to valid `mailto:` destinations in `_smtp._tls.<domain>` RFC 8460 records using `application/tlsrpt+json`; reports themselves use a null reverse path to prevent loops
 
+Health probes are exposed by `rmail_web` without authentication so an orchestrator can use them:
+
+- `GET /healthz` (also `/health`) is a process-liveness check and returns `200` while the HTTP service is responsive.
+- `GET /readyz` (also `/ready`) returns JSON and `200` only when every configured dependency is ready. It verifies queue writability, SQLite access, asynchronous DNS resolution, TLS certificate/private-key PEM parsing, and connectivity to enabled ClamAV and Rspamd services. Unconfigured optional dependencies are reported as `skipped`; failures return `503` with per-component details.
+
+The web listener binds to loopback by default. If it is exposed on a public address, restrict these
+probe paths at the reverse proxy or firewall because readiness details are intentionally useful to
+operators.
+
 ### 5. Install systemd units
 
 ```bash

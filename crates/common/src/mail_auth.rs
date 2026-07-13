@@ -26,6 +26,16 @@ fn authenticator() -> Result<&'static MessageAuthenticator> {
     })
 }
 
+/// Confirm that the configured asynchronous DNS resolver can complete a lookup.
+pub async fn dns_health_check() -> Result<()> {
+    authenticator()?
+        .resolver()
+        .lookup_ip("localhost.")
+        .await
+        .context("resolving the DNS health-check name")?;
+    Ok(())
+}
+
 /// Verify DKIM, ARC, SPF and DMARC using the system's asynchronous DNS resolver.
 ///
 /// The message is borrowed throughout verification; callers do not need to clone

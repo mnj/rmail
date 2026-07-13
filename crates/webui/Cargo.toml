@@ -13,6 +13,8 @@ rmail_common = { path = "../common" }
 base64 = "0.21"
 argon2 = "0.5"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls-pemfile = "1.0"
 
 [dev-dependencies]
 tempfile = "3.5"

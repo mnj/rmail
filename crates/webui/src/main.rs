@@ -15,9 +15,14 @@ use rmail_common::net::bind_tcp_listener;
 use rmail_common::outbound::QueueControl;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
+use tokio::time::timeout;
 
 #[derive(Serialize)]
 struct Stats {
@@ -73,6 +78,209 @@ struct OverviewSummary {
     domains: Vec<DomainSummary>,
     top_mailboxes: Vec<MailboxLoadSummary>,
     queue: QueueSummary,
+}
+
+#[derive(Clone, Default)]
+struct ReadinessConfig {
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    security: rmail_common::config::SecurityConfig,
+    check_dns: bool,
+}
+
+#[derive(Serialize)]
+struct ReadinessReport {
+    ready: bool,
+    checks: BTreeMap<String, ProbeResult>,
+}
+
+#[derive(Serialize)]
+struct ProbeResult {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProbeResult {
+    fn ok() -> Self {
+        Self {
+            status: "ok",
+            error: None,
+        }
+    }
+
+    fn skipped() -> Self {
+        Self {
+            status: "skipped",
+            error: None,
+        }
+    }
+
+    fn from_result(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::ok(),
+            Err(error) => Self {
+                status: "error",
+                error: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+async fn readiness_report(
+    mail_root: PathBuf,
+    db_path: Option<String>,
+    config: ReadinessConfig,
+) -> ReadinessReport {
+    let queue = tokio::task::spawn_blocking(move || probe_queue(&mail_root))
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("queue probe task failed: {error}")));
+    let database = if let Some(db_path) = db_path {
+        tokio::task::spawn_blocking(move || probe_database(Path::new(&db_path)))
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("database probe task failed: {error}")))
+            .into()
+    } else {
+        None
+    };
+    let certificates = probe_certificates(config.tls_cert.as_deref(), config.tls_key.as_deref());
+    let dns = if config.check_dns {
+        Some(
+            timeout(
+                Duration::from_secs(2),
+                rmail_common::mail_auth::dns_health_check(),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("DNS probe timed out"))),
+        )
+    } else {
+        None
+    };
+    let clamav = if config.security.clamav_enabled {
+        Some(probe_clamav(&config.security.clamav_endpoint).await)
+    } else {
+        None
+    };
+    let rspamd = if config.security.rspamd_enabled {
+        Some(probe_rspamd(&config.security.rspamd_url).await)
+    } else {
+        None
+    };
+
+    let mut checks = BTreeMap::new();
+    checks.insert("queue".to_string(), ProbeResult::from_result(queue));
+    checks.insert(
+        "database".to_string(),
+        database.map_or_else(ProbeResult::skipped, ProbeResult::from_result),
+    );
+    checks.insert(
+        "certificates".to_string(),
+        ProbeResult::from_result(certificates),
+    );
+    checks.insert(
+        "dns".to_string(),
+        dns.map_or_else(ProbeResult::skipped, ProbeResult::from_result),
+    );
+    checks.insert(
+        "clamav".to_string(),
+        clamav.map_or_else(ProbeResult::skipped, ProbeResult::from_result),
+    );
+    checks.insert(
+        "rspamd".to_string(),
+        rspamd.map_or_else(ProbeResult::skipped, ProbeResult::from_result),
+    );
+    ReadinessReport {
+        ready: checks.values().all(|probe| probe.status != "error"),
+        checks,
+    }
+}
+
+fn probe_queue(mail_root: &Path) -> Result<()> {
+    let directory = mail_root.join("outbound").join("maildrop").join("tmp");
+    std::fs::create_dir_all(&directory).context("creating outbound queue directories")?;
+    let path = directory.join(format!(
+        ".readiness-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .context("creating queue readiness probe")?;
+        file.write_all(b"ready")?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn probe_database(path: &Path) -> Result<()> {
+    let connection = rmail_common::sqlite_pool::connection(path)?;
+    connection.query_row("SELECT 1", [], |_| Ok(()))?;
+    Ok(())
+}
+
+fn probe_certificates(cert: Option<&str>, key: Option<&str>) -> Result<()> {
+    match (cert, key) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("TLS certificate and key must both be configured")
+        }
+        (Some(cert), Some(key)) => {
+            let certificate_bytes = std::fs::read(cert).context("reading TLS certificate")?;
+            let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
+                .context("parsing TLS certificate PEM")?;
+            if certificates.is_empty() {
+                anyhow::bail!("TLS certificate PEM contains no certificates");
+            }
+            let key_bytes = std::fs::read(key).context("reading TLS private key")?;
+            let mut reader = key_bytes.as_slice();
+            let has_private_key = loop {
+                match rustls_pemfile::read_one(&mut reader)
+                    .context("parsing TLS private key PEM")?
+                {
+                    Some(
+                        rustls_pemfile::Item::RSAKey(_)
+                        | rustls_pemfile::Item::PKCS8Key(_)
+                        | rustls_pemfile::Item::ECKey(_),
+                    ) => break true,
+                    Some(_) => {}
+                    None => break false,
+                }
+            };
+            if !has_private_key {
+                anyhow::bail!("TLS private key PEM contains no supported private key");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn probe_clamav(endpoint: &str) -> Result<()> {
+    timeout(Duration::from_secs(2), async {
+        if let Some(path) = endpoint.strip_prefix("unix:") {
+            UnixStream::connect(path).await?;
+        } else if let Some(address) = endpoint.strip_prefix("tcp:") {
+            TcpStream::connect(address).await?;
+        } else {
+            anyhow::bail!("unsupported ClamAV endpoint");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("ClamAV probe timed out"))?
+}
+
+async fn probe_rspamd(url: &str) -> Result<()> {
+    timeout(
+        Duration::from_secs(2),
+        reqwest::Client::new().get(url).send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Rspamd probe timed out"))??;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -966,6 +1174,7 @@ async fn handle_connection(
     admin_hash: Option<String>,
     db_path: Option<String>,
     acme_challenge_dir: Option<String>,
+    readiness: ReadinessConfig,
 ) {
     let peer = match stream.peer_addr() {
         Ok(p) => p.to_string(),
@@ -1099,13 +1308,31 @@ async fn handle_connection(
                     }
                 }
             }
-            "/health" => {
+            "/health" | "/healthz" => {
                 if method != "GET" {
                     status = 405;
                     body = "Method Not Allowed".to_string();
                 } else {
                     content_type = "text/plain".to_string();
                     body = "ok".to_string();
+                }
+            }
+            "/ready" | "/readyz" => {
+                if method != "GET" {
+                    status = 405;
+                    body = "Method Not Allowed".to_string();
+                } else {
+                    let report =
+                        readiness_report(mail_root.clone(), db_path.clone(), readiness.clone())
+                            .await;
+                    if !report.ready {
+                        status = 503;
+                    }
+                    content_type = "application/json".to_string();
+                    body = serde_json::to_string(&report).unwrap_or_else(|error| {
+                        status = 500;
+                        format!("{{\"ready\":false,\"error\":\"{error}\"}}")
+                    });
                 }
             }
             "/stats" => {
@@ -2025,6 +2252,12 @@ async fn main() -> Result<()> {
     let admin_hash = cfg.global.web_admin_password_hash.clone();
     let db_path = cfg.global.db_path.clone();
     let acme_dir = cfg.global.acme_challenge_dir.clone();
+    let readiness = ReadinessConfig {
+        tls_cert: cfg.global.tls_cert.clone(),
+        tls_key: cfg.global.tls_key.clone(),
+        security: cfg.security.clone(),
+        check_dns: true,
+    };
     let port = cfg.global.web_port.unwrap_or(8080);
     let bind_addrs = cfg
         .global
@@ -2039,6 +2272,7 @@ async fn main() -> Result<()> {
         let admin_hash = admin_hash.clone();
         let db_path = db_path.clone();
         let acme_dir = acme_dir.clone();
+        let readiness = readiness.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = match listener.accept().await {
@@ -2053,8 +2287,12 @@ async fn main() -> Result<()> {
                 let admin_hash = admin_hash.clone();
                 let db_path = db_path.clone();
                 let acme_dir = acme_dir.clone();
+                let readiness = readiness.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, mr, admin_user, admin_hash, db_path, acme_dir).await;
+                    handle_connection(
+                        stream, mr, admin_user, admin_hash, db_path, acme_dir, readiness,
+                    )
+                    .await;
                 });
             }
         });
@@ -2082,11 +2320,20 @@ mod tests {
         request: String,
         db_path: Option<String>,
     ) -> String {
+        send_request_with_readiness(mail_root, request, db_path, ReadinessConfig::default()).await
+    }
+
+    async fn send_request_with_readiness(
+        mail_root: PathBuf,
+        request: String,
+        db_path: Option<String>,
+        readiness: ReadinessConfig,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_connection(stream, mail_root, None, None, db_path, None).await;
+            handle_connection(stream, mail_root, None, None, db_path, None, readiness).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -2103,6 +2350,85 @@ mod tests {
             .expect("read response");
         server.await.expect("server");
         response
+    }
+
+    #[tokio::test]
+    async fn liveness_and_readiness_have_distinct_semantics() {
+        let td = tempdir().expect("tempdir");
+        let health = send_request(
+            td.path().to_path_buf(),
+            "GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+        )
+        .await;
+        assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
+
+        let db_path = td.path().join("rmail.sqlite");
+        rmail_common::db::init_db(&db_path).unwrap();
+        let ready = send_request_with_db(
+            td.path().to_path_buf(),
+            "GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+            Some(db_path.to_string_lossy().into_owned()),
+        )
+        .await;
+        assert!(ready.starts_with("HTTP/1.1 200 OK"), "{ready}");
+        assert!(ready.contains("\"ready\":true"), "{ready}");
+        assert!(
+            ready.contains("\"database\":{\"status\":\"ok\"}"),
+            "{ready}"
+        );
+        assert!(ready.contains("\"queue\":{\"status\":\"ok\"}"), "{ready}");
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_dependency_failures_with_service_unavailable() {
+        let td = tempdir().expect("tempdir");
+        let readiness = ReadinessConfig {
+            tls_cert: Some(td.path().join("missing.pem").to_string_lossy().into_owned()),
+            tls_key: None,
+            ..ReadinessConfig::default()
+        };
+        let response = send_request_with_readiness(
+            td.path().to_path_buf(),
+            "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+            None,
+            readiness,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503 ERR"), "{response}");
+        assert!(response.contains("\"ready\":false"), "{response}");
+        assert!(
+            response.contains("\"certificates\":{\"status\":\"error\""),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_readiness_probes_enabled_services() {
+        let clamav = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clamav_address = clamav.local_addr().unwrap();
+        let clamav_task = tokio::spawn(async move {
+            let _ = clamav.accept().await.unwrap();
+        });
+        assert!(probe_clamav(&format!("tcp:{clamav_address}")).await.is_ok());
+        clamav_task.await.unwrap();
+
+        let rspamd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rspamd_address = rspamd.local_addr().unwrap();
+        let rspamd_task = tokio::spawn(async move {
+            let (mut stream, _) = rspamd.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        assert!(
+            probe_rspamd(&format!("http://{rspamd_address}/checkv2"))
+                .await
+                .is_ok()
+        );
+        rspamd_task.await.unwrap();
     }
 
     #[tokio::test]
