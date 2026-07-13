@@ -176,6 +176,11 @@ The web listener binds to loopback by default. If it is exposed on a public addr
 probe paths at the reverse proxy or firewall because readiness details are intentionally useful to
 operators.
 
+The admin console uses dedicated browser routes for its main operating areas: `/` (overview),
+`/accounts`, `/routing`, `/delivery`, and `/observability`. These routes are served through the same
+single-page frontend, so a reverse proxy should pass unknown non-API paths to `rmail_web` rather than
+returning its own 404 page.
+
 Prometheus metrics are available from authenticated `GET /metrics`. Each daemon publishes an
 atomic snapshot every 15 seconds, and the web service aggregates them with a bounded `component`
 label (`smtpd`, `outbound`, `imapd`, or `web`). In addition to counters, rMail exports cumulative

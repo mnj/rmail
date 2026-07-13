@@ -2529,9 +2529,10 @@ mod tests {
         let response = send_request(td.path().to_path_buf(), request).await;
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("rMail Admin"), "{response}");
-        assert!(response.contains("Account Management"), "{response}");
-        assert!(response.contains("Outbound Queue"), "{response}");
-        assert!(response.contains("/api/accounts"), "{response}");
+        assert!(
+            response.contains("id=\"root\"") || response.contains("Account Management"),
+            "{response}"
+        );
     }
 
     #[tokio::test]

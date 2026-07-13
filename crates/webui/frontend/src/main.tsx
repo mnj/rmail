@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, AlertTriangle, BarChart3, CheckCircle2, Database, Mail, Plus, RefreshCw, RotateCcw, Route, Send, Server, Shield, Trash2, Users, Zap } from 'lucide-react';
+import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronRight, Database, Gauge, Mail, Menu, Network, Plus, RefreshCw, RotateCcw, Route, Send, Server, Shield, Trash2, Users, X, Zap } from 'lucide-react';
 import './style.css';
 
 type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
@@ -22,6 +22,18 @@ type DmarcRow = { domain: string; events: number };
 type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[] };
 
 const numberFmt = new Intl.NumberFormat();
+type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'observability';
+const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; description: string; icon: React.ElementType }> = {
+  overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'System health, storage activity, and delivery pressure at a glance.', icon: Gauge },
+  accounts: { path: '/accounts', label: 'Accounts', eyebrow: 'Identity & storage', description: 'Provision mailboxes and inspect account storage and authentication state.', icon: Users },
+  routing: { path: '/routing', label: 'Routing', eyebrow: 'Mail flow', description: 'Manage aliases, catchalls, and domain-level recipient routing.', icon: Network },
+  delivery: { path: '/delivery', label: 'Delivery', eyebrow: 'Outbound operations', description: 'Inspect queue pressure, recover messages, and review DMARC activity.', icon: Send },
+  observability: { path: '/observability', label: 'Observability', eyebrow: 'Diagnostics', description: 'Review daemon telemetry and live operational logs.', icon: Activity },
+};
+
+function pageFromPath(path: string): Page {
+  return (Object.entries(pageMeta).find(([, value]) => value.path === path)?.[0] as Page | undefined) || 'overview';
+}
 
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, options);
@@ -45,6 +57,8 @@ function BarRow({ label, value, max, detail }: { label: string; value: number; m
 }
 
 function App() {
+  const [page, setPage] = useState<Page>(() => pageFromPath(window.location.pathname));
+  const [mobileNav, setMobileNav] = useState(false);
   const [stats, setStats] = useState<Stats | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -159,6 +173,19 @@ function App() {
     text(`/logs?component=${logComponent}&lines=180`).then(setLogs).catch((err) => setLogs(err.message));
   }, [logComponent]);
 
+  useEffect(() => {
+    const onPopState = () => setPage(pageFromPath(window.location.pathname));
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  function navigate(next: Page) {
+    window.history.pushState({}, '', pageMeta[next].path);
+    setPage(next);
+    setMobileNav(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
   const HealthIcon = health.icon;
   const domainMax = Math.max(0, ...(overview?.domains.map((domain) => domain.messages) || []));
   const mailboxMax = Math.max(0, ...(overview?.top_mailboxes.map((mailbox) => mailbox.messages) || []));
@@ -166,24 +193,28 @@ function App() {
 
   return (
     <main className="shell">
-      <aside className="sidebar">
+      {mobileNav && <button className="navScrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
+      <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span>Admin console</span></div></div>
-        <nav><a href="#overview">Overview</a><a href="#analytics">Analytics</a><a href="#accounts">Accounts</a><a href="#routing">Routing</a><a href="#queue">Queue</a><a href="#metrics">Metrics</a><a href="#logs">Logs</a></nav>
+        <button className="closeNav" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X size={20} /></button>
+        <div className="navLabel">Workspace</div>
+        <nav>{(Object.entries(pageMeta) as [Page, typeof pageMeta[Page]][]).map(([key, item]) => { const Icon = item.icon; return <a key={key} href={item.path} className={page === key ? 'active' : ''} onClick={(event) => { event.preventDefault(); navigate(key); }}><Icon size={18} /><span>{item.label}</span><ChevronRight size={15} /></a>; })}</nav>
         <div className="health"><HealthIcon size={18} /><div><strong>{health.label}</strong><span>{health.detail}</span></div></div>
       </aside>
       <section className="content">
         <header className="topbar">
-          <div><h1>Mail Operations</h1><p>Operational control for accounts, delivery queues, metrics, and daemon diagnostics.</p></div>
-          <button className="button primary" onClick={() => refresh()} disabled={loading}><RefreshCw size={16} />Refresh</button>
+          <button className="menuButton" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button>
+          <div className="pageTitle"><span>{pageMeta[page].eyebrow}</span><h1>{pageMeta[page].label}</h1><p>{pageMeta[page].description}</p></div>
+          <div className="topActions"><span className="refreshState"><i className={loading ? 'loading' : ''} />{loading ? 'Refreshing' : 'Auto-refresh · 30s'}</span><button className="button primary" onClick={() => refresh()} disabled={loading}><RefreshCw size={16} />Refresh</button></div>
         </header>
         {error && <div className="banner">{error}</div>}
-        <section className="kpis" id="overview">
+        <section className="kpis" id="overview" hidden={page !== 'overview'}>
           <Kpi label="Mailboxes" value={numberFmt.format(overview?.accounts ?? stats?.mailboxes ?? 0)} detail={`${overview?.folders ?? 0} folders tracked`} icon={Users} />
           <Kpi label="Stored Messages" value={numberFmt.format(overview?.total_messages ?? stats?.total_messages ?? 0)} detail={`${numberFmt.format(overview?.unseen_messages ?? 0)} unseen messages`} icon={Mail} />
           <Kpi label="Delivered" value={numberFmt.format(stats?.delivered_count || 0)} detail="Runtime delivery counter" icon={Send} />
           <Kpi label="Pending" value={numberFmt.format(stats?.outbound_pending || queueSummary?.queued || 0)} detail={`${queueSummary?.inflight || 0} inflight, ${queueSummary?.failed || 0} failed`} icon={Server} />
         </section>
-        <section className="grid analytics" id="analytics">
+        <section className="grid analytics" id="analytics" hidden={page !== 'overview'}>
           <article className="panel">
             <div className="panelHead"><h2>Domain Distribution</h2><span>{overview ? `${overview.domains.length} domains` : 'Loading'}</span></div>
             <div className="barList">{overview?.domains.length ? overview.domains.slice(0, 8).map((domain) => <BarRow key={domain.domain} label={domain.domain} value={domain.messages} max={domainMax} detail={`${domain.accounts} accounts, ${domain.unseen} unseen`} />) : <div className="empty">No domain activity yet.</div>}</div>
@@ -210,18 +241,18 @@ function App() {
             <div className="barList twoCol">{overview?.top_mailboxes.length ? overview.top_mailboxes.map((mailbox) => <BarRow key={mailbox.address} label={mailbox.address} value={mailbox.messages} max={mailboxMax} detail={`${mailbox.folders} folders, ${mailbox.unseen} unseen`} />) : <div className="empty">No mailbox messages found.</div>}</div>
           </article>
         </section>
-        <section className="grid">
+        <section className="grid accountPage" hidden={page !== 'accounts'}>
           <article className="panel wide" id="accounts">
             <div className="panelHead"><h2>Account Management</h2><span>{accounts.length} accounts</span></div>
             <form className="inlineForm" onSubmit={saveAccount}><input value={newAccount.address} onChange={(e) => setNewAccount({ ...newAccount, address: e.target.value })} placeholder="mailbox@example.com" /><input value={newAccount.password} onChange={(e) => setNewAccount({ ...newAccount, password: e.target.value })} placeholder="New password" type="password" /><button className="button primary"><Plus size={16} />Save mailbox</button></form>
             <table><thead><tr><th>Mailbox</th><th>Auth</th><th>Folders</th><th>Messages</th><th>Unseen</th><th></th></tr></thead><tbody>{accounts.length ? accounts.map((a) => <tr key={a.address}><td><strong>{a.address}</strong><small>{a.unseen ? 'Unread activity' : 'No unread mail'}</small></td><td><span className="pill">{a.auth}</span></td><td>{a.folders}</td><td>{a.messages}</td><td>{a.unseen}</td><td><button className="iconButton danger" onClick={() => deleteAccount(a.address)} title="Delete mailbox"><Trash2 size={15} /></button></td></tr>) : <tr><td colSpan={6} className="empty">No DB-backed accounts found.</td></tr>}</tbody></table>
           </article>
-          <article className="panel" id="metrics">
-            <div className="panelHead"><h2>Metrics</h2><BarChart3 size={18} /></div>
-            <div className="metricList">{metrics.length ? metrics.map((line) => <div className="metric" key={line}><span>{line.split(/\s+/)[0]}</span><strong>{line.split(/\s+/).slice(1).join(' ')}</strong></div>) : <div className="empty">No metrics emitted yet.</div>}</div>
+          <article className="panel accountSummary">
+            <div className="panelHead"><h2>Storage Summary</h2><Database size={18} /></div>
+            <div className="snapshotGrid"><div><span>Accounts</span><strong>{overview?.accounts || 0}</strong></div><div><span>Folders</span><strong>{overview?.folders || 0}</strong></div><div><span>Messages</span><strong>{overview?.total_messages || 0}</strong></div><div><span>Unseen</span><strong>{overview?.unseen_messages || 0}</strong></div></div>
           </article>
         </section>
-        <section className="grid" id="routing">
+        <section className="grid" id="routing" hidden={page !== 'routing'}>
           <article className="panel">
             <div className="panelHead"><h2>Aliases</h2><Route size={18} /></div>
             <form className="stackForm" onSubmit={saveAlias}><input value={aliasForm.address} onChange={(e) => setAliasForm({ ...aliasForm, address: e.target.value })} placeholder="alias@example.com" /><input value={aliasForm.targets} onChange={(e) => setAliasForm({ ...aliasForm, targets: e.target.value })} placeholder="target1@example.com, target2@example.com" /><button className="button primary"><Plus size={16} />Save alias</button></form>
@@ -233,7 +264,7 @@ function App() {
             <div className="metricList">{routing.catchalls.length ? routing.catchalls.map((row) => <div className="metric" key={row.domain}><span>@{row.domain}</span><strong>{row.target}</strong></div>) : <div className="empty">No catchalls configured.</div>}</div>
           </article>
         </section>
-        <section className="grid">
+        <section className="grid" hidden={page !== 'delivery'}>
           <article className="panel wide" id="queue">
             <div className="panelHead"><h2>Outbound Queue</h2><span>{queueSummary ? `${queueSummary.queued} queued, ${queueSummary.failed} failed` : 'Loading'}</span></div>
             <div className="queueTools"><input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="Message name or wildcard pattern" /><button className="button" onClick={() => queueAction('requeue')}><RotateCcw size={16} />Requeue</button><button className="button primary" onClick={() => queueAction('promote')}><Zap size={16} />Promote</button><button className="button danger" onClick={() => queueAction('delete')}><Trash2 size={16} />Delete</button></div>
@@ -244,7 +275,14 @@ function App() {
             <div className="metricList">{dmarc.length ? dmarc.map((row) => <div className="metric" key={row.domain}><span>{row.domain}</span><strong>{row.events} events</strong></div>) : <div className="empty">No unreported DMARC events.</div>}</div>
           </article>
         </section>
-        <article className="panel" id="logs">
+        <section className="grid observability" hidden={page !== 'observability'}>
+          <article className="panel" id="metrics">
+            <div className="panelHead"><div><h2>Prometheus Metrics</h2><small>Latest cross-service samples</small></div><BarChart3 size={18} /></div>
+            <div className="metricList">{metrics.length ? metrics.map((line) => <div className="metric" key={line}><span>{line.split(/\s+/)[0]}</span><strong>{line.split(/\s+/).slice(1).join(' ')}</strong></div>) : <div className="empty">No metrics emitted yet.</div>}</div>
+          </article>
+          <article className="panel diagnosticCard"><div className="panelHead"><h2>Service Diagnostics</h2><Shield size={18} /></div><div className="diagnosticBody"><CheckCircle2 size={28} /><strong>{health.label}</strong><p>{health.detail}</p><span>Readiness and dependency checks are available at <code>/readyz</code>.</span></div></article>
+        </section>
+        <article className="panel" id="logs" hidden={page !== 'observability'}>
           <div className="panelHead"><h2>Daemon Logs</h2><div className="tabs">{['smtpd', 'imapd', 'outbound', 'web'].map((name) => <button key={name} className={name === logComponent ? 'active' : ''} onClick={() => setLogComponent(name)}>{name}</button>)}</div></div>
           <pre>{logs}</pre>
         </article>
