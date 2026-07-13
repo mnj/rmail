@@ -13,6 +13,7 @@ pub mod mail_auth;
 pub mod maildir;
 pub mod metrics;
 pub mod net;
+pub mod oauth;
 pub mod outbound;
 pub mod runtime;
 pub mod scanner;

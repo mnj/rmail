@@ -90,6 +90,14 @@ SMTP resource limits are configured in the `[security]` section:
 - `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
 - `submission_require_from_alignment` — when `true`, every parsed RFC 5322 `From` mailbox on authenticated submission must equal the authenticated mailbox; missing, malformed, or mismatched author fields are rejected (default: `false`)
 
+OAuth bearer authentication uses an RFC 7662 token-introspection authority configured under
+`[security.oauth]`. The endpoint must use HTTPS unless `allow_insecure_http = true` is explicitly
+set for a trusted development environment. Configure `client_id` and `client_secret` together,
+select the claim (`username`, `sub`, or `email`) that contains the local mailbox address, and use
+`required_scopes`, `issuer`, and `audience` to constrain accepted tokens. Client secrets and access
+tokens are redacted from diagnostics. Adding `OAUTHBEARER` or `XOAUTH2` to an IMAP or SMTP SASL
+mechanism list without valid OAuth settings is a startup error.
+
 ## LMTP local delivery
 
 LMTP is disabled by default. Enable a TCP endpoint with, for example,

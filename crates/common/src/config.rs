@@ -249,6 +249,10 @@ pub struct SecurityConfig {
     pub imap_sasl_mechanisms: Vec<String>,
     #[serde(default = "default_smtp_sasl_mechanisms")]
     pub smtp_sasl_mechanisms: Vec<String>,
+    /// OAuth 2.0 token introspection authority. Required before an OAuth SASL
+    /// mechanism can be enabled.
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
     #[serde(default = "default_scanner_failure_action")]
     pub scanner_failure_action: ScannerFailureAction,
     #[serde(default = "default_scanner_timeout_ms")]
@@ -281,6 +285,7 @@ impl Default for SecurityConfig {
             submission_require_from_alignment: false,
             imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             smtp_sasl_mechanisms: default_smtp_sasl_mechanisms(),
+            oauth: None,
             scanner_failure_action: default_scanner_failure_action(),
             scanner_timeout_ms: default_scanner_timeout_ms(),
             scanner_max_message_bytes: default_scanner_max_message_bytes(),
@@ -292,6 +297,55 @@ impl Default for SecurityConfig {
             rspamd_reject_actions: Vec::new(),
         }
     }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct OAuthConfig {
+    pub introspection_url: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default = "default_oauth_identity_claim")]
+    pub identity_claim: String,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_oauth_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+impl std::fmt::Debug for OAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthConfig")
+            .field("introspection_url", &self.introspection_url)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("required_scopes", &self.required_scopes)
+            .field("identity_claim", &self.identity_claim)
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
+}
+
+fn default_oauth_identity_claim() -> String {
+    "username".to_string()
+}
+
+fn default_oauth_timeout_ms() -> u64 {
+    5_000
 }
 
 fn default_smtp_max_concurrent_sessions() -> usize {
@@ -406,11 +460,36 @@ mod tests {
             cfg.security.smtp_sasl_mechanisms,
             ["PLAIN", "LOGIN", "SCRAM-SHA-256"]
         );
+        assert!(cfg.security.oauth.is_none());
         assert!(!cfg.security.rspamd_enabled);
         assert!(!cfg.security.scanners_enabled());
         assert_eq!(cfg.global.tls.minimum_version, TlsMinimumVersion::Tls12);
         assert!(cfg.global.tls.cipher_suites.is_empty());
         assert!(cfg.global.tls.ocsp_response.is_none());
+    }
+
+    #[test]
+    fn oauth_introspection_configuration_parses_without_exposing_secret() {
+        let cfg: Config = toml::from_str(
+            r#"[global]
+mail_root = "mail"
+[security.oauth]
+introspection_url = "https://identity.example.test/oauth/introspect"
+client_id = "rmail"
+client_secret = "top-secret"
+required_scopes = ["mail"]
+identity_claim = "email"
+issuer = "https://identity.example.test/"
+audience = "rmail"
+timeout_ms = 2500
+"#,
+        )
+        .expect("OAuth configuration");
+        let oauth = cfg.security.oauth.expect("OAuth settings");
+        assert_eq!(oauth.identity_claim, "email");
+        assert_eq!(oauth.required_scopes, ["mail"]);
+        assert_eq!(oauth.timeout_ms, 2500);
+        assert!(!format!("{oauth:?}").contains("top-secret"));
     }
 
     #[test]

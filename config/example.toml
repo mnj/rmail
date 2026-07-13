@@ -80,5 +80,18 @@ rspamd_url = "http://127.0.0.1:11333/checkv2"
 rspamd_quarantine_actions = ["add header", "rewrite subject", "reject"]
 rspamd_reject_actions = []
 
+# Required before adding OAUTHBEARER or XOAUTH2 to either SASL mechanism list.
+# Tokens are POSTed to an RFC 7662 endpoint and are never compared with mailbox passwords.
+# [security.oauth]
+# introspection_url = "https://identity.example.test/oauth2/introspect"
+# client_id = "rmail"
+# client_secret = "replace-with-secret"
+# required_scopes = ["mail"]
+# identity_claim = "email" # username | sub | email
+# issuer = "https://identity.example.test/"
+# audience = "rmail"
+# timeout_ms = 5000
+# allow_insecure_http = false
+
 # Experimental: enable DANE/TLSA verification for outbound deliveries via environment variable
 # RMAIL_ENABLE_DANE=1  (set to 0 or false to disable)
