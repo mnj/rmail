@@ -147,15 +147,15 @@ fn result_data(
     if uid_mode {
         data.push_str(" UID");
     }
-    if options.min {
-        if let Some(minimum) = ids.first() {
-            data.push_str(&format!(" MIN {minimum}"));
-        }
+    if options.min
+        && let Some(minimum) = ids.first()
+    {
+        data.push_str(&format!(" MIN {minimum}"));
     }
-    if options.max {
-        if let Some(maximum) = ids.last() {
-            data.push_str(&format!(" MAX {maximum}"));
-        }
+    if options.max
+        && let Some(maximum) = ids.last()
+    {
+        data.push_str(&format!(" MAX {maximum}"));
     }
     if options.all && !ids.is_empty() {
         data.push_str(&format!(" ALL {}", compress_ids(ids)));

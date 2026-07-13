@@ -16,7 +16,6 @@ use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 ///   checks ip4/ip6 mechanisms only (basic support). Returns pass/softfail/fail/neutral/none.
 /// - DMARC: performs a TXT lookup for _dmarc.<from-domain> and applies simple alignment rules:
 ///   DKIM relaxed (d==From) or SPF aligned (envelope-from domain == From domain). Returns pass/fail/none.
-
 pub fn analyze_message(
     data: &[u8],
     peer_ip: Option<IpAddr>,
@@ -36,7 +35,7 @@ pub fn analyze_message(
     Ok((dkim, spf, dmarc, header_from))
 }
 
-fn parse_headers_body<'a>(data: &'a [u8]) -> (Vec<(String, String)>, &'a [u8], &'a [u8]) {
+fn parse_headers_body(data: &[u8]) -> (Vec<(String, String)>, &[u8], &[u8]) {
     // find header/body separator (prefer CRLFCRLF)
     let mut split_at: Option<usize> = None;
     let mut sep_len: usize = 0;
@@ -74,7 +73,7 @@ fn parse_headers_body<'a>(data: &'a [u8]) -> (Vec<(String, String)>, &'a [u8], &
     (headers, hdr_bytes, body)
 }
 
-fn get_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<String> {
+fn get_header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     for (k, v) in headers.iter() {
         if k.eq_ignore_ascii_case(name) {
             return Some(v.clone());
@@ -137,15 +136,11 @@ fn verify_dkim(
                 let mut has_d = false;
                 for part in val.split(';') {
                     let p = part.trim();
-                    if p.to_ascii_lowercase().starts_with("s=") {
-                        if p[2..].trim() == selector {
-                            has_s = true;
-                        }
+                    if p.to_ascii_lowercase().starts_with("s=") && p[2..].trim() == selector {
+                        has_s = true;
                     }
-                    if p.to_ascii_lowercase().starts_with("d=") {
-                        if p[2..].trim() == domain {
-                            has_d = true;
-                        }
+                    if p.to_ascii_lowercase().starts_with("d=") && p[2..].trim() == domain {
+                        has_d = true;
                     }
                 }
                 if has_s && has_d {
@@ -182,7 +177,7 @@ fn verify_dkim(
         let mut canon: Option<String> = None;
         for part in v.split(';') {
             let p = part.trim();
-            if p.len() == 0 {
+            if p.is_empty() {
                 continue;
             }
             let lower = p.to_ascii_lowercase();
@@ -234,12 +229,12 @@ fn verify_dkim(
         // If signature is present and algorithm is supported, attempt verification
         if let (Some(sig_b64), Some(selector), Some(domain)) = (b_sig.clone(), s.clone(), d.clone())
         {
-            if let Some(a) = a_alg.clone() {
-                if !a.to_ascii_lowercase().contains("rsa-sha256") {
-                    // unsupported algorithm -> treat as tried but skip
-                    tried_any = true;
-                    continue;
-                }
+            if let Some(a) = a_alg.clone()
+                && !a.to_ascii_lowercase().contains("rsa-sha256")
+            {
+                // unsupported algorithm -> treat as tried but skip
+                tried_any = true;
+                continue;
             }
 
             // Build list of signed header bytes according to h= list
@@ -413,41 +408,41 @@ const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn cached_txt_lookup(name: &str) -> Option<Vec<String>> {
     let cache = TXT_CACHE.lock().unwrap();
-    if let Some((ts, val)) = cache.get(name) {
-        if ts.elapsed() < DNS_CACHE_TTL {
-            return Some(val.clone());
-        }
+    if let Some((ts, val)) = cache.get(name)
+        && ts.elapsed() < DNS_CACHE_TTL
+    {
+        return Some(val.clone());
     }
     drop(cache);
-    if let Ok(res) = resolver() {
-        if let Ok(lookup) = res.txt_lookup(name) {
-            let mut vals: Vec<String> = Vec::new();
-            for txt in lookup.iter() {
-                vals.push(txt.to_string());
-            }
-            let mut cache = TXT_CACHE.lock().unwrap();
-            cache.insert(name.to_string(), (Instant::now(), vals.clone()));
-            return Some(vals);
+    if let Ok(res) = resolver()
+        && let Ok(lookup) = res.txt_lookup(name)
+    {
+        let mut vals: Vec<String> = Vec::new();
+        for txt in lookup.iter() {
+            vals.push(txt.to_string());
         }
+        let mut cache = TXT_CACHE.lock().unwrap();
+        cache.insert(name.to_string(), (Instant::now(), vals.clone()));
+        return Some(vals);
     }
     None
 }
 
 fn cached_lookup_ip(name: &str) -> Option<Vec<std::net::IpAddr>> {
     let cache = A_CACHE.lock().unwrap();
-    if let Some((ts, val)) = cache.get(name) {
-        if ts.elapsed() < DNS_CACHE_TTL {
-            return Some(val.clone());
-        }
+    if let Some((ts, val)) = cache.get(name)
+        && ts.elapsed() < DNS_CACHE_TTL
+    {
+        return Some(val.clone());
     }
     drop(cache);
-    if let Ok(res) = resolver() {
-        if let Ok(lookup) = res.lookup_ip(name) {
-            let ips: Vec<std::net::IpAddr> = lookup.iter().collect();
-            let mut cache = A_CACHE.lock().unwrap();
-            cache.insert(name.to_string(), (Instant::now(), ips.clone()));
-            return Some(ips);
-        }
+    if let Ok(res) = resolver()
+        && let Ok(lookup) = res.lookup_ip(name)
+    {
+        let ips: Vec<std::net::IpAddr> = lookup.iter().collect();
+        let mut cache = A_CACHE.lock().unwrap();
+        cache.insert(name.to_string(), (Instant::now(), ips.clone()));
+        return Some(ips);
     }
     None
 }
@@ -464,7 +459,7 @@ fn expand_spf_macros(s: &str, peer: IpAddr, mail_from: &str, current_domain: &st
                     '-' => out.push_str("%20"),
                     '{' => {
                         let mut mac = String::new();
-                        while let Some(n) = chars.next() {
+                        for n in chars.by_ref() {
                             if n == '}' {
                                 break;
                             }
@@ -477,7 +472,7 @@ fn expand_spf_macros(s: &str, peer: IpAddr, mail_from: &str, current_domain: &st
                                 .split('@')
                                 .next()
                                 .map(|s| s.to_string())
-                                .unwrap_or_else(|| "".to_string()),
+                                .unwrap_or_default(),
                             "d" => current_domain.to_string(),
                             _ => "".to_string(),
                         };
@@ -559,17 +554,17 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
                 // ip4/ip6
                 if mech.starts_with("ip4:") || mech.starts_with("ip6:") {
                     let cid = &mech[4..];
-                    if let Ok(net) = cid.parse::<IpNet>() {
-                        if net.contains(&peer) {
-                            return Some(map_qual(qual).to_string());
-                        }
+                    if let Ok(net) = cid.parse::<IpNet>()
+                        && net.contains(&peer)
+                    {
+                        return Some(map_qual(qual).to_string());
                     }
                 } else if mech.starts_with("a") {
                     // a or a:domain
                     let target = if mech == "a" {
                         domain.to_string()
-                    } else if mech.starts_with("a:") {
-                        expand_spf_macros(&mech[2..], peer, mail_from, domain)
+                    } else if let Some(target) = mech.strip_prefix("a:") {
+                        expand_spf_macros(target, peer, mail_from, domain)
                     } else {
                         domain.to_string()
                     };
@@ -584,37 +579,35 @@ fn verify_spf(peer_ip: Option<IpAddr>, mail_from: Option<&str>) -> Result<Option
                     // mx or mx:domain
                     let target = if mech == "mx" {
                         domain.to_string()
-                    } else if mech.starts_with("mx:") {
-                        mech[3..].to_string()
+                    } else if let Some(target) = mech.strip_prefix("mx:") {
+                        target.to_string()
                     } else {
                         domain.to_string()
                     };
-                    if let Ok(resolver) = resolver() {
-                        if let Ok(mxlookup) = resolver.mx_lookup(target.as_str()) {
-                            for mx in mxlookup.iter() {
-                                let host = mx.exchange().to_utf8();
-                                if let Some(ips) = cached_lookup_ip(host.as_str()) {
-                                    for ip in ips.iter() {
-                                        if *ip == peer {
-                                            return Some(map_qual(qual).to_string());
-                                        }
+                    if let Ok(resolver) = resolver()
+                        && let Ok(mxlookup) = resolver.mx_lookup(target.as_str())
+                    {
+                        for mx in mxlookup.iter() {
+                            let host = mx.exchange().to_utf8();
+                            if let Some(ips) = cached_lookup_ip(host.as_str()) {
+                                for ip in ips.iter() {
+                                    if *ip == peer {
+                                        return Some(map_qual(qual).to_string());
                                     }
                                 }
                             }
                         }
                     }
-                } else if mech.starts_with("include:") {
-                    let inc_raw = &mech[8..];
+                } else if let Some(inc_raw) = mech.strip_prefix("include:") {
                     let inc = expand_spf_macros(inc_raw, peer, mail_from, domain);
                     let mut v2 = visited.clone();
                     if let Some(res) =
                         eval_spf_for_domain(&inc, peer, depth.saturating_add(1), &mut v2, mail_from)
+                        && res == "pass"
                     {
-                        if res == "pass" {
-                            return Some("pass".to_string());
-                        }
-                        // otherwise continue
+                        return Some("pass".to_string());
                     }
+                    // otherwise continue
                 } else if mech.ends_with("all") {
                     // like -all, ~all, ?all, +all
                     let q = mech.chars().next().unwrap_or('+');
@@ -674,10 +667,11 @@ fn verify_dmarc(
             // find p= value
             for part in txt_str.split(';') {
                 let p = part.trim();
-                if p.starts_with('p') && p.contains('=') {
-                    if let Some(eq) = p.find('=') {
-                        policy = Some(p[eq + 1..].trim().to_string());
-                    }
+                if p.starts_with('p')
+                    && p.contains('=')
+                    && let Some(eq) = p.find('=')
+                {
+                    policy = Some(p[eq + 1..].trim().to_string());
                 }
             }
         }
@@ -685,28 +679,28 @@ fn verify_dmarc(
     let policy = policy.unwrap_or_else(|| "none".to_string());
 
     // DMARC alignment: prefer DKIM then SPF
-    if let Some(dkim_s) = dkim {
-        if dkim_s.starts_with("pass") {
-            // attempt to extract d= from DKIM result or headers
-            if let Some(pos) = dkim_s.find("d=") {
-                let rem = &dkim_s[pos + 2..];
-                let dval = rem.split_whitespace().next().unwrap_or("");
-                let dval = crate::domain::canonicalize_domain(dval).unwrap_or_default();
-                if dval == from_domain || dval.ends_with(&format!(".{}", from_domain)) {
-                    return Ok(Some("pass".to_string()));
-                }
+    if let Some(dkim_s) = dkim
+        && dkim_s.starts_with("pass")
+    {
+        // attempt to extract d= from DKIM result or headers
+        if let Some(pos) = dkim_s.find("d=") {
+            let rem = &dkim_s[pos + 2..];
+            let dval = rem.split_whitespace().next().unwrap_or("");
+            let dval = crate::domain::canonicalize_domain(dval).unwrap_or_default();
+            if dval == from_domain || dval.ends_with(&format!(".{}", from_domain)) {
+                return Ok(Some("pass".to_string()));
             }
-            // fallback: inspect DKIM-Signature headers for d= tag
-            for (k, v) in headers.iter() {
-                if k.eq_ignore_ascii_case("DKIM-Signature") {
-                    for part in v.split(';') {
-                        let p = part.trim();
-                        if p.starts_with("d=") {
-                            let d = crate::domain::canonicalize_domain(p[2..].trim())
-                                .unwrap_or_default();
-                            if d == from_domain || d.ends_with(&format!(".{}", from_domain)) {
-                                return Ok(Some("pass".to_string()));
-                            }
+        }
+        // fallback: inspect DKIM-Signature headers for d= tag
+        for (k, v) in headers.iter() {
+            if k.eq_ignore_ascii_case("DKIM-Signature") {
+                for part in v.split(';') {
+                    let p = part.trim();
+                    if let Some(value) = p.strip_prefix("d=") {
+                        let d =
+                            crate::domain::canonicalize_domain(value.trim()).unwrap_or_default();
+                        if d == from_domain || d.ends_with(&format!(".{}", from_domain)) {
+                            return Ok(Some("pass".to_string()));
                         }
                     }
                 }
@@ -714,18 +708,16 @@ fn verify_dmarc(
         }
     }
 
-    if let Some(spf_s) = spf {
-        if spf_s == "pass" {
-            // envelope-from domain alignment
-            if let Some(mf) = mail_from {
-                if let Some(idx) = mf.rfind('@') {
-                    let ef_domain =
-                        crate::domain::canonicalize_domain(&mf[idx + 1..]).unwrap_or_default();
-                    if ef_domain == from_domain || ef_domain.ends_with(&format!(".{}", from_domain))
-                    {
-                        return Ok(Some("pass".to_string()));
-                    }
-                }
+    if let Some(spf_s) = spf
+        && spf_s == "pass"
+    {
+        // envelope-from domain alignment
+        if let Some(mf) = mail_from
+            && let Some(idx) = mf.rfind('@')
+        {
+            let ef_domain = crate::domain::canonicalize_domain(&mf[idx + 1..]).unwrap_or_default();
+            if ef_domain == from_domain || ef_domain.ends_with(&format!(".{}", from_domain)) {
+                return Ok(Some("pass".to_string()));
             }
         }
     }
@@ -773,8 +765,8 @@ pub fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
         for txt in txts.iter() {
             for part in txt.split(';') {
                 let p = part.trim();
-                if p.starts_with("rua=") {
-                    let list = p[4..].trim();
+                if let Some(value) = p.strip_prefix("rua=") {
+                    let list = value.trim();
                     for addr in list.split(',') {
                         let a = addr.trim();
                         if a.to_ascii_lowercase().starts_with("mailto:") {
@@ -797,8 +789,8 @@ pub fn get_dmarc_policy(domain: &str) -> Result<Option<String>> {
         for txt in txts.iter() {
             for part in txt.split(';') {
                 let p = part.trim();
-                if p.starts_with("p=") {
-                    return Ok(Some(p[2..].trim().to_string()));
+                if let Some(value) = p.strip_prefix("p=") {
+                    return Ok(Some(value.trim().to_string()));
                 }
             }
         }

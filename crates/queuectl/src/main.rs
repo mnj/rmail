@@ -1,3 +1,5 @@
+#![allow(clippy::ptr_arg, clippy::type_complexity)]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rmail_common::config::Config;
@@ -6,7 +8,7 @@ use rmail_common::outbound::QueueControl;
 use serde_json::json;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// rmail_queuectl: inspect and manage the on-disk outbound queue (queue/inflight/sent/failed)
 #[derive(Parser)]
@@ -180,7 +182,7 @@ fn cmd_alias_list(_root: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn spool_dirs(base: &PathBuf) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+fn spool_dirs(base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let base = base.join("outbound");
     (
         base.join("maildrop").join("queue"),
@@ -265,7 +267,7 @@ fn write_control(path: &PathBuf, ctrl: &QueueControl) -> Result<()> {
 }
 
 fn move_with_json(
-    src_eml: &PathBuf,
+    src_eml: &Path,
     dst_dir: &PathBuf,
     _json_opt: &Option<PathBuf>,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -297,12 +299,11 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
                 return false;
             }
         }
-        if !pattern.ends_with('*') {
-            if let Some(last) = parts.iter().rev().find(|s| !s.is_empty()) {
-                if !name.ends_with(last) {
-                    return false;
-                }
-            }
+        if !pattern.ends_with('*')
+            && let Some(last) = parts.iter().rev().find(|s| !s.is_empty())
+            && !name.ends_with(last)
+        {
+            return false;
         }
         true
     } else {
@@ -377,7 +378,7 @@ fn cmd_list(root: &PathBuf, as_json: bool) -> Result<()> {
         for (name, ctrl) in q.iter() {
             let mut obj = json!({"name": name});
             if let Some(c) = ctrl {
-                obj["control"] = serde_json::to_value(&c).unwrap_or(json!(null));
+                obj["control"] = serde_json::to_value(c).unwrap_or(json!(null));
             }
             arr.push(obj);
         }
@@ -488,7 +489,7 @@ fn requeue_single(
 
 fn cmd_requeue(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: bool) -> Result<()> {
     if let Some(n) = name {
-        let fname = ensure_ext(n.as_ref());
+        let fname = ensure_ext(n);
         if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
             if !confirm(&format!("Requeue {} from {}?", fname, spool), yes) {
                 println!("aborted");
@@ -526,7 +527,7 @@ fn cmd_promote(
     yes: bool,
 ) -> Result<()> {
     if let Some(n) = name {
-        let fname = ensure_ext(n.as_ref());
+        let fname = ensure_ext(n);
         if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
             if !confirm(
                 &format!("Promote {} from {} to priority {}?", fname, spool, priority),
@@ -587,7 +588,7 @@ fn cmd_promote(
 
 fn cmd_delete(root: &PathBuf, name: Option<&str>, pattern: Option<&str>, yes: bool) -> Result<()> {
     if let Some(n) = name {
-        let fname = ensure_ext(n.as_ref());
+        let fname = ensure_ext(n);
         if let Some((spool, eml, jsonp)) = find_message(root, &fname)? {
             if !confirm(
                 &format!("Delete {} from {}? (move to failed)", fname, spool),

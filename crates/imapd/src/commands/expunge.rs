@@ -108,7 +108,7 @@ async fn run(
             .then_some((index + 1, *uid))
         })
         .collect::<Vec<_>>();
-    deleted.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    deleted.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
     let deleted_uids = deleted.iter().map(|(_, uid)| *uid).collect::<Vec<_>>();
     let root = mail_root.to_string();
     let domain = selected.domain.clone();

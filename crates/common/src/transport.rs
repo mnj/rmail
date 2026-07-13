@@ -32,22 +32,22 @@ pub fn load_transport_map<P: AsRef<Path>>(
     if let Some(map) = cfg.transport {
         for (k, v) in map {
             let key = k.to_ascii_lowercase();
-            if v.starts_with("smtp:") {
-                let nh = v["smtp:".len()..].to_string();
+            if let Some(next_hop) = v.strip_prefix("smtp:") {
+                let nh = next_hop.to_string();
                 if nh.is_empty() {
                     out.insert(key, Transport::Smtp(None));
                 } else {
                     out.insert(key, Transport::Smtp(Some(nh)));
                 }
-            } else if v.starts_with("smtps:") {
-                let nh = v["smtps:".len()..].to_string();
+            } else if let Some(next_hop) = v.strip_prefix("smtps:") {
+                let nh = next_hop.to_string();
                 if nh.is_empty() {
                     out.insert(key, Transport::Smtps(None));
                 } else {
                     out.insert(key, Transport::Smtps(Some(nh)));
                 }
-            } else if v.starts_with("error:") {
-                let msg = v["error:".len()..].to_string();
+            } else if let Some(message) = v.strip_prefix("error:") {
+                let msg = message.to_string();
                 out.insert(key, Transport::Error(msg));
             } else if v == "smtp" {
                 out.insert(key, Transport::Smtp(None));

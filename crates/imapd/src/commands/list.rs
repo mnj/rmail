@@ -177,10 +177,10 @@ fn attributes(
     if command_name == "XLIST" && summary.folder.name.eq_ignore_ascii_case("INBOX") {
         attributes.push("\\Inbox".to_string());
     }
-    if request.returns.special_use {
-        if let Some(special_use) = &summary.folder.special_use {
-            attributes.push(special_use.clone());
-        }
+    if request.returns.special_use
+        && let Some(special_use) = &summary.folder.special_use
+    {
+        attributes.push(special_use.clone());
     }
     attributes
 }

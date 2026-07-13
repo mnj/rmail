@@ -186,22 +186,22 @@ pub(crate) async fn refresh_selected_mailbox(
     }
 
     for (uid, (new_seq, new_flags)) in &new_by_uid {
-        if let Some((_old_seq, old_flags)) = old_by_uid.get(uid) {
-            if old_flags != new_flags {
-                events.push(MailboxSyncEvent::FetchFlags {
-                    seq: *new_seq,
-                    uid: *uid,
-                    flags: {
-                        let mut flags = new_flags.clone();
-                        if refreshed.recent_uids.contains(uid) {
-                            flags.push("\\Recent".to_string());
-                            flags.sort();
-                            flags.dedup();
-                        }
-                        flags
-                    },
-                });
-            }
+        if let Some((_old_seq, old_flags)) = old_by_uid.get(uid)
+            && old_flags != new_flags
+        {
+            events.push(MailboxSyncEvent::FetchFlags {
+                seq: *new_seq,
+                uid: *uid,
+                flags: {
+                    let mut flags = new_flags.clone();
+                    if refreshed.recent_uids.contains(uid) {
+                        flags.push("\\Recent".to_string());
+                        flags.sort();
+                        flags.dedup();
+                    }
+                    flags
+                },
+            });
         }
     }
 
@@ -234,7 +234,7 @@ pub(crate) fn address_parts(address: &str) -> Result<(String, String)> {
 
 pub(crate) fn decode_wire_mailbox_name(name: &str, utf8_accept: bool) -> Result<String> {
     if !utf8_accept && name.contains('&') {
-        rmail_common::maildir::imap_utf7_to_utf8(name).map_err(Into::into)
+        rmail_common::maildir::imap_utf7_to_utf8(name)
     } else {
         Ok(name.to_string())
     }

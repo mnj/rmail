@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
     let conn = Connection::open(path)?;
-    conn.pragma_update(None, "journal_mode", &"WAL")?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS mailboxes (

@@ -273,9 +273,9 @@ fn prune_nodes(nodes: &mut [Node], indices: Vec<usize>) -> Vec<usize> {
     output
 }
 
-fn sort_tree(nodes: &mut [Node], indices: &mut Vec<usize>) {
-    indices.sort_by(|left, right| node_sort_key(nodes, *left).cmp(&node_sort_key(nodes, *right)));
-    for index in indices.clone() {
+fn sort_tree(nodes: &mut [Node], indices: &mut [usize]) {
+    indices.sort_by_key(|left| node_sort_key(nodes, *left));
+    for index in indices.iter().copied() {
         let mut children = std::mem::take(&mut nodes[index].children);
         sort_tree(nodes, &mut children);
         nodes[index].children = children;

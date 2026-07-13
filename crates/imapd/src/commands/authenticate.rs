@@ -63,8 +63,8 @@ pub(crate) async fn handle_password(
 
     let user = credentials.authcid;
     if credentials.authzid.as_ref().is_some_and(|authzid| {
-        rmail_common::auth::saslprep(authzid).to_ascii_lowercase()
-            != rmail_common::auth::saslprep(&user).to_ascii_lowercase()
+        !rmail_common::auth::saslprep(authzid)
+            .eq_ignore_ascii_case(&rmail_common::auth::saslprep(&user))
     }) {
         record_failure(peer);
         return terminal(

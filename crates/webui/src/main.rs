@@ -1,5 +1,7 @@
 // rmail_web: minimal tokio-based HTTP UI for stats and logs (no hyper/axum)
 
+#![allow(clippy::ptr_arg, clippy::type_complexity)]
+
 use anyhow::{Context, Result};
 use argon2::{
     Argon2,
@@ -14,7 +16,7 @@ use rmail_common::outbound::QueueControl;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Serialize)]
@@ -391,10 +393,10 @@ fn read_admin_static(path: &str) -> Option<(&'static str, String)> {
         } else {
             continue;
         };
-        if file_path.is_file() {
-            if let Ok(body) = std::fs::read_to_string(&file_path) {
-                return Some((static_content_type(&file_path), body));
-            }
+        if file_path.is_file()
+            && let Ok(body) = std::fs::read_to_string(&file_path)
+        {
+            return Some((static_content_type(&file_path), body));
         }
     }
     None
@@ -499,14 +501,13 @@ fn account_summaries_sync(
             let mut folders = 0usize;
             let mut messages = 0usize;
             let mut unseen = 0usize;
-            if let Some((local, domain)) = split_address(&mailbox.address) {
-                if let Ok(summaries) =
+            if let Some((local, domain)) = split_address(&mailbox.address)
+                && let Ok(summaries) =
                     rmail_common::imap_state::list_folder_summaries(mail_root, domain, local)
-                {
-                    folders = summaries.len();
-                    messages = summaries.iter().map(|summary| summary.messages).sum();
-                    unseen = summaries.iter().map(|summary| summary.unseen).sum();
-                }
+            {
+                folders = summaries.len();
+                messages = summaries.iter().map(|summary| summary.messages).sum();
+                unseen = summaries.iter().map(|summary| summary.unseen).sum();
             }
             accounts.push(AccountSummary {
                 address: mailbox.address,
@@ -596,7 +597,7 @@ fn upsert_catchall_sync(db_path: &str, req: CatchallRequest) -> Result<()> {
 }
 
 // --- on-disk queue helper functions (synchronous) ---
-fn spool_dirs(base: &PathBuf) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+fn spool_dirs(base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let base = base.join("outbound");
     (
         base.join("maildrop").join("queue"),
@@ -745,7 +746,7 @@ fn read_queue_entries(dir: &PathBuf) -> Result<Vec<serde_json::Value>> {
         a["name"]
             .as_str()
             .unwrap_or("")
-            .cmp(&b["name"].as_str().unwrap_or(""))
+            .cmp(b["name"].as_str().unwrap_or(""))
     });
     Ok(out)
 }
@@ -838,12 +839,11 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
                 return false;
             }
         }
-        if !pattern.ends_with('*') {
-            if let Some(last) = parts.iter().rev().find(|s| !s.is_empty()) {
-                if !name.ends_with(last) {
-                    return false;
-                }
-            }
+        if !pattern.ends_with('*')
+            && let Some(last) = parts.iter().rev().find(|s| !s.is_empty())
+            && !name.ends_with(last)
+        {
+            return false;
         }
         true
     } else {
@@ -898,12 +898,12 @@ fn requeue_single_sync(
 ) -> Result<()> {
     let (queue, _inflight, _sent, _failed) = spool_dirs(root);
     if spool == "queue" {
-        if let Some(j) = jsonp {
-            if let Some(mut ctrl) = read_control_opt_sync(&Some(j.clone())) {
-                ctrl.attempts = 0;
-                ctrl.next_try = None;
-                write_control_sync(j, &ctrl)?;
-            }
+        if let Some(j) = jsonp
+            && let Some(mut ctrl) = read_control_opt_sync(&Some(j.clone()))
+        {
+            ctrl.attempts = 0;
+            ctrl.next_try = None;
+            write_control_sync(j, &ctrl)?;
         }
         return Ok(());
     }
@@ -1018,21 +1018,21 @@ async fn handle_connection(
             Some(h) => h,
             None => return false,
         };
-        if let Some(authz) = headers.get("authorization") {
-            if authz.len() > 6 && authz[..6].eq_ignore_ascii_case("Basic ") {
-                let b64 = authz[6..].trim();
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    if let Ok(creds) = String::from_utf8(bytes) {
-                        if let Some(colon) = creds.find(':') {
-                            let u = &creds[..colon];
-                            let p = &creds[colon + 1..];
-                            if u == expected_user {
-                                if let Ok(valid) = auth::verify_password(p, expected_hash) {
-                                    return valid;
-                                }
-                            }
-                        }
-                    }
+        if let Some(authz) = headers.get("authorization")
+            && authz.len() > 6
+            && authz[..6].eq_ignore_ascii_case("Basic ")
+        {
+            let b64 = authz[6..].trim();
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
+                && let Ok(creds) = String::from_utf8(bytes)
+                && let Some(colon) = creds.find(':')
+            {
+                let u = &creds[..colon];
+                let p = &creds[colon + 1..];
+                if u == expected_user
+                    && let Ok(valid) = auth::verify_password(p, expected_hash)
+                {
+                    return valid;
                 }
             }
         }
@@ -1047,13 +1047,12 @@ async fn handle_connection(
 
     // read body for POST requests
     let mut body_bytes: Vec<u8> = Vec::new();
-    if method == "POST" || method == "DELETE" {
-        if let Some(cl) = headers.get("content-length") {
-            if let Ok(n) = cl.parse::<usize>() {
-                body_bytes.resize(n, 0);
-                let _ = reader.read_exact(&mut body_bytes).await;
-            }
-        }
+    if (method == "POST" || method == "DELETE")
+        && let Some(cl) = headers.get("content-length")
+        && let Ok(n) = cl.parse::<usize>()
+    {
+        body_bytes.resize(n, 0);
+        let _ = reader.read_exact(&mut body_bytes).await;
     }
 
     let (path, query) = if let Some(pos) = path_q.find('?') {
@@ -1062,12 +1061,11 @@ async fn handle_connection(
         (path_q, "")
     };
     // Serve ACME http-01 challenge files from configured directory
-    if path.starts_with("/.well-known/acme-challenge/") {
+    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
         if method != "GET" {
             status = 405;
             body = "Method Not Allowed".to_string();
         } else {
-            let token = &path["/.well-known/acme-challenge/".len()..];
             if let Some(acme_dir) = acme_challenge_dir.as_ref() {
                 let fpath = std::path::Path::new(acme_dir).join(token);
                 match tokio::fs::read_to_string(fpath).await {
@@ -1974,7 +1972,7 @@ async fn handle_connection(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n{}\r\n{}",
         status,
         if status == 200 { "OK" } else { "ERR" },
-        body.as_bytes().len(),
+        body.len(),
         content_type,
         extra_headers,
         body

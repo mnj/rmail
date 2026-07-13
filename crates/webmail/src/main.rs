@@ -853,12 +853,12 @@ fn decode_quoted_printable(input: &[u8]) -> Vec<u8> {
                 i += 2;
                 continue;
             }
-            if i + 2 < input.len() {
-                if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                    continue;
-                }
+            if i + 2 < input.len()
+                && let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2]))
+            {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
             }
         }
         out.push(input[i]);
@@ -1169,27 +1169,27 @@ fn static_spa(path: &str, state: &AppState) -> Response {
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
         {
             let file_path = state.static_dir.join(relative);
-            if file_path.is_file() {
-                if let Ok(body) = fs::read(&file_path) {
-                    return Response {
-                        status: 200,
-                        content_type: static_content_type(&file_path),
-                        headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
-                        body,
-                    };
-                }
-            }
-        }
-        let index = state.static_dir.join("index.html");
-        if index.is_file() {
-            if let Ok(body) = fs::read(index) {
+            if file_path.is_file()
+                && let Ok(body) = fs::read(&file_path)
+            {
                 return Response {
                     status: 200,
-                    content_type: "text/html; charset=utf-8",
+                    content_type: static_content_type(&file_path),
                     headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
                     body,
                 };
             }
+        }
+        let index = state.static_dir.join("index.html");
+        if index.is_file()
+            && let Ok(body) = fs::read(index)
+        {
+            return Response {
+                status: 200,
+                content_type: "text/html; charset=utf-8",
+                headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
+                body,
+            };
         }
     }
     embedded_spa()

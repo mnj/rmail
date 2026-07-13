@@ -32,13 +32,11 @@ pub(crate) fn handle(
     if !newly_enabled.is_empty() {
         response = response.data(format!("ENABLED {}", newly_enabled.join(" ")));
     }
-    if condstore_enabled {
-        if let Some(highest_modseq) = selected_highest_modseq {
-            response = response.status(
-                StatusLine::untagged(Status::Ok, "Highest")
-                    .with_code(format!("HIGHESTMODSEQ {highest_modseq}")),
-            );
-        }
+    if condstore_enabled && let Some(highest_modseq) = selected_highest_modseq {
+        response = response.status(
+            StatusLine::untagged(Status::Ok, "Highest")
+                .with_code(format!("HIGHESTMODSEQ {highest_modseq}")),
+        );
     }
     Ok(response.status(StatusLine::tagged(tag, Status::Ok, "ENABLE completed")))
 }

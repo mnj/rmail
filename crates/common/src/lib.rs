@@ -1,5 +1,9 @@
 //! rmail_common: shared utilities and types
 
+// These data-access and protocol APIs deliberately mirror records/wire fields.
+// Grouping them solely to satisfy lint thresholds would obscure their call sites.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 pub mod auth;
 pub mod config;
 pub mod db;

@@ -224,10 +224,10 @@ fn strip_subject_prefixes(subject: &str) -> String {
     let mut value = subject.trim_start();
     loop {
         let before = value;
-        if value.starts_with('[') {
-            if let Some(end) = value.find(']') {
-                value = value[end + 1..].trim_start();
-            }
+        if value.starts_with('[')
+            && let Some(end) = value.find(']')
+        {
+            value = value[end + 1..].trim_start();
         }
         let lower = value.to_ascii_lowercase();
         let mut stripped = false;

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use std::net::{IpAddr, SocketAddr};
@@ -68,12 +70,12 @@ async fn increment_delivery_counter(mail_root: &std::path::Path) -> Result<()> {
 /// Check whether the remote IP is currently blocked from authenticating. Returns remaining block Duration if blocked.
 fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
     let m = AUTH_FAILS.lock().unwrap();
-    if let Some(info) = m.get(&ip) {
-        if let Some(until) = info.locked_until {
-            let now = Instant::now();
-            if until > now {
-                return Some(until - now);
-            }
+    if let Some(info) = m.get(&ip)
+        && let Some(until) = info.locked_until
+    {
+        let now = Instant::now();
+        if until > now {
+            return Some(until - now);
         }
     }
     None
@@ -124,11 +126,11 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     // initialize DB schema if missing
-    if let Some(ref dbp) = db_path {
-        if let Err(e) = rmail_common::db::init_db(dbp) {
-            eprintln!("Failed to initialize database {}: {}", dbp, e);
-            std::process::exit(1);
-        }
+    if let Some(ref dbp) = db_path
+        && let Err(e) = rmail_common::db::init_db(dbp)
+    {
+        eprintln!("Failed to initialize database {}: {}", dbp, e);
+        std::process::exit(1);
     }
 
     // build TLS context if certificate paths present (includes acceptor and channel-binding info)
@@ -675,20 +677,20 @@ async fn process_stream(
                     continue;
                 }
                 // Rate-limiting: block repeated failures per remote IP
-                if let Some(peer_addr) = peer {
-                    if let Some(rem) = auth_block_remaining(peer_addr.ip()) {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "454 4.7.1 Too many failed auth attempts; try again in {}s\r\n",
-                                rem.as_secs()
-                            )
-                            .as_bytes(),
+                if let Some(peer_addr) = peer
+                    && let Some(rem) = auth_block_remaining(peer_addr.ip())
+                {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!(
+                            "454 4.7.1 Too many failed auth attempts; try again in {}s\r\n",
+                            rem.as_secs()
                         )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
+                        .as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
                 }
                 // Require encryption (implicit SMTPS or STARTTLS) for authentication in production
                 if !session_encrypted {
@@ -1696,7 +1698,7 @@ mod tests {
         let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();
         mac.update(b"Client Key");
         let client_key = mac.finalize().into_bytes();
-        let stored_key = Sha256::digest(&client_key);
+        let stored_key = Sha256::digest(client_key);
         let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).unwrap();
         mac.update(auth_message.as_bytes());
         let signature = mac.finalize().into_bytes();
@@ -2208,7 +2210,7 @@ mod tests {
         let mut input =
             b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n".to_vec();
         while input.len() < MAX_MESSAGE_BYTES + 4096 {
-            input.extend(std::iter::repeat(b'a').take(900));
+            input.extend(std::iter::repeat_n(b'a', 900));
             input.extend_from_slice(b"\r\n");
         }
         input.extend_from_slice(b".\r\nQUIT\r\n");
@@ -2225,7 +2227,7 @@ mod tests {
     async fn overlong_data_line_is_drained_before_next_command() {
         let mut input =
             b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n".to_vec();
-        input.extend(std::iter::repeat(b'a').take(1001));
+        input.extend(std::iter::repeat_n(b'a', 1001));
         input.extend_from_slice(b"\r\nQUIT\r\n.\r\nQUIT\r\n");
         let (responses, _td) = run_session(input, 16 * 1024).await;
         let line_too_long = responses

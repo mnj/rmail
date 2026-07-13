@@ -36,12 +36,11 @@ pub fn deliver_blocking(
                 return Err(anyhow::anyhow!("connection closed by peer"));
             }
             full.push_str(&line);
-            if line.len() >= 4 {
-                if let Ok(code) = line[0..3].parse::<u16>() {
-                    if line.as_bytes()[3] == b' ' {
-                        return Ok((code, full));
-                    }
-                }
+            if line.len() >= 4
+                && let Ok(code) = line[0..3].parse::<u16>()
+                && line.as_bytes()[3] == b' '
+            {
+                return Ok((code, full));
             }
         }
     }

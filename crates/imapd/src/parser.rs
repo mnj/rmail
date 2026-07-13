@@ -281,13 +281,11 @@ pub(crate) fn parse_id_args(
         let ImapArg::String(key) = &pair[0] else {
             return Err(ParseError::InvalidAtom);
         };
-        if key.as_bytes().len() > MAX_KEY_BYTES {
+        if key.len() > MAX_KEY_BYTES {
             return Err(ParseError::InvalidAtom);
         }
         let value = match &pair[1] {
-            ImapArg::String(value) if value.as_bytes().len() <= MAX_VALUE_BYTES => {
-                Some(value.clone())
-            }
+            ImapArg::String(value) if value.len() <= MAX_VALUE_BYTES => Some(value.clone()),
             ImapArg::Nil => None,
             _ => return Err(ParseError::InvalidAtom),
         };
@@ -456,9 +454,7 @@ pub(crate) fn valid_tag(tag: &str) -> bool {
 }
 
 pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseError> {
-    let tag_end = input
-        .find(|ch: char| ch == ' ' || ch == '\t')
-        .unwrap_or(input.len());
+    let tag_end = input.find([' ', '\t']).unwrap_or(input.len());
     let tag = &input[..tag_end];
     if tag.len() > 1024 {
         return Err(ParseError::TagTooLong);
@@ -467,9 +463,7 @@ pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseEr
         return Err(ParseError::InvalidTag);
     }
     let rest = input[tag_end..].trim_start_matches([' ', '\t']);
-    let command_end = rest
-        .find(|ch: char| ch == ' ' || ch == '\t')
-        .unwrap_or(rest.len());
+    let command_end = rest.find([' ', '\t']).unwrap_or(rest.len());
     let raw_name = &rest[..command_end];
     if raw_name.is_empty() {
         return Err(ParseError::MissingCommand);
@@ -1059,7 +1053,7 @@ fn parse_search_tokens(tokens: &[String]) -> Option<SearchCriterion> {
     }
     let mut criteria = Vec::new();
     while pos < tokens.len() {
-        criteria.push(parse_search_criterion(&tokens, &mut pos)?);
+        criteria.push(parse_search_criterion(tokens, &mut pos)?);
     }
     if criteria.len() == 1 {
         criteria.pop()

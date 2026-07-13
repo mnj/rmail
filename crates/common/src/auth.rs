@@ -391,7 +391,7 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
     let client_key = mac.finalize().into_bytes();
 
     // stored_key = H(client_key)
-    let stored_key = Sha256::digest(&client_key);
+    let stored_key = Sha256::digest(client_key);
 
     // server_key = HMAC(salted_password, "Server Key")
     let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&salted_password)
@@ -400,10 +400,10 @@ pub fn create_scram_verifier(password: &str, iterations: u32) -> anyhow::Result<
     let server_key = mac2.finalize().into_bytes();
 
     let obj = serde_json::json!({
-        "salt": base64::engine::general_purpose::STANDARD.encode(&salt),
+        "salt": base64::engine::general_purpose::STANDARD.encode(salt),
         "iter": iterations,
-        "stored_key": base64::engine::general_purpose::STANDARD.encode(&stored_key),
-        "server_key": base64::engine::general_purpose::STANDARD.encode(&server_key)
+        "stored_key": base64::engine::general_purpose::STANDARD.encode(stored_key),
+        "server_key": base64::engine::general_purpose::STANDARD.encode(server_key)
     });
     Ok(serde_json::to_string(&obj)?)
 }
@@ -603,7 +603,7 @@ mod tests {
         let client_key = mac.finalize().into_bytes();
 
         // stored_key = H(client_key)
-        let stored_key = Sha256::digest(&client_key);
+        let stored_key = Sha256::digest(client_key);
 
         // server_key = HMAC(salted_password, "Server Key")
         let mut mac2 = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();

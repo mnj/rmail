@@ -1,3 +1,9 @@
+#![allow(
+    clippy::items_after_test_module,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
@@ -189,6 +195,1372 @@ async fn read_textual_command_literals(
             return Err(CommandLiteralError::TooLarge);
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cfg_path =
+        std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
+    let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
+    let auth_policy = Arc::new(
+        auth::AuthPolicy::from_names(&cfg.security.imap_sasl_mechanisms)
+            .context("validating security.imap_sasl_mechanisms")?,
+    );
+    let mail_root = cfg.global.mail_root.clone();
+    rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "imapd")
+        .context("redirecting logs")?;
+
+    // SQLite DB is the authoritative source for mailboxes/catchalls
+    let db_path = cfg.global.db_path.clone();
+    if db_path.is_none() {
+        eprintln!("No db_path configured; SQLite DB is required");
+        std::process::exit(1);
+    }
+
+    // TLS context if certs present
+    let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
+        match load_tls_context(cert, key) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                eprintln!("Failed to load TLS: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let db_path = cfg.global.db_path.clone();
+    // Plain IMAP listener (supports STARTTLS if tls_context present)
+    let imap_port = cfg.global.imap_port.unwrap_or(143);
+    let imap_addrs = cfg
+        .global
+        .imap_listen_addrs
+        .clone()
+        .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imap_port)]);
+    let mut listener_count = 0usize;
+    for addr in imap_addrs {
+        let listener = bind_tcp_listener(&addr)
+            .with_context(|| format!("starting IMAP plain listener on {addr}"))?;
+        println!("rMail IMAPD listening on {}", addr);
+        listener_count += 1;
+        let mail_root_clone = mail_root.clone();
+        let acceptor_clone = tls_context.clone();
+        let db_clone = db_path.clone();
+        let auth_policy = auth_policy.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_plain_listener(
+                addr,
+                listener,
+                mail_root_clone,
+                acceptor_clone,
+                db_clone,
+                auth_policy,
+            )
+            .await
+            {
+                eprintln!("IMAP plain listener failed: {}", e);
+            }
+        });
+    }
+
+    // IMAPS (implicit TLS) listener
+    if let Some(ctx) = tls_context.clone() {
+        if let Some(imaps_port) = cfg.global.imaps_port {
+            let imaps_addrs = cfg
+                .global
+                .imaps_listen_addrs
+                .clone()
+                .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imaps_port)]);
+            for addr in imaps_addrs {
+                let listener = bind_tcp_listener(&addr)
+                    .with_context(|| format!("starting IMAPS listener on {addr}"))?;
+                println!("rMail IMAPD (IMAPS) listening on {}", addr);
+                listener_count += 1;
+                let mail_root_clone = mail_root.clone();
+                let ctx_clone = ctx.clone();
+                let db_clone = db_path.clone();
+                let auth_policy = auth_policy.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_imaps_listener(
+                        addr,
+                        listener,
+                        ctx_clone,
+                        mail_root_clone,
+                        db_clone,
+                        auth_policy,
+                    )
+                    .await
+                    {
+                        eprintln!("IMAPS listener failed: {}", e);
+                    }
+                });
+            }
+        }
+    } else if cfg.global.imaps_port.is_some() || cfg.global.imaps_listen_addrs.is_some() {
+        eprintln!("IMAPS listener not started because TLS certificate/key could not be loaded");
+    }
+
+    if listener_count == 0 {
+        return Err(anyhow!("no IMAP listeners were started"));
+    }
+
+    // keep running
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
+async fn run_plain_listener(
+    addr: String,
+    listener: tokio::net::TcpListener,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    auth_policy: Arc<auth::AuthPolicy>,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        println!(
+            "Accepted IMAP plaintext connection on {} from {} (starttls_available={})",
+            addr,
+            peer,
+            tls_ctx.is_some()
+        );
+        let mail_root = mail_root.clone();
+        let acceptor = tls_ctx.clone();
+        let db_clone = db_path.clone();
+        let auth_policy = auth_policy.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_stream_with_policy(
+                Box::new(stream),
+                mail_root,
+                acceptor,
+                db_clone,
+                Some(peer),
+                false,
+                auth_policy,
+            )
+            .await
+            {
+                eprintln!("IMAP client error: {}", e);
+            }
+        });
+    }
+}
+
+async fn run_imaps_listener(
+    addr: String,
+    listener: tokio::net::TcpListener,
+    ctx: Arc<tls::TlsContext>,
+    mail_root: String,
+    db_path: Option<String>,
+    auth_policy: Arc<auth::AuthPolicy>,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
+        let ctx = ctx.clone();
+        let mail_root = mail_root.clone();
+        let db_clone = db_path.clone();
+        let auth_policy = auth_policy.clone();
+        tokio::spawn(async move {
+            match ctx.acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    if let Err(e) = process_stream_with_policy(
+                        Box::new(tls_stream),
+                        mail_root,
+                        Some(ctx.clone()),
+                        db_clone,
+                        Some(peer),
+                        true,
+                        auth_policy,
+                    )
+                    .await
+                    {
+                        eprintln!("IMAPS client error: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("IMAPS TLS accept error from {}: {}", peer, e),
+            }
+        });
+    }
+}
+
+fn log_imap_response(peer: Option<SocketAddr>, tag: &str, cmd: &str, response: &str) {
+    response::log_imap_response(peer, tag, cmd, response)
+}
+
+fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
+    mailbox::selected_mailbox_name(selected)
+}
+
+fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &str {
+    mailbox::selected_mailbox_for_log(selected)
+}
+
+fn log_unsupported_imap(
+    peer: Option<SocketAddr>,
+    selected: &Option<SelectedMailbox>,
+    tag: &str,
+    command: &str,
+    raw_args: &str,
+) {
+    eprintln!(
+        "imap_unsupported peer={:?} selected_mailbox={} tag={} command={} raw_args={:?}",
+        peer,
+        selected_mailbox_for_log(selected),
+        tag,
+        command,
+        raw_args
+    );
+}
+
+#[cfg(test)]
+fn parse_scram_attr<'a>(message: &'a str, key: &str) -> Option<&'a str> {
+    auth::parse_scram_attr(message, key)
+}
+
+async fn sync_selected_mailbox(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+    mail_root: &str,
+    selected: &mut Option<SelectedMailbox>,
+    qresync_enabled: bool,
+) -> Result<()> {
+    let Some(current) = selected.as_ref().cloned() else {
+        return Ok(());
+    };
+    let (refreshed, events) = mailbox::refresh_selected_mailbox(mail_root, &current).await?;
+    if !events.is_empty() {
+        let w = reader.get_mut();
+        for event in &events {
+            w.write_all(event.response_line(qresync_enabled).as_bytes())
+                .await?;
+        }
+        w.flush().await?;
+    }
+    *selected = Some(refreshed);
+    Ok(())
+}
+
+async fn reload_selected_mailbox_preserving_mode(
+    mail_root: &str,
+    address: &str,
+    mailbox_name: &str,
+    previous: &Option<SelectedMailbox>,
+) -> Result<SelectedMailbox> {
+    let read_only = previous
+        .as_ref()
+        .map(|selected| selected.read_only)
+        .unwrap_or(false);
+    let mut refreshed = mailbox::load_selected_mailbox(mail_root, address, mailbox_name).await?;
+    refreshed.read_only = read_only;
+    Ok(refreshed)
+}
+
+// session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
+// and after a successful STARTTLS). Enforcing authentication methods (like LOGIN) only on
+// encrypted sessions prevents accidental credential disclosure over plain-text.
+// session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
+// and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
+// for per-IP rate-limiting of authentication attempts.
+#[cfg(test)]
+async fn process_stream(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+) -> Result<()> {
+    process_stream_with_policy(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        Arc::new(auth::AuthPolicy::default()),
+    )
+    .await
+}
+
+async fn process_stream_with_policy(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    auth_policy: Arc<auth::AuthPolicy>,
+) -> Result<()> {
+    process_stream_inner(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        true,
+        auth_policy,
+    )
+    .await
+}
+
+async fn process_stream_inner(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    send_greeting: bool,
+    auth_policy: Arc<auth::AuthPolicy>,
+) -> Result<()> {
+    let stream: Box<dyn AsyncStream + Send + 'static> = Box::new(SwitchableStream::new(stream));
+    let mut reader = BufReader::new(stream);
+    println!(
+        "Starting IMAP session peer={:?} encrypted={} tls_configured={}",
+        peer,
+        session_encrypted,
+        tls_ctx.is_some()
+    );
+    if send_greeting {
+        let w = reader.get_mut();
+        let phase = if session_encrypted {
+            response::CapabilityPhase::NotAuthenticatedTls
+        } else {
+            response::CapabilityPhase::NotAuthenticatedPlain
+        };
+        let caps =
+            response::capability_tokens_with_policy(phase, tls_ctx.is_some(), auth_policy.as_ref());
+        println!(
+            "Greeting peer={:?} encrypted={} capabilities={}",
+            peer, session_encrypted, caps
+        );
+        w.write_all(response::greeting(&caps).as_bytes()).await?;
+        w.flush().await?;
+    }
+    let mut session_state = state::SessionState::default();
+    let mut authed_mailbox: Option<String> = None; // store address lowercase
+    // current mailbox selection state (set by SELECT)
+    let mut selected: Option<SelectedMailbox> = None;
+
+    loop {
+        let line_limit = if session_state.authenticated_mailbox.is_some() {
+            MAX_AUTHENTICATED_LINE_BYTES
+        } else {
+            MAX_PREAUTH_LINE_BYTES
+        };
+        let mut line = match read_bounded_line(&mut reader, line_limit).await {
+            Ok(BoundedLine::Line(line)) => line,
+            Ok(BoundedLine::Eof) => {
+                println!(
+                    "IMAP session peer={:?} encrypted={} closed by client",
+                    peer, session_encrypted
+                );
+                break;
+            }
+            Ok(BoundedLine::TooLong) => {
+                let w = reader.get_mut();
+                w.write_all(b"* BAD Command line too long\r\n").await?;
+                w.flush().await?;
+                continue;
+            }
+            Err(e) => {
+                if e.kind() == ErrorKind::UnexpectedEof {
+                    println!(
+                        "IMAP session peer={:?} encrypted={} closed by client without TLS close_notify",
+                        peer, session_encrypted
+                    );
+                    break;
+                }
+                eprintln!(
+                    "IMAP read error peer={:?} encrypted={} err={}",
+                    peer, session_encrypted, e
+                );
+                return Err(e.into());
+            }
+        };
+        let is_append = std::str::from_utf8(&line)
+            .ok()
+            .and_then(|line| line.split_ascii_whitespace().nth(1))
+            .is_some_and(|command| command.eq_ignore_ascii_case("APPEND"));
+        if !is_append && trailing_literal_marker(&line).is_some() {
+            line = match read_textual_command_literals(&mut reader, line, line_limit).await {
+                Ok(line) => line,
+                Err(CommandLiteralError::Eof) => break,
+                Err(CommandLiteralError::NonSyncLiteral8) => {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        b"* BYE Non-synchronizing literal8 desynchronized command stream\r\n",
+                    )
+                    .await?;
+                    w.flush().await?;
+                    break;
+                }
+                Err(CommandLiteralError::TooLarge) => {
+                    let w = reader.get_mut();
+                    w.write_all(b"* BAD Command literal too large\r\n").await?;
+                    w.flush().await?;
+                    continue;
+                }
+                Err(CommandLiteralError::Literal8) => {
+                    let w = reader.get_mut();
+                    w.write_all(b"* BAD Literal8 is not valid for this command\r\n")
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                Err(CommandLiteralError::InvalidUtf8) => {
+                    let w = reader.get_mut();
+                    w.write_all(b"* BAD Textual command literal is not valid UTF-8\r\n")
+                        .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                Err(CommandLiteralError::Io) => return Err(anyhow!("command literal read error")),
+            };
+        }
+        let input = match std::str::from_utf8(&line) {
+            Ok(input) => input.trim_end_matches(['\r', '\n']),
+            Err(_) => {
+                let w = reader.get_mut();
+                w.write_all(b"* BAD Command line is not valid UTF-8\r\n")
+                    .await?;
+                w.flush().await?;
+                continue;
+            }
+        };
+        if input.is_empty() {
+            continue;
+        }
+        let request = match parser::parse_request_line(input) {
+            Ok(request) => request,
+            Err(error) => {
+                let candidate_tag = input
+                    .split([' ', '\t'])
+                    .next()
+                    .filter(|tag| parser::valid_tag(tag));
+                let response_tag = candidate_tag.unwrap_or("*");
+                let w = reader.get_mut();
+                w.write_all(
+                    format!(
+                        "{} BAD Invalid command framing: {:?}\r\n",
+                        response_tag, error
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+                w.flush().await?;
+                continue;
+            }
+        };
+        let tag = request.tag;
+        let cmd = request.command_name().to_string();
+        let args = request.raw_args();
+        println!(
+            "IMAP peer={:?} encrypted={} tag={} cmd={} args={:?} authed={} selected={}",
+            peer,
+            session_encrypted,
+            tag,
+            cmd,
+            args,
+            session_state.authenticated_mailbox.is_some(),
+            session_state.selected_mailbox.is_some()
+        );
+        let command_spec = commands::command_spec(&request.command);
+        if let Some(reason) = commands::preflight(
+            command_spec,
+            commands::SessionContext {
+                authenticated: session_state.authenticated_mailbox.is_some(),
+                selected: session_state.selected_mailbox.is_some(),
+                encrypted: session_encrypted,
+            },
+        ) {
+            let w = reader.get_mut();
+            w.write_all(format!("{} {}\r\n", tag, reason).as_bytes())
+                .await?;
+            w.flush().await?;
+            continue;
+        }
+        if request.command.requires_empty_arguments() && !args.is_empty() {
+            let w = reader.get_mut();
+            w.write_all(format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes())
+                .await?;
+            w.flush().await?;
+            continue;
+        }
+        if command_spec.is_some_and(commands::CommandSpec::needs_mailbox_sync) && selected.is_some()
+        {
+            sync_selected_mailbox(
+                &mut reader,
+                &mail_root,
+                &mut selected,
+                session_state.feature_enabled("QRESYNC"),
+            )
+            .await?;
+        }
+        match &request.command {
+            parser::Command::Capability => {
+                let w = reader.get_mut();
+                let phase = if session_state.selected_mailbox.is_some() {
+                    response::CapabilityPhase::Selected
+                } else if session_state.authenticated_mailbox.is_some() {
+                    response::CapabilityPhase::Authenticated
+                } else if session_encrypted {
+                    response::CapabilityPhase::NotAuthenticatedTls
+                } else {
+                    response::CapabilityPhase::NotAuthenticatedPlain
+                };
+                let caps = response::capability_tokens_with_policy(
+                    phase,
+                    tls_ctx.is_some(),
+                    auth_policy.as_ref(),
+                );
+                let response = commands::basic::capability(tag, &caps).encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Compress => {
+                transport::enable_deflate(&mut reader, tag, args).await?;
+            }
+            parser::Command::Login => {
+                let authenticated_capabilities = response::capability_tokens_with_policy(
+                    response::CapabilityPhase::Authenticated,
+                    tls_ctx.is_some(),
+                    auth_policy.as_ref(),
+                );
+                let outcome = commands::login::handle(
+                    tag,
+                    args,
+                    db_path.as_ref(),
+                    peer,
+                    &authenticated_capabilities,
+                )
+                .await;
+                if let Some(mailbox) = outcome.authenticated_mailbox {
+                    authed_mailbox = Some(mailbox.clone());
+                    session_state.authenticated_mailbox = Some(mailbox);
+                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Authenticate => {
+                let (mechanism, initial_response) = match parser::parse_authenticate_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{} BAD Invalid AUTHENTICATE arguments: {:?}\r\n", tag, err)
+                                .as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
+                let Some(mechanism_metadata) = auth_policy.mechanism(&mechanism) else {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} NO Unsupported authentication mechanism\r\n", tag).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                };
+                if let Some(peer_addr) = peer
+                    && let Some(rem) = auth::auth_block_remaining(peer_addr.ip())
+                {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!(
+                            "{} NO Too many failed auth attempts; try again in {}s\r\n",
+                            tag,
+                            rem.as_secs()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                if !session_encrypted
+                    && mechanism_metadata.security == auth::SaslSecurity::PlaintextPassword
+                {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!(
+                            "{} NO [PRIVACYREQUIRED] Encryption required for authentication\r\n",
+                            tag
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                if mechanism_metadata.channel_binding_required
+                    && (!session_encrypted || tls_ctx.is_none())
+                {
+                    let w = reader.get_mut();
+                    w.write_all(
+                        format!("{} NO Channel binding is not available\r\n", tag).as_bytes(),
+                    )
+                    .await?;
+                    w.flush().await?;
+                    continue;
+                }
+                if mechanism == "PLAIN" || mechanism == "LOGIN" {
+                    let authenticated_capabilities = response::capability_tokens_with_policy(
+                        response::CapabilityPhase::Authenticated,
+                        tls_ctx.is_some(),
+                        auth_policy.as_ref(),
+                    );
+                    let outcome = commands::authenticate::handle_password(
+                        &mut reader,
+                        tag,
+                        &mechanism,
+                        initial_response.as_deref(),
+                        db_path.as_ref(),
+                        peer,
+                        &authenticated_capabilities,
+                    )
+                    .await;
+                    if outcome.disconnected {
+                        return Ok(());
+                    }
+                    if let Some(mailbox) = outcome.authenticated_mailbox {
+                        authed_mailbox = Some(mailbox.clone());
+                        session_state.authenticated_mailbox = Some(mailbox);
+                    }
+                    if let Some(response) = outcome.response {
+                        let response = response.encode();
+                        log_imap_response(peer, tag, &cmd, &response);
+                        let w = reader.get_mut();
+                        w.write_all(response.as_bytes()).await?;
+                        w.flush().await?;
+                    }
+                    continue;
+                }
+                let authenticated_capabilities = response::capability_tokens_with_policy(
+                    response::CapabilityPhase::Authenticated,
+                    tls_ctx.is_some(),
+                    auth_policy.as_ref(),
+                );
+                let outcome = commands::authenticate::handle_scram(
+                    &mut reader,
+                    tag,
+                    initial_response.as_deref(),
+                    db_path.as_ref(),
+                    peer,
+                    mechanism_metadata.channel_binding_required,
+                    tls_ctx
+                        .as_ref()
+                        .map(|context| context.server_end_point.as_slice()),
+                    &authenticated_capabilities,
+                )
+                .await;
+                if outcome.disconnected {
+                    return Ok(());
+                }
+                if let Some(mailbox) = outcome.authenticated_mailbox {
+                    authed_mailbox = Some(mailbox.clone());
+                    session_state.authenticated_mailbox = Some(mailbox);
+                }
+                if let Some(response) = outcome.response {
+                    let response = response.encode();
+                    log_imap_response(peer, tag, &cmd, &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+                }
+            }
+            parser::Command::Noop => {
+                let w = reader.get_mut();
+                let response = commands::basic::completed(tag, "NOOP").encode();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Check => {
+                let outcome = commands::session::check(tag);
+                let w = reader.get_mut();
+                let response = outcome.response.encode();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Unselect => {
+                let outcome = commands::session::unselect(tag);
+                if outcome.selection_effect == commands::session::SelectionEffect::Clear {
+                    selected = None;
+                    session_state.selected_mailbox = None;
+                }
+                let w = reader.get_mut();
+                let response = outcome.response.encode();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Append => {
+                let outcome = commands::append::handle(
+                    &mut reader,
+                    tag,
+                    args,
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    session_state.feature_enabled("UTF8=ACCEPT"),
+                )
+                .await?;
+                if let Some(mailbox_name) = outcome.appended_mailbox
+                    && selected.as_ref().is_some_and(|selected_mailbox| {
+                        selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
+                    })
+                {
+                    selected = Some(
+                        reload_selected_mailbox_preserving_mode(
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
+                        )
+                        .await?,
+                    );
+                }
+            }
+            parser::Command::List { .. } | parser::Command::Lsub => {
+                let operation = cmd.clone();
+                let root = mail_root.clone();
+                let address = authed_mailbox.as_ref().unwrap().clone();
+                let raw_args = args.to_string();
+                let tag_owned = tag.to_string();
+                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let response = tokio::task::spawn_blocking(move || {
+                    commands::list::handle(
+                        &tag_owned,
+                        &operation,
+                        &raw_args,
+                        Path::new(&root),
+                        &address,
+                        utf8_accept,
+                    )
+                    .encode()
+                })
+                .await?;
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Namespace => {
+                println!("IMAP NAMESPACE peer={:?}", peer);
+                let w = reader.get_mut();
+                let response = commands::basic::namespace(tag).encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Enable => {
+                let response = match commands::enable::handle(
+                    tag,
+                    args,
+                    &mut session_state,
+                    selected.as_ref().map(|mailbox| mailbox.highest_modseq),
+                ) {
+                    Ok(response) => response.encode(),
+                    Err(err) => {
+                        let w = reader.get_mut();
+                        let response = response::Response::new()
+                            .status(response::StatusLine::tagged(
+                                tag,
+                                response::Status::Bad,
+                                format!("Invalid ENABLE arguments: {err:?}"),
+                            ))
+                            .encode();
+                        w.write_all(response.as_bytes()).await?;
+                        w.flush().await?;
+                        continue;
+                    }
+                };
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Create
+            | parser::Command::Delete
+            | parser::Command::Rename
+            | parser::Command::Subscribe { .. } => {
+                let operation = match &request.command {
+                    parser::Command::Create => commands::mailboxes::Operation::Create,
+                    parser::Command::Delete => commands::mailboxes::Operation::Delete,
+                    parser::Command::Rename => commands::mailboxes::Operation::Rename,
+                    parser::Command::Subscribe { subscribe: true } => {
+                        commands::mailboxes::Operation::Subscribe
+                    }
+                    parser::Command::Subscribe { subscribe: false } => {
+                        commands::mailboxes::Operation::Unsubscribe
+                    }
+                    _ => unreachable!(),
+                };
+                let address = authed_mailbox.as_ref().unwrap().clone();
+                let root = mail_root.clone();
+                let raw_args = args.to_string();
+                let tag_owned = tag.to_string();
+                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let outcome = tokio::task::spawn_blocking(move || {
+                    commands::mailboxes::handle(
+                        operation,
+                        &tag_owned,
+                        &raw_args,
+                        Path::new(&root),
+                        &address,
+                        utf8_accept,
+                    )
+                })
+                .await?;
+
+                let renamed_selection = selected.as_ref().and_then(|selected_mailbox| {
+                    outcome
+                        .selection_effect
+                        .renamed_selection(&selected_mailbox.mailbox)
+                });
+                match &outcome.selection_effect {
+                    commands::mailboxes::SelectionEffect::Deleted(mailbox_name) => {
+                        if selected.as_ref().is_some_and(|selected_mailbox| {
+                            selected_mailbox.mailbox.eq_ignore_ascii_case(mailbox_name)
+                        }) {
+                            selected = None;
+                            session_state.selected_mailbox = None;
+                        }
+                    }
+                    commands::mailboxes::SelectionEffect::Renamed {
+                        source: _,
+                        destination: _,
+                    } => {
+                        if let Some(destination) = renamed_selection {
+                            selected = Some(
+                                mailbox::load_selected_mailbox(
+                                    &mail_root,
+                                    authed_mailbox.as_ref().unwrap(),
+                                    &destination,
+                                )
+                                .await?,
+                            );
+                            session_state.selected_mailbox = Some(destination);
+                        }
+                    }
+                    commands::mailboxes::SelectionEffect::None => {}
+                }
+
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Id => {
+                let outcome = commands::id::handle(tag, args);
+                if !outcome.field_keys.is_empty() {
+                    println!(
+                        "IMAP ID peer={:?} field_keys={:?}",
+                        peer, outcome.field_keys
+                    );
+                }
+                let response = outcome.response.encode();
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Select { .. } => {
+                let outcome = commands::select::handle(
+                    tag,
+                    &cmd,
+                    args,
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    session_state.feature_enabled("UTF8=ACCEPT"),
+                    session_state.feature_enabled("CONDSTORE"),
+                    session_state.feature_enabled("QRESYNC"),
+                    selected.is_some(),
+                )
+                .await;
+                selected = outcome.selected;
+                session_state.selected_mailbox =
+                    selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Status => {
+                let root = mail_root.clone();
+                let address = authed_mailbox.as_ref().unwrap().clone();
+                let raw_args = args.to_string();
+                let tag_owned = tag.to_string();
+                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let selected_name = selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
+                let response = tokio::task::spawn_blocking(move || {
+                    commands::status::handle(
+                        &tag_owned,
+                        &raw_args,
+                        Path::new(&root),
+                        &address,
+                        utf8_accept,
+                        selected_name.as_deref(),
+                    )
+                    .encode()
+                })
+                .await?;
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::StartTls => {
+                println!("IMAP STARTTLS begin peer={:?}", peer);
+                match transport::start_tls(reader, tag, tls_ctx.clone()).await {
+                    Ok(transport::StartTlsOutcome::Rejected(returned_reader)) => {
+                        reader = returned_reader;
+                        continue;
+                    }
+                    Ok(transport::StartTlsOutcome::Upgraded(tls_stream)) => {
+                        println!("IMAP STARTTLS handshake success peer={:?}", peer);
+                        let fut = Box::pin(process_stream_inner(
+                            tls_stream,
+                            mail_root,
+                            tls_ctx.clone(),
+                            db_path.clone(),
+                            peer,
+                            true,
+                            false,
+                            auth_policy.clone(),
+                        ));
+                        return fut.await;
+                    }
+                    Err(error) => {
+                        eprintln!("IMAP STARTTLS handshake failed peer={:?}: {error}", peer);
+                        return Err(error);
+                    }
+                }
+            }
+
+            parser::Command::Fetch => {
+                let outcome = commands::fetch::handle(
+                    &mut reader,
+                    tag,
+                    args,
+                    &mail_root,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                    session_state.feature_enabled("QRESYNC"),
+                )
+                .await?;
+                if outcome.refresh_selected {
+                    let mailbox_name = selected_mailbox_name(&selected).to_string();
+                    selected = Some(
+                        reload_selected_mailbox_preserving_mode(
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
+                        )
+                        .await?,
+                    );
+                }
+            }
+            parser::Command::Copy | parser::Command::Move => {
+                let outcome = commands::transfer::handle(
+                    tag,
+                    &cmd,
+                    args,
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                    session_state.feature_enabled("UTF8=ACCEPT"),
+                )
+                .await;
+                if outcome.refresh_selected {
+                    let mailbox_name = selected_mailbox_name(&selected).to_string();
+                    selected = Some(
+                        reload_selected_mailbox_preserving_mode(
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
+                        )
+                        .await?,
+                    );
+                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Uid {
+                command: uid_command,
+            } => {
+                let subcmd = uid_command.as_str();
+                let subargs = args
+                    .trim()
+                    .split_once(|character: char| character.is_ascii_whitespace())
+                    .map(|(_, subargs)| subargs.trim_start())
+                    .unwrap_or("");
+                if subcmd == "FETCH" {
+                    let outcome = commands::fetch::handle(
+                        &mut reader,
+                        tag,
+                        subargs,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                        session_state.feature_enabled("QRESYNC"),
+                    )
+                    .await?;
+                    if outcome.refresh_selected {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
+                        selected = Some(
+                            reload_selected_mailbox_preserving_mode(
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
+                            )
+                            .await?,
+                        );
+                    }
+                } else if subcmd == "THREAD" {
+                    let response = commands::sort_thread::thread(
+                        tag,
+                        subargs,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                    )
+                    .await
+                    .encode();
+                    log_imap_response(peer, tag, "UID THREAD", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+                } else if subcmd == "SORT" {
+                    let response = commands::sort_thread::sort(
+                        tag,
+                        subargs,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                    )
+                    .await
+                    .encode();
+                    log_imap_response(peer, tag, "UID SORT", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+                } else if subcmd == "SEARCH" {
+                    let outcome = commands::search::handle(
+                        tag,
+                        subargs,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                        session_state.feature_enabled("UTF8=ACCEPT"),
+                    )
+                    .await;
+                    if let Some(saved_uids) = outcome.saved_uids {
+                        session_state.save_search_uids(saved_uids);
+                    }
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, "UID SEARCH", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+                } else if subcmd == "STORE" {
+                    let outcome = commands::store::handle(
+                        tag,
+                        subargs,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                    )
+                    .await;
+                    if outcome.refresh_selected {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
+                        selected = Some(
+                            reload_selected_mailbox_preserving_mode(
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
+                            )
+                            .await?,
+                        );
+                    }
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, "UID STORE", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+                } else if subcmd == "EXPUNGE" {
+                    let outcome = commands::expunge::uid_expunge(
+                        tag,
+                        subargs,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        session_state.feature_enabled("QRESYNC"),
+                    )
+                    .await;
+                    match outcome.selection_effect {
+                        commands::expunge::SelectionEffect::Refresh => {
+                            let mailbox_name = selected_mailbox_name(&selected).to_string();
+                            selected = Some(
+                                reload_selected_mailbox_preserving_mode(
+                                    &mail_root,
+                                    authed_mailbox.as_ref().unwrap(),
+                                    &mailbox_name,
+                                    &selected,
+                                )
+                                .await?,
+                            );
+                        }
+                        commands::expunge::SelectionEffect::Clear => {
+                            selected = None;
+                            session_state.selected_mailbox = None;
+                        }
+                        commands::expunge::SelectionEffect::Keep => {}
+                    }
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, "UID EXPUNGE", &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+                } else if subcmd == "COPY" || subcmd == "MOVE" {
+                    let command_name = format!("UID {subcmd}");
+                    let outcome = commands::transfer::handle(
+                        tag,
+                        &command_name,
+                        subargs,
+                        &mail_root,
+                        authed_mailbox.as_ref().unwrap(),
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.saved_search_uids(),
+                        true,
+                        session_state.feature_enabled("UTF8=ACCEPT"),
+                    )
+                    .await;
+                    if outcome.refresh_selected {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
+                        selected = Some(
+                            reload_selected_mailbox_preserving_mode(
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
+                            )
+                            .await?,
+                        );
+                    }
+                    let response = outcome.response.encode();
+                    log_imap_response(peer, tag, &command_name, &response);
+                    let w = reader.get_mut();
+                    w.write_all(response.as_bytes()).await?;
+                    w.flush().await?;
+
+                    let w = reader.get_mut();
+                    w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes())
+                        .await?;
+                    w.flush().await?;
+                }
+            }
+            parser::Command::Search => {
+                let outcome = commands::search::handle(
+                    tag,
+                    args,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                    session_state.feature_enabled("UTF8=ACCEPT"),
+                )
+                .await;
+                if let Some(saved_uids) = outcome.saved_uids {
+                    session_state.save_search_uids(saved_uids);
+                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, "SEARCH", &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Thread => {
+                let response = commands::sort_thread::thread(
+                    tag,
+                    args,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                )
+                .await
+                .encode();
+                log_imap_response(peer, tag, "THREAD", &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Sort => {
+                let response = commands::sort_thread::sort(
+                    tag,
+                    args,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                )
+                .await
+                .encode();
+                log_imap_response(peer, tag, "SORT", &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Store => {
+                let outcome = commands::store::handle(
+                    tag,
+                    args,
+                    &mail_root,
+                    selected
+                        .as_ref()
+                        .expect("preflight requires selected mailbox"),
+                    session_state.saved_search_uids(),
+                    false,
+                )
+                .await;
+                if outcome.refresh_selected {
+                    let mailbox_name = selected_mailbox_name(&selected).to_string();
+                    selected = Some(
+                        reload_selected_mailbox_preserving_mode(
+                            &mail_root,
+                            authed_mailbox.as_ref().unwrap(),
+                            &mailbox_name,
+                            &selected,
+                        )
+                        .await?,
+                    );
+                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, "STORE", &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Expunge | parser::Command::Close => {
+                let outcome = if matches!(request.command, parser::Command::Close) {
+                    commands::expunge::close(
+                        tag,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                    )
+                    .await
+                } else {
+                    commands::expunge::expunge(
+                        tag,
+                        &mail_root,
+                        selected
+                            .as_ref()
+                            .expect("preflight requires selected mailbox"),
+                        session_state.feature_enabled("QRESYNC"),
+                    )
+                    .await
+                };
+                match outcome.selection_effect {
+                    commands::expunge::SelectionEffect::Refresh => {
+                        let mailbox_name = selected_mailbox_name(&selected).to_string();
+                        selected = Some(
+                            reload_selected_mailbox_preserving_mode(
+                                &mail_root,
+                                authed_mailbox.as_ref().unwrap(),
+                                &mailbox_name,
+                                &selected,
+                            )
+                            .await?,
+                        );
+                    }
+                    commands::expunge::SelectionEffect::Clear => {
+                        selected = None;
+                        session_state.selected_mailbox = None;
+                    }
+                    commands::expunge::SelectionEffect::Keep => {}
+                }
+                let response = outcome.response.encode();
+                log_imap_response(peer, tag, &cmd, &response);
+                let w = reader.get_mut();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+            parser::Command::Idle => {
+                let outcome = commands::idle::handle(
+                    &mut reader,
+                    tag,
+                    &mail_root,
+                    &mut selected,
+                    session_state.feature_enabled("QRESYNC"),
+                )
+                .await?;
+                if outcome == commands::idle::Outcome::Disconnected {
+                    return Ok(());
+                }
+            }
+            parser::Command::Logout => {
+                let w = reader.get_mut();
+                let response = commands::basic::logout(tag).encode();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+                break;
+            }
+            parser::Command::Unknown { .. } => {
+                log_unsupported_imap(peer, &selected, tag, &cmd, args);
+                let w = reader.get_mut();
+                let response = commands::basic::unknown(tag).encode();
+                w.write_all(response.as_bytes()).await?;
+                w.flush().await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1670,7 +3042,7 @@ mod tests {
         let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&salted_password).unwrap();
         mac.update(b"Client Key");
         let client_key = mac.finalize().into_bytes();
-        let stored_key = Sha256::digest(&client_key);
+        let stored_key = Sha256::digest(client_key);
         let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&stored_key).unwrap();
         mac.update(auth_message.as_bytes());
         let client_signature = mac.finalize().into_bytes();
@@ -5046,1370 +6418,4 @@ mod tests {
         let _logout = read_until_contains(&mut reader, "A007 OK").await;
         server_task.await.expect("join").expect("server");
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cfg_path =
-        std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
-    let auth_policy = Arc::new(
-        auth::AuthPolicy::from_names(&cfg.security.imap_sasl_mechanisms)
-            .context("validating security.imap_sasl_mechanisms")?,
-    );
-    let mail_root = cfg.global.mail_root.clone();
-    rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "imapd")
-        .context("redirecting logs")?;
-
-    // SQLite DB is the authoritative source for mailboxes/catchalls
-    let db_path = cfg.global.db_path.clone();
-    if db_path.is_none() {
-        eprintln!("No db_path configured; SQLite DB is required");
-        std::process::exit(1);
-    }
-
-    // TLS context if certs present
-    let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
-        match load_tls_context(cert, key) {
-            Ok(ctx) => Some(ctx),
-            Err(e) => {
-                eprintln!("Failed to load TLS: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let db_path = cfg.global.db_path.clone();
-    // Plain IMAP listener (supports STARTTLS if tls_context present)
-    let imap_port = cfg.global.imap_port.unwrap_or(143);
-    let imap_addrs = cfg
-        .global
-        .imap_listen_addrs
-        .clone()
-        .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imap_port)]);
-    let mut listener_count = 0usize;
-    for addr in imap_addrs {
-        let listener = bind_tcp_listener(&addr)
-            .with_context(|| format!("starting IMAP plain listener on {addr}"))?;
-        println!("rMail IMAPD listening on {}", addr);
-        listener_count += 1;
-        let mail_root_clone = mail_root.clone();
-        let acceptor_clone = tls_context.clone();
-        let db_clone = db_path.clone();
-        let auth_policy = auth_policy.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_plain_listener(
-                addr,
-                listener,
-                mail_root_clone,
-                acceptor_clone,
-                db_clone,
-                auth_policy,
-            )
-            .await
-            {
-                eprintln!("IMAP plain listener failed: {}", e);
-            }
-        });
-    }
-
-    // IMAPS (implicit TLS) listener
-    if let Some(ctx) = tls_context.clone() {
-        if let Some(imaps_port) = cfg.global.imaps_port {
-            let imaps_addrs = cfg
-                .global
-                .imaps_listen_addrs
-                .clone()
-                .unwrap_or_else(|| vec![format!("0.0.0.0:{}", imaps_port)]);
-            for addr in imaps_addrs {
-                let listener = bind_tcp_listener(&addr)
-                    .with_context(|| format!("starting IMAPS listener on {addr}"))?;
-                println!("rMail IMAPD (IMAPS) listening on {}", addr);
-                listener_count += 1;
-                let mail_root_clone = mail_root.clone();
-                let ctx_clone = ctx.clone();
-                let db_clone = db_path.clone();
-                let auth_policy = auth_policy.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = run_imaps_listener(
-                        addr,
-                        listener,
-                        ctx_clone,
-                        mail_root_clone,
-                        db_clone,
-                        auth_policy,
-                    )
-                    .await
-                    {
-                        eprintln!("IMAPS listener failed: {}", e);
-                    }
-                });
-            }
-        }
-    } else if cfg.global.imaps_port.is_some() || cfg.global.imaps_listen_addrs.is_some() {
-        eprintln!("IMAPS listener not started because TLS certificate/key could not be loaded");
-    }
-
-    if listener_count == 0 {
-        return Err(anyhow!("no IMAP listeners were started"));
-    }
-
-    // keep running
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-    }
-}
-
-async fn run_plain_listener(
-    addr: String,
-    listener: tokio::net::TcpListener,
-    mail_root: String,
-    tls_ctx: Option<Arc<tls::TlsContext>>,
-    db_path: Option<String>,
-    auth_policy: Arc<auth::AuthPolicy>,
-) -> Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        println!(
-            "Accepted IMAP plaintext connection on {} from {} (starttls_available={})",
-            addr,
-            peer,
-            tls_ctx.is_some()
-        );
-        let mail_root = mail_root.clone();
-        let acceptor = tls_ctx.clone();
-        let db_clone = db_path.clone();
-        let auth_policy = auth_policy.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_stream_with_policy(
-                Box::new(stream),
-                mail_root,
-                acceptor,
-                db_clone,
-                Some(peer),
-                false,
-                auth_policy,
-            )
-            .await
-            {
-                eprintln!("IMAP client error: {}", e);
-            }
-        });
-    }
-}
-
-async fn run_imaps_listener(
-    addr: String,
-    listener: tokio::net::TcpListener,
-    ctx: Arc<tls::TlsContext>,
-    mail_root: String,
-    db_path: Option<String>,
-    auth_policy: Arc<auth::AuthPolicy>,
-) -> Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
-        let ctx = ctx.clone();
-        let mail_root = mail_root.clone();
-        let db_clone = db_path.clone();
-        let auth_policy = auth_policy.clone();
-        tokio::spawn(async move {
-            match ctx.acceptor.accept(stream).await {
-                Ok(tls_stream) => {
-                    if let Err(e) = process_stream_with_policy(
-                        Box::new(tls_stream),
-                        mail_root,
-                        Some(ctx.clone()),
-                        db_clone,
-                        Some(peer),
-                        true,
-                        auth_policy,
-                    )
-                    .await
-                    {
-                        eprintln!("IMAPS client error: {}", e);
-                    }
-                }
-                Err(e) => eprintln!("IMAPS TLS accept error from {}: {}", peer, e),
-            }
-        });
-    }
-}
-
-fn log_imap_response(peer: Option<SocketAddr>, tag: &str, cmd: &str, response: &str) {
-    response::log_imap_response(peer, tag, cmd, response)
-}
-
-fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
-    mailbox::selected_mailbox_name(selected)
-}
-
-fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &str {
-    mailbox::selected_mailbox_for_log(selected)
-}
-
-fn log_unsupported_imap(
-    peer: Option<SocketAddr>,
-    selected: &Option<SelectedMailbox>,
-    tag: &str,
-    command: &str,
-    raw_args: &str,
-) {
-    eprintln!(
-        "imap_unsupported peer={:?} selected_mailbox={} tag={} command={} raw_args={:?}",
-        peer,
-        selected_mailbox_for_log(selected),
-        tag,
-        command,
-        raw_args
-    );
-}
-
-#[cfg(test)]
-fn parse_scram_attr<'a>(message: &'a str, key: &str) -> Option<&'a str> {
-    auth::parse_scram_attr(message, key)
-}
-
-async fn sync_selected_mailbox(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
-    mail_root: &str,
-    selected: &mut Option<SelectedMailbox>,
-    qresync_enabled: bool,
-) -> Result<()> {
-    let Some(current) = selected.as_ref().cloned() else {
-        return Ok(());
-    };
-    let (refreshed, events) = mailbox::refresh_selected_mailbox(mail_root, &current).await?;
-    if !events.is_empty() {
-        let w = reader.get_mut();
-        for event in &events {
-            w.write_all(event.response_line(qresync_enabled).as_bytes())
-                .await?;
-        }
-        w.flush().await?;
-    }
-    *selected = Some(refreshed);
-    Ok(())
-}
-
-async fn reload_selected_mailbox_preserving_mode(
-    mail_root: &str,
-    address: &str,
-    mailbox_name: &str,
-    previous: &Option<SelectedMailbox>,
-) -> Result<SelectedMailbox> {
-    let read_only = previous
-        .as_ref()
-        .map(|selected| selected.read_only)
-        .unwrap_or(false);
-    let mut refreshed = mailbox::load_selected_mailbox(mail_root, address, mailbox_name).await?;
-    refreshed.read_only = read_only;
-    Ok(refreshed)
-}
-
-// session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
-// and after a successful STARTTLS). Enforcing authentication methods (like LOGIN) only on
-// encrypted sessions prevents accidental credential disclosure over plain-text.
-// session_encrypted indicates whether the current connection is protected by TLS (true for IMAPS
-// and after a successful STARTTLS). `peer` is the remote socket address of the client and is used
-// for per-IP rate-limiting of authentication attempts.
-#[cfg(test)]
-async fn process_stream(
-    stream: Box<dyn RawStream + Send + 'static>,
-    mail_root: String,
-    tls_ctx: Option<Arc<tls::TlsContext>>,
-    db_path: Option<String>,
-    peer: Option<SocketAddr>,
-    session_encrypted: bool,
-) -> Result<()> {
-    process_stream_with_policy(
-        stream,
-        mail_root,
-        tls_ctx,
-        db_path,
-        peer,
-        session_encrypted,
-        Arc::new(auth::AuthPolicy::default()),
-    )
-    .await
-}
-
-async fn process_stream_with_policy(
-    stream: Box<dyn RawStream + Send + 'static>,
-    mail_root: String,
-    tls_ctx: Option<Arc<tls::TlsContext>>,
-    db_path: Option<String>,
-    peer: Option<SocketAddr>,
-    session_encrypted: bool,
-    auth_policy: Arc<auth::AuthPolicy>,
-) -> Result<()> {
-    process_stream_inner(
-        stream,
-        mail_root,
-        tls_ctx,
-        db_path,
-        peer,
-        session_encrypted,
-        true,
-        auth_policy,
-    )
-    .await
-}
-
-async fn process_stream_inner(
-    stream: Box<dyn RawStream + Send + 'static>,
-    mail_root: String,
-    tls_ctx: Option<Arc<tls::TlsContext>>,
-    db_path: Option<String>,
-    peer: Option<SocketAddr>,
-    session_encrypted: bool,
-    send_greeting: bool,
-    auth_policy: Arc<auth::AuthPolicy>,
-) -> Result<()> {
-    let stream: Box<dyn AsyncStream + Send + 'static> = Box::new(SwitchableStream::new(stream));
-    let mut reader = BufReader::new(stream);
-    println!(
-        "Starting IMAP session peer={:?} encrypted={} tls_configured={}",
-        peer,
-        session_encrypted,
-        tls_ctx.is_some()
-    );
-    if send_greeting {
-        let w = reader.get_mut();
-        let phase = if session_encrypted {
-            response::CapabilityPhase::NotAuthenticatedTls
-        } else {
-            response::CapabilityPhase::NotAuthenticatedPlain
-        };
-        let caps =
-            response::capability_tokens_with_policy(phase, tls_ctx.is_some(), auth_policy.as_ref());
-        println!(
-            "Greeting peer={:?} encrypted={} capabilities={}",
-            peer, session_encrypted, caps
-        );
-        w.write_all(response::greeting(&caps).as_bytes()).await?;
-        w.flush().await?;
-    }
-    let mut session_state = state::SessionState::default();
-    let mut authed_mailbox: Option<String> = None; // store address lowercase
-    // current mailbox selection state (set by SELECT)
-    let mut selected: Option<SelectedMailbox> = None;
-
-    loop {
-        let line_limit = if session_state.authenticated_mailbox.is_some() {
-            MAX_AUTHENTICATED_LINE_BYTES
-        } else {
-            MAX_PREAUTH_LINE_BYTES
-        };
-        let mut line = match read_bounded_line(&mut reader, line_limit).await {
-            Ok(BoundedLine::Line(line)) => line,
-            Ok(BoundedLine::Eof) => {
-                println!(
-                    "IMAP session peer={:?} encrypted={} closed by client",
-                    peer, session_encrypted
-                );
-                break;
-            }
-            Ok(BoundedLine::TooLong) => {
-                let w = reader.get_mut();
-                w.write_all(b"* BAD Command line too long\r\n").await?;
-                w.flush().await?;
-                continue;
-            }
-            Err(e) => {
-                if e.kind() == ErrorKind::UnexpectedEof {
-                    println!(
-                        "IMAP session peer={:?} encrypted={} closed by client without TLS close_notify",
-                        peer, session_encrypted
-                    );
-                    break;
-                }
-                eprintln!(
-                    "IMAP read error peer={:?} encrypted={} err={}",
-                    peer, session_encrypted, e
-                );
-                return Err(e.into());
-            }
-        };
-        let is_append = std::str::from_utf8(&line)
-            .ok()
-            .and_then(|line| line.split_ascii_whitespace().nth(1))
-            .is_some_and(|command| command.eq_ignore_ascii_case("APPEND"));
-        if !is_append && trailing_literal_marker(&line).is_some() {
-            line = match read_textual_command_literals(&mut reader, line, line_limit).await {
-                Ok(line) => line,
-                Err(CommandLiteralError::Eof) => break,
-                Err(CommandLiteralError::NonSyncLiteral8) => {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        b"* BYE Non-synchronizing literal8 desynchronized command stream\r\n",
-                    )
-                    .await?;
-                    w.flush().await?;
-                    break;
-                }
-                Err(CommandLiteralError::TooLarge) => {
-                    let w = reader.get_mut();
-                    w.write_all(b"* BAD Command literal too large\r\n").await?;
-                    w.flush().await?;
-                    continue;
-                }
-                Err(CommandLiteralError::Literal8) => {
-                    let w = reader.get_mut();
-                    w.write_all(b"* BAD Literal8 is not valid for this command\r\n")
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                Err(CommandLiteralError::InvalidUtf8) => {
-                    let w = reader.get_mut();
-                    w.write_all(b"* BAD Textual command literal is not valid UTF-8\r\n")
-                        .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                Err(CommandLiteralError::Io) => return Err(anyhow!("command literal read error")),
-            };
-        }
-        let input = match std::str::from_utf8(&line) {
-            Ok(input) => input.trim_end_matches(['\r', '\n']),
-            Err(_) => {
-                let w = reader.get_mut();
-                w.write_all(b"* BAD Command line is not valid UTF-8\r\n")
-                    .await?;
-                w.flush().await?;
-                continue;
-            }
-        };
-        if input.is_empty() {
-            continue;
-        }
-        let request = match parser::parse_request_line(input) {
-            Ok(request) => request,
-            Err(error) => {
-                let candidate_tag = input
-                    .split(|ch: char| ch == ' ' || ch == '\t')
-                    .next()
-                    .filter(|tag| parser::valid_tag(tag));
-                let response_tag = candidate_tag.unwrap_or("*");
-                let w = reader.get_mut();
-                w.write_all(
-                    format!(
-                        "{} BAD Invalid command framing: {:?}\r\n",
-                        response_tag, error
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-                w.flush().await?;
-                continue;
-            }
-        };
-        let tag = request.tag;
-        let cmd = request.command_name().to_string();
-        let args = request.raw_args();
-        println!(
-            "IMAP peer={:?} encrypted={} tag={} cmd={} args={:?} authed={} selected={}",
-            peer,
-            session_encrypted,
-            tag,
-            cmd,
-            args,
-            session_state.authenticated_mailbox.is_some(),
-            session_state.selected_mailbox.is_some()
-        );
-        let command_spec = commands::command_spec(&request.command);
-        if let Some(reason) = commands::preflight(
-            command_spec,
-            commands::SessionContext {
-                authenticated: session_state.authenticated_mailbox.is_some(),
-                selected: session_state.selected_mailbox.is_some(),
-                encrypted: session_encrypted,
-            },
-        ) {
-            let w = reader.get_mut();
-            w.write_all(format!("{} {}\r\n", tag, reason).as_bytes())
-                .await?;
-            w.flush().await?;
-            continue;
-        }
-        if request.command.requires_empty_arguments() && !args.is_empty() {
-            let w = reader.get_mut();
-            w.write_all(format!("{} BAD Invalid {} arguments\r\n", tag, cmd).as_bytes())
-                .await?;
-            w.flush().await?;
-            continue;
-        }
-        if command_spec.is_some_and(commands::CommandSpec::needs_mailbox_sync) && selected.is_some()
-        {
-            sync_selected_mailbox(
-                &mut reader,
-                &mail_root,
-                &mut selected,
-                session_state.feature_enabled("QRESYNC"),
-            )
-            .await?;
-        }
-        match &request.command {
-            parser::Command::Capability => {
-                let w = reader.get_mut();
-                let phase = if session_state.selected_mailbox.is_some() {
-                    response::CapabilityPhase::Selected
-                } else if session_state.authenticated_mailbox.is_some() {
-                    response::CapabilityPhase::Authenticated
-                } else if session_encrypted {
-                    response::CapabilityPhase::NotAuthenticatedTls
-                } else {
-                    response::CapabilityPhase::NotAuthenticatedPlain
-                };
-                let caps = response::capability_tokens_with_policy(
-                    phase,
-                    tls_ctx.is_some(),
-                    auth_policy.as_ref(),
-                );
-                let response = commands::basic::capability(tag, &caps).encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Compress => {
-                transport::enable_deflate(&mut reader, tag, args).await?;
-            }
-            parser::Command::Login => {
-                let authenticated_capabilities = response::capability_tokens_with_policy(
-                    response::CapabilityPhase::Authenticated,
-                    tls_ctx.is_some(),
-                    auth_policy.as_ref(),
-                );
-                let outcome = commands::login::handle(
-                    tag,
-                    args,
-                    db_path.as_ref(),
-                    peer,
-                    &authenticated_capabilities,
-                )
-                .await;
-                if let Some(mailbox) = outcome.authenticated_mailbox {
-                    authed_mailbox = Some(mailbox.clone());
-                    session_state.authenticated_mailbox = Some(mailbox);
-                }
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Authenticate => {
-                let (mechanism, initial_response) = match parser::parse_authenticate_args(args) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!("{} BAD Invalid AUTHENTICATE arguments: {:?}\r\n", tag, err)
-                                .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                let Some(mechanism_metadata) = auth_policy.mechanism(&mechanism) else {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!("{} NO Unsupported authentication mechanism\r\n", tag).as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                };
-                if let Some(peer_addr) = peer {
-                    if let Some(rem) = auth::auth_block_remaining(peer_addr.ip()) {
-                        let w = reader.get_mut();
-                        w.write_all(
-                            format!(
-                                "{} NO Too many failed auth attempts; try again in {}s\r\n",
-                                tag,
-                                rem.as_secs()
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                }
-                if !session_encrypted
-                    && mechanism_metadata.security == auth::SaslSecurity::PlaintextPassword
-                {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!(
-                            "{} NO [PRIVACYREQUIRED] Encryption required for authentication\r\n",
-                            tag
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if mechanism_metadata.channel_binding_required
-                    && (!session_encrypted || tls_ctx.is_none())
-                {
-                    let w = reader.get_mut();
-                    w.write_all(
-                        format!("{} NO Channel binding is not available\r\n", tag).as_bytes(),
-                    )
-                    .await?;
-                    w.flush().await?;
-                    continue;
-                }
-                if mechanism == "PLAIN" || mechanism == "LOGIN" {
-                    let authenticated_capabilities = response::capability_tokens_with_policy(
-                        response::CapabilityPhase::Authenticated,
-                        tls_ctx.is_some(),
-                        auth_policy.as_ref(),
-                    );
-                    let outcome = commands::authenticate::handle_password(
-                        &mut reader,
-                        tag,
-                        &mechanism,
-                        initial_response.as_deref(),
-                        db_path.as_ref(),
-                        peer,
-                        &authenticated_capabilities,
-                    )
-                    .await;
-                    if outcome.disconnected {
-                        return Ok(());
-                    }
-                    if let Some(mailbox) = outcome.authenticated_mailbox {
-                        authed_mailbox = Some(mailbox.clone());
-                        session_state.authenticated_mailbox = Some(mailbox);
-                    }
-                    if let Some(response) = outcome.response {
-                        let response = response.encode();
-                        log_imap_response(peer, tag, &cmd, &response);
-                        let w = reader.get_mut();
-                        w.write_all(response.as_bytes()).await?;
-                        w.flush().await?;
-                    }
-                    continue;
-                }
-                let authenticated_capabilities = response::capability_tokens_with_policy(
-                    response::CapabilityPhase::Authenticated,
-                    tls_ctx.is_some(),
-                    auth_policy.as_ref(),
-                );
-                let outcome = commands::authenticate::handle_scram(
-                    &mut reader,
-                    tag,
-                    initial_response.as_deref(),
-                    db_path.as_ref(),
-                    peer,
-                    mechanism_metadata.channel_binding_required,
-                    tls_ctx
-                        .as_ref()
-                        .map(|context| context.server_end_point.as_slice()),
-                    &authenticated_capabilities,
-                )
-                .await;
-                if outcome.disconnected {
-                    return Ok(());
-                }
-                if let Some(mailbox) = outcome.authenticated_mailbox {
-                    authed_mailbox = Some(mailbox.clone());
-                    session_state.authenticated_mailbox = Some(mailbox);
-                }
-                if let Some(response) = outcome.response {
-                    let response = response.encode();
-                    log_imap_response(peer, tag, &cmd, &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                }
-            }
-            parser::Command::Noop => {
-                let w = reader.get_mut();
-                let response = commands::basic::completed(tag, "NOOP").encode();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Check => {
-                let outcome = commands::session::check(tag);
-                let w = reader.get_mut();
-                let response = outcome.response.encode();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Unselect => {
-                let outcome = commands::session::unselect(tag);
-                if outcome.selection_effect == commands::session::SelectionEffect::Clear {
-                    selected = None;
-                    session_state.selected_mailbox = None;
-                }
-                let w = reader.get_mut();
-                let response = outcome.response.encode();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Append => {
-                let outcome = commands::append::handle(
-                    &mut reader,
-                    tag,
-                    args,
-                    &mail_root,
-                    authed_mailbox.as_ref().unwrap(),
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                )
-                .await?;
-                if let Some(mailbox_name) = outcome.appended_mailbox {
-                    if selected.as_ref().is_some_and(|selected_mailbox| {
-                        selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
-                    }) {
-                        selected = Some(
-                            reload_selected_mailbox_preserving_mode(
-                                &mail_root,
-                                authed_mailbox.as_ref().unwrap(),
-                                &mailbox_name,
-                                &selected,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-            }
-            parser::Command::List { .. } | parser::Command::Lsub => {
-                let operation = cmd.clone();
-                let root = mail_root.clone();
-                let address = authed_mailbox.as_ref().unwrap().clone();
-                let raw_args = args.to_string();
-                let tag_owned = tag.to_string();
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
-                let response = tokio::task::spawn_blocking(move || {
-                    commands::list::handle(
-                        &tag_owned,
-                        &operation,
-                        &raw_args,
-                        Path::new(&root),
-                        &address,
-                        utf8_accept,
-                    )
-                    .encode()
-                })
-                .await?;
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Namespace => {
-                println!("IMAP NAMESPACE peer={:?}", peer);
-                let w = reader.get_mut();
-                let response = commands::basic::namespace(tag).encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Enable => {
-                let response = match commands::enable::handle(
-                    tag,
-                    args,
-                    &mut session_state,
-                    selected.as_ref().map(|mailbox| mailbox.highest_modseq),
-                ) {
-                    Ok(response) => response.encode(),
-                    Err(err) => {
-                        let w = reader.get_mut();
-                        let response = response::Response::new()
-                            .status(response::StatusLine::tagged(
-                                tag,
-                                response::Status::Bad,
-                                format!("Invalid ENABLE arguments: {err:?}"),
-                            ))
-                            .encode();
-                        w.write_all(response.as_bytes()).await?;
-                        w.flush().await?;
-                        continue;
-                    }
-                };
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Create
-            | parser::Command::Delete
-            | parser::Command::Rename
-            | parser::Command::Subscribe { .. } => {
-                let operation = match &request.command {
-                    parser::Command::Create => commands::mailboxes::Operation::Create,
-                    parser::Command::Delete => commands::mailboxes::Operation::Delete,
-                    parser::Command::Rename => commands::mailboxes::Operation::Rename,
-                    parser::Command::Subscribe { subscribe: true } => {
-                        commands::mailboxes::Operation::Subscribe
-                    }
-                    parser::Command::Subscribe { subscribe: false } => {
-                        commands::mailboxes::Operation::Unsubscribe
-                    }
-                    _ => unreachable!(),
-                };
-                let address = authed_mailbox.as_ref().unwrap().clone();
-                let root = mail_root.clone();
-                let raw_args = args.to_string();
-                let tag_owned = tag.to_string();
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
-                let outcome = tokio::task::spawn_blocking(move || {
-                    commands::mailboxes::handle(
-                        operation,
-                        &tag_owned,
-                        &raw_args,
-                        Path::new(&root),
-                        &address,
-                        utf8_accept,
-                    )
-                })
-                .await?;
-
-                let renamed_selection = selected.as_ref().and_then(|selected_mailbox| {
-                    outcome
-                        .selection_effect
-                        .renamed_selection(&selected_mailbox.mailbox)
-                });
-                match &outcome.selection_effect {
-                    commands::mailboxes::SelectionEffect::Deleted(mailbox_name) => {
-                        if selected.as_ref().is_some_and(|selected_mailbox| {
-                            selected_mailbox.mailbox.eq_ignore_ascii_case(&mailbox_name)
-                        }) {
-                            selected = None;
-                            session_state.selected_mailbox = None;
-                        }
-                    }
-                    commands::mailboxes::SelectionEffect::Renamed {
-                        source: _,
-                        destination: _,
-                    } => {
-                        if let Some(destination) = renamed_selection {
-                            selected = Some(
-                                mailbox::load_selected_mailbox(
-                                    &mail_root,
-                                    authed_mailbox.as_ref().unwrap(),
-                                    &destination,
-                                )
-                                .await?,
-                            );
-                            session_state.selected_mailbox = Some(destination);
-                        }
-                    }
-                    commands::mailboxes::SelectionEffect::None => {}
-                }
-
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Id => {
-                let outcome = commands::id::handle(tag, args);
-                if !outcome.field_keys.is_empty() {
-                    println!(
-                        "IMAP ID peer={:?} field_keys={:?}",
-                        peer, outcome.field_keys
-                    );
-                }
-                let response = outcome.response.encode();
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Select { .. } => {
-                let outcome = commands::select::handle(
-                    tag,
-                    &cmd,
-                    args,
-                    &mail_root,
-                    authed_mailbox.as_ref().unwrap(),
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                    session_state.feature_enabled("CONDSTORE"),
-                    session_state.feature_enabled("QRESYNC"),
-                    selected.is_some(),
-                )
-                .await;
-                selected = outcome.selected;
-                session_state.selected_mailbox =
-                    selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Status => {
-                let root = mail_root.clone();
-                let address = authed_mailbox.as_ref().unwrap().clone();
-                let raw_args = args.to_string();
-                let tag_owned = tag.to_string();
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
-                let selected_name = selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
-                let response = tokio::task::spawn_blocking(move || {
-                    commands::status::handle(
-                        &tag_owned,
-                        &raw_args,
-                        Path::new(&root),
-                        &address,
-                        utf8_accept,
-                        selected_name.as_deref(),
-                    )
-                    .encode()
-                })
-                .await?;
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::StartTls => {
-                println!("IMAP STARTTLS begin peer={:?}", peer);
-                match transport::start_tls(reader, tag, tls_ctx.clone()).await {
-                    Ok(transport::StartTlsOutcome::Rejected(returned_reader)) => {
-                        reader = returned_reader;
-                        continue;
-                    }
-                    Ok(transport::StartTlsOutcome::Upgraded(tls_stream)) => {
-                        println!("IMAP STARTTLS handshake success peer={:?}", peer);
-                        let fut = Box::pin(process_stream_inner(
-                            tls_stream,
-                            mail_root,
-                            tls_ctx.clone(),
-                            db_path.clone(),
-                            peer,
-                            true,
-                            false,
-                            auth_policy.clone(),
-                        ));
-                        return fut.await;
-                    }
-                    Err(error) => {
-                        eprintln!("IMAP STARTTLS handshake failed peer={:?}: {error}", peer);
-                        return Err(error);
-                    }
-                }
-            }
-
-            parser::Command::Fetch => {
-                let outcome = commands::fetch::handle(
-                    &mut reader,
-                    tag,
-                    args,
-                    &mail_root,
-                    selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox"),
-                    session_state.saved_search_uids(),
-                    false,
-                    session_state.feature_enabled("QRESYNC"),
-                )
-                .await?;
-                if outcome.refresh_selected {
-                    let mailbox_name = selected_mailbox_name(&selected).to_string();
-                    selected = Some(
-                        reload_selected_mailbox_preserving_mode(
-                            &mail_root,
-                            authed_mailbox.as_ref().unwrap(),
-                            &mailbox_name,
-                            &selected,
-                        )
-                        .await?,
-                    );
-                }
-            }
-            parser::Command::Copy | parser::Command::Move => {
-                let outcome = commands::transfer::handle(
-                    tag,
-                    &cmd,
-                    args,
-                    &mail_root,
-                    authed_mailbox.as_ref().unwrap(),
-                    selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox"),
-                    session_state.saved_search_uids(),
-                    false,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                )
-                .await;
-                if outcome.refresh_selected {
-                    let mailbox_name = selected_mailbox_name(&selected).to_string();
-                    selected = Some(
-                        reload_selected_mailbox_preserving_mode(
-                            &mail_root,
-                            authed_mailbox.as_ref().unwrap(),
-                            &mailbox_name,
-                            &selected,
-                        )
-                        .await?,
-                    );
-                }
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Uid {
-                command: uid_command,
-            } => {
-                let subcmd = uid_command.as_str();
-                let subargs = args
-                    .trim()
-                    .split_once(|character: char| character.is_ascii_whitespace())
-                    .map(|(_, subargs)| subargs.trim_start())
-                    .unwrap_or("");
-                if subcmd == "FETCH" {
-                    let outcome = commands::fetch::handle(
-                        &mut reader,
-                        tag,
-                        subargs,
-                        &mail_root,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        true,
-                        session_state.feature_enabled("QRESYNC"),
-                    )
-                    .await?;
-                    if outcome.refresh_selected {
-                        let mailbox_name = selected_mailbox_name(&selected).to_string();
-                        selected = Some(
-                            reload_selected_mailbox_preserving_mode(
-                                &mail_root,
-                                authed_mailbox.as_ref().unwrap(),
-                                &mailbox_name,
-                                &selected,
-                            )
-                            .await?,
-                        );
-                    }
-                } else if subcmd == "THREAD" {
-                    let response = commands::sort_thread::thread(
-                        tag,
-                        subargs,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        true,
-                    )
-                    .await
-                    .encode();
-                    log_imap_response(peer, tag, "UID THREAD", &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                } else if subcmd == "SORT" {
-                    let response = commands::sort_thread::sort(
-                        tag,
-                        subargs,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        true,
-                    )
-                    .await
-                    .encode();
-                    log_imap_response(peer, tag, "UID SORT", &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                } else if subcmd == "SEARCH" {
-                    let outcome = commands::search::handle(
-                        tag,
-                        subargs,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        true,
-                        session_state.feature_enabled("UTF8=ACCEPT"),
-                    )
-                    .await;
-                    if let Some(saved_uids) = outcome.saved_uids {
-                        session_state.save_search_uids(saved_uids);
-                    }
-                    let response = outcome.response.encode();
-                    log_imap_response(peer, tag, "UID SEARCH", &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                } else if subcmd == "STORE" {
-                    let outcome = commands::store::handle(
-                        tag,
-                        subargs,
-                        &mail_root,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        true,
-                    )
-                    .await;
-                    if outcome.refresh_selected {
-                        let mailbox_name = selected_mailbox_name(&selected).to_string();
-                        selected = Some(
-                            reload_selected_mailbox_preserving_mode(
-                                &mail_root,
-                                authed_mailbox.as_ref().unwrap(),
-                                &mailbox_name,
-                                &selected,
-                            )
-                            .await?,
-                        );
-                    }
-                    let response = outcome.response.encode();
-                    log_imap_response(peer, tag, "UID STORE", &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                } else if subcmd == "EXPUNGE" {
-                    let outcome = commands::expunge::uid_expunge(
-                        tag,
-                        subargs,
-                        &mail_root,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        session_state.feature_enabled("QRESYNC"),
-                    )
-                    .await;
-                    match outcome.selection_effect {
-                        commands::expunge::SelectionEffect::Refresh => {
-                            let mailbox_name = selected_mailbox_name(&selected).to_string();
-                            selected = Some(
-                                reload_selected_mailbox_preserving_mode(
-                                    &mail_root,
-                                    authed_mailbox.as_ref().unwrap(),
-                                    &mailbox_name,
-                                    &selected,
-                                )
-                                .await?,
-                            );
-                        }
-                        commands::expunge::SelectionEffect::Clear => {
-                            selected = None;
-                            session_state.selected_mailbox = None;
-                        }
-                        commands::expunge::SelectionEffect::Keep => {}
-                    }
-                    let response = outcome.response.encode();
-                    log_imap_response(peer, tag, "UID EXPUNGE", &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-                } else if subcmd == "COPY" || subcmd == "MOVE" {
-                    let command_name = format!("UID {subcmd}");
-                    let outcome = commands::transfer::handle(
-                        tag,
-                        &command_name,
-                        subargs,
-                        &mail_root,
-                        authed_mailbox.as_ref().unwrap(),
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.saved_search_uids(),
-                        true,
-                        session_state.feature_enabled("UTF8=ACCEPT"),
-                    )
-                    .await;
-                    if outcome.refresh_selected {
-                        let mailbox_name = selected_mailbox_name(&selected).to_string();
-                        selected = Some(
-                            reload_selected_mailbox_preserving_mode(
-                                &mail_root,
-                                authed_mailbox.as_ref().unwrap(),
-                                &mailbox_name,
-                                &selected,
-                            )
-                            .await?,
-                        );
-                    }
-                    let response = outcome.response.encode();
-                    log_imap_response(peer, tag, &command_name, &response);
-                    let w = reader.get_mut();
-                    w.write_all(response.as_bytes()).await?;
-                    w.flush().await?;
-
-                    let w = reader.get_mut();
-                    w.write_all(format!("{} BAD Unsupported UID subcommand\r\n", tag).as_bytes())
-                        .await?;
-                    w.flush().await?;
-                }
-            }
-            parser::Command::Search => {
-                let outcome = commands::search::handle(
-                    tag,
-                    args,
-                    selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox"),
-                    session_state.saved_search_uids(),
-                    false,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
-                )
-                .await;
-                if let Some(saved_uids) = outcome.saved_uids {
-                    session_state.save_search_uids(saved_uids);
-                }
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, "SEARCH", &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Thread => {
-                let response = commands::sort_thread::thread(
-                    tag,
-                    args,
-                    selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox"),
-                    session_state.saved_search_uids(),
-                    false,
-                )
-                .await
-                .encode();
-                log_imap_response(peer, tag, "THREAD", &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Sort => {
-                let response = commands::sort_thread::sort(
-                    tag,
-                    args,
-                    selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox"),
-                    session_state.saved_search_uids(),
-                    false,
-                )
-                .await
-                .encode();
-                log_imap_response(peer, tag, "SORT", &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Store => {
-                let outcome = commands::store::handle(
-                    tag,
-                    args,
-                    &mail_root,
-                    selected
-                        .as_ref()
-                        .expect("preflight requires selected mailbox"),
-                    session_state.saved_search_uids(),
-                    false,
-                )
-                .await;
-                if outcome.refresh_selected {
-                    let mailbox_name = selected_mailbox_name(&selected).to_string();
-                    selected = Some(
-                        reload_selected_mailbox_preserving_mode(
-                            &mail_root,
-                            authed_mailbox.as_ref().unwrap(),
-                            &mailbox_name,
-                            &selected,
-                        )
-                        .await?,
-                    );
-                }
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, "STORE", &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Expunge | parser::Command::Close => {
-                let outcome = if matches!(request.command, parser::Command::Close) {
-                    commands::expunge::close(
-                        tag,
-                        &mail_root,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                    )
-                    .await
-                } else {
-                    commands::expunge::expunge(
-                        tag,
-                        &mail_root,
-                        selected
-                            .as_ref()
-                            .expect("preflight requires selected mailbox"),
-                        session_state.feature_enabled("QRESYNC"),
-                    )
-                    .await
-                };
-                match outcome.selection_effect {
-                    commands::expunge::SelectionEffect::Refresh => {
-                        let mailbox_name = selected_mailbox_name(&selected).to_string();
-                        selected = Some(
-                            reload_selected_mailbox_preserving_mode(
-                                &mail_root,
-                                authed_mailbox.as_ref().unwrap(),
-                                &mailbox_name,
-                                &selected,
-                            )
-                            .await?,
-                        );
-                    }
-                    commands::expunge::SelectionEffect::Clear => {
-                        selected = None;
-                        session_state.selected_mailbox = None;
-                    }
-                    commands::expunge::SelectionEffect::Keep => {}
-                }
-                let response = outcome.response.encode();
-                log_imap_response(peer, tag, &cmd, &response);
-                let w = reader.get_mut();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-            parser::Command::Idle => {
-                let outcome = commands::idle::handle(
-                    &mut reader,
-                    tag,
-                    &mail_root,
-                    &mut selected,
-                    session_state.feature_enabled("QRESYNC"),
-                )
-                .await?;
-                if outcome == commands::idle::Outcome::Disconnected {
-                    return Ok(());
-                }
-            }
-            parser::Command::Logout => {
-                let w = reader.get_mut();
-                let response = commands::basic::logout(tag).encode();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-                break;
-            }
-            parser::Command::Unknown { .. } => {
-                log_unsupported_imap(peer, &selected, tag, &cmd, args);
-                let w = reader.get_mut();
-                let response = commands::basic::unknown(tag).encode();
-                w.write_all(response.as_bytes()).await?;
-                w.flush().await?;
-            }
-        }
-    }
-    Ok(())
 }

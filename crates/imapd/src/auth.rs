@@ -122,12 +122,12 @@ static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
 
 pub(crate) fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
     let m = AUTH_FAILS.lock().unwrap();
-    if let Some(info) = m.get(&ip) {
-        if let Some(until) = info.locked_until {
-            let now = Instant::now();
-            if until > now {
-                return Some(until - now);
-            }
+    if let Some(info) = m.get(&ip)
+        && let Some(until) = info.locked_until
+    {
+        let now = Instant::now();
+        if until > now {
+            return Some(until - now);
         }
     }
     None

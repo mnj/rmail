@@ -98,17 +98,16 @@ pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Optio
 
 pub(crate) fn parse_command(command: &str) -> Command<'_> {
     if command.is_empty()
-        || command.starts_with(|character: char| character == ' ' || character == '\t')
+        || command.starts_with([' ', '\t'])
         || command.chars().any(|character| character == '\0')
     {
         return Command::BadSyntax;
     }
     let trimmed = command;
-    let (verb, args) =
-        match trimmed.split_once(|character: char| character == ' ' || character == '\t') {
-            Some((verb, rest)) => (verb, rest.trim_start()),
-            None => (trimmed, ""),
-        };
+    let (verb, args) = match trimmed.split_once([' ', '\t']) {
+        Some((verb, rest)) => (verb, rest.trim_start()),
+        None => (trimmed, ""),
+    };
     let verb_upper = verb.to_ascii_uppercase();
     match verb_upper.as_str() {
         "HELO" if !args.is_empty() => Command::Helo(args),
@@ -179,7 +178,7 @@ fn is_atext(character: char) -> bool {
 }
 
 fn valid_local_part(value: &str, allow_utf8: bool) -> bool {
-    if value.is_empty() || value.as_bytes().len() > 64 {
+    if value.is_empty() || value.len() > 64 {
         return false;
     }
     if value.starts_with('"') {
@@ -277,7 +276,7 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
         return None;
     }
     let mut rest = trimmed[prefix_len..].trim_start();
-    if !rest.starts_with('<') || rest.as_bytes().len() > 256 {
+    if !rest.starts_with('<') || rest.len() > 256 {
         return None;
     }
     let mut quoted = false;

@@ -475,12 +475,12 @@ fn main() -> Result<()> {
             } else {
                 // fallback: pick first dir under /etc/letsencrypt/live
                 let live_root = Path::new("/etc/letsencrypt/live");
-                let first = std::fs::read_dir(live_root)?
+
+                std::fs::read_dir(live_root)?
                     .filter_map(|e| e.ok())
                     .filter_map(|e| e.file_name().into_string().ok())
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("no live certs found to copy"))?;
-                first
+                    .ok_or_else(|| anyhow::anyhow!("no live certs found to copy"))?
             };
             let live_dir = Path::new("/etc/letsencrypt/live").join(&primary_domain);
             let fullchain = live_dir.join("fullchain.pem");
@@ -551,10 +551,9 @@ fn normalize_unit_name(name: &str) -> Result<&'static str> {
         if let Some(short) = unit
             .strip_prefix("rmail_")
             .and_then(|s| s.strip_suffix(".service"))
+            && trimmed == short
         {
-            if trimmed == short {
-                return Ok(unit);
-            }
+            return Ok(unit);
         }
     }
     Err(anyhow::anyhow!(

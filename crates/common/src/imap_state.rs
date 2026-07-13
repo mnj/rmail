@@ -419,7 +419,7 @@ pub fn rename_folder(
             }
         })
         .collect::<Vec<_>>();
-    mappings.sort_by(|left, right| left.0.len().cmp(&right.0.len()));
+    mappings.sort_by_key(|left| left.0.len());
     for (_, new_name) in &mappings {
         if let Some(existing_id) = folder_id(&conn, new_name)? {
             let replacing_source = mappings.iter().any(|(old_name, _)| {
