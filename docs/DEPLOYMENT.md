@@ -86,6 +86,29 @@ SMTP resource limits are configured in the `[security]` section:
 - `submission_max_recipients` — recipients per authenticated submission transaction (default: `50`)
 - `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
 
+## DKIM signing and inbound authentication
+
+Inbound SMTP verifies SPF, DKIM, DMARC, and ARC with the system asynchronous DNS resolver. DNS
+failures remain authentication temporary errors and do not turn into DMARC policy rejections.
+
+Outbound messages are signed immediately before their atomic queue publication. Create
+`<mail_root>/dkim.toml` with one or more sender-domain entries:
+
+```toml
+[[signer]]
+domain = "example.com"
+selector = "mail2026"
+private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
+# Optional; these are the defaults.
+headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"]
+```
+
+The private key may be PKCS#1 or PKCS#8 PEM and must have no group/other permission bits (for
+example, mode `0600`). Publish the corresponding RSA public key at
+`mail2026._domainkey.example.com`. A missing `dkim.toml`, or a sender domain without a matching
+entry, leaves the message unsigned; an invalid matching entry prevents the message from entering
+the queue.
+
 Optional outbound-worker tuning in `/etc/default/rmail`:
 
 - `RMAIL_OUTBOUND_CONCURRENCY` — maximum simultaneous delivery tasks (default: `20`)

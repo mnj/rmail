@@ -1533,29 +1533,25 @@ async fn process_stream(
                         data.len(),
                         rcpts
                     );
-                    let data_for_analysis = data.clone();
                     let peer_ip_for_analysis = peer.map(|peer| peer.ip());
-                    let envelope_for_analysis = mail_from.clone();
-                    let (dkim_res, spf_res, dmarc_res, _header_from_res) =
-                        match tokio::task::spawn_blocking(move || {
-                            rmail_common::mail_auth::analyze_message(
-                                &data_for_analysis,
-                                peer_ip_for_analysis,
-                                envelope_for_analysis.as_deref(),
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(results)) => results,
-                            Ok(Err(error)) => {
-                                eprintln!("mail auth analyze error: {error}");
-                                (None, None, None, None)
-                            }
-                            Err(error) => {
-                                eprintln!("mail auth join error: {error}");
-                                (None, None, None, None)
-                            }
-                        };
+                    let auth = match rmail_common::mail_auth::analyze_message(
+                        &data,
+                        peer_ip_for_analysis,
+                        helo_name.as_deref(),
+                        "localhost",
+                        mail_from.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(results) => results,
+                        Err(error) => {
+                            eprintln!("mail auth analyze error: {error}");
+                            rmail_common::mail_auth::AuthenticationResults::default()
+                        }
+                    };
+                    let dkim_res = auth.dkim;
+                    let spf_res = auth.spf;
+                    let dmarc_res = auth.dmarc;
                     if let Some(result) = dkim_res.as_deref() {
                         if result.starts_with("pass") {
                             rmail_common::metrics::inc_dkim_pass();

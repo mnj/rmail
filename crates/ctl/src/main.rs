@@ -126,7 +126,8 @@ struct ServiceCommandOptions {
     dry_run: bool,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Hash { password } => {
@@ -260,6 +261,7 @@ fn main() -> Result<()> {
                     let org_name = "rMail";
                     let org_email = "dmarc-reports@localhost";
                     let policy = rmail_common::mail_auth::get_dmarc_policy(&domain)
+                        .await
                         .unwrap_or(None)
                         .unwrap_or_else(|| "none".to_string());
 
@@ -318,7 +320,7 @@ fn main() -> Result<()> {
                     );
 
                     // enqueue to each rua recipient
-                    let ruas = rmail_common::mail_auth::get_dmarc_rua(&domain)?;
+                    let ruas = rmail_common::mail_auth::get_dmarc_rua(&domain).await?;
                     if ruas.is_empty() {
                         eprintln!("No rua recipients found for {}", domain);
                         continue;

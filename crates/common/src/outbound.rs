@@ -99,6 +99,7 @@ pub fn queue_outbound_with_options(
     {
         anyhow::bail!("envelope addresses must not contain line breaks");
     }
+    let data = crate::mail_auth::sign_outbound(maildir_root, data, envelope_from.as_deref())?;
     let outbound_dir = maildir_root.join("outbound").join("maildrop");
     let tmp_dir = outbound_dir.join("tmp");
     let queue_dir = outbound_dir.join("queue");
@@ -130,7 +131,7 @@ pub fn queue_outbound_with_options(
     write!(f, "X-RMail-Envelope-To: {recipient}\r\n\r\n")?;
 
     // write the original message bytes unchanged
-    f.write_all(data)?;
+    f.write_all(&data)?;
     // ensure data is flushed to disk before moving
     f.sync_all()?;
 
