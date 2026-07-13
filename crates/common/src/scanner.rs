@@ -1,5 +1,6 @@
 use crate::config::SecurityConfig;
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -45,7 +46,7 @@ pub struct ScanEnvelope {
 
 pub async fn scan_message(
     cfg: &SecurityConfig,
-    message: &[u8],
+    message: Bytes,
     envelope: &ScanEnvelope,
 ) -> Result<ScanVerdict> {
     if !cfg.scanners_enabled() {
@@ -59,7 +60,7 @@ pub async fn scan_message(
     let mut verdict = ScanVerdict::clean();
 
     if cfg.clamav_enabled {
-        let infected = timeout(duration, scan_clamav(&cfg.clamav_endpoint, message))
+        let infected = timeout(duration, scan_clamav(&cfg.clamav_endpoint, &message))
             .await
             .context("ClamAV scan timed out")??;
         if let Some(sig) = infected {
@@ -72,7 +73,7 @@ pub async fn scan_message(
     }
 
     if cfg.rspamd_enabled {
-        let rspamd = timeout(duration, scan_rspamd(cfg, message, envelope))
+        let rspamd = timeout(duration, scan_rspamd(cfg, message.clone(), envelope))
             .await
             .context("Rspamd scan timed out")??;
         if rspamd.action == ScanAction::Reject {
@@ -154,7 +155,7 @@ struct RspamdResponse {
 
 async fn scan_rspamd(
     cfg: &SecurityConfig,
-    message: &[u8],
+    message: Bytes,
     envelope: &ScanEnvelope,
 ) -> Result<ScanVerdict> {
     let client = reqwest::Client::new();
@@ -185,7 +186,7 @@ async fn scan_rspamd(
     let resp = client
         .post(&cfg.rspamd_url)
         .headers(headers)
-        .body(message.to_vec())
+        .body(message)
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -258,9 +259,9 @@ async fn scan_rspamd(
     })
 }
 
-pub fn prepend_scan_headers(message: &[u8], headers: &[(String, String)]) -> Vec<u8> {
+pub fn prepend_scan_headers(message: Bytes, headers: &[(String, String)]) -> Bytes {
     if headers.is_empty() {
-        return message.to_vec();
+        return message;
     }
     let mut out = Vec::new();
     for (name, value) in headers {
@@ -269,14 +270,15 @@ pub fn prepend_scan_headers(message: &[u8], headers: &[(String, String)]) -> Vec
         out.extend_from_slice(value.replace(['\r', '\n'], " ").as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(message);
-    out
+    out.extend_from_slice(&message);
+    out.into()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ScanAction, ScanEnvelope, scan_clamav, scan_message};
+    use super::{ScanAction, ScanEnvelope, prepend_scan_headers, scan_clamav, scan_message};
     use crate::config::SecurityConfig;
+    use bytes::Bytes;
     use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UnixListener};
@@ -298,6 +300,33 @@ mod tests {
             stream.read_exact(&mut body[start..]).await.expect("chunk");
         }
         body
+    }
+
+    #[test]
+    fn unchanged_scan_result_preserves_shared_message_storage() {
+        let message = Bytes::from_static(b"Subject: shared\r\n\r\nbody");
+        let original = message.as_ptr();
+        let unchanged = prepend_scan_headers(message, &[]);
+
+        assert_eq!(unchanged.as_ptr(), original);
+        assert_eq!(
+            unchanged,
+            Bytes::from_static(b"Subject: shared\r\n\r\nbody")
+        );
+    }
+
+    #[test]
+    fn scan_headers_are_prepended_to_shared_message_bytes() {
+        let message = Bytes::from_static(b"Subject: scanned\r\n\r\nbody");
+        let result = prepend_scan_headers(
+            message,
+            &[("X-Scan".to_string(), "clean\r\ninjected".to_string())],
+        );
+
+        assert_eq!(
+            result,
+            Bytes::from_static(b"X-Scan: clean  injected\r\nSubject: scanned\r\n\r\nbody")
+        );
     }
 
     #[tokio::test]
@@ -378,7 +407,7 @@ mod tests {
             hostname: Some("mx.example.test".to_string()),
             user: Some("user@example.test".to_string()),
         };
-        let verdict = scan_message(&cfg, b"Subject: hi\r\n\r\nbody", &env)
+        let verdict = scan_message(&cfg, Bytes::from_static(b"Subject: hi\r\n\r\nbody"), &env)
             .await
             .expect("scan");
         assert_eq!(verdict.action, ScanAction::Quarantine);

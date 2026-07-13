@@ -17,6 +17,7 @@ r2d2_sqlite = "0.22"
 moka = { version = "0.12", features = ["sync"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+bytes = "1"
 
 # SCRAM helpers
 pbkdf2 = "0.11"

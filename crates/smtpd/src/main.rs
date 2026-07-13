@@ -1348,7 +1348,7 @@ async fn process_stream(
                     _ => unreachable!(),
                 };
 
-                let mut data = match incoming {
+                let data = match incoming {
                     DataReadResult::Complete(mut data) => {
                         if bdat_started
                             && mail_body != protocol::MailBody::BinaryMime
@@ -1450,6 +1450,7 @@ async fn process_stream(
                     }
                     DataReadResult::Eof => break,
                 };
+                let mut data = bytes::Bytes::from(data);
 
                 let mut scanner_quarantine = false;
                 if service == SmtpService::Submission
@@ -1478,12 +1479,14 @@ async fn process_stream(
                         hostname: helo_name.clone(),
                         user: authenticated_user.clone(),
                     };
-                    match rmail_common::scanner::scan_message(&security, &data, &envelope).await {
+                    match rmail_common::scanner::scan_message(&security, data.clone(), &envelope)
+                        .await
+                    {
                         Ok(verdict) => match verdict.action {
                             ScanAction::Clean => {
                                 if !verdict.headers.is_empty() {
                                     data = rmail_common::scanner::prepend_scan_headers(
-                                        &data,
+                                        data,
                                         &verdict.headers,
                                     );
                                 }
@@ -1491,7 +1494,7 @@ async fn process_stream(
                             ScanAction::Quarantine => {
                                 scanner_quarantine = true;
                                 data = rmail_common::scanner::prepend_scan_headers(
-                                    &data,
+                                    data,
                                     &verdict.headers,
                                 );
                             }
