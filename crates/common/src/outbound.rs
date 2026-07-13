@@ -18,6 +18,8 @@ pub struct QueueControl {
     pub last_smtp_code: Option<u16>,
     #[serde(default)]
     pub last_enhanced_status: Option<String>,
+    #[serde(default)]
+    pub delay_notification_sent: bool,
     pub created_at: i64,
 }
 
@@ -40,6 +42,7 @@ impl QueueControl {
             last_error: None,
             last_smtp_code: None,
             last_enhanced_status: None,
+            delay_notification_sent: false,
             created_at: now,
         }
     }
@@ -53,6 +56,7 @@ impl QueueControl {
             last_error: None,
             last_smtp_code: None,
             last_enhanced_status: None,
+            delay_notification_sent: false,
             created_at: ts,
         }
     }
@@ -92,6 +96,78 @@ pub fn queue_outbound(
 pub struct QueueOptions {
     pub require_tls: bool,
     pub tracking_id: Option<String>,
+    pub dsn: DsnOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsnReturn {
+    Full,
+    Headers,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DsnNotify {
+    pub success: bool,
+    pub failure: bool,
+    pub delay: bool,
+    pub never: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DsnOptions {
+    /// Decoded RFC 3461 ENVID xtext value.
+    pub envelope_id: Option<String>,
+    pub return_content: Option<DsnReturn>,
+    pub notify: Option<DsnNotify>,
+    /// `(address-type, decoded generic-address)` from ORCPT.
+    pub original_recipient: Option<(String, String)>,
+}
+
+pub fn encode_xtext(value: &str) -> anyhow::Result<String> {
+    if value.is_empty() || value.len() > 500 {
+        anyhow::bail!("DSN xtext value must contain 1-500 UTF-8 bytes");
+    }
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if (33..=126).contains(&byte) && byte != b'+' && byte != b'=' {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "+{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    Ok(encoded)
+}
+
+pub fn decode_xtext(value: &str) -> anyhow::Result<String> {
+    if value.is_empty() || value.len() > 1500 || !value.is_ascii() {
+        anyhow::bail!("invalid DSN xtext length or encoding");
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                let hex = bytes
+                    .get(index + 1..index + 3)
+                    .context("truncated DSN xtext escape")?;
+                let hex = std::str::from_utf8(hex)?;
+                let byte = u8::from_str_radix(hex, 16).context("invalid DSN xtext escape")?;
+                if byte == 0 || byte == b'\r' || byte == b'\n' {
+                    anyhow::bail!("DSN xtext contains a prohibited control byte");
+                }
+                decoded.push(byte);
+                index += 3;
+            }
+            byte if (33..=126).contains(&byte) && byte != b'=' => {
+                decoded.push(byte);
+                index += 1;
+            }
+            _ => anyhow::bail!("invalid unescaped byte in DSN xtext"),
+        }
+    }
+    String::from_utf8(decoded).context("DSN xtext is not valid UTF-8")
 }
 
 pub fn queue_outbound_with_options(
@@ -141,6 +217,59 @@ pub fn queue_outbound_with_options(
     if options.require_tls {
         write!(f, "X-RMail-Require-TLS: yes\r\n")?;
     }
+    if let Some(envelope_id) = options.dsn.envelope_id.as_deref() {
+        writeln!(
+            f,
+            "X-RMail-DSN-Envelope-ID: {}\r",
+            encode_xtext(envelope_id)?
+        )?;
+    }
+    if let Some(return_content) = options.dsn.return_content {
+        writeln!(
+            f,
+            "X-RMail-DSN-Return: {}\r",
+            if return_content == DsnReturn::Full {
+                "FULL"
+            } else {
+                "HDRS"
+            }
+        )?;
+    }
+    if let Some(notify) = options.dsn.notify.as_ref() {
+        let requested = notify.success || notify.failure || notify.delay;
+        if notify.never == requested {
+            anyhow::bail!("DSN NOTIFY must be NEVER or one or more notification conditions");
+        }
+        let value = if notify.never {
+            "NEVER".to_string()
+        } else {
+            [
+                (notify.success, "SUCCESS"),
+                (notify.failure, "FAILURE"),
+                (notify.delay, "DELAY"),
+            ]
+            .into_iter()
+            .filter_map(|(enabled, name)| enabled.then_some(name))
+            .collect::<Vec<_>>()
+            .join(",")
+        };
+        writeln!(f, "X-RMail-DSN-Notify: {value}\r")?;
+    }
+    if let Some((address_type, address)) = options.dsn.original_recipient.as_ref() {
+        if address_type.is_empty()
+            || !address_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            anyhow::bail!("invalid DSN original-recipient address type");
+        }
+        writeln!(
+            f,
+            "X-RMail-DSN-Original-Recipient: {};{}\r",
+            address_type,
+            encode_xtext(address)?
+        )?;
+    }
     write!(f, "X-RMail-Envelope-To: {recipient}\r\n\r\n")?;
 
     // write the original message bytes unchanged
@@ -174,7 +303,10 @@ pub fn queue_outbound_with_options(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueOptions, control_path_for_eml, queue_outbound, queue_outbound_with_options};
+    use super::{
+        DsnNotify, DsnOptions, DsnReturn, QueueOptions, control_path_for_eml, decode_xtext,
+        encode_xtext, queue_outbound, queue_outbound_with_options,
+    };
     use std::path::Path;
 
     #[test]
@@ -215,6 +347,7 @@ mod tests {
             QueueOptions {
                 require_tls: true,
                 tracking_id: None,
+                dsn: DsnOptions::default(),
             },
         )
         .unwrap();
@@ -222,5 +355,47 @@ mod tests {
         assert!(data.starts_with(
             "X-RMail-Envelope-From: from@example.test\r\nX-RMail-Require-TLS: yes\r\nX-RMail-Envelope-To: to@example.test\r\n\r\n"
         ));
+    }
+
+    #[test]
+    fn dsn_xtext_round_trips_and_rejects_injection() {
+        let encoded = encode_xtext("id + equals= space").unwrap();
+        assert_eq!(encoded, "id+20+2B+20equals+3D+20space");
+        assert_eq!(decode_xtext(&encoded).unwrap(), "id + equals= space");
+        assert!(decode_xtext("bad+0Avalue").is_err());
+        assert!(decode_xtext("bad raw space").is_err());
+        assert!(decode_xtext("truncated+").is_err());
+    }
+
+    #[test]
+    fn dsn_preferences_are_private_spool_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let queued = queue_outbound_with_options(
+            temp.path(),
+            "to@example.test",
+            b"Subject: DSN\r\n\r\nbody\r\n",
+            Some("from@example.test"),
+            QueueOptions {
+                require_tls: false,
+                tracking_id: None,
+                dsn: DsnOptions {
+                    envelope_id: Some("job + 7".into()),
+                    return_content: Some(DsnReturn::Headers),
+                    notify: Some(DsnNotify {
+                        success: true,
+                        failure: true,
+                        delay: false,
+                        never: false,
+                    }),
+                    original_recipient: Some(("rfc822".into(), "alias@example.test".into())),
+                },
+            },
+        )
+        .unwrap();
+        let data = std::fs::read_to_string(queued).unwrap();
+        assert!(data.contains("X-RMail-DSN-Envelope-ID: job+20+2B+207\r\n"));
+        assert!(data.contains("X-RMail-DSN-Return: HDRS\r\n"));
+        assert!(data.contains("X-RMail-DSN-Notify: SUCCESS,FAILURE\r\n"));
+        assert!(data.contains("X-RMail-DSN-Original-Recipient: rfc822;alias@example.test\r\n"));
     }
 }

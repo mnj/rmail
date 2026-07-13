@@ -102,6 +102,7 @@ struct QueuedMessage {
     body_len: u64,
     requirements: MessageRequirements,
     require_tls: bool,
+    dsn: rmail_common::outbound::DsnOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -490,6 +491,16 @@ async fn process_claim(
     {
         Ok(()) => {
             emit("delivery", "delivered", Some(fname.clone()), Some(250));
+            if let Err(error) = queue_delivery_notification(
+                &base,
+                &inflight_eml,
+                &control,
+                DeliveryNotificationKind::Success,
+            )
+            .await
+            {
+                eprintln!("failed to queue success notification for {fname}: {error}");
+            }
             let destination = sent_dir.join(&fname);
             if let Err(error) = move_spool_message(&inflight_eml, &destination).await {
                 eprintln!("failed to move delivered message {fname} to sent: {error}");
@@ -539,10 +550,26 @@ async fn process_claim(
                 );
                 queue_dir.join(&fname)
             };
+            let send_delay_notification =
+                !terminal && control.attempts >= 2 && !control.delay_notification_sent;
+            if send_delay_notification {
+                control.delay_notification_sent = true;
+            }
 
             if let Err(error) = write_control(&inflight_json, &control).await {
                 eprintln!("failed to persist failure state for {fname}: {error}");
                 return;
+            }
+            if send_delay_notification
+                && let Err(error) = queue_delivery_notification(
+                    &base,
+                    &inflight_eml,
+                    &control,
+                    DeliveryNotificationKind::Delay,
+                )
+                .await
+            {
+                eprintln!("failed to queue delay notification for {fname}: {error}");
             }
             match move_spool_message(&inflight_eml, &destination).await {
                 Ok(()) if terminal => {
@@ -583,7 +610,7 @@ async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
     if body_offset > file_len {
         anyhow::bail!("queued message metadata extends beyond the file");
     }
-    let (envelope_from, envelope_to, require_tls) = parse_queue_metadata(&metadata)?;
+    let (envelope_from, envelope_to, require_tls, dsn) = parse_queue_metadata(&metadata)?;
     let body_len = file_len - body_offset;
     let requirements =
         scan_message_requirements(path, body_offset, envelope_from.as_deref(), &envelope_to)
@@ -595,6 +622,7 @@ async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
         body_len,
         requirements,
         require_tls,
+        dsn,
     })
 }
 
@@ -632,12 +660,20 @@ async fn read_queue_metadata(reader: &mut BufReader<File>) -> anyhow::Result<Vec
     }
 }
 
-fn parse_queue_metadata(metadata: &[u8]) -> anyhow::Result<(Option<String>, String, bool)> {
+fn parse_queue_metadata(
+    metadata: &[u8],
+) -> anyhow::Result<(
+    Option<String>,
+    String,
+    bool,
+    rmail_common::outbound::DsnOptions,
+)> {
     let metadata =
         std::str::from_utf8(metadata).context("queued message metadata is not valid UTF-8")?;
     let mut envelope_from = None;
     let mut envelope_to = None;
     let mut require_tls = false;
+    let mut dsn = rmail_common::outbound::DsnOptions::default();
     for raw_line in metadata.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
@@ -669,11 +705,69 @@ fn parse_queue_metadata(metadata: &[u8]) -> anyhow::Result<(Option<String>, Stri
                 anyhow::bail!("invalid or duplicate REQUIRETLS queue metadata");
             }
             require_tls = true;
+        } else if let Some(value) = line.strip_prefix("X-RMail-DSN-Envelope-ID:") {
+            if dsn.envelope_id.is_some() {
+                anyhow::bail!("duplicate DSN envelope ID queue metadata");
+            }
+            dsn.envelope_id = Some(rmail_common::outbound::decode_xtext(value.trim())?);
+        } else if let Some(value) = line.strip_prefix("X-RMail-DSN-Return:") {
+            if dsn.return_content.is_some() {
+                anyhow::bail!("duplicate DSN return queue metadata");
+            }
+            dsn.return_content = Some(if value.trim().eq_ignore_ascii_case("FULL") {
+                rmail_common::outbound::DsnReturn::Full
+            } else if value.trim().eq_ignore_ascii_case("HDRS") {
+                rmail_common::outbound::DsnReturn::Headers
+            } else {
+                anyhow::bail!("invalid DSN return queue metadata");
+            });
+        } else if let Some(value) = line.strip_prefix("X-RMail-DSN-Notify:") {
+            if dsn.notify.is_some() {
+                anyhow::bail!("duplicate DSN notify queue metadata");
+            }
+            let value = value.trim();
+            let mut notify = rmail_common::outbound::DsnNotify::default();
+            for item in value.split(',') {
+                if item.eq_ignore_ascii_case("NEVER") {
+                    notify.never = true;
+                } else if item.eq_ignore_ascii_case("SUCCESS") {
+                    notify.success = true;
+                } else if item.eq_ignore_ascii_case("FAILURE") {
+                    notify.failure = true;
+                } else if item.eq_ignore_ascii_case("DELAY") {
+                    notify.delay = true;
+                } else {
+                    anyhow::bail!("invalid DSN notify queue metadata");
+                }
+            }
+            if notify.never == (notify.success || notify.failure || notify.delay) {
+                anyhow::bail!("invalid DSN notify combination in queue metadata");
+            }
+            dsn.notify = Some(notify);
+        } else if let Some(value) = line.strip_prefix("X-RMail-DSN-Original-Recipient:") {
+            if dsn.original_recipient.is_some() {
+                anyhow::bail!("duplicate DSN original recipient queue metadata");
+            }
+            let (address_type, address) = value
+                .trim()
+                .split_once(';')
+                .context("invalid DSN original recipient queue metadata")?;
+            if address_type.is_empty()
+                || !address_type
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                anyhow::bail!("invalid DSN original recipient address type");
+            }
+            dsn.original_recipient = Some((
+                address_type.to_ascii_lowercase(),
+                rmail_common::outbound::decode_xtext(address)?,
+            ));
         }
     }
     let envelope_to = envelope_to
         .ok_or_else(|| anyhow::anyhow!("no envelope recipient found in queued message"))?;
-    Ok((envelope_from, envelope_to, require_tls))
+    Ok((envelope_from, envelope_to, require_tls, dsn))
 }
 
 struct MessageAnalyzer {
@@ -790,28 +884,67 @@ async fn queue_failure_notification(
     failed_message: &Path,
     control: &rmail_common::outbound::QueueControl,
 ) -> anyhow::Result<()> {
-    let message = inspect_queued_message(failed_message).await?;
+    queue_delivery_notification(
+        mail_root,
+        failed_message,
+        control,
+        DeliveryNotificationKind::Failure,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum DeliveryNotificationKind {
+    Success,
+    Delay,
+    Failure,
+}
+
+async fn queue_delivery_notification(
+    mail_root: &Path,
+    queued_message: &Path,
+    control: &rmail_common::outbound::QueueControl,
+    kind: DeliveryNotificationKind,
+) -> anyhow::Result<()> {
+    let message = inspect_queued_message(queued_message).await?;
     let Some(original_sender) = message.envelope_from else {
         // RFC 5321 null reverse paths are used for bounces specifically to
         // prevent notification loops. Do not generate a second notification.
         return Ok(());
     };
-    let original_headers = match read_original_headers(failed_message, message.body_offset).await {
-        Ok(headers) => headers,
-        Err(error) => {
-            eprintln!(
-                "unable to include original headers in delivery notification for {}: {}",
-                failed_message.display(),
-                error
-            );
-            Vec::new()
-        }
+    let requested = match (message.dsn.notify.as_ref(), kind) {
+        (Some(notify), _) if notify.never => false,
+        (Some(notify), DeliveryNotificationKind::Success) => notify.success,
+        (Some(notify), DeliveryNotificationKind::Delay) => notify.delay,
+        (Some(notify), DeliveryNotificationKind::Failure) => notify.failure,
+        (None, DeliveryNotificationKind::Failure) => true,
+        (None, _) => false,
     };
+    if !requested {
+        return Ok(());
+    }
+    let return_full =
+        message.dsn.return_content != Some(rmail_common::outbound::DsnReturn::Headers);
+    let returned_content =
+        match read_returned_content(queued_message, message.body_offset, return_full).await {
+            Ok(content) => content,
+            Err(error) => {
+                eprintln!(
+                    "unable to include original content in delivery notification for {}: {}",
+                    queued_message.display(),
+                    error
+                );
+                Vec::new()
+            }
+        };
     let notification = build_failure_notification(
         &original_sender,
         &message.envelope_to,
         control,
-        &original_headers,
+        &message.dsn,
+        kind,
+        return_full,
+        &returned_content,
     );
     let mail_root = mail_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -822,17 +955,30 @@ async fn queue_failure_notification(
     Ok(())
 }
 
-async fn read_original_headers(path: &Path, body_offset: u64) -> anyhow::Result<Vec<u8>> {
+async fn read_returned_content(
+    path: &Path,
+    body_offset: u64,
+    return_full: bool,
+) -> anyhow::Result<Vec<u8>> {
     let file = open_message_body(path, body_offset).await?;
     let mut reader = BufReader::new(file);
-    read_queue_metadata(&mut reader).await
+    if return_full {
+        let mut content = Vec::new();
+        reader.read_to_end(&mut content).await?;
+        Ok(content)
+    } else {
+        read_queue_metadata(&mut reader).await
+    }
 }
 
 fn build_failure_notification(
     original_sender: &str,
     final_recipient: &str,
     control: &rmail_common::outbound::QueueControl,
-    original_headers: &[u8],
+    dsn: &rmail_common::outbound::DsnOptions,
+    kind: DeliveryNotificationKind,
+    return_full: bool,
+    returned_content: &[u8],
 ) -> Vec<u8> {
     let date = Utc::now().to_rfc2822();
     let nonce = SystemTime::now()
@@ -840,24 +986,77 @@ fn build_failure_notification(
         .unwrap_or_default()
         .as_nanos();
     let boundary = format!("rmail-dsn-{}-{nonce}", std::process::id());
-    let status = control.last_enhanced_status.as_deref().unwrap_or_else(|| {
-        if control.last_smtp_code.is_some_and(|code| code / 100 == 5) {
-            "5.0.0"
-        } else {
-            "4.4.7"
+    let status = match kind {
+        DeliveryNotificationKind::Success => "2.0.0",
+        DeliveryNotificationKind::Delay => {
+            control.last_enhanced_status.as_deref().unwrap_or("4.4.7")
         }
-    });
+        DeliveryNotificationKind::Failure => {
+            control.last_enhanced_status.as_deref().unwrap_or_else(|| {
+                if control.last_smtp_code.is_some_and(|code| code / 100 == 5) {
+                    "5.0.0"
+                } else {
+                    "4.4.7"
+                }
+            })
+        }
+    };
     let diagnostic = control
         .last_error
         .as_deref()
         .map(sanitize_header_value)
-        .unwrap_or_else(|| "delivery failed without a diagnostic response".to_string());
+        .unwrap_or_else(|| match kind {
+            DeliveryNotificationKind::Success => "recipient accepted the message".to_string(),
+            DeliveryNotificationKind::Delay => "delivery is still being retried".to_string(),
+            DeliveryNotificationKind::Failure => {
+                "delivery failed without a diagnostic response".to_string()
+            }
+        });
+    let (subject, action, human_message) = match kind {
+        DeliveryNotificationKind::Success => (
+            "Delivery Status Notification (Success)",
+            "delivered",
+            "was delivered successfully.",
+        ),
+        DeliveryNotificationKind::Delay => (
+            "Delivery Status Notification (Delay)",
+            "delayed",
+            "has been delayed; delivery attempts will continue.",
+        ),
+        DeliveryNotificationKind::Failure => (
+            "Delivery Status Notification (Failure)",
+            "failed",
+            "could not be delivered.",
+        ),
+    };
     let sender = sanitize_header_value(original_sender);
     let recipient = sanitize_header_value(final_recipient);
+    let original_recipient = dsn
+        .original_recipient
+        .as_ref()
+        .map(|(address_type, address)| {
+            format!(
+                "Original-Recipient: {}; {}\r\n",
+                sanitize_header_value(address_type),
+                sanitize_header_value(address)
+            )
+        })
+        .unwrap_or_default();
+    let envelope_id = dsn
+        .envelope_id
+        .as_deref()
+        .map(sanitize_header_value)
+        .map(|value| format!("Original-Envelope-Id: {value}\r\n"))
+        .unwrap_or_default();
+    let returned_type = if return_full {
+        "message/rfc822"
+    } else {
+        "message/rfc822-headers"
+    };
     let mut notification = format!(
         "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\n\
          To: <{sender}>\r\n\
-         Subject: Delivery Status Notification (Failure)\r\n\
+         Subject: {subject}\r\n\
          Date: {date}\r\n\
          Auto-Submitted: auto-replied\r\n\
          MIME-Version: 1.0\r\n\
@@ -868,26 +1067,28 @@ fn build_failure_notification(
          Content-Transfer-Encoding: 8bit\r\n\
          \r\n\
          This is an automatically generated Delivery Status Notification.\r\n\
-         Delivery to <{recipient}> failed.\r\n\
+         Delivery to <{recipient}> {human_message}\r\n\
          \r\n\
          --{boundary}\r\n\
          Content-Type: message/delivery-status\r\n\
          \r\n\
          Reporting-MTA: dns; rmail\r\n\
+         {envelope_id}\
          Arrival-Date: {date}\r\n\
          \r\n\
+         {original_recipient}\
          Final-Recipient: rfc822; {recipient}\r\n\
-         Action: failed\r\n\
+         Action: {action}\r\n\
          Status: {status}\r\n\
          Diagnostic-Code: smtp; {diagnostic}\r\n\
          \r\n\
          --{boundary}\r\n\
-         Content-Type: message/rfc822-headers\r\n\
+         Content-Type: {returned_type}\r\n\
          \r\n"
     )
     .into_bytes();
-    notification.extend_from_slice(original_headers);
-    if !original_headers.is_empty() && !original_headers.ends_with(b"\n") {
+    notification.extend_from_slice(returned_content);
+    if !returned_content.is_empty() && !returned_content.ends_with(b"\n") {
         notification.extend_from_slice(b"\r\n");
     }
     notification.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
@@ -1087,6 +1288,7 @@ async fn smtp_send_with_reader(
         recipient,
         &requirements,
         false,
+        None,
         capabilities,
         None,
     )
@@ -1153,6 +1355,7 @@ async fn smtp_send_file_with_reader(
         recipient,
         &message.requirements,
         message.require_tls,
+        Some(&message.dsn),
         capabilities,
         trace.as_deref_mut(),
     )
@@ -1172,12 +1375,14 @@ async fn smtp_send_file_with_reader(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn smtp_begin_transaction(
     reader: &mut BufReader<Box<dyn AsyncStream>>,
     envelope_from: Option<&str>,
     recipient: &str,
     requirements: &MessageRequirements,
     require_tls: bool,
+    dsn: Option<&rmail_common::outbound::DsnOptions>,
     capabilities: &SmtpCapabilities,
     mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
@@ -1185,6 +1390,7 @@ async fn smtp_begin_transaction(
         envelope_from,
         requirements,
         require_tls,
+        dsn,
         capabilities,
     )?;
 
@@ -1201,7 +1407,7 @@ async fn smtp_begin_transaction(
         return Err(rejected("MAIL FROM", code, resp));
     }
 
-    let rcptcmd = format!("RCPT TO:<{}>\r\n", recipient);
+    let rcptcmd = build_rcpt_command(recipient, dsn, capabilities)?;
     reader.get_mut().write_all(rcptcmd.as_bytes()).await?;
     if let Some(trace) = trace.as_deref_mut() {
         trace.command("rcpt", &rcptcmd, rcptcmd.len());
@@ -1216,6 +1422,43 @@ async fn smtp_begin_transaction(
     }
 
     Ok(())
+}
+
+fn build_rcpt_command(
+    recipient: &str,
+    dsn: Option<&rmail_common::outbound::DsnOptions>,
+    capabilities: &SmtpCapabilities,
+) -> anyhow::Result<String> {
+    let mut rcptcmd = format!("RCPT TO:<{}>", recipient);
+    if capabilities.dsn
+        && let Some(dsn) = dsn
+    {
+        if let Some(notify) = dsn.notify.as_ref() {
+            rcptcmd.push_str(" NOTIFY=");
+            if notify.never {
+                rcptcmd.push_str("NEVER");
+            } else {
+                let values = [
+                    (notify.success, "SUCCESS"),
+                    (notify.failure, "FAILURE"),
+                    (notify.delay, "DELAY"),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, name)| enabled.then_some(name))
+                .collect::<Vec<_>>()
+                .join(",");
+                rcptcmd.push_str(&values);
+            }
+        }
+        if let Some((address_type, address)) = dsn.original_recipient.as_ref() {
+            rcptcmd.push_str(" ORCPT=");
+            rcptcmd.push_str(address_type);
+            rcptcmd.push(';');
+            rcptcmd.push_str(&rmail_common::outbound::encode_xtext(address)?);
+        }
+    }
+    rcptcmd.push_str("\r\n");
+    Ok(rcptcmd)
 }
 
 #[cfg(test)]
@@ -1373,7 +1616,13 @@ fn build_mail_from_command(
     capabilities: &SmtpCapabilities,
 ) -> anyhow::Result<String> {
     let requirements = requirements_for_bytes(envelope_from, recipient, body);
-    build_mail_from_command_for_requirements(envelope_from, &requirements, false, capabilities)
+    build_mail_from_command_for_requirements(
+        envelope_from,
+        &requirements,
+        false,
+        None,
+        capabilities,
+    )
 }
 
 #[cfg(test)]
@@ -1401,6 +1650,7 @@ fn build_mail_from_command_for_requirements(
     envelope_from: Option<&str>,
     requirements: &MessageRequirements,
     require_tls: bool,
+    dsn: Option<&rmail_common::outbound::DsnOptions>,
     capabilities: &SmtpCapabilities,
 ) -> anyhow::Result<String> {
     if requirements.smtp_utf8 && !capabilities.smtp_utf8 {
@@ -1432,6 +1682,24 @@ fn build_mail_from_command_for_requirements(
     if require_tls {
         mailcmd.push_str(" REQUIRETLS");
     }
+    if capabilities.dsn
+        && let Some(dsn) = dsn
+    {
+        if let Some(envelope_id) = dsn.envelope_id.as_deref() {
+            mailcmd.push_str(" ENVID=");
+            mailcmd.push_str(&rmail_common::outbound::encode_xtext(envelope_id)?);
+        }
+        if let Some(return_content) = dsn.return_content {
+            mailcmd.push_str(" RET=");
+            mailcmd.push_str(
+                if return_content == rmail_common::outbound::DsnReturn::Full {
+                    "FULL"
+                } else {
+                    "HDRS"
+                },
+            );
+        }
+    }
     mailcmd.push_str("\r\n");
     Ok(mailcmd)
 }
@@ -1444,6 +1712,7 @@ struct SmtpCapabilities {
     chunking: bool,
     binary_mime: bool,
     require_tls: bool,
+    dsn: bool,
 }
 
 fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
@@ -1470,6 +1739,8 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.binary_mime = true;
         } else if keyword.eq_ignore_ascii_case("REQUIRETLS") {
             capabilities.require_tls = true;
+        } else if keyword.eq_ignore_ascii_case("DSN") {
+            capabilities.dsn = true;
         }
     }
     capabilities
@@ -2327,6 +2598,9 @@ mod tests {
             "sender@example.test",
             "missing@example.test",
             &control,
+            &rmail_common::outbound::DsnOptions::default(),
+            DeliveryNotificationKind::Failure,
+            false,
             b"Subject: original\r\nMessage-ID: <original@example.test>\r\n\r\n",
         );
         let notification = String::from_utf8(notification).unwrap();
@@ -2343,13 +2617,14 @@ mod tests {
     #[test]
     fn ehlo_capabilities_are_parsed_by_keyword_not_response_substrings() {
         let capabilities = parse_ehlo_capabilities(
-            "250-mail.example\r\n250-8bitmime\r\n250-SMTPUTF8\r\n250-CHUNKING\r\n250-BINARYMIME\r\n250 STARTTLS\r\n",
+            "250-mail.example\r\n250-8bitmime\r\n250-SMTPUTF8\r\n250-CHUNKING\r\n250-BINARYMIME\r\n250-DSN\r\n250 STARTTLS\r\n",
         );
         assert!(capabilities.eight_bit_mime);
         assert!(capabilities.smtp_utf8);
         assert!(capabilities.starttls);
         assert!(capabilities.chunking);
         assert!(capabilities.binary_mime);
+        assert!(capabilities.dsn);
         assert_eq!(
             parse_ehlo_capabilities("250 mail without STARTTLS support"),
             SmtpCapabilities::default()
@@ -2365,6 +2640,7 @@ mod tests {
             chunking: true,
             binary_mime: true,
             require_tls: true,
+            dsn: false,
         };
         assert_eq!(
             build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
@@ -2413,6 +2689,7 @@ mod tests {
             Some("sender@example.test"),
             &MessageRequirements::default(),
             true,
+            None,
             &all,
         )
         .unwrap();
@@ -2421,6 +2698,7 @@ mod tests {
             Some("sender@example.test"),
             &MessageRequirements::default(),
             true,
+            None,
             &SmtpCapabilities::default(),
         )
         .unwrap_err();
@@ -2428,6 +2706,34 @@ mod tests {
             unsupported
                 .downcast_ref::<PermanentDeliveryError>()
                 .is_some()
+        );
+
+        let dsn = rmail_common::outbound::DsnOptions {
+            envelope_id: Some("job + 7".into()),
+            return_content: Some(rmail_common::outbound::DsnReturn::Headers),
+            notify: Some(rmail_common::outbound::DsnNotify {
+                success: true,
+                failure: true,
+                delay: false,
+                never: false,
+            }),
+            original_recipient: Some(("rfc822".into(), "alias@example.test".into())),
+        };
+        let dsn_capabilities = SmtpCapabilities { dsn: true, ..all };
+        assert_eq!(
+            build_mail_from_command_for_requirements(
+                Some("sender@example.test"),
+                &MessageRequirements::default(),
+                false,
+                Some(&dsn),
+                &dsn_capabilities,
+            )
+            .unwrap(),
+            "MAIL FROM:<sender@example.test> ENVID=job+20+2B+207 RET=HDRS\r\n"
+        );
+        assert_eq!(
+            build_rcpt_command("target@example.test", Some(&dsn), &dsn_capabilities).unwrap(),
+            "RCPT TO:<target@example.test> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;alias@example.test\r\n"
         );
     }
 
@@ -2597,6 +2903,7 @@ mod tests {
                 chunking: true,
                 binary_mime: true,
                 require_tls: false,
+                dsn: false,
             },
             None,
         )
@@ -2743,6 +3050,7 @@ mod tests {
                 chunking: true,
                 binary_mime: true,
                 require_tls: false,
+                dsn: false,
             },
         )
         .await

@@ -940,6 +940,10 @@ async fn process_stream(
     let mut mail_body = protocol::MailBody::SevenBit;
     let mut smtp_utf8 = false;
     let mut require_tls = false;
+    let mut mail_dsn = rmail_common::outbound::DsnOptions::default();
+    let mut dsn_generation = 0_u64;
+    let mut recipient_dsn: HashMap<String, (u64, rmail_common::outbound::DsnOptions)> =
+        HashMap::new();
     let mut bdat_buffer = Vec::new();
     let mut bdat_started = false;
     // track authenticated identity when AUTH is used (local mailbox address)
@@ -1144,6 +1148,7 @@ async fn process_stream(
                     resp.push_str("250-PIPELINING\r\n");
                     resp.push_str("250-SMTPUTF8\r\n");
                     resp.push_str("250-REQUIRETLS\r\n");
+                    resp.push_str("250-DSN\r\n");
                     resp.push_str("250 ENHANCEDSTATUSCODES\r\n");
                 }
                 let w = reader.get_mut();
@@ -1269,6 +1274,12 @@ async fn process_stream(
                         mail_body = parsed.body;
                         smtp_utf8 = parsed.smtp_utf8;
                         require_tls = parsed.require_tls;
+                        mail_dsn = rmail_common::outbound::DsnOptions {
+                            envelope_id: parsed.dsn_envelope_id,
+                            return_content: parsed.dsn_return,
+                            ..rmail_common::outbound::DsnOptions::default()
+                        };
+                        dsn_generation = dsn_generation.wrapping_add(1);
                         mail_from = parsed.sender;
                         if service == SmtpService::Submission {
                             let sender_matches_identity =
@@ -1348,7 +1359,14 @@ async fn process_stream(
                     continue;
                 }
                 match parse_rcpt_to_args(rcpt_args, smtp_utf8) {
-                    Ok(addr) => {
+                    Ok(parsed) => {
+                        let addr = parsed.recipient;
+                        let dsn = rmail_common::outbound::DsnOptions {
+                            envelope_id: mail_dsn.envelope_id.clone(),
+                            return_content: mail_dsn.return_content,
+                            notify: parsed.dsn_notify,
+                            original_recipient: parsed.original_recipient,
+                        };
                         println!("SMTP RCPT TO peer={:?} parsed={}", peer, addr);
                         // DB is authoritative — must be configured at startup
                         if let Some(dbp) = db_path.as_ref() {
@@ -1369,7 +1387,10 @@ async fn process_stream(
                                         w.write_all(b"452 4.5.3 Too many recipients\r\n").await?;
                                         w.flush().await?;
                                     } else {
-                                        rcpts.push(mailbox.address.to_ascii_lowercase());
+                                        let target = mailbox.address.to_ascii_lowercase();
+                                        recipient_dsn
+                                            .insert(target.clone(), (dsn_generation, dsn.clone()));
+                                        rcpts.push(target);
                                         println!(
                                             "SMTP RCPT accepted peer={:?} rcpt_count={} current_rcpts={:?}",
                                             peer,
@@ -1419,11 +1440,14 @@ async fn process_stream(
                                                         .await?;
                                                     writer.flush().await?;
                                                 } else {
-                                                    rcpts.extend(
-                                                        targets.into_iter().map(|target| {
-                                                            target.to_ascii_lowercase()
-                                                        }),
-                                                    );
+                                                    for target in targets {
+                                                        let target = target.to_ascii_lowercase();
+                                                        recipient_dsn.insert(
+                                                            target.clone(),
+                                                            (dsn_generation, dsn.clone()),
+                                                        );
+                                                        rcpts.push(target);
+                                                    }
                                                     let writer = reader.get_mut();
                                                     writer
                                                         .write_all(b"250 2.1.5 Recipient OK\r\n")
@@ -1452,6 +1476,10 @@ async fn process_stream(
                                                             .await?;
                                                             w.flush().await?;
                                                         } else {
+                                                            recipient_dsn.insert(
+                                                                target.clone(),
+                                                                (dsn_generation, dsn.clone()),
+                                                            );
                                                             rcpts.push(target.clone());
                                                             let w = reader.get_mut();
                                                             w.write_all(
@@ -1473,6 +1501,10 @@ async fn process_stream(
                                                                 .await?;
                                                                 w.flush().await?;
                                                             } else {
+                                                                recipient_dsn.insert(
+                                                                    addr.clone(),
+                                                                    (dsn_generation, dsn.clone()),
+                                                                );
                                                                 rcpts.push(addr.clone());
                                                                 let w = reader.get_mut();
                                                                 w.write_all(
@@ -1951,6 +1983,7 @@ async fn process_stream(
                             };
 
                             if is_local {
+                                let mut local_delivered = false;
                                 // measure per-recipient delivery latency
                                 let start = std::time::Instant::now();
                                 // If DMARC recommends quarantine, deliver to quarantine Maildir
@@ -1959,6 +1992,7 @@ async fn process_stream(
                                     match maildir::deliver_quarantine(&mr, &domain, &local, &data) {
                                         Ok(path) => {
                                             any_accepted = true;
+                                            local_delivered = true;
                                             let elapsed_us = start.elapsed().as_micros() as u64;
                                             // update metrics
                                             rmail_common::metrics::inc_deliveries();
@@ -1995,6 +2029,7 @@ async fn process_stream(
                                     match maildir::deliver(&mr, &domain, &local, &data) {
                                         Ok(path) => {
                                             any_accepted = true;
+                                            local_delivered = true;
                                             let elapsed_us = start.elapsed().as_micros() as u64;
                                             // update metrics
                                             rmail_common::metrics::inc_deliveries();
@@ -2025,6 +2060,17 @@ async fn process_stream(
                                         }
                                     }
                                 }
+                                if local_delivered
+                                    && let Some(sender) = mail_from.as_deref()
+                                    && let Some((generation, dsn)) = recipient_dsn.get(rcpt)
+                                    && *generation == dsn_generation
+                                    && let Err(error) =
+                                        queue_local_success_notification(&mr, sender, rcpt, dsn)
+                                {
+                                    eprintln!(
+                                        "failed to queue local DSN success notification for {rcpt}: {error}"
+                                    );
+                                }
                             } else {
                                 // queue outbound for remote recipients (requires authentication in RCPT stage)
                                 {
@@ -2035,6 +2081,11 @@ async fn process_stream(
                                     let queue_options = rmail_common::outbound::QueueOptions {
                                         require_tls,
                                         tracking_id: tracking_message_id.clone(),
+                                        dsn: recipient_dsn
+                                            .get(&rcpt_c)
+                                            .filter(|(generation, _)| *generation == dsn_generation)
+                                            .map(|(_, options)| options.clone())
+                                            .unwrap_or_default(),
                                     };
                                     let data_c = data.clone();
                                     match tokio::task::spawn_blocking(move || {
@@ -2265,6 +2316,92 @@ async fn process_stream(
     disconnected.bytes_out = trace.state.bytes_out.load(Ordering::Relaxed);
     emit_tracking(disconnected);
     Ok(())
+}
+
+fn queue_local_success_notification(
+    mail_root: &std::path::Path,
+    original_sender: &str,
+    final_recipient: &str,
+    dsn: &rmail_common::outbound::DsnOptions,
+) -> anyhow::Result<()> {
+    let requested = dsn
+        .notify
+        .as_ref()
+        .is_some_and(|notify| notify.success && !notify.never);
+    if !requested {
+        return Ok(());
+    }
+    let boundary = new_tracking_id("dsn");
+    let date = chrono::Utc::now().to_rfc2822();
+    let envelope_id = dsn
+        .envelope_id
+        .as_deref()
+        .map(|value| format!("Original-Envelope-Id: {}\r\n", dsn_header_value(value)))
+        .unwrap_or_default();
+    let original_recipient = dsn
+        .original_recipient
+        .as_ref()
+        .map(|(address_type, address)| {
+            format!(
+                "Original-Recipient: {}; {}\r\n",
+                dsn_header_value(address_type),
+                dsn_header_value(address)
+            )
+        })
+        .unwrap_or_default();
+    let sender = dsn_header_value(original_sender);
+    let recipient = dsn_header_value(final_recipient);
+    let notification = format!(
+        "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\n\
+         To: <{sender}>\r\n\
+         Subject: Delivery Status Notification (Success)\r\n\
+         Date: {date}\r\n\
+         Auto-Submitted: auto-replied\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type=delivery-status; boundary=\"{boundary}\"\r\n\
+         \r\n\
+         --{boundary}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         Delivery to <{recipient}> was successful.\r\n\
+         \r\n\
+         --{boundary}\r\n\
+         Content-Type: message/delivery-status\r\n\
+         \r\n\
+         Reporting-MTA: dns; rmail\r\n\
+         {envelope_id}\
+         Arrival-Date: {date}\r\n\
+         \r\n\
+         {original_recipient}\
+         Final-Recipient: rfc822; {recipient}\r\n\
+         Action: delivered\r\n\
+         Status: 2.0.0\r\n\
+         \r\n\
+         --{boundary}--\r\n"
+    );
+    rmail_common::outbound::queue_outbound(
+        mail_root,
+        original_sender,
+        notification.as_bytes(),
+        None,
+    )?;
+    Ok(())
+}
+
+fn dsn_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character == '\r' || character == '\n' || character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(900)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -2846,9 +2983,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn envelope_extensions_return_501_for_syntax_and_555_for_unsupported_parameters() {
+    async fn envelope_extensions_accept_dsn_and_classify_other_errors() {
         let (responses, _td) = run_session(
-            b"HELO localhost\r\nMAIL FROM:<a@example.test> SIZE=1\r\nEHLO localhost\r\nMAIL FROM:<a@example.test> RET=FULL\r\nMAIL FROM:<a..b@example.test>\r\nMAIL FROM:<a@example.test>\r\nRCPT TO:<user@example.test> NOTIFY=SUCCESS\r\nQUIT\r\n"
+            b"HELO localhost\r\nMAIL FROM:<a@example.test> SIZE=1\r\nEHLO localhost\r\nMAIL FROM:<a@example.test> UNKNOWN=x\r\nMAIL FROM:<a..b@example.test>\r\nMAIL FROM:<a@example.test> ENVID=job+207 RET=FULL\r\nRCPT TO:<user@example.test> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;alias+40example.test\r\nRCPT TO:<user@example.test> UNKNOWN=x\r\nQUIT\r\n"
                 .to_vec(),
             16 * 1024,
         )
@@ -2873,6 +3010,43 @@ mod tests {
                 .iter()
                 .any(|response| response.starts_with("555 5.5.4 Unsupported RCPT TO parameter"))
         );
+        assert!(responses.iter().any(|response| response == "250-DSN\r\n"));
+        assert!(
+            responses
+                .iter()
+                .filter(|response| response.starts_with("250 2.1."))
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn local_delivery_honors_requested_success_dsn_with_null_reverse_path() {
+        let (responses, td) = run_session(
+            b"EHLO localhost\r\nMAIL FROM:<sender@remote.test> ENVID=job+207 RET=HDRS\r\nRCPT TO:<user@example.test> NOTIFY=SUCCESS ORCPT=rfc822;alias+40example.test\r\nDATA\r\nSubject: delivered\r\n\r\nmessage\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            16 * 1024,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("250 2.0.0 Message accepted"))
+        );
+        let queue = td.path().join("mail/outbound/maildrop/queue");
+        let dsn_path = std::fs::read_dir(queue)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|ext| ext.to_str()) == Some("eml")).then_some(path)
+            })
+            .expect("success DSN queued");
+        let dsn = std::fs::read_to_string(dsn_path).unwrap();
+        assert!(dsn.starts_with("X-RMail-Envelope-To: sender@remote.test\r\n\r\n"));
+        assert!(dsn.contains("Subject: Delivery Status Notification (Success)\r\n"));
+        assert!(dsn.contains("Original-Envelope-Id: job 7\r\n"));
+        assert!(dsn.contains("Original-Recipient: rfc822; alias@example.test\r\n"));
+        assert!(dsn.contains("Action: delivered\r\nStatus: 2.0.0\r\n"));
     }
 
     #[tokio::test]

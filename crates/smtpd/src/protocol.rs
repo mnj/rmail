@@ -1,3 +1,5 @@
+use rmail_common::outbound::{DsnNotify, DsnReturn, decode_xtext};
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MailFromArgs {
     pub(crate) sender: Option<String>,
@@ -5,7 +7,16 @@ pub(crate) struct MailFromArgs {
     pub(crate) body: MailBody,
     pub(crate) smtp_utf8: bool,
     pub(crate) require_tls: bool,
+    pub(crate) dsn_envelope_id: Option<String>,
+    pub(crate) dsn_return: Option<DsnReturn>,
     pub(crate) has_esmtp_parameters: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RcptToArgs {
+    pub(crate) recipient: String,
+    pub(crate) dsn_notify: Option<DsnNotify>,
+    pub(crate) original_recipient: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +322,8 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut body = None;
     let mut smtp_utf8 = false;
     let mut require_tls = false;
+    let mut dsn_envelope_id = None;
+    let mut dsn_return = None;
     for parameter in params.split_whitespace() {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
@@ -340,6 +353,22 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
                 return Err(EnvelopeError::Syntax);
             }
             require_tls = true;
+        } else if name.eq_ignore_ascii_case("ENVID") && !value.is_empty() {
+            if dsn_envelope_id.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            dsn_envelope_id = Some(decode_xtext(value).map_err(|_| EnvelopeError::Syntax)?);
+        } else if name.eq_ignore_ascii_case("RET") {
+            if dsn_return.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            dsn_return = Some(if value.eq_ignore_ascii_case("FULL") {
+                DsnReturn::Full
+            } else if value.eq_ignore_ascii_case("HDRS") {
+                DsnReturn::Headers
+            } else {
+                return Err(EnvelopeError::Syntax);
+            });
         } else {
             return Err(EnvelopeError::UnsupportedParameter);
         }
@@ -359,14 +388,70 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
         body: body.unwrap_or_default(),
         smtp_utf8,
         require_tls,
+        dsn_envelope_id,
+        dsn_return,
         has_esmtp_parameters: !params.is_empty(),
     })
 }
 
-pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<String, EnvelopeError> {
+pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<RcptToArgs, EnvelopeError> {
     let (path, params) = parse_path_with_params(args, "TO:").ok_or(EnvelopeError::Syntax)?;
-    if !params.is_empty() {
-        return Err(EnvelopeError::UnsupportedParameter);
+    let mut dsn_notify = None;
+    let mut original_recipient = None;
+    for parameter in params.split_whitespace() {
+        let (name, value) = parameter.split_once('=').ok_or(EnvelopeError::Syntax)?;
+        if name.eq_ignore_ascii_case("NOTIFY") && !value.is_empty() {
+            if dsn_notify.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            let mut notify = DsnNotify::default();
+            for item in value.split(',') {
+                if item.eq_ignore_ascii_case("NEVER") {
+                    notify.never = true;
+                } else if item.eq_ignore_ascii_case("SUCCESS") {
+                    if notify.success {
+                        return Err(EnvelopeError::Syntax);
+                    }
+                    notify.success = true;
+                } else if item.eq_ignore_ascii_case("FAILURE") {
+                    if notify.failure {
+                        return Err(EnvelopeError::Syntax);
+                    }
+                    notify.failure = true;
+                } else if item.eq_ignore_ascii_case("DELAY") {
+                    if notify.delay {
+                        return Err(EnvelopeError::Syntax);
+                    }
+                    notify.delay = true;
+                } else {
+                    return Err(EnvelopeError::Syntax);
+                }
+            }
+            if notify.never == (notify.success || notify.failure || notify.delay)
+                || (!notify.never && !notify.success && !notify.failure && !notify.delay)
+            {
+                return Err(EnvelopeError::Syntax);
+            }
+            dsn_notify = Some(notify);
+        } else if name.eq_ignore_ascii_case("ORCPT") && !value.is_empty() {
+            if original_recipient.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            let (address_type, address) = value.split_once(';').ok_or(EnvelopeError::Syntax)?;
+            if address_type.is_empty()
+                || !address_type
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return Err(EnvelopeError::Syntax);
+            }
+            original_recipient = Some((
+                address_type.to_ascii_lowercase(),
+                decode_xtext(address).map_err(|_| EnvelopeError::Syntax)?,
+            ));
+        } else {
+            return Err(EnvelopeError::UnsupportedParameter);
+        }
     }
     let inner = path
         .strip_prefix('<')
@@ -376,9 +461,17 @@ pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<String, 
         return Err(EnvelopeError::Syntax);
     }
     if inner.eq_ignore_ascii_case("postmaster") {
-        return Ok("postmaster".to_string());
+        return Ok(RcptToArgs {
+            recipient: "postmaster".to_string(),
+            dsn_notify,
+            original_recipient,
+        });
     }
-    parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)
+    Ok(RcptToArgs {
+        recipient: parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)?,
+        dsn_notify,
+        original_recipient,
+    })
 }
 
 #[cfg(test)]
@@ -483,12 +576,17 @@ mod tests {
                 body: MailBody::EightBitMime,
                 smtp_utf8: true,
                 require_tls: false,
+                dsn_envelope_id: None,
+                dsn_return: None,
                 has_esmtp_parameters: true,
             })
         );
-        assert_eq!(
-            parse_rcpt_to_args("TO:<a@b> NOTIFY=SUCCESS", false),
-            Err(EnvelopeError::UnsupportedParameter)
+        assert!(
+            parse_rcpt_to_args("TO:<a@b> NOTIFY=SUCCESS", false)
+                .unwrap()
+                .dsn_notify
+                .unwrap()
+                .success
         );
         assert!(parse_mail_from_args("FROM:<a..b@example.test>").is_err());
         assert!(parse_mail_from_args("FROM:<a@example..test>").is_err());
@@ -501,20 +599,28 @@ mod tests {
             Some("user@xn--bcher-kva.example".to_string())
         );
         assert_eq!(
-            parse_rcpt_to_args("TO:<\"quoted local\"@[127.0.0.1]>", false),
-            Ok("\"quoted local\"@[127.0.0.1]".to_string())
+            parse_rcpt_to_args("TO:<\"quoted local\"@[127.0.0.1]>", false)
+                .unwrap()
+                .recipient,
+            "\"quoted local\"@[127.0.0.1]"
         );
         assert_eq!(
-            parse_rcpt_to_args("TO:<\"quoted>local\"@[X-TEST:value]>", false),
-            Ok("\"quoted>local\"@[x-test:value]".to_string())
+            parse_rcpt_to_args("TO:<\"quoted>local\"@[X-TEST:value]>", false)
+                .unwrap()
+                .recipient,
+            "\"quoted>local\"@[x-test:value]"
         );
         assert_eq!(
-            parse_rcpt_to_args("TO:<@old.example,@relay.example:user@Example.TEST>", false),
-            Ok("user@example.test".to_string())
+            parse_rcpt_to_args("TO:<@old.example,@relay.example:user@Example.TEST>", false)
+                .unwrap()
+                .recipient,
+            "user@example.test"
         );
         assert_eq!(
-            parse_rcpt_to_args("TO:<Postmaster>", false),
-            Ok("postmaster".to_string())
+            parse_rcpt_to_args("TO:<Postmaster>", false)
+                .unwrap()
+                .recipient,
+            "postmaster"
         );
         assert!(parse_mail_from_args("FROM:<a@example.test>SiZe=1").is_err());
         assert_eq!(
@@ -525,9 +631,35 @@ mod tests {
                 body: MailBody::EightBitMime,
                 smtp_utf8: false,
                 require_tls: false,
+                dsn_envelope_id: None,
+                dsn_return: None,
                 has_esmtp_parameters: true,
             })
         );
+    }
+
+    #[test]
+    fn dsn_envelope_parameters_are_strict_and_decoded() {
+        let mail = parse_mail_from_args("FROM:<sender@example.test> ENVID=job+20+2B+207 RET=HDRS")
+            .unwrap();
+        assert_eq!(mail.dsn_envelope_id.as_deref(), Some("job + 7"));
+        assert_eq!(mail.dsn_return, Some(DsnReturn::Headers));
+
+        let rcpt = parse_rcpt_to_args(
+            "TO:<target@example.test> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;alias+40example.test",
+            false,
+        )
+        .unwrap();
+        let notify = rcpt.dsn_notify.unwrap();
+        assert!(notify.success && notify.failure && !notify.delay && !notify.never);
+        assert_eq!(
+            rcpt.original_recipient,
+            Some(("rfc822".into(), "alias@example.test".into()))
+        );
+        assert!(
+            parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER,FAILURE", false).is_err()
+        );
+        assert!(parse_mail_from_args("FROM:<sender@example.test> ENVID=bad+0Avalue").is_err());
     }
 
     #[test]
