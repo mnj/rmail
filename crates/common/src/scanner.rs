@@ -52,6 +52,17 @@ pub async fn scan_message(
     if !cfg.scanners_enabled() {
         return Ok(ScanVerdict::clean());
     }
+    let started = std::time::Instant::now();
+    let result = scan_message_inner(cfg, message, envelope).await;
+    crate::metrics::observe_scanner_duration(started.elapsed());
+    result
+}
+
+async fn scan_message_inner(
+    cfg: &SecurityConfig,
+    message: Bytes,
+    envelope: &ScanEnvelope,
+) -> Result<ScanVerdict> {
     if message.len() > cfg.scanner_max_message_bytes {
         bail!("message exceeds scanner_max_message_bytes");
     }

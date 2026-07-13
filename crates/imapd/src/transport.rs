@@ -193,10 +193,9 @@ pub(crate) async fn start_tls(
         .write_all(format!("{tag} OK Begin TLS negotiation now\r\n").as_bytes())
         .await?;
     reader.get_mut().flush().await?;
-    let stream = tls_context
-        .acceptor
-        .accept(reader.into_inner())
-        .await
-        .map_err(|error| anyhow!("TLS accept failed: {error}"))?;
+    let started = std::time::Instant::now();
+    let handshake = tls_context.acceptor.accept(reader.into_inner()).await;
+    rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
+    let stream = handshake.map_err(|error| anyhow!("TLS accept failed: {error}"))?;
     Ok(StartTlsOutcome::Upgraded(Box::new(stream)))
 }

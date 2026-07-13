@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_DATABASE_POOLS: u64 = 1_024;
 const MAX_CONNECTIONS_PER_DATABASE: u32 = 8;
@@ -24,6 +24,13 @@ static POOLS: Lazy<Cache<PathBuf, SqlitePool>> = Lazy::new(|| {
 /// Pools are evicted after inactivity and every connection gets consistent
 /// contention, integrity, and durability settings when it is created.
 pub fn connection(path: &Path) -> Result<SqliteConnection> {
+    let started = Instant::now();
+    let result = connection_inner(path);
+    crate::metrics::observe_database_wait_duration(started.elapsed());
+    result
+}
+
+fn connection_inner(path: &Path) -> Result<SqliteConnection> {
     let path = absolute_path(path)?;
     let pool = POOLS
         .try_get_with(path.clone(), || build_pool(&path))

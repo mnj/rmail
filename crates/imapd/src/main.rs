@@ -211,6 +211,10 @@ async fn main() -> Result<()> {
     let mail_root = cfg.global.mail_root.clone();
     rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "imapd")
         .context("redirecting logs")?;
+    let _metrics_task = rmail_common::metrics::spawn_prometheus_snapshot_task(
+        std::path::Path::new(&mail_root),
+        "imapd",
+    )?;
 
     // SQLite DB is the authoritative source for mailboxes/catchalls
     let db_path = cfg.global.db_path.clone();
@@ -400,7 +404,10 @@ async fn run_imaps_listener(
         let session = shutdown.start_session();
         tokio::spawn(async move {
             let _session = session;
-            match ctx.acceptor.accept(stream).await {
+            let started = std::time::Instant::now();
+            let handshake = ctx.acceptor.accept(stream).await;
+            rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
+            match handshake {
                 Ok(tls_stream) => {
                     if let Err(e) = process_stream_with_policy(
                         Box::new(tls_stream),
@@ -691,6 +698,7 @@ async fn process_stream_inner(
                 continue;
             }
         };
+        let _command_timer = rmail_common::metrics::imap_command_timer();
         let tag = request.tag;
         let cmd = request.command_name().to_string();
         let args = request.raw_args();

@@ -28,11 +28,10 @@ fn authenticator() -> Result<&'static MessageAuthenticator> {
 
 /// Confirm that the configured asynchronous DNS resolver can complete a lookup.
 pub async fn dns_health_check() -> Result<()> {
-    authenticator()?
-        .resolver()
-        .lookup_ip("localhost.")
-        .await
-        .context("resolving the DNS health-check name")?;
+    let started = std::time::Instant::now();
+    let result = authenticator()?.resolver().lookup_ip("localhost.").await;
+    crate::metrics::observe_dns_duration(started.elapsed());
+    result.context("resolving the DNS health-check name")?;
     Ok(())
 }
 
@@ -68,8 +67,12 @@ pub async fn analyze_message(
         .ok_or_else(|| anyhow!("message does not contain valid RFC 5322 headers"))?;
     let resolver = authenticator()?;
 
+    let started = std::time::Instant::now();
     let dkim_output = resolver.verify_dkim(&message).await;
+    crate::metrics::observe_dns_duration(started.elapsed());
+    let started = std::time::Instant::now();
     let arc_output = resolver.verify_arc(&message).await;
+    crate::metrics::observe_dns_duration(started.elapsed());
     let dkim = aggregate_dkim(&dkim_output);
     let arc = dkim_result_name(arc_output.result());
 
@@ -78,14 +81,17 @@ pub async fn analyze_message(
         .unwrap_or("unknown");
     let sender = mail_from.filter(|value| !value.is_empty()).unwrap_or("");
     let spf_output = if let Some(peer_ip) = peer_ip {
-        resolver
+        let started = std::time::Instant::now();
+        let output = resolver
             .verify_spf(SpfParameters::verify_mail_from(
                 peer_ip,
                 helo_domain,
                 host_domain,
                 sender,
             ))
-            .await
+            .await;
+        crate::metrics::observe_dns_duration(started.elapsed());
+        output
     } else {
         mail_auth::SpfOutput::new(
             sender
@@ -99,6 +105,7 @@ pub async fn analyze_message(
     let envelope_domain = sender
         .rsplit_once('@')
         .map_or(helo_domain, |(_, domain)| domain);
+    let started = std::time::Instant::now();
     let dmarc_output = resolver
         .verify_dmarc(DmarcParameters {
             message: &message,
@@ -108,6 +115,7 @@ pub async fn analyze_message(
             spf_output: &spf_output,
         })
         .await;
+    crate::metrics::observe_dns_duration(started.elapsed());
     let dmarc = Some(dmarc_disposition(&dmarc_output).to_string());
 
     Ok(AuthenticationResults {
@@ -186,9 +194,11 @@ fn dmarc_disposition(output: &mail_auth::DmarcOutput) -> &'static str {
 /// Parse the DMARC record and return its aggregate-report mailboxes.
 pub async fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
     let domain = crate::domain::canonicalize_domain(domain)?;
+    let started = std::time::Instant::now();
     let record = authenticator()?
         .txt_lookup::<Dmarc>(format!("_dmarc.{domain}"), None::<&NoResolverCache>)
         .await;
+    crate::metrics::observe_dns_duration(started.elapsed());
     let Ok(record) = record else {
         return Ok(Vec::new());
     };
@@ -203,9 +213,11 @@ pub async fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
 /// Retrieve the published DMARC policy for a domain, if one exists.
 pub async fn get_dmarc_policy(domain: &str) -> Result<Option<String>> {
     let domain = crate::domain::canonicalize_domain(domain)?;
+    let started = std::time::Instant::now();
     let record = authenticator()?
         .txt_lookup::<Dmarc>(format!("_dmarc.{domain}"), None::<&NoResolverCache>)
         .await;
+    crate::metrics::observe_dns_duration(started.elapsed());
     Ok(record.ok().map(|record| record.p.to_string()))
 }
 

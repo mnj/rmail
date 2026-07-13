@@ -148,6 +148,10 @@ impl DeliveryTrace<'_> {
     }
 
     fn reply(&mut self, phase: &str, code: u16, response: &str) {
+        rmail_common::metrics::inc_smtp_response(
+            rmail_common::metrics::SmtpDirection::Outbound,
+            code,
+        );
         self.bytes_in = self.bytes_in.saturating_add(response.len() as u64);
         self.emit(
             "reply",
@@ -205,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
     let mail_root = std::env::var("RMAIL_MAIL_ROOT").unwrap_or_else(|_| "./mail".to_string());
     let base = PathBuf::from(mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&base, "outbound").context("redirecting logs")?;
+    let _metrics_task = rmail_common::metrics::spawn_prometheus_snapshot_task(&base, "outbound")?;
     let maildrop_dir = base.join("outbound").join("maildrop");
     let queue_dir = maildrop_dir.join("queue");
     let inflight_dir = maildrop_dir.join("inflight");
@@ -440,6 +445,15 @@ async fn process_claim(
             .unwrap_or_else(|_| rmail_common::outbound::QueueControl::default_with_timestamp(0)),
         Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
     };
+    if control.created_at > 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        rmail_common::metrics::observe_queue_delay(Duration::from_secs(
+            now.saturating_sub(control.created_at as u64),
+        ));
+    }
     control.attempts = control.attempts.saturating_add(1);
     let connection_id = new_tracking_id("outbound");
     let tracking_message_id = control.tracking_id.clone();
@@ -1633,7 +1647,10 @@ async fn mta_sts_policy_for_domain(
 }
 
 async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> Vec<String> {
-    let Ok(lookup) = resolver.txt_lookup(format!("_smtp._tls.{domain}")).await else {
+    let started = Instant::now();
+    let lookup_result = resolver.txt_lookup(format!("_smtp._tls.{domain}")).await;
+    rmail_common::metrics::observe_dns_duration(started.elapsed());
+    let Ok(lookup) = lookup_result else {
         return Vec::new();
     };
     let valid_records = lookup
@@ -1832,7 +1849,10 @@ async fn deliver_to_remote(
 
     // If transport map didn't provide a next-hop, perform MX lookup.
     if targets.is_empty() {
-        match resolver.mx_lookup(domain).await {
+        let started = Instant::now();
+        let mx_result = resolver.mx_lookup(domain).await;
+        rmail_common::metrics::observe_dns_duration(started.elapsed());
+        match mx_result {
             Ok(mx) => {
                 let mut mxs: Vec<(u16, String)> = mx
                     .iter()
@@ -2103,10 +2123,10 @@ async fn establish_smtp_connection(
         let native = NativeTlsConnector::builder()
             .build()
             .context("building native TLS connector")?;
-        let tls_stream = TokioTlsConnector::from(native)
-            .connect(host, stream)
-            .await
-            .context("TLS connect failed (implicit)")?;
+        let started = Instant::now();
+        let handshake = TokioTlsConnector::from(native).connect(host, stream).await;
+        rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
+        let tls_stream = handshake.context("TLS connect failed (implicit)")?;
         Box::new(tls_stream)
     } else {
         Box::new(stream)
@@ -2151,10 +2171,10 @@ async fn establish_smtp_connection(
         let native = NativeTlsConnector::builder()
             .build()
             .context("building native TLS connector")?;
-        let tls_stream = TokioTlsConnector::from(native)
-            .connect(host, inner)
-            .await
-            .context("TLS connect failed")?;
+        let started = Instant::now();
+        let handshake = TokioTlsConnector::from(native).connect(host, inner).await;
+        rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
+        let tls_stream = handshake.context("TLS connect failed")?;
         reader = BufReader::new(Box::new(tls_stream));
         encrypted = true;
         trace.emit("tls", "encrypted", Some(host.to_string()), None);
@@ -2206,8 +2226,11 @@ async fn connect_host_with_fallback(
 ) -> anyhow::Result<TcpStream> {
     const HOST_CONNECT_BUDGET: Duration = Duration::from_secs(30);
     const ADDRESS_CONNECT_BUDGET: Duration = Duration::from_secs(10);
-    let addresses = tokio::time::timeout(Duration::from_secs(10), resolver.lookup_ip(host))
-        .await
+    let started = Instant::now();
+    let lookup_result =
+        tokio::time::timeout(Duration::from_secs(10), resolver.lookup_ip(host)).await;
+    rmail_common::metrics::observe_dns_duration(started.elapsed());
+    let addresses = lookup_result
         .map_err(|_| anyhow::anyhow!("timed out resolving {host}:{port}"))??
         .iter()
         .map(|address| std::net::SocketAddr::new(address, port))

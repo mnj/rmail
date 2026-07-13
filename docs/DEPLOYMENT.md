@@ -160,6 +160,22 @@ The web listener binds to loopback by default. If it is exposed on a public addr
 probe paths at the reverse proxy or firewall because readiness details are intentionally useful to
 operators.
 
+Prometheus metrics are available from authenticated `GET /metrics`. Each daemon publishes an
+atomic snapshot every 15 seconds, and the web service aggregates them with a bounded `component`
+label (`smtpd`, `outbound`, `imapd`, or `web`). In addition to counters, rMail exports cumulative
+histograms for:
+
+- `rmail_dns_duration_seconds`
+- `rmail_tls_handshake_duration_seconds`
+- `rmail_scanner_duration_seconds`
+- `rmail_queue_delay_seconds`
+- `rmail_imap_command_duration_seconds`
+- `rmail_database_wait_duration_seconds`
+
+SMTP reply counts are exported as `rmail_smtp_responses_total` with bounded `direction` and `code`
+labels. No hostname, address, mailbox, message ID, or command label is used in Prometheus metrics;
+those high-cardinality details belong in message tracking instead.
+
 ### 5. Install systemd units
 
 ```bash

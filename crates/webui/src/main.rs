@@ -1388,15 +1388,33 @@ async fn handle_connection(
                     body = "Unauthorized".to_string();
                     extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
                 } else {
-                    // Expose Prometheus-style metrics
-                    let mut metrics_text = match tokio::fs::read_to_string(
-                        rmail_common::runtime::prometheus_snapshot_path(&mail_root, "smtpd"),
-                    )
-                    .await
-                    {
-                        Ok(s) => s,
-                        Err(_) => rmail_common::metrics::gather_prometheus(),
-                    };
+                    // Aggregate process-local snapshots with one bounded component label.
+                    let mut metrics_text = String::new();
+                    let mut have_metadata = false;
+                    for component in ["smtpd", "outbound", "imapd", "web"] {
+                        let Ok(snapshot) = tokio::fs::read_to_string(
+                            rmail_common::runtime::prometheus_snapshot_path(&mail_root, component),
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
+                        let labeled =
+                            rmail_common::metrics::add_component_label(&snapshot, component);
+                        for line in labeled.lines() {
+                            if !line.starts_with('#') || !have_metadata {
+                                metrics_text.push_str(line);
+                                metrics_text.push('\n');
+                            }
+                        }
+                        have_metadata = true;
+                    }
+                    if metrics_text.is_empty() {
+                        metrics_text = rmail_common::metrics::add_component_label(
+                            &rmail_common::metrics::gather_prometheus(),
+                            "web",
+                        );
+                    }
                     match count_queue_entries_sync(&mail_root) {
                         Ok(n) => {
                             metrics_text.push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
@@ -2253,6 +2271,7 @@ async fn main() -> Result<()> {
     });
     let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "web").context("redirecting logs")?;
+    let _metrics_task = rmail_common::metrics::spawn_prometheus_snapshot_task(&mail_root, "web")?;
     let admin_user = cfg.global.web_admin_user.clone();
     let admin_hash = cfg.global.web_admin_password_hash.clone();
     let db_path = cfg.global.db_path.clone();

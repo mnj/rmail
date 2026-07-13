@@ -147,6 +147,9 @@ impl ReplyTrackingStream {
                     event.detail =
                         Some(String::from_utf8_lossy(&self.reply_line).trim().to_string());
                     event.smtp_code = code;
+                    if let Some(code) = code {
+                        metrics::inc_smtp_response(metrics::SmtpDirection::Inbound, code);
+                    }
                     event.bytes_in = self.trace.state.bytes_in.load(Ordering::Relaxed);
                     event.bytes_out = self.trace.state.bytes_out.load(Ordering::Relaxed);
                     emit_tracking(event);
@@ -354,8 +357,10 @@ async fn main() -> Result<()> {
     TRACKING_HUB
         .set(tracking)
         .map_err(|_| anyhow::anyhow!("SMTP tracking hub was already initialized"))?;
-    rmail_common::metrics::persist_prometheus_snapshot(std::path::Path::new(&mail_root), "smtpd")
-        .context("initializing metrics snapshot")?;
+    let _metrics_task = rmail_common::metrics::spawn_prometheus_snapshot_task(
+        std::path::Path::new(&mail_root),
+        "smtpd",
+    )?;
     // SQLite DB is the authoritative source for mailboxes and catchalls
     let db_path = cfg.global.db_path.clone();
     if db_path.is_none() {
@@ -662,7 +667,10 @@ async fn run_smtps_listener(
         tokio::spawn(async move {
             let _session = session;
             let _permit = permit;
-            match ctx.acceptor.accept(stream).await {
+            let started = Instant::now();
+            let handshake = ctx.acceptor.accept(stream).await;
+            metrics::observe_tls_handshake_duration(started.elapsed());
+            match handshake {
                 Ok(tls_stream) => {
                     println!("SMTPS TLS handshake success peer={}", peer);
                     if let Err(e) = process_stream(
@@ -2076,12 +2084,6 @@ async fn process_stream(
                         w.write_all(b"250 2.0.0 Message accepted\r\n").await?;
                     }
                     w.flush().await?;
-                    if let Err(e) = rmail_common::metrics::persist_prometheus_snapshot(
-                        std::path::Path::new(&mail_root),
-                        "smtpd",
-                    ) {
-                        eprintln!("metrics snapshot update failed: {}", e);
-                    }
                 }
 
                 // reset transaction state after DATA
@@ -2154,12 +2156,14 @@ async fn process_stream(
                     reader.get_mut().disable();
                     // take ownership of the underlying stream and perform TLS accept
                     let inner = reader.into_inner();
-                    match timeout(
+                    let started = Instant::now();
+                    let handshake = timeout(
                         STARTTLS_HANDSHAKE_TIMEOUT,
                         acceptor_ctx.acceptor.accept(inner),
                     )
-                    .await
-                    {
+                    .await;
+                    metrics::observe_tls_handshake_duration(started.elapsed());
+                    match handshake {
                         Ok(Ok(tls_stream)) => {
                             println!("SMTP STARTTLS handshake success peer={:?}", peer);
                             // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
