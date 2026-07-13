@@ -973,6 +973,28 @@ async fn process_stream_inner(
                 w.write_all(response.as_bytes()).await?;
                 w.flush().await?;
             }
+            parser::Command::GetQuota
+            | parser::Command::GetQuotaRoot
+            | parser::Command::SetQuota => {
+                sync_account_storage_quota(
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    db_path.as_deref(),
+                )
+                .await?;
+                let response = commands::quota::handle(
+                    tag,
+                    &request.command,
+                    args,
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    session_state.feature_enabled("UTF8=ACCEPT"),
+                )
+                .encode();
+                let writer = reader.get_mut();
+                writer.write_all(response.as_bytes()).await?;
+                writer.flush().await?;
+            }
             parser::Command::Unselect => {
                 let outcome = commands::session::unselect(tag);
                 if outcome.selection_effect == commands::session::SelectionEffect::Clear {
@@ -985,6 +1007,12 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Append => {
+                sync_account_storage_quota(
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    db_path.as_deref(),
+                )
+                .await?;
                 let outcome = commands::append::handle(
                     &mut reader,
                     tag,
@@ -1260,6 +1288,12 @@ async fn process_stream_inner(
                 }
             }
             parser::Command::Copy | parser::Command::Move => {
+                sync_account_storage_quota(
+                    &mail_root,
+                    authed_mailbox.as_ref().unwrap(),
+                    db_path.as_deref(),
+                )
+                .await?;
                 let outcome = commands::transfer::handle(
                     tag,
                     &cmd,
@@ -1445,6 +1479,12 @@ async fn process_stream_inner(
                     w.write_all(response.as_bytes()).await?;
                     w.flush().await?;
                 } else if subcmd == "COPY" || subcmd == "MOVE" {
+                    sync_account_storage_quota(
+                        &mail_root,
+                        authed_mailbox.as_ref().unwrap(),
+                        db_path.as_deref(),
+                    )
+                    .await?;
                     let command_name = format!("UID {subcmd}");
                     let outcome = commands::transfer::handle(
                         tag,
@@ -1644,6 +1684,32 @@ async fn process_stream_inner(
             }
         }
     }
+    Ok(())
+}
+
+async fn sync_account_storage_quota(
+    mail_root: &str,
+    address: &str,
+    db_path: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(db_path) = db_path else {
+        return Ok(());
+    };
+    let (local, domain) = mailbox::address_parts(address)?;
+    let db_path = db_path.to_string();
+    let address = address.to_string();
+    let mail_root = mail_root.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mailbox = rmail_common::db::get_mailbox(&db_path, &address)?
+            .ok_or_else(|| anyhow::anyhow!("authenticated mailbox no longer exists"))?;
+        rmail_common::imap_state::set_storage_quota(
+            Path::new(&mail_root),
+            &domain,
+            &local,
+            mailbox.quota_bytes,
+        )
+    })
+    .await??;
     Ok(())
 }
 
@@ -1915,6 +1981,7 @@ mod tests {
                 "LITERAL-",
                 "UIDPLUS",
                 "CATENATE",
+                "QUOTA",
                 "NAMESPACE",
                 "SPECIAL-USE",
                 "LIST-EXTENDED",
@@ -6200,6 +6267,77 @@ mod tests {
                 "旅行 & Stuff"
             )
             .expect("utf8 folder")
+        );
+    }
+
+    #[tokio::test]
+    async fn append_rejects_configured_storage_quota_without_publishing_message() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        rmail_common::db::set_mailbox_quota(&db_path, "user@example.test", Some(5))
+            .expect("set quota");
+        let server_mail_root = mail_root.clone();
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                server_mail_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.expect("capability");
+        reader
+            .get_mut()
+            .write_all(
+                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 GETQUOTA \"\"\r\nA003 GETQUOTAROOT INBOX\r\nA004 SETQUOTA \"\" (STORAGE 2)\r\nA005 APPEND INBOX {6+}\r\n123456\r\nA006 LOGOUT\r\n",
+            )
+            .await
+            .expect("commands");
+        reader.get_mut().flush().await.expect("flush");
+        let _login = read_until_contains_bounded(&mut reader, "A001 OK").await;
+        let getquota = read_until_contains_bounded(&mut reader, "A002 OK").await;
+        assert!(
+            getquota
+                .iter()
+                .any(|line| line.trim_end() == "* QUOTA \"\" (STORAGE 0 1)")
+        );
+        let root = read_until_contains_bounded(&mut reader, "A003 OK").await;
+        assert!(
+            root.iter()
+                .any(|line| line.trim_end() == "* QUOTAROOT \"INBOX\" \"\"")
+        );
+        assert!(
+            root.iter()
+                .any(|line| line.trim_end() == "* QUOTA \"\" (STORAGE 0 1)")
+        );
+        let setquota = read_until_contains_bounded(&mut reader, "A004 NO").await;
+        assert!(setquota.iter().any(|line| line.contains("[NOPERM]")));
+        let append = read_until_contains_bounded(&mut reader, "A005 NO").await;
+        assert!(append.iter().any(|line| line.contains("[OVERQUOTA]")));
+        let _logout = read_until_contains_bounded(&mut reader, "A006 OK").await;
+        server_task.await.expect("join").expect("server");
+        assert_eq!(
+            rmail_common::imap_state::storage_quota(mail_root.as_path(), "example.test", "user")
+                .expect("quota state"),
+            (0, Some(5))
         );
     }
 

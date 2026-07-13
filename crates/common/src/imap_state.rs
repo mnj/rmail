@@ -47,6 +47,25 @@ pub struct QresyncChanges {
     pub changed_messages: Vec<Message>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageQuotaExceeded {
+    pub used: u64,
+    pub limit: u64,
+    pub requested: u64,
+}
+
+impl std::fmt::Display for StorageQuotaExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "storage quota exceeded: {} used + {} requested > {} limit",
+            self.used, self.requested, self.limit
+        )
+    }
+}
+
+impl std::error::Error for StorageQuotaExceeded {}
+
 pub fn account_maildir(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
     maildir_root.join(domain).join(localpart).join("Maildir")
 }
@@ -124,6 +143,11 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS subscriptions(
             name TEXT PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS account_settings(
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            quota_bytes INTEGER
+        );
+        INSERT OR IGNORE INTO account_settings(singleton, quota_bytes) VALUES(1, NULL);
         INSERT OR IGNORE INTO subscriptions(name)
             SELECT name FROM folders WHERE subscribed != 0;
         ",
@@ -177,6 +201,68 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             "UPDATE folders SET uidvalidity = ?1 WHERE id = ?2",
             params![new_uidvalidity() as i64, folder_id],
         )?;
+    }
+    Ok(())
+}
+
+/// Synchronize the configured storage limit into the account-local state DB.
+pub fn set_storage_quota(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    quota_bytes: Option<u64>,
+) -> Result<()> {
+    let quota_bytes = quota_bytes.map(i64::try_from).transpose()?;
+    let conn = open_account(maildir_root, domain, localpart)?;
+    conn.execute(
+        "UPDATE account_settings SET quota_bytes = ?1 WHERE singleton = 1",
+        params![quota_bytes],
+    )?;
+    Ok(())
+}
+
+/// Return indexed storage use and the configured limit for one account.
+pub fn storage_quota(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+) -> Result<(u64, Option<u64>)> {
+    let conn = open_account(maildir_root, domain, localpart)?;
+    let used: i64 = conn.query_row("SELECT COALESCE(SUM(size), 0) FROM messages", [], |row| {
+        row.get(0)
+    })?;
+    let limit: Option<i64> = conn.query_row(
+        "SELECT quota_bytes FROM account_settings WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((u64::try_from(used)?, limit.map(u64::try_from).transpose()?))
+}
+
+fn enforce_storage_quota(conn: &Connection, requested: u64) -> Result<()> {
+    let limit: Option<i64> = conn.query_row(
+        "SELECT quota_bytes FROM account_settings WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let Some(limit) = limit.map(u64::try_from).transpose()? else {
+        return Ok(());
+    };
+    let used = u64::try_from(conn.query_row(
+        "SELECT COALESCE(SUM(size), 0) FROM messages",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?)?;
+    if used
+        .checked_add(requested)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(StorageQuotaExceeded {
+            used,
+            limit,
+            requested,
+        }
+        .into());
     }
     Ok(())
 }
@@ -808,7 +894,7 @@ pub fn transfer_messages_by_uid(
     if !source.eq_ignore_ascii_case(&destination) {
         reconcile_folder(&conn, maildir_root, domain, localpart, &destination)?;
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
     if move_messages && source_id == destination_id {
@@ -828,6 +914,24 @@ pub fn transfer_messages_by_uid(
         }
         tx.commit()?;
         return Ok(existing);
+    }
+    if !move_messages {
+        let mut requested_bytes = 0u64;
+        for uid in &requested {
+            let size = tx
+                .query_row(
+                    "SELECT size FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                    params![source_id, *uid as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(size) = size {
+                requested_bytes = requested_bytes
+                    .checked_add(u64::try_from(size)?)
+                    .context("COPY size overflow")?;
+            }
+        }
+        enforce_storage_quota(&tx, requested_bytes)?;
     }
 
     let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
@@ -1047,7 +1151,7 @@ pub fn copy_message_by_uid(
     reconcile_folder(&conn, maildir_root, domain, localpart, &source)?;
     reconcile_folder(&conn, maildir_root, domain, localpart, &destination)?;
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
     let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
@@ -1070,6 +1174,7 @@ pub fn copy_message_by_uid(
     else {
         return Ok(None);
     };
+    enforce_storage_quota(&tx, u64::try_from(size)?)?;
 
     let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
     let destination_dir = mailbox_dir(maildir_root, domain, localpart, &destination)?;
@@ -1305,6 +1410,48 @@ pub fn append_message_with_internal_date(
     flags: Vec<String>,
     internal_date: Option<(i64, i32)>,
 ) -> Result<(u64, u64)> {
+    append_message_internal(
+        maildir_root,
+        domain,
+        localpart,
+        mailbox,
+        data,
+        flags,
+        internal_date,
+        false,
+    )
+}
+
+/// Deliver an externally received message and make it eligible for one
+/// session's `\Recent` claim while enforcing the account storage quota.
+pub fn deliver_message(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    data: &[u8],
+) -> Result<(u64, u64)> {
+    append_message_internal(
+        maildir_root,
+        domain,
+        localpart,
+        "INBOX",
+        data,
+        Vec::new(),
+        None,
+        true,
+    )
+}
+
+fn append_message_internal(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    data: &[u8],
+    flags: Vec<String>,
+    internal_date: Option<(i64, i32)>,
+    recent: bool,
+) -> Result<(u64, u64)> {
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1312,6 +1459,7 @@ pub fn append_message_with_internal_date(
         anyhow::bail!("destination mailbox does not exist");
     }
     reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
+    enforce_storage_quota(&tx, data.len() as u64)?;
 
     let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
     ensure_maildir(&dir)?;
@@ -1339,8 +1487,8 @@ pub fn append_message_with_internal_date(
     let uid = allocatable_uid(i64::try_from(folder.uidnext).unwrap_or(i64::MAX))?;
     let modseq = next_modseq(&tx, folder_id)?;
     tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
-         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq, recent)
+         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             folder_id,
             filename,
@@ -1350,7 +1498,8 @@ pub fn append_message_with_internal_date(
             internaldate,
             internaldate_tz,
             now.as_secs() as i64,
-            modseq as i64
+            modseq as i64,
+            i64::from(recent)
         ],
     )?;
     tx.execute(
@@ -1410,6 +1559,7 @@ pub fn publish_staged_append(
         anyhow::bail!("destination mailbox does not exist");
     }
     reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
+    enforce_storage_quota(&tx, metadata.len())?;
 
     let directory = mailbox_dir(maildir_root, domain, localpart, &name)?;
     ensure_maildir(&directory)?;
@@ -2104,6 +2254,32 @@ mod tests {
     }
 
     #[test]
+    fn copy_consumes_quota_but_move_does_not() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let data = b"123456";
+        let (_, uid) =
+            append_message(td.path(), "example.test", "user", "INBOX", data, Vec::new()).unwrap();
+        set_storage_quota(td.path(), "example.test", "user", Some(10)).unwrap();
+        let error = copy_message_by_uid(td.path(), "example.test", "user", "INBOX", uid, "Archive")
+            .unwrap_err();
+        assert!(error.downcast_ref::<StorageQuotaExceeded>().is_some());
+        assert_eq!(
+            storage_quota(td.path(), "example.test", "user").unwrap().0,
+            6
+        );
+        assert!(
+            move_message_by_uid(td.path(), "example.test", "user", "INBOX", uid, "Archive",)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            storage_quota(td.path(), "example.test", "user").unwrap().0,
+            6
+        );
+    }
+
+    #[test]
     fn copy_and_move_roll_back_maildir_when_database_commit_fails() {
         for move_message in [false, true] {
             let td = tempfile::tempdir().unwrap();
@@ -2442,6 +2618,51 @@ mod tests {
                 Vec::new(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_quota_is_enforced_inside_append_transaction() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        set_storage_quota(td.path(), "example.test", "user", Some(10)).unwrap();
+        append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"123456",
+            Vec::new(),
+        )
+        .unwrap();
+        let error = append_message(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            b"abcde",
+            Vec::new(),
+        )
+        .unwrap_err();
+        let quota = error.downcast_ref::<StorageQuotaExceeded>().unwrap();
+        assert_eq!(
+            *quota,
+            StorageQuotaExceeded {
+                used: 6,
+                limit: 10,
+                requested: 5,
+            }
+        );
+        assert_eq!(
+            storage_quota(td.path(), "example.test", "user").unwrap(),
+            (6, Some(10))
+        );
+        assert_eq!(
+            load_folder(td.path(), "example.test", "user", "INBOX")
+                .unwrap()
+                .1
+                .len(),
+            1
         );
     }
 

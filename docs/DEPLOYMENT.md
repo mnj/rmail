@@ -124,6 +124,21 @@ minutes; inactive database pools are evicted after fifteen minutes, and at most 
 database pools are retained. This bounds file descriptors and prevents concurrent IMAP, SMTP, and
 admin requests from creating a new connection for every command.
 
+## Account storage quotas
+
+Storage quotas are optional and account-wide across every IMAP folder. Configure them from the
+admin portal's Accounts page or while provisioning from the CLI:
+
+```bash
+rmail_ctl add-mailbox user@example.com --quota-mib 10240
+```
+
+Use `--quota-mib 0` to remove an existing limit. Quota admission and message-index publication
+share one immediate SQLite transaction, so concurrent SMTP deliveries and IMAP APPEND/COPY
+operations cannot overrun a limit through a check-then-write race. SMTP reports `452 4.2.2` and
+IMAP reports `[OVERQUOTA]`; IMAP clients can inspect usage with GETQUOTA/GETQUOTAROOT. MOVE does
+not consume additional quota.
+
 ## Live SMTP watch and message tracking
 
 `rmail_smtpd` and `rmail_outbound` publish protocol events over Unix datagram sockets beneath the

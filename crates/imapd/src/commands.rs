@@ -129,6 +129,9 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
         | Command::Lsub
         | Command::Namespace
         | Command::Status
+        | Command::GetQuota
+        | Command::GetQuotaRoot
+        | Command::SetQuota
         | Command::Subscribe { .. }
         | Command::Enable
         | Command::Compress
@@ -345,6 +348,7 @@ pub(crate) mod idle;
 pub(crate) mod list;
 pub(crate) mod login;
 pub(crate) mod mailboxes;
+pub(crate) mod quota;
 pub(crate) mod search;
 pub(crate) mod select;
 pub(crate) mod session;

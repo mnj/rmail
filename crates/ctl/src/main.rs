@@ -56,6 +56,9 @@ enum Commands {
         /// optional explicit maildir path
         #[arg(long)]
         maildir: Option<String>,
+        /// storage quota in MiB; zero removes the limit
+        #[arg(long)]
+        quota_mib: Option<u64>,
         /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
         #[arg(long)]
         config: Option<String>,
@@ -182,6 +185,7 @@ async fn main() -> Result<()> {
             password,
             password_hash,
             maildir: maildir_opt,
+            quota_mib,
             config,
         } => {
             let cfg_path = config.unwrap_or_else(|| {
@@ -229,6 +233,28 @@ async fn main() -> Result<()> {
                         Some(&maildir_path),
                         scram_json.as_deref(),
                     )?;
+                    if let Some(quota_mib) = quota_mib {
+                        let quota_bytes = if quota_mib == 0 {
+                            None
+                        } else {
+                            Some(
+                                quota_mib
+                                    .checked_mul(1024 * 1024)
+                                    .ok_or_else(|| anyhow::anyhow!("quota is too large"))?,
+                            )
+                        };
+                        rmail_common::db::set_mailbox_quota(
+                            dbp,
+                            &address.to_ascii_lowercase(),
+                            quota_bytes,
+                        )?;
+                        rmail_common::imap_state::set_storage_quota(
+                            Path::new(&cfg.global.mail_root),
+                            domain,
+                            local,
+                            quota_bytes,
+                        )?;
+                    }
                     println!("Added mailbox {} into DB at {}", address, dbp);
                 } else {
                     eprintln!("No db_path configured; SQLite DB is required");
@@ -246,7 +272,10 @@ async fn main() -> Result<()> {
             if let Some(dbp) = cfg.global.db_path.as_ref() {
                 // list from DB
                 for m in rmail_common::db::list_mailboxes(dbp)? {
-                    println!("{}", m.address);
+                    match m.quota_bytes {
+                        Some(limit) => println!("{} quota={} MiB", m.address, limit / 1024 / 1024),
+                        None => println!("{} quota=unlimited", m.address),
+                    }
                 }
             } else {
                 eprintln!("No db_path configured; SQLite DB is required");

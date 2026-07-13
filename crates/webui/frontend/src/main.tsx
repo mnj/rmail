@@ -4,7 +4,7 @@ import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronRight, Databas
 import './style.css';
 
 type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
-type Account = { address: string; auth: string; folders: number; messages: number; unseen: number };
+type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null };
 type QueueSummary = { queued: number; inflight: number; sent: number; failed: number };
 type Overview = {
   accounts: number;
@@ -22,6 +22,7 @@ type DmarcRow = { domain: string; events: number };
 type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[] };
 
 const numberFmt = new Intl.NumberFormat();
+const formatBytes = (value: number) => value >= 1024 * 1024 * 1024 ? `${(value / (1024 * 1024 * 1024)).toFixed(1)} GiB` : value >= 1024 * 1024 ? `${(value / (1024 * 1024)).toFixed(1)} MiB` : `${Math.ceil(value / 1024)} KiB`;
 type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'observability';
 const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; description: string; icon: React.ElementType }> = {
   overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'System health, storage activity, and delivery pressure at a glance.', icon: Gauge },
@@ -70,7 +71,7 @@ function App() {
   const [logComponent, setLogComponent] = useState('smtpd');
   const [logs, setLogs] = useState('');
   const [target, setTarget] = useState('');
-  const [newAccount, setNewAccount] = useState({ address: '', password: '' });
+  const [newAccount, setNewAccount] = useState({ address: '', password: '', quota_mib: '' });
   const [aliasForm, setAliasForm] = useState({ address: '', targets: '' });
   const [catchallForm, setCatchallForm] = useState({ domain: '', target: '' });
   const [error, setError] = useState('');
@@ -112,9 +113,9 @@ function App() {
     await api('/api/accounts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address: newAccount.address.trim(), password: newAccount.password || undefined }),
+      body: JSON.stringify({ address: newAccount.address.trim(), password: newAccount.password || undefined, quota_mib: newAccount.quota_mib === '' ? undefined : Number(newAccount.quota_mib) }),
     });
-    setNewAccount({ address: '', password: '' });
+    setNewAccount({ address: '', password: '', quota_mib: '' });
     await refresh();
   }
 
@@ -244,8 +245,8 @@ function App() {
         <section className="grid accountPage" hidden={page !== 'accounts'}>
           <article className="panel wide" id="accounts">
             <div className="panelHead"><h2>Account Management</h2><span>{accounts.length} accounts</span></div>
-            <form className="inlineForm" onSubmit={saveAccount}><input value={newAccount.address} onChange={(e) => setNewAccount({ ...newAccount, address: e.target.value })} placeholder="mailbox@example.com" /><input value={newAccount.password} onChange={(e) => setNewAccount({ ...newAccount, password: e.target.value })} placeholder="New password" type="password" /><button className="button primary"><Plus size={16} />Save mailbox</button></form>
-            <table><thead><tr><th>Mailbox</th><th>Auth</th><th>Folders</th><th>Messages</th><th>Unseen</th><th></th></tr></thead><tbody>{accounts.length ? accounts.map((a) => <tr key={a.address}><td><strong>{a.address}</strong><small>{a.unseen ? 'Unread activity' : 'No unread mail'}</small></td><td><span className="pill">{a.auth}</span></td><td>{a.folders}</td><td>{a.messages}</td><td>{a.unseen}</td><td><button className="iconButton danger" onClick={() => deleteAccount(a.address)} title="Delete mailbox"><Trash2 size={15} /></button></td></tr>) : <tr><td colSpan={6} className="empty">No DB-backed accounts found.</td></tr>}</tbody></table>
+            <form className="inlineForm" onSubmit={saveAccount}><input value={newAccount.address} onChange={(e) => setNewAccount({ ...newAccount, address: e.target.value })} placeholder="mailbox@example.com" /><input value={newAccount.password} onChange={(e) => setNewAccount({ ...newAccount, password: e.target.value })} placeholder="New password" type="password" /><input value={newAccount.quota_mib} onChange={(e) => setNewAccount({ ...newAccount, quota_mib: e.target.value })} placeholder="Quota MiB (0 = none)" type="number" min="0" /><button className="button primary"><Plus size={16} />Save mailbox</button></form>
+            <table><thead><tr><th>Mailbox</th><th>Auth</th><th>Storage</th><th>Folders</th><th>Messages</th><th>Unseen</th><th></th></tr></thead><tbody>{accounts.length ? accounts.map((a) => <tr key={a.address}><td><strong>{a.address}</strong><small>{a.unseen ? 'Unread activity' : 'No unread mail'}</small></td><td><span className="pill">{a.auth}</span></td><td>{formatBytes(a.used_bytes)} / {a.quota_bytes == null ? 'Unlimited' : formatBytes(a.quota_bytes)}</td><td>{a.folders}</td><td>{a.messages}</td><td>{a.unseen}</td><td><button className="iconButton danger" onClick={() => deleteAccount(a.address)} title="Delete mailbox"><Trash2 size={15} /></button></td></tr>) : <tr><td colSpan={7} className="empty">No DB-backed accounts found.</td></tr>}</tbody></table>
           </article>
           <article className="panel accountSummary">
             <div className="panelHead"><h2>Storage Summary</h2><Database size={18} /></div>

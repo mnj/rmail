@@ -17,6 +17,8 @@ pub struct Mailbox {
     pub password_hash: Option<String>,
     pub maildir: Option<String>,
     pub scram: Option<String>,
+    /// Maximum stored message bytes for this account. `None` means unlimited.
+    pub quota_bytes: Option<u64>,
 }
 
 use serde_json;
@@ -35,7 +37,8 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             maildir TEXT,
             created_at INTEGER,
             uidvalidity INTEGER,
-            scram TEXT
+            scram TEXT,
+            quota_bytes INTEGER
         );
         CREATE TABLE IF NOT EXISTS catchalls (
             domain TEXT PRIMARY KEY,
@@ -104,6 +107,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
         "#,
     )?;
     ensure_outbound_columns(path)?;
+    add_column_if_missing(path, "mailboxes", "quota_bytes", "INTEGER")?;
     Ok(())
 }
 
@@ -118,7 +122,12 @@ pub fn add_mailbox<P: AsRef<Path>>(
     let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     conn.execute(
-        "INSERT OR REPLACE INTO mailboxes (address, password_hash, maildir, created_at, scram) VALUES (?1, ?2, ?3, strftime('%s','now'), ?4)",
+        "INSERT INTO mailboxes (address, password_hash, maildir, created_at, scram)
+         VALUES (?1, ?2, ?3, strftime('%s','now'), ?4)
+         ON CONFLICT(address) DO UPDATE SET
+             password_hash = excluded.password_hash,
+             maildir = excluded.maildir,
+             scram = excluded.scram",
         params![address, password_hash, maildir, scram],
     )?;
     Ok(())
@@ -137,7 +146,7 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
     let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare(
-        "SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address = ?1",
+        "SELECT address, password_hash, maildir, scram, quota_bytes FROM mailboxes WHERE address = ?1",
     )?;
     let mut rows = stmt.query(params![address])?;
     if let Some(row) = rows.next()? {
@@ -145,11 +154,16 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
         let scram: Option<String> = row.get(3)?;
+        let quota_bytes = row
+            .get::<_, Option<i64>>(4)?
+            .map(u64::try_from)
+            .transpose()?;
         Ok(Some(Mailbox {
             address,
             password_hash,
             maildir,
             scram,
+            quota_bytes,
         }))
     } else {
         Ok(None)
@@ -160,7 +174,7 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
 pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result<Option<Mailbox>> {
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare(
-        "SELECT address, password_hash, maildir, scram FROM mailboxes WHERE address LIKE ?1",
+        "SELECT address, password_hash, maildir, scram, quota_bytes FROM mailboxes WHERE address LIKE ?1",
     )?;
     let like = format!("{}@%", local);
     let mut rows = stmt.query(params![like])?;
@@ -173,11 +187,16 @@ pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
         let scram: Option<String> = row.get(3)?;
+        let quota_bytes = row
+            .get::<_, Option<i64>>(4)?
+            .map(u64::try_from)
+            .transpose()?;
         found = Some(Mailbox {
             address,
             password_hash,
             maildir,
             scram,
+            quota_bytes,
         });
     }
     Ok(found)
@@ -192,7 +211,7 @@ pub fn mailbox_exists<P: AsRef<Path>>(path: P, address: &str) -> Result<bool> {
 pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
     let conn = Connection::open(path)?;
     let mut stmt = conn
-        .prepare("SELECT address, password_hash, maildir, scram FROM mailboxes ORDER BY address")?;
+        .prepare("SELECT address, password_hash, maildir, scram, quota_bytes FROM mailboxes ORDER BY address")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -200,14 +219,38 @@ pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
         let password_hash: Option<String> = row.get(1)?;
         let maildir: Option<String> = row.get(2)?;
         let scram: Option<String> = row.get(3)?;
+        let quota_bytes = row
+            .get::<_, Option<i64>>(4)?
+            .map(u64::try_from)
+            .transpose()?;
         out.push(Mailbox {
             address,
             password_hash,
             maildir,
             scram,
+            quota_bytes,
         });
     }
     Ok(out)
+}
+
+/// Set the maximum stored message bytes for an account. `None` removes the limit.
+pub fn set_mailbox_quota<P: AsRef<Path>>(
+    path: P,
+    address: &str,
+    quota_bytes: Option<u64>,
+) -> Result<()> {
+    let address = crate::domain::canonicalize_mailbox_address(address)?;
+    let quota_bytes = quota_bytes.map(i64::try_from).transpose()?;
+    let conn = Connection::open(path)?;
+    let changed = conn.execute(
+        "UPDATE mailboxes SET quota_bytes = ?1 WHERE address = ?2",
+        params![quota_bytes, address],
+    )?;
+    if changed == 0 {
+        anyhow::bail!("mailbox does not exist");
+    }
+    Ok(())
 }
 
 /// Get catchall target for a domain
@@ -681,10 +724,26 @@ pub fn ensure_outbound_columns<P: AsRef<Path>>(path: P) -> Result<()> {
     Ok(())
 }
 
+fn add_column_if_missing(path: &Path, table: &str, column: &str, definition: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        add_alias, add_mailbox, get_alias_targets, get_catchall, get_mailbox, init_db, set_catchall,
+        add_alias, add_mailbox, get_alias_targets, get_catchall, get_mailbox, init_db,
+        set_catchall, set_mailbox_quota,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -706,6 +765,58 @@ mod tests {
 
         assert!(columns.iter().any(|c| c == "priority"));
         assert!(columns.iter().any(|c| c == "max_attempts"));
+    }
+
+    #[test]
+    fn mailbox_quota_migrates_and_survives_credential_updates() {
+        let td = tempdir().expect("tempdir");
+        let db_path = td.path().join("legacy.db");
+        let conn = Connection::open(&db_path).expect("open legacy db");
+        conn.execute_batch(
+            "CREATE TABLE mailboxes(
+                address TEXT PRIMARY KEY,
+                password_hash TEXT,
+                maildir TEXT,
+                created_at INTEGER,
+                uidvalidity INTEGER,
+                scram TEXT
+            );",
+        )
+        .expect("legacy schema");
+        drop(conn);
+
+        init_db(&db_path).expect("migrate schema");
+        add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:first"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        set_mailbox_quota(&db_path, "user@example.test", Some(1_048_576)).expect("set quota");
+        add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:second"),
+            None,
+            None,
+        )
+        .expect("update credentials");
+
+        let mailbox = get_mailbox(&db_path, "user@example.test")
+            .expect("lookup")
+            .expect("mailbox");
+        assert_eq!(mailbox.password_hash.as_deref(), Some("plain:second"));
+        assert_eq!(mailbox.quota_bytes, Some(1_048_576));
+        set_mailbox_quota(&db_path, "user@example.test", None).expect("clear quota");
+        assert_eq!(
+            get_mailbox(&db_path, "user@example.test")
+                .unwrap()
+                .unwrap()
+                .quota_bytes,
+            None
+        );
     }
 
     #[test]

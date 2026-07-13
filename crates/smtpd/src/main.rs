@@ -1960,6 +1960,7 @@ async fn process_stream(
                     }
                     let mut any_accepted = false;
                     let mut any_rejected = false;
+                    let mut any_quota_exceeded = false;
                     for rcpt in &rcpts {
                         if let Some(at) = rcpt.find('@') {
                             let local = rcpt[..at].to_string();
@@ -1967,22 +1968,22 @@ async fn process_stream(
                             let mr = PathBuf::from(&mail_root);
 
                             // determine if this recipient is local (exists in the SQLite DB)
-                            let is_local = if let Some(dbp) = db_path.as_ref() {
+                            let local_mailbox = if let Some(dbp) = db_path.as_ref() {
                                 let dbp2 = dbp.clone();
                                 let rcpt_clone = rcpt.clone();
                                 match tokio::task::spawn_blocking(move || {
-                                    rmail_common::db::mailbox_exists(&dbp2, &rcpt_clone)
+                                    rmail_common::db::get_mailbox(&dbp2, &rcpt_clone)
                                 })
                                 .await
                                 {
-                                    Ok(Ok(b)) => b,
-                                    _ => false,
+                                    Ok(Ok(mailbox)) => mailbox,
+                                    _ => None,
                                 }
                             } else {
-                                false
+                                None
                             };
 
-                            if is_local {
+                            if let Some(local_mailbox) = local_mailbox {
                                 let mut local_delivered = false;
                                 // measure per-recipient delivery latency
                                 let start = std::time::Instant::now();
@@ -2026,8 +2027,19 @@ async fn process_stream(
                                         }
                                     }
                                 } else {
-                                    match maildir::deliver(&mr, &domain, &local, &data) {
-                                        Ok(path) => {
+                                    let delivery = rmail_common::imap_state::set_storage_quota(
+                                        &mr,
+                                        &domain,
+                                        &local,
+                                        local_mailbox.quota_bytes,
+                                    )
+                                    .and_then(|()| {
+                                        rmail_common::imap_state::deliver_message(
+                                            &mr, &domain, &local, &data,
+                                        )
+                                    });
+                                    match delivery {
+                                        Ok((_uidvalidity, uid)) => {
                                             any_accepted = true;
                                             local_delivered = true;
                                             let elapsed_us = start.elapsed().as_micros() as u64;
@@ -2041,10 +2053,10 @@ async fn process_stream(
                                             );
 
                                             println!(
-                                                "SMTP local delivery peer={:?} rcpt={} path={:?} bytes={} dmarc={:?}",
+                                                "SMTP local delivery peer={:?} rcpt={} uid={} bytes={} dmarc={:?}",
                                                 peer,
                                                 rcpt,
-                                                path,
+                                                uid,
                                                 data.len(),
                                                 dmarc_res
                                             );
@@ -2055,6 +2067,9 @@ async fn process_stream(
                                         }
                                         Err(e) => {
                                             any_rejected = true;
+                                            any_quota_exceeded |= e
+                                                .downcast_ref::<rmail_common::imap_state::StorageQuotaExceeded>()
+                                                .is_some();
                                             rmail_common::metrics::inc_failed_deliveries();
                                             eprintln!("deliver error for {}: {}", rcpt, e);
                                         }
@@ -2162,8 +2177,13 @@ async fn process_stream(
                             "SMTP DATA completed peer={:?} accepted=false temporary_failure=true",
                             peer
                         );
-                        w.write_all(b"451 4.3.0 Temporary delivery failure\r\n")
-                            .await?;
+                        if any_quota_exceeded {
+                            w.write_all(b"452 4.2.2 Mailbox storage limit exceeded\r\n")
+                                .await?;
+                        } else {
+                            w.write_all(b"451 4.3.0 Temporary delivery failure\r\n")
+                                .await?;
+                        }
                     } else {
                         println!(
                             "SMTP DATA completed peer={:?} accepted=false rejected=false",
@@ -2659,6 +2679,51 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("250 2.1.0 Sender OK"))
         );
+    }
+
+    #[tokio::test]
+    async fn local_delivery_rejects_storage_quota_without_publishing_message() {
+        let (td, mail_root, db_path) = setup_mailbox();
+        rmail_common::db::set_mailbox_quota(&db_path, "user@example.test", Some(5))
+            .expect("set quota");
+        let server_mail_root = mail_root.clone();
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                server_mail_root.to_string_lossy().to_string(),
+                None,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                false,
+                false,
+                true,
+                Arc::new(SecurityConfig::default()),
+                SmtpService::Mta,
+                None,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        reader
+            .get_mut()
+            .write_all(
+                b"EHLO sender.example\r\nMAIL FROM:<sender@sender.example>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: too large\r\n\r\n123456\r\n.\r\nQUIT\r\n",
+            )
+            .await
+            .expect("commands");
+        reader.get_mut().flush().await.expect("flush");
+        let responses = read_until(&mut reader, "221 2.0.0 Bye").await;
+        assert!(responses.contains("452 4.2.2 Mailbox storage limit exceeded"));
+        server_task.await.expect("join").expect("server");
+        assert_eq!(
+            rmail_common::imap_state::storage_quota(mail_root.as_path(), "example.test", "user")
+                .expect("quota state"),
+            (0, Some(5))
+        );
+        drop(td);
     }
 
     #[tokio::test]

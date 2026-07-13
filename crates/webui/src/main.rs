@@ -41,6 +41,8 @@ struct AccountSummary {
     folders: usize,
     messages: usize,
     unseen: usize,
+    used_bytes: u64,
+    quota_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -306,6 +308,8 @@ struct AccountRequest {
     address: String,
     password: Option<String>,
     password_hash: Option<String>,
+    /// Storage quota in MiB. Zero or absent preserves the existing setting.
+    quota_mib: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -711,6 +715,7 @@ fn account_summaries_sync(
             let mut folders = 0usize;
             let mut messages = 0usize;
             let mut unseen = 0usize;
+            let mut used_bytes = 0u64;
             if let Some((local, domain)) = split_address(&mailbox.address)
                 && let Ok(summaries) =
                     rmail_common::imap_state::list_folder_summaries(mail_root, domain, local)
@@ -718,6 +723,7 @@ fn account_summaries_sync(
                 folders = summaries.len();
                 messages = summaries.iter().map(|summary| summary.messages).sum();
                 unseen = summaries.iter().map(|summary| summary.unseen).sum();
+                used_bytes = summaries.iter().map(|summary| summary.size).sum();
             }
             accounts.push(AccountSummary {
                 address: mailbox.address,
@@ -731,6 +737,8 @@ fn account_summaries_sync(
                 folders,
                 messages,
                 unseen,
+                used_bytes,
+                quota_bytes: mailbox.quota_bytes,
             });
         }
     }
@@ -774,7 +782,21 @@ fn upsert_account_sync(
         password_hash.as_deref(),
         Some(&maildir_path.to_string_lossy()),
         scram.as_deref(),
-    )
+    )?;
+    if let Some(quota_mib) = req.quota_mib {
+        let quota_bytes = if quota_mib == 0 {
+            None
+        } else {
+            Some(
+                quota_mib
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| anyhow::anyhow!("quota is too large"))?,
+            )
+        };
+        rmail_common::db::set_mailbox_quota(db_path, &address, quota_bytes)?;
+        rmail_common::imap_state::set_storage_quota(mail_root, domain, local, quota_bytes)?;
+    }
+    Ok(())
 }
 
 fn delete_account_sync(db_path: &str, req: AccountDeleteRequest) -> Result<()> {
@@ -2581,7 +2603,7 @@ mod tests {
         let db_path = td.path().join("config.db");
         rmail_common::db::init_db(&db_path).expect("init db");
 
-        let body = r#"{"address":"New@Example.Test","password":"secret"}"#;
+        let body = r#"{"address":"New@Example.Test","password":"secret","quota_mib":256}"#;
         let request = format!(
             "POST /api/accounts HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -2594,10 +2616,14 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            rmail_common::db::get_mailbox(&db_path, "new@example.test")
-                .unwrap()
-                .is_some()
+        let mailbox = rmail_common::db::get_mailbox(&db_path, "new@example.test")
+            .unwrap()
+            .expect("mailbox");
+        assert_eq!(mailbox.quota_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(
+            rmail_common::imap_state::storage_quota(mail_root.as_path(), "example.test", "new")
+                .unwrap(),
+            (0, Some(256 * 1024 * 1024))
         );
         assert!(mail_root.join("example.test/new/Maildir").is_dir());
 

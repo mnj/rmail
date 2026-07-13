@@ -60,7 +60,7 @@ pub(crate) async fn handle(
     .await
     {
         Ok(Ok(mappings)) => mappings,
-        Ok(Err(error)) => return failure(storage_error(tag, command_name, error)),
+        Ok(Err(error)) => return failure(storage_operation_error(tag, command_name, error)),
         Err(error) => return failure(storage_error(tag, command_name, error)),
     };
     let (local, domain) = match mailbox::address_parts(address) {
@@ -88,7 +88,7 @@ pub(crate) async fn handle(
                 ),
             );
         }
-        Ok(Err(error)) => return failure(storage_error(tag, command_name, error)),
+        Ok(Err(error)) => return failure(storage_operation_error(tag, command_name, error)),
         Err(error) => return failure(storage_error(tag, command_name, error)),
     };
 
@@ -161,6 +161,23 @@ fn storage_error(tag: &str, command_name: &str, error: impl std::fmt::Display) -
         line = line.with_code("TRYCREATE");
     }
     Response::new().status(line)
+}
+
+fn storage_operation_error(tag: &str, command_name: &str, error: anyhow::Error) -> Response {
+    if error
+        .downcast_ref::<rmail_common::imap_state::StorageQuotaExceeded>()
+        .is_some()
+    {
+        return Response::new().status(
+            StatusLine::tagged(
+                tag,
+                Status::No,
+                format!("{command_name} exceeds storage quota"),
+            )
+            .with_code("OVERQUOTA"),
+        );
+    }
+    storage_error(tag, command_name, error)
 }
 
 fn failure(response: Response) -> Outcome {

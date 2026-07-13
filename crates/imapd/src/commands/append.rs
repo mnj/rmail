@@ -275,7 +275,12 @@ pub(crate) async fn handle(
         Err(error) => {
             let message = error.to_string();
             let mut line = StatusLine::tagged(tag, Status::No, format!("APPEND failed: {message}"));
-            if message.contains("does not exist") {
+            if error
+                .downcast_ref::<rmail_common::imap_state::StorageQuotaExceeded>()
+                .is_some()
+            {
+                line = line.with_code("OVERQUOTA");
+            } else if message.contains("does not exist") {
                 line = line.with_code("TRYCREATE");
             }
             write_response(reader, Response::new().status(line)).await?;
@@ -457,7 +462,18 @@ async fn handle_catenate(
             })
         }
         Err(error) => {
-            write_response(reader, unavailable(tag, error)).await?;
+            let response = if error
+                .downcast_ref::<rmail_common::imap_state::StorageQuotaExceeded>()
+                .is_some()
+            {
+                Response::new().status(
+                    StatusLine::tagged(tag, Status::No, "Mailbox storage limit exceeded")
+                        .with_code("OVERQUOTA"),
+                )
+            } else {
+                unavailable(tag, error)
+            };
+            write_response(reader, response).await?;
             Ok(failure())
         }
     }
