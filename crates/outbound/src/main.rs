@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{error::Error, fmt};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, lookup_host};
-use tokio::sync::Mutex;
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinSet;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use trust_dns_resolver::TokioAsyncResolver;
@@ -27,6 +27,12 @@ const MAX_QUEUE_METADATA_BYTES: usize = 64 * 1024;
 const BDAT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_MTA_STS_POLICY_BYTES: usize = 64 * 1024;
 const MAX_MTA_STS_CACHE_ENTRIES: usize = 1_024;
+const DNS_CACHE_ENTRIES: usize = 4_096;
+const DNS_POSITIVE_MAX_TTL: Duration = Duration::from_secs(60 * 60);
+const DNS_NEGATIVE_MIN_TTL: Duration = Duration::from_secs(5);
+const DNS_NEGATIVE_MAX_TTL: Duration = Duration::from_secs(5 * 60);
+
+static OUTBOUND_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MtaStsMode {
@@ -50,6 +56,35 @@ struct CachedMtaStsPolicy {
 
 static MTA_STS_CACHE: Lazy<Mutex<HashMap<String, CachedMtaStsPolicy>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn configure_resolver_options(
+    mut options: trust_dns_resolver::config::ResolverOpts,
+    require_dnssec: bool,
+) -> trust_dns_resolver::config::ResolverOpts {
+    options.validate = require_dnssec;
+    options.cache_size = DNS_CACHE_ENTRIES;
+    options.positive_max_ttl = Some(DNS_POSITIVE_MAX_TTL);
+    options.negative_min_ttl = Some(DNS_NEGATIVE_MIN_TTL);
+    options.negative_max_ttl = Some(DNS_NEGATIVE_MAX_TTL);
+    options
+}
+
+async fn outbound_resolver() -> anyhow::Result<&'static TokioAsyncResolver> {
+    OUTBOUND_RESOLVER
+        .get_or_try_init(|| async {
+            let require_dnssec = std::env::var("RMAIL_REQUIRE_DNSSEC")
+                .map(|value| {
+                    let value = value.to_ascii_lowercase();
+                    value != "0" && value != "false"
+                })
+                .unwrap_or(false);
+            let (config, options) = trust_dns_resolver::system_conf::read_system_conf()
+                .context("reading system dns config")?;
+            TokioAsyncResolver::tokio(config, configure_resolver_options(options, require_dnssec))
+                .context("creating dns resolver")
+        })
+        .await
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MessageRequirements {
@@ -1585,19 +1620,9 @@ async fn deliver_to_remote(
         .ok_or_else(|| anyhow::anyhow!("invalid recipient address"))?;
     let domain = &recipient[at + 1..];
 
-    // Resolve MX records using system DNS configuration. If RMAIL_REQUIRE_DNSSEC=1, enable DNSSEC validation in resolver options.
-    let require_dnssec_on_init = std::env::var("RMAIL_REQUIRE_DNSSEC")
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            !(v == "0" || v == "false")
-        })
-        .unwrap_or(false);
-    let (conf, mut opts) =
-        trust_dns_resolver::system_conf::read_system_conf().context("reading system dns config")?;
-    if require_dnssec_on_init {
-        opts.validate = true;
-    }
-    let resolver = TokioAsyncResolver::tokio(conf, opts).context("creating dns resolver")?;
+    // All outbound MX, policy, and address lookups share one bounded resolver
+    // cache so DNS TTLs and negative responses survive across queue entries.
+    let resolver = outbound_resolver().await?;
     // transport may indicate implicit TLS (smtps) or explicit SMTP. Track optional port.
     let mut targets: Vec<(String, Option<u16>)> = Vec::new();
     match rmail_common::transport::lookup_transport(base, domain) {
@@ -1652,7 +1677,7 @@ async fn deliver_to_remote(
         targets.push((domain.to_string(), None));
     }
 
-    let mta_sts_policy = mta_sts_policy_for_domain(&resolver, domain).await;
+    let mta_sts_policy = mta_sts_policy_for_domain(resolver, domain).await;
     let mta_sts_enforced = mta_sts_policy
         .as_ref()
         .is_some_and(|policy| policy.mode == MtaStsMode::Enforce);
@@ -1672,7 +1697,7 @@ async fn deliver_to_remote(
                     mismatched.join(", ")
                 );
                 if envelope_from.is_some() {
-                    queue_tls_failure_report(base, &resolver, domain, None, "sts", &diagnostic)
+                    queue_tls_failure_report(base, resolver, domain, None, "sts", &diagnostic)
                         .await;
                 }
                 anyhow::bail!(diagnostic);
@@ -1706,6 +1731,7 @@ async fn deliver_to_remote(
                             key.host, key.port, error
                         );
                         establish_smtp_connection(
+                            resolver,
                             &key.host,
                             key.port,
                             transport_tls_required,
@@ -1717,6 +1743,7 @@ async fn deliver_to_remote(
             }
             Some(_) | None => {
                 establish_smtp_connection(
+                    resolver,
                     &key.host,
                     key.port,
                     transport_tls_required,
@@ -1762,7 +1789,7 @@ async fn deliver_to_remote(
                     if transport_tls_required && envelope_from.is_some() {
                         queue_tls_failure_report(
                             base,
-                            &resolver,
+                            resolver,
                             domain,
                             Some(&key.host),
                             if mta_sts_enforced {
@@ -1786,7 +1813,7 @@ async fn deliver_to_remote(
     if transport_tls_required && envelope_from.is_some() {
         queue_tls_failure_report(
             base,
-            &resolver,
+            resolver,
             domain,
             None,
             if mta_sts_enforced {
@@ -1812,12 +1839,13 @@ async fn smtp_noop(connection: &mut SmtpConnection) -> anyhow::Result<()> {
 }
 
 async fn establish_smtp_connection(
+    resolver: &TokioAsyncResolver,
     host: &str,
     port: u16,
     require_encryption: bool,
     requiretls_message: bool,
 ) -> anyhow::Result<SmtpConnection> {
-    let stream = connect_host_with_fallback(host, port).await?;
+    let stream = connect_host_with_fallback(resolver, host, port).await?;
     let mut encrypted = port == 465;
     let boxed_stream: Box<dyn AsyncStream> = if encrypted {
         let native = NativeTlsConnector::builder()
@@ -1904,12 +1932,18 @@ async fn establish_smtp_connection(
     })
 }
 
-async fn connect_host_with_fallback(host: &str, port: u16) -> anyhow::Result<TcpStream> {
+async fn connect_host_with_fallback(
+    resolver: &TokioAsyncResolver,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<TcpStream> {
     const HOST_CONNECT_BUDGET: Duration = Duration::from_secs(30);
     const ADDRESS_CONNECT_BUDGET: Duration = Duration::from_secs(10);
-    let addresses = tokio::time::timeout(Duration::from_secs(10), lookup_host((host, port)))
+    let addresses = tokio::time::timeout(Duration::from_secs(10), resolver.lookup_ip(host))
         .await
         .map_err(|_| anyhow::anyhow!("timed out resolving {host}:{port}"))??
+        .iter()
+        .map(|address| std::net::SocketAddr::new(address, port))
         .collect::<Vec<_>>();
     if addresses.is_empty() {
         anyhow::bail!("no addresses found for {host}:{port}");
@@ -1939,6 +1973,26 @@ async fn connect_host_with_fallback(host: &str, port: u16) -> anyhow::Result<Tcp
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn outbound_dns_cache_is_bounded_and_clamps_ttls() {
+        let options =
+            configure_resolver_options(trust_dns_resolver::config::ResolverOpts::default(), true);
+
+        assert!(options.validate);
+        assert_eq!(options.cache_size, DNS_CACHE_ENTRIES);
+        assert_eq!(options.positive_max_ttl, Some(DNS_POSITIVE_MAX_TTL));
+        assert_eq!(options.negative_min_ttl, Some(DNS_NEGATIVE_MIN_TTL));
+        assert_eq!(options.negative_max_ttl, Some(DNS_NEGATIVE_MAX_TTL));
+    }
+
+    #[tokio::test]
+    async fn outbound_deliveries_reuse_one_dns_resolver() {
+        let first = outbound_resolver().await.unwrap();
+        let second = outbound_resolver().await.unwrap();
+
+        assert!(std::ptr::eq(first, second));
+    }
 
     #[test]
     fn smtp_reply_classification_preserves_enhanced_status() {
