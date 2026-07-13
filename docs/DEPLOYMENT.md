@@ -103,13 +103,24 @@ selector = "mail2026"
 private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
 # Optional; these are the defaults.
 headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"]
+
+# Optional local ARC identity. This is used only for remote targets reached
+# through a local alias or catchall, never for ordinary authenticated relay.
+[arc_signer]
+domain = "example.com"
+selector = "mail2026"
+private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
+headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "DKIM-Signature"]
 ```
 
 The private key may be PKCS#1 or PKCS#8 PEM and must have no group/other permission bits (for
 example, mode `0600`). Publish the corresponding RSA public key at
 `mail2026._domainkey.example.com`. A missing `dkim.toml`, or a sender domain without a matching
 entry, leaves the message unsigned; an invalid matching entry prevents the message from entering
-the queue.
+the queue. When `arc_signer` is present, rMail verifies the incoming ARC chain and adds an
+ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal set before publishing a forwarded
+message. A chain with invalid continuity is forwarded unchanged rather than being extended with a
+misleading local seal. The ARC key has the same `0600` permission requirement as DKIM keys.
 
 Optional outbound-worker tuning in `/etc/default/rmail`:
 

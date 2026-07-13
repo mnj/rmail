@@ -129,6 +129,9 @@ pub static SPF_FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DMARC_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DMARC_QUARANTINE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DMARC_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static ARC_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static ARC_FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static ARC_SEALED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SMTP_MESSAGES_RECEIVED: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 static SMTP_RESPONSES: [AtomicU64; 1_200] = [const { AtomicU64::new(0) }; 1_200];
 
@@ -200,6 +203,15 @@ pub fn inc_dmarc_quarantine() {
 }
 pub fn inc_dmarc_reject() {
     DMARC_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+pub fn inc_arc_pass() {
+    ARC_PASS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+pub fn inc_arc_fail() {
+    ARC_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+pub fn inc_arc_sealed() {
+    ARC_SEALED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn inc_smtp_message_received(
@@ -352,6 +364,22 @@ pub fn gather_prometheus() -> String {
     out.push_str(&format!(
         "rmail_dmarc_reject_total {}\n",
         DMARC_REJECT_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP rmail_arc_verifications_total ARC chain verification outcomes\n");
+    out.push_str("# TYPE rmail_arc_verifications_total counter\n");
+    out.push_str(&format!(
+        "rmail_arc_verifications_total{{result=\"pass\"}} {}\n",
+        ARC_PASS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "rmail_arc_verifications_total{{result=\"fail\"}} {}\n",
+        ARC_FAIL_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP rmail_arc_sealed_total Forwarded messages given a new ARC set\n");
+    out.push_str("# TYPE rmail_arc_sealed_total counter\n");
+    out.push_str(&format!(
+        "rmail_arc_sealed_total {}\n",
+        ARC_SEALED_TOTAL.load(Ordering::Relaxed)
     ));
     DNS_DURATION.render(&mut out, "rmail_dns_duration_seconds", "DNS lookup latency");
     TLS_HANDSHAKE_DURATION.render(

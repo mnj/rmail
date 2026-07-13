@@ -225,6 +225,16 @@ enum SmtpService {
     Submission,
 }
 
+fn is_forwarded_recipient(
+    recipients: &HashMap<String, u64>,
+    recipient: &str,
+    transaction_generation: u64,
+) -> bool {
+    recipients
+        .get(recipient)
+        .is_some_and(|generation| *generation == transaction_generation)
+}
+
 #[cfg(unix)]
 fn spawn_tls_reloader(
     sender: tokio::sync::watch::Sender<Option<Arc<tls::TlsContext>>>,
@@ -944,6 +954,9 @@ async fn process_stream(
     let mut dsn_generation = 0_u64;
     let mut recipient_dsn: HashMap<String, (u64, rmail_common::outbound::DsnOptions)> =
         HashMap::new();
+    // Recipient -> SMTP transaction generation for aliases/catchalls. Keeping
+    // the generation avoids stale forwarding state across transactions.
+    let mut forwarded_recipient: HashMap<String, u64> = HashMap::new();
     let mut bdat_buffer = Vec::new();
     let mut bdat_started = false;
     // track authenticated identity when AUTH is used (local mailbox address)
@@ -1442,6 +1455,8 @@ async fn process_stream(
                                                 } else {
                                                     for target in targets {
                                                         let target = target.to_ascii_lowercase();
+                                                        forwarded_recipient
+                                                            .insert(target.clone(), dsn_generation);
                                                         recipient_dsn.insert(
                                                             target.clone(),
                                                             (dsn_generation, dsn.clone()),
@@ -1476,11 +1491,17 @@ async fn process_stream(
                                                             .await?;
                                                             w.flush().await?;
                                                         } else {
+                                                            let target =
+                                                                target.to_ascii_lowercase();
+                                                            forwarded_recipient.insert(
+                                                                target.clone(),
+                                                                dsn_generation,
+                                                            );
                                                             recipient_dsn.insert(
                                                                 target.clone(),
                                                                 (dsn_generation, dsn.clone()),
                                                             );
-                                                            rcpts.push(target.clone());
+                                                            rcpts.push(target);
                                                             let w = reader.get_mut();
                                                             w.write_all(
                                                                 b"250 2.1.5 Recipient OK\r\n",
@@ -1925,6 +1946,11 @@ async fn process_stream(
                     let dkim_res = auth.dkim;
                     let spf_res = auth.spf;
                     let dmarc_res = auth.dmarc;
+                    if auth.arc.as_deref() == Some("pass") {
+                        rmail_common::metrics::inc_arc_pass();
+                    } else if auth.arc.as_deref() != Some("none") {
+                        rmail_common::metrics::inc_arc_fail();
+                    }
                     if let Some(result) = dkim_res.as_deref() {
                         if result.starts_with("pass") {
                             rmail_common::metrics::inc_dkim_pass();
@@ -1961,6 +1987,7 @@ async fn process_stream(
                     let mut any_accepted = false;
                     let mut any_rejected = false;
                     let mut any_quota_exceeded = false;
+                    let mut arc_sealed_data: Option<Vec<u8>> = None;
                     for rcpt in &rcpts {
                         if let Some(at) = rcpt.find('@') {
                             let local = rcpt[..at].to_string();
@@ -2087,8 +2114,41 @@ async fn process_stream(
                                     );
                                 }
                             } else {
-                                // queue outbound for remote recipients (requires authentication in RCPT stage)
+                                // Queue direct authenticated relay as-is. Remote
+                                // alias/catchall targets are server-side
+                                // forwarding and receive one ARC set per message.
                                 {
+                                    let forwarded = is_forwarded_recipient(
+                                        &forwarded_recipient,
+                                        rcpt,
+                                        dsn_generation,
+                                    );
+                                    if forwarded && arc_sealed_data.is_none() {
+                                        let peer_ip = peer
+                                            .map(|address| address.ip())
+                                            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                                        match rmail_common::mail_auth::seal_forwarded(
+                                            &mr,
+                                            &data,
+                                            peer_ip,
+                                            helo_name.as_deref().unwrap_or("unknown"),
+                                            "localhost",
+                                            mail_from.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(sealed) => {
+                                                arc_sealed_data = Some(sealed.into_owned());
+                                            }
+                                            Err(error) => {
+                                                any_rejected = true;
+                                                eprintln!(
+                                                    "failed to ARC-seal forwarded message for {rcpt}: {error:#}"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     // Always use on-disk queueing to avoid SQLite for queues. Use spawn_blocking since filesystem ops are blocking.
                                     let mr2 = mr.clone();
                                     let rcpt_c = rcpt.clone();
@@ -2102,7 +2162,11 @@ async fn process_stream(
                                             .map(|(_, options)| options.clone())
                                             .unwrap_or_default(),
                                     };
-                                    let data_c = data.clone();
+                                    let data_c = if forwarded {
+                                        arc_sealed_data.as_deref().unwrap_or(&data).to_vec()
+                                    } else {
+                                        data.to_vec()
+                                    };
                                     match tokio::task::spawn_blocking(move || {
                                         rmail_common::outbound::queue_outbound_with_options(
                                             &mr2,
@@ -2428,12 +2492,14 @@ fn dsn_header_value(value: &str) -> String {
 mod tests {
     use super::{
         ConnectionTrace, MAX_MESSAGE_BYTES, ReplyTraceState, ReplyTrackingStream, SmtpService,
-        TRACKING_TEST_EVENTS, parse_mail_from_arg, process_stream, received_header,
+        TRACKING_TEST_EVENTS, is_forwarded_recipient, parse_mail_from_arg, process_stream,
+        received_header,
     };
     use crate::protocol;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
     use rmail_common::config::{ScannerFailureAction, SecurityConfig};
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -2545,6 +2611,22 @@ mod tests {
         format!("{without_proof},p={}", BASE64_ENGINE.encode(proof))
     }
 
+    #[test]
+    fn forwarding_origin_is_scoped_to_the_current_smtp_transaction() {
+        let recipients = HashMap::from([("remote@example.net".to_string(), 7_u64)]);
+        assert!(is_forwarded_recipient(&recipients, "remote@example.net", 7));
+        assert!(!is_forwarded_recipient(
+            &recipients,
+            "remote@example.net",
+            8
+        ));
+        assert!(!is_forwarded_recipient(
+            &recipients,
+            "direct@example.net",
+            7
+        ));
+    }
+
     fn setup_mailbox() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
@@ -2597,6 +2679,23 @@ mod tests {
         service: SmtpService,
     ) -> (Vec<String>, tempfile::TempDir) {
         let (td, mail_root, db_path) = setup_mailbox();
+        run_prepared_session(
+            input, capacity, security, encrypted, service, td, mail_root, db_path,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_prepared_session(
+        input: Vec<u8>,
+        capacity: usize,
+        security: SecurityConfig,
+        encrypted: bool,
+        service: SmtpService,
+        td: tempfile::TempDir,
+        mail_root: std::path::PathBuf,
+        db_path: std::path::PathBuf,
+    ) -> (Vec<String>, tempfile::TempDir) {
         let (client, server) = duplex(capacity);
         let server_task = tokio::spawn(async move {
             process_stream(
@@ -3168,6 +3267,58 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remote_alias_is_arc_sealed_before_queue_publication() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (td, mail_root, db_path) = setup_mailbox();
+        rmail_common::db::add_alias(&db_path, "forward@example.test", &["recipient@example.net"])
+            .unwrap();
+        std::fs::create_dir_all(&mail_root).unwrap();
+        let key = mail_root.join("arc.pem");
+        std::fs::write(&key, include_str!("../testdata/arc-test-key.pem")).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            mail_root.join("dkim.toml"),
+            format!(
+                "[arc_signer]\ndomain = \"forwarder.example\"\nselector = \"arc1\"\nprivate_key = {:?}\nheaders = [\"From\", \"To\", \"Subject\"]\n",
+                key.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let (responses, td) = run_prepared_session(
+            b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<forward@example.test>\r\nDATA\r\nFrom: sender@localhost\r\nTo: forward@example.test\r\nSubject: forwarded\r\n\r\nmessage\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            32 * 1024,
+            SecurityConfig::default(),
+            false,
+            SmtpService::Mta,
+            td,
+            mail_root,
+            db_path,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("250 2.0.0 Message accepted")),
+            "{responses:?}"
+        );
+        let queue = td.path().join("mail/outbound/maildrop/queue");
+        let queued = std::fs::read_dir(queue)
+            .unwrap()
+            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .expect("forwarded queue entry");
+        let message = std::fs::read_to_string(queued).unwrap();
+        assert_eq!(message.matches("ARC-Seal: i=1;").count(), 1, "{message}");
+        assert_eq!(message.matches("ARC-Message-Signature: i=1;").count(), 1);
+        assert_eq!(
+            message.matches("ARC-Authentication-Results: i=1;").count(),
+            1
+        );
     }
 
     #[tokio::test]
