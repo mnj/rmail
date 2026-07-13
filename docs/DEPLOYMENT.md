@@ -116,6 +116,12 @@ Optional outbound-worker tuning in `/etc/default/rmail`:
 - `RMAIL_IDLE_CONNECTIONS_PER_DEST` — reusable idle SMTP sessions retained for one MX host (default: `2`)
 - `RMAIL_MAX_IDLE_CONNECTIONS` — total reusable idle SMTP sessions (default: outbound concurrency)
 
+SQLite access uses shared, path-keyed connection pools. Each database is limited to eight open
+connections with a five-second acquisition/busy timeout. Idle connections are retired after five
+minutes; inactive database pools are evicted after fifteen minutes, and at most 1,024 mailbox
+database pools are retained. This bounds file descriptors and prevents concurrent IMAP, SMTP, and
+admin requests from creating a new connection for every command.
+
 Outbound transport security:
 
 - rMail advertises and relays RFC 8689 `REQUIRETLS`; such messages are never sent over plaintext, and the next hop must advertise `REQUIRETLS`

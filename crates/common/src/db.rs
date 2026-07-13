@@ -1,6 +1,15 @@
+use crate::sqlite_pool::SqliteConnection;
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::params;
 use std::path::Path;
+
+struct Connection;
+
+impl Connection {
+    fn open(path: impl AsRef<Path>) -> Result<SqliteConnection> {
+        crate::sqlite_pool::connection(path.as_ref())
+    }
+}
 // Mailbox representation used by DB APIs
 #[derive(Debug, Clone)]
 pub struct Mailbox {

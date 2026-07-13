@@ -1,11 +1,12 @@
 use crate::maildir::{STANDARD_FOLDERS, ensure_maildir, mailbox_dir, normalize_mailbox_name};
+use crate::sqlite_pool::SqliteConnection;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const STATE_DB_FILENAME: &str = ".rmail-state.sqlite";
 
@@ -63,11 +64,10 @@ pub fn init_account(maildir_root: &Path, domain: &str, localpart: &str) -> Resul
     Ok(())
 }
 
-fn open_account(maildir_root: &Path, domain: &str, localpart: &str) -> Result<Connection> {
+fn open_account(maildir_root: &Path, domain: &str, localpart: &str) -> Result<SqliteConnection> {
     let root = account_maildir(maildir_root, domain, localpart);
     fs::create_dir_all(&root)?;
-    let conn = Connection::open(root.join(STATE_DB_FILENAME))?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    let conn = crate::sqlite_pool::connection(&root.join(STATE_DB_FILENAME))?;
     ensure_schema(&conn)?;
     ensure_standard_folders(&conn, maildir_root, domain, localpart)?;
     Ok(conn)
