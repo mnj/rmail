@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const APPEND_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -172,31 +172,31 @@ pub(crate) async fn handle(
         }
     };
 
+    let root = mail_root.to_string();
+    let domain_for_check = domain.clone();
+    let local_for_check = local.clone();
+    let mailbox_for_check = mailbox_name.clone();
+    let exists = match tokio::task::spawn_blocking(move || {
+        rmail_common::imap_state::folder_exists(
+            Path::new(&root),
+            &domain_for_check,
+            &local_for_check,
+            &mailbox_for_check,
+        )
+    })
+    .await
+    {
+        Ok(Ok(exists)) => exists,
+        Ok(Err(error)) => {
+            write_response(reader, unavailable(tag, error)).await?;
+            return Ok(failure());
+        }
+        Err(error) => {
+            write_response(reader, unavailable(tag, error)).await?;
+            return Ok(failure());
+        }
+    };
     if !request.non_sync {
-        let root = mail_root.to_string();
-        let domain_for_check = domain.clone();
-        let local_for_check = local.clone();
-        let mailbox_for_check = mailbox_name.clone();
-        let exists = tokio::task::spawn_blocking(move || {
-            rmail_common::imap_state::folder_exists(
-                Path::new(&root),
-                &domain_for_check,
-                &local_for_check,
-                &mailbox_for_check,
-            )
-        })
-        .await;
-        let exists = match exists {
-            Ok(Ok(exists)) => exists,
-            Ok(Err(error)) => {
-                write_response(reader, unavailable(tag, error)).await?;
-                return Ok(failure());
-            }
-            Err(error) => {
-                write_response(reader, unavailable(tag, error)).await?;
-                return Ok(failure());
-            }
-        };
         if !exists {
             write_response(reader, missing_mailbox(tag)).await?;
             return Ok(failure());
@@ -208,62 +208,176 @@ pub(crate) async fn handle(
         reader.get_mut().flush().await?;
     }
 
-    let root = mail_root.to_string();
-    let stage_root = root.clone();
-    let stage_domain = domain.clone();
-    let stage_local = local.clone();
-    let staged_path = tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::append_staging_path(
-            Path::new(&stage_root),
-            &stage_domain,
-            &stage_local,
-        )
-    })
-    .await??;
-    if let Err(error) =
-        stream_literal_to_stage(reader, &staged_path, request.literal_len, request.utf8).await
-    {
-        let _ = tokio::fs::remove_file(&staged_path).await;
-        let response = match error {
-            LiteralStreamError::InvalidUtf8 => Response::new().status(
-                StatusLine::tagged(tag, Status::No, "Invalid UTF-8 message").with_code("UTF8"),
-            ),
-            LiteralStreamError::Io(error) => Response::new().status(
-                StatusLine::tagged(tag, Status::No, format!("Error reading literal: {error}"))
-                    .with_code("UNAVAILABLE"),
-            ),
+    enum Payload {
+        Literal(parser::AppendRequest),
+        Catenate(parser::AppendRequest, String),
+    }
+    let mut current = Payload::Literal(request);
+    let mut staged = Vec::new();
+    loop {
+        let staged_path = create_append_stage(mail_root, &domain, &local).await?;
+        let (request, inline_continuation) = match current {
+            Payload::Literal(request) => {
+                if let Err(error) =
+                    stream_literal_to_stage(reader, &staged_path, request.literal_len, request.utf8)
+                        .await
+                {
+                    let _ = tokio::fs::remove_file(&staged_path).await;
+                    remove_staged_appends(&staged).await;
+                    let response = match error {
+                        LiteralStreamError::InvalidUtf8 => Response::new().status(
+                            StatusLine::tagged(tag, Status::No, "Invalid UTF-8 message")
+                                .with_code("UTF8"),
+                        ),
+                        LiteralStreamError::Io(error) => Response::new().status(
+                            StatusLine::tagged(
+                                tag,
+                                Status::No,
+                                format!("Error reading literal: {error}"),
+                            )
+                            .with_code("UNAVAILABLE"),
+                        ),
+                    };
+                    write_response(reader, response).await?;
+                    return Ok(failure());
+                }
+                (request, String::new())
+            }
+            Payload::Catenate(request, parts) => {
+                match stream_catenate_parts(
+                    reader,
+                    &parts,
+                    &staged_path,
+                    mail_root,
+                    &domain,
+                    &local,
+                    selected_mailbox,
+                )
+                .await
+                {
+                    Ok(tail) => (request, tail),
+                    Err(error) => {
+                        let _ = tokio::fs::remove_file(&staged_path).await;
+                        remove_staged_appends(&staged).await;
+                        let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
+                        write_response(reader, catenate_error_response(tag, error)).await?;
+                        return Ok(Outcome {
+                            appended_mailbox: None,
+                            close_connection,
+                        });
+                    }
+                }
+            }
         };
-        write_response(reader, response).await?;
-        return Ok(failure());
+        staged.push(rmail_common::imap_state::StagedAppend {
+            path: staged_path,
+            flags: request.flags,
+            internal_date: bounded_internal_date(request.internal_date),
+        });
+
+        let continuation = if inline_continuation.is_empty() {
+            match read_multiappend_continuation(reader).await {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(error) => {
+                    remove_staged_appends(&staged).await;
+                    write_response(
+                        reader,
+                        bad(tag, &format!("Invalid MULTIAPPEND arguments: {error}")),
+                    )
+                    .await?;
+                    return Ok(failure());
+                }
+            }
+        } else {
+            inline_continuation
+        };
+        if let Some((prefix, parts)) = split_catenate_args(&continuation) {
+            let request = match parser::parse_append_message_args(&format!("{prefix} {{0+}}")) {
+                Ok(request) if !request.utf8 => request,
+                _ => {
+                    remove_staged_appends(&staged).await;
+                    write_response(reader, bad(tag, "Invalid CATENATE arguments")).await?;
+                    return Ok(failure());
+                }
+            };
+            current = Payload::Catenate(request, parts.to_string());
+            continue;
+        }
+        let next = match parser::parse_append_message_args(&continuation) {
+            Ok(request) => request,
+            Err(parser::ParseError::InvalidDateTime) => {
+                remove_staged_appends(&staged).await;
+                write_response(reader, bad(tag, "Invalid APPEND internal date")).await?;
+                return Ok(failure());
+            }
+            Err(_) => {
+                remove_staged_appends(&staged).await;
+                write_response(reader, bad(tag, "Invalid MULTIAPPEND arguments")).await?;
+                return Ok(failure());
+            }
+        };
+        if next.utf8 && !utf8_accept {
+            remove_staged_appends(&staged).await;
+            write_response(reader, bad(tag, "UTF8=ACCEPT is not enabled")).await?;
+            return Ok(failure());
+        }
+        if next.literal_len > MAX_APPEND_LITERAL_BYTES {
+            remove_staged_appends(&staged).await;
+            write_response(
+                reader,
+                Response::new().status(
+                    StatusLine::tagged(tag, Status::No, "APPEND literal too large")
+                        .with_code("TOOBIG"),
+                ),
+            )
+            .await?;
+            return Ok(failure());
+        }
+        if !next.non_sync {
+            if !exists {
+                remove_staged_appends(&staged).await;
+                write_response(reader, missing_mailbox(tag)).await?;
+                return Ok(failure());
+            }
+            let w = reader.get_mut();
+            w.write_all(b"+ Ready for literal data\r\n").await?;
+            w.flush().await?;
+        }
+        current = Payload::Literal(next);
     }
 
+    let root = mail_root.to_string();
+    let cleanup_paths = staged
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
     let mailbox_for_task = mailbox_name.clone();
-    let flags = request.flags;
-    let internal_date = request
-        .internal_date
-        .filter(|date| date.timestamp <= chrono::Utc::now().timestamp() + 2 * 60 * 60)
-        .map(|date| (date.timestamp, date.timezone_offset_minutes));
     let append = tokio::task::spawn_blocking(move || {
-        let result = rmail_common::imap_state::publish_staged_append(
+        rmail_common::imap_state::publish_staged_appends(
             Path::new(&root),
             &domain,
             &local,
             &mailbox_for_task,
-            &staged_path,
-            flags,
-            internal_date,
-        );
-        let _ = std::fs::remove_file(&staged_path);
-        result
+            staged,
+        )
     })
     .await?;
+    for path in cleanup_paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
     match append {
-        Ok((uidvalidity, uid)) => {
+        Ok((uidvalidity, uids)) => {
+            let uid_set = if uids.len() == 1 {
+                uids[0].to_string()
+            } else {
+                format!("{}:{}", uids[0], uids[uids.len() - 1])
+            };
             write_response(
                 reader,
                 Response::new().status(
                     StatusLine::tagged(tag, Status::Ok, "APPEND completed")
-                        .with_code(format!("APPENDUID {uidvalidity} {uid}")),
+                        .with_code(format!("APPENDUID {uidvalidity} {uid_set}")),
                 ),
             )
             .await?;
@@ -286,6 +400,12 @@ pub(crate) async fn handle(
             write_response(reader, Response::new().status(line)).await?;
             Ok(failure())
         }
+    }
+}
+
+async fn remove_staged_appends(staged: &[rmail_common::imap_state::StagedAppend]) {
+    for item in staged {
+        let _ = tokio::fs::remove_file(&item.path).await;
     }
 }
 
@@ -400,59 +520,162 @@ async fn handle_catenate(
         selected_mailbox,
     )
     .await;
-    if let Err(error) = result {
-        let _ = tokio::fs::remove_file(&staged_path).await;
-        let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
-        let response = match error {
-            CatenateError::BadUrl(url) => Response::new().status(
-                StatusLine::tagged(tag, Status::No, "CATENATE URL could not be resolved")
-                    .with_code(format!("BADURL {}", quote_response_code(&url))),
-            ),
-            CatenateError::TooBig => Response::new().status(
-                StatusLine::tagged(tag, Status::No, "CATENATE result is too large")
-                    .with_code("TOOBIG"),
-            ),
-            CatenateError::TooBigDesynchronized => Response::new().status(
-                StatusLine::tagged(tag, Status::No, "CATENATE result is too large")
-                    .with_code("TOOBIG"),
-            ),
-            CatenateError::Syntax => bad(tag, "Invalid CATENATE arguments"),
-            CatenateError::Io(error) => unavailable(tag, error),
+    let mut continuation = match result {
+        Ok(continuation) => continuation,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&staged_path).await;
+            let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
+            write_response(reader, catenate_error_response(tag, error)).await?;
+            return Ok(Outcome {
+                appended_mailbox: None,
+                close_connection,
+            });
+        }
+    };
+    let mut staged = vec![rmail_common::imap_state::StagedAppend {
+        path: staged_path,
+        flags: request.flags,
+        internal_date: bounded_internal_date(request.internal_date),
+    }];
+
+    loop {
+        if continuation.is_empty() {
+            continuation = match read_multiappend_continuation(reader).await {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(error) => {
+                    remove_staged_appends(&staged).await;
+                    write_response(
+                        reader,
+                        bad(tag, &format!("Invalid MULTIAPPEND arguments: {error}")),
+                    )
+                    .await?;
+                    return Ok(failure());
+                }
+            };
+        }
+        if let Some((next_prefix, next_parts)) = split_catenate_args(&continuation) {
+            let next = match parser::parse_append_message_args(&format!("{next_prefix} {{0+}}")) {
+                Ok(request) if !request.utf8 => request,
+                _ => {
+                    remove_staged_appends(&staged).await;
+                    write_response(reader, bad(tag, "Invalid CATENATE arguments")).await?;
+                    return Ok(failure());
+                }
+            };
+            let path = create_append_stage(mail_root, &domain, &local).await?;
+            match stream_catenate_parts(
+                reader,
+                next_parts,
+                &path,
+                mail_root,
+                &domain,
+                &local,
+                selected_mailbox,
+            )
+            .await
+            {
+                Ok(tail) => continuation = tail,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(path).await;
+                    remove_staged_appends(&staged).await;
+                    let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
+                    write_response(reader, catenate_error_response(tag, error)).await?;
+                    return Ok(Outcome {
+                        appended_mailbox: None,
+                        close_connection,
+                    });
+                }
+            }
+            staged.push(rmail_common::imap_state::StagedAppend {
+                path,
+                flags: next.flags,
+                internal_date: bounded_internal_date(next.internal_date),
+            });
+            continue;
+        }
+
+        let next = match parser::parse_append_message_args(&continuation) {
+            Ok(request) => request,
+            Err(_) => {
+                remove_staged_appends(&staged).await;
+                write_response(reader, bad(tag, "Invalid MULTIAPPEND arguments")).await?;
+                return Ok(failure());
+            }
         };
-        write_response(reader, response).await?;
-        return Ok(Outcome {
-            appended_mailbox: None,
-            close_connection,
+        if next.utf8 && !utf8_accept {
+            remove_staged_appends(&staged).await;
+            write_response(reader, bad(tag, "UTF8=ACCEPT is not enabled")).await?;
+            return Ok(failure());
+        }
+        if next.literal_len > MAX_APPEND_LITERAL_BYTES {
+            remove_staged_appends(&staged).await;
+            write_response(
+                reader,
+                Response::new().status(
+                    StatusLine::tagged(tag, Status::No, "APPEND literal too large")
+                        .with_code("TOOBIG"),
+                ),
+            )
+            .await?;
+            return Ok(failure());
+        }
+        if !next.non_sync {
+            let w = reader.get_mut();
+            w.write_all(b"+ Ready for literal data\r\n").await?;
+            w.flush().await?;
+        }
+        let path = create_append_stage(mail_root, &domain, &local).await?;
+        if let Err(error) =
+            stream_literal_to_stage(reader, &path, next.literal_len, next.utf8).await
+        {
+            let _ = tokio::fs::remove_file(path).await;
+            remove_staged_appends(&staged).await;
+            write_response(
+                reader,
+                unavailable(tag, format!("Error reading literal: {error:?}")),
+            )
+            .await?;
+            return Ok(failure());
+        }
+        staged.push(rmail_common::imap_state::StagedAppend {
+            path,
+            flags: next.flags,
+            internal_date: bounded_internal_date(next.internal_date),
         });
+        continuation.clear();
     }
 
-    let flags = request.flags;
-    let internal_date = request
-        .internal_date
-        .filter(|date| date.timestamp <= chrono::Utc::now().timestamp() + 2 * 60 * 60)
-        .map(|date| (date.timestamp, date.timezone_offset_minutes));
+    let cleanup_paths = staged
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
     let mailbox_for_task = mailbox_name.clone();
     let append = tokio::task::spawn_blocking(move || {
-        let result = rmail_common::imap_state::publish_staged_append(
+        rmail_common::imap_state::publish_staged_appends(
             Path::new(&root),
             &domain,
             &local,
             &mailbox_for_task,
-            &staged_path,
-            flags,
-            internal_date,
-        );
-        let _ = std::fs::remove_file(&staged_path);
-        result
+            staged,
+        )
     })
     .await?;
+    for path in cleanup_paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
     match append {
-        Ok((uidvalidity, uid)) => {
+        Ok((uidvalidity, uids)) => {
+            let uid_set = if uids.len() == 1 {
+                uids[0].to_string()
+            } else {
+                format!("{}:{}", uids[0], uids[uids.len() - 1])
+            };
             write_response(
                 reader,
                 Response::new().status(
                     StatusLine::tagged(tag, Status::Ok, "CATENATE APPEND completed")
-                        .with_code(format!("APPENDUID {uidvalidity} {uid}")),
+                        .with_code(format!("APPENDUID {uidvalidity} {uid_set}")),
                 ),
             )
             .await?;
@@ -479,6 +702,61 @@ async fn handle_catenate(
     }
 }
 
+fn bounded_internal_date(date: Option<parser::AppendDate>) -> Option<(i64, i32)> {
+    date.filter(|date| date.timestamp <= chrono::Utc::now().timestamp() + 2 * 60 * 60)
+        .map(|date| (date.timestamp, date.timezone_offset_minutes))
+}
+
+async fn create_append_stage(
+    mail_root: &str,
+    domain: &str,
+    local: &str,
+) -> Result<std::path::PathBuf> {
+    let root = mail_root.to_string();
+    let domain = domain.to_string();
+    let local = local.to_string();
+    tokio::task::spawn_blocking(move || {
+        rmail_common::imap_state::append_staging_path(Path::new(&root), &domain, &local)
+    })
+    .await?
+}
+
+async fn read_multiappend_continuation(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+) -> Result<Option<String>> {
+    if !reader
+        .buffer()
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return Ok(None);
+    }
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).await?;
+    if line.len() > crate::MAX_AUTHENTICATED_LINE_BYTES {
+        anyhow::bail!("MULTIAPPEND arguments too long");
+    }
+    let line = std::str::from_utf8(&line)?
+        .trim_end_matches(['\r', '\n'])
+        .trim_start()
+        .to_string();
+    Ok(Some(line))
+}
+
+fn catenate_error_response(tag: &str, error: CatenateError) -> Response {
+    match error {
+        CatenateError::BadUrl(url) => Response::new().status(
+            StatusLine::tagged(tag, Status::No, "CATENATE URL could not be resolved")
+                .with_code(format!("BADURL {}", quote_response_code(&url))),
+        ),
+        CatenateError::TooBig | CatenateError::TooBigDesynchronized => Response::new().status(
+            StatusLine::tagged(tag, Status::No, "CATENATE result is too large").with_code("TOOBIG"),
+        ),
+        CatenateError::Syntax => bad(tag, "Invalid CATENATE arguments"),
+        CatenateError::Io(error) => unavailable(tag, error),
+    }
+}
+
 #[derive(Debug)]
 enum CatenateError {
     Syntax,
@@ -496,7 +774,7 @@ async fn stream_catenate_parts(
     domain: &str,
     local: &str,
     selected_mailbox: Option<&str>,
-) -> std::result::Result<(), CatenateError> {
+) -> std::result::Result<String, CatenateError> {
     let mut tail = initial_parts.trim().to_string();
     if !tail.starts_with('(') {
         return Err(CatenateError::Syntax);
@@ -507,10 +785,10 @@ async fn stream_catenate_parts(
     loop {
         let remaining = tail.trim_start();
         if let Some(after) = remaining.strip_prefix(')') {
-            if parts == 0 || !after.trim().is_empty() {
+            if parts == 0 {
                 return Err(CatenateError::Syntax);
             }
-            return Ok(());
+            return Ok(after.trim().to_string());
         }
         if atom_prefix(remaining, "URL") {
             let argument = remaining[3..].trim_start();

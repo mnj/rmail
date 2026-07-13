@@ -1884,6 +1884,12 @@ pub(crate) fn parse_append_args(args: &str) -> Result<AppendRequest, ParseError>
     })
 }
 
+/// Parse an additional RFC 3502 append-message, which repeats the optional
+/// flags/date and literal but not the destination mailbox.
+pub(crate) fn parse_append_message_args(args: &str) -> Result<AppendRequest, ParseError> {
+    parse_append_args(&format!("INBOX {args}"))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListSelectionOptions {
     pub(crate) subscribed: bool,
@@ -2275,6 +2281,18 @@ mod tests {
             Err(ParseError::InvalidDateTime)
         );
         assert!(parse_append_args(r#"Sent "17-Jul-1996 02:44:25 -0700" () {1}"#).is_err());
+        assert_eq!(
+            parse_append_message_args(r#"(\Flagged) {7+}"#).unwrap(),
+            AppendRequest {
+                mailbox: "INBOX".to_string(),
+                flags: vec!["\\FLAGGED".to_string()],
+                internal_date: None,
+                literal_len: 7,
+                non_sync: true,
+                literal8: false,
+                utf8: false,
+            }
+        );
     }
 
     #[test]

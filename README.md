@@ -81,6 +81,7 @@ or conformance-validation gaps.
 | RFC 2342 | `NAMESPACE` | 100% | Complete for rMail's single personal Maildir namespace. |
 | RFC 2971 | `ID` | 100% | Includes strict argument and size validation. |
 | RFC 4315 | `UIDPLUS` | 100% | `APPENDUID`, `COPYUID`, and `UID EXPUNGE` are implemented. |
+| RFC 3502 | `MULTIAPPEND` | 100% | Streamed literal and CATENATE messages publish atomically with ordered `APPENDUID` sets and rollback on any failure. |
 | RFC 5161 | `ENABLE` | 100% | Enabled features are tracked per session and validated. |
 | RFC 5256 | `SORT` and `THREAD` | 90% | Advertised algorithms are implemented; international collation coverage is not exhaustive. |
 | RFC 4731 | `ESEARCH` | 95% | Core and UID result forms are implemented; no external conformance certification. |
@@ -95,6 +96,7 @@ or conformance-validation gaps.
 | RFC 3516 | `BINARY` | 95% | Binary FETCH sections and sizes are implemented; exhaustive MIME corpus validation remains. |
 | RFC 4466 | Collected extension grammar | 95% | Extension argument/response forms used by advertised capabilities are implemented. |
 | RFC 4469 | `CATENATE` | 100% | Streaming `TEXT`, relative same-session message/section `URL`, URL literals, `BADURL`, `TOOBIG`, and `APPENDUID` are implemented. |
+| RFC 8970 | `PREVIEW` | 100% | MIME-aware UTF-8 previews and the `LAZY` priority modifier are implemented with bounded output. |
 | RFC 2087 | `QUOTA` | 95% | Account-wide STORAGE limits, GETQUOTA/GETQUOTAROOT, atomic APPEND/COPY and SMTP enforcement, and `OVERQUOTA` are implemented; regular users cannot change limits through SETQUOTA. |
 | RFC 2088 / RFC 7888 | `LITERAL+` / `LITERAL-` | 100% | Synchronizing and bounded non-synchronizing literals are implemented. |
 | RFC 4978 | `COMPRESS=DEFLATE` | 100% | Compression negotiation and post-negotiation command transport are implemented. |
@@ -103,8 +105,9 @@ or conformance-validation gaps.
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
 | RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
 
-IMAP4rev2 (RFC 9051), OAuth mechanisms, `MULTIAPPEND`, and `SNIPPET` are not
-currently advertised. RFC 8970 `PREVIEW`, including its `LAZY` priority
+IMAP4rev2 (RFC 9051), OAuth mechanisms, and `SNIPPET` are not currently
+advertised. RFC 3502 `MULTIAPPEND` provides atomic streamed batch appends and
+ordered `APPENDUID` sets. RFC 8970 `PREVIEW`, including its `LAZY` priority
 modifier, is supported.
 
 Repeatable storage and queue performance workloads are documented in

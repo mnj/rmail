@@ -211,6 +211,7 @@ pub(crate) fn capability_tokens_with_policy(
         }
         CapabilityPhase::Authenticated | CapabilityPhase::Selected => caps.extend([
             "UIDPLUS",
+            "MULTIAPPEND",
             "CATENATE",
             "QUOTA",
             "NAMESPACE",

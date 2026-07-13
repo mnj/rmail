@@ -1538,18 +1538,61 @@ pub fn publish_staged_append(
     flags: Vec<String>,
     internal_date: Option<(i64, i32)>,
 ) -> Result<(u64, u64)> {
-    let expected_parent = account_maildir(maildir_root, domain, localpart).join("tmp");
-    let valid_stage = staged_path.parent() == Some(expected_parent.as_path())
-        && staged_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".append-stage."));
-    if !valid_stage {
-        anyhow::bail!("invalid APPEND staging path");
+    let (uidvalidity, mut uids) = publish_staged_appends(
+        maildir_root,
+        domain,
+        localpart,
+        mailbox,
+        vec![StagedAppend {
+            path: staged_path.to_path_buf(),
+            flags,
+            internal_date,
+        }],
+    )?;
+    Ok((uidvalidity, uids.remove(0)))
+}
+
+#[derive(Debug)]
+pub struct StagedAppend {
+    pub path: PathBuf,
+    pub flags: Vec<String>,
+    pub internal_date: Option<(i64, i32)>,
+}
+
+/// Publish a batch of staged APPEND messages atomically. Database changes are
+/// committed together and filesystem publication is rolled back if any item
+/// fails, as required by IMAP MULTIAPPEND.
+pub fn publish_staged_appends(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    staged: Vec<StagedAppend>,
+) -> Result<(u64, Vec<u64>)> {
+    if staged.is_empty() {
+        anyhow::bail!("APPEND batch is empty");
     }
-    let metadata = fs::symlink_metadata(staged_path).context("reading APPEND staging file")?;
-    if !metadata.is_file() {
-        anyhow::bail!("APPEND staging path is not a regular file");
+    let expected_parent = account_maildir(maildir_root, domain, localpart).join("tmp");
+    let mut metadata = Vec::with_capacity(staged.len());
+    for item in &staged {
+        let valid_stage = item.path.parent() == Some(expected_parent.as_path())
+            && item
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".append-stage."));
+        if !valid_stage {
+            anyhow::bail!("invalid APPEND staging path");
+        }
+        let item_metadata =
+            fs::symlink_metadata(&item.path).context("reading APPEND staging file")?;
+        if !item_metadata.is_file() {
+            anyhow::bail!("APPEND staging path is not a regular file");
+        }
+        metadata.push(item_metadata);
+    }
+    if staged.len() > 1 && metadata.iter().any(|item| item.len() == 0) {
+        anyhow::bail!("zero-length MULTIAPPEND message");
     }
 
     let name = normalize_mailbox_name(mailbox)?;
@@ -1559,49 +1602,64 @@ pub fn publish_staged_append(
         anyhow::bail!("destination mailbox does not exist");
     }
     reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
-    enforce_storage_quota(&tx, metadata.len())?;
+    let total_size = metadata.iter().try_fold(0_u64, |total, item| {
+        total
+            .checked_add(item.len())
+            .context("APPEND batch too large")
+    })?;
+    enforce_storage_quota(&tx, total_size)?;
 
     let directory = mailbox_dir(maildir_root, domain, localpart, &name)?;
     ensure_maildir(&directory)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let (internaldate, internaldate_tz) = internal_date.unwrap_or((now.as_secs() as i64, 0));
-    let filename = format!(
-        "{}.{}.{}.append",
-        now.as_nanos(),
-        std::process::id(),
-        rand::random::<u64>()
-    );
-    set_file_mtime(staged_path, internaldate)?;
-    let new_path = directory.join("new").join(&filename);
-    fs::rename(staged_path, &new_path)?;
-    let new_guard = FileMutationGuard::copied(new_path);
-
     let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
     let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
-    let uid = allocatable_uid(i64::try_from(folder.uidnext).unwrap_or(i64::MAX))?;
-    let modseq = next_modseq(&tx, folder_id)?;
-    tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
-         VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            folder_id,
-            filename,
-            uid as i64,
-            flags_to_text(&flags)?,
-            metadata.len() as i64,
-            internaldate,
-            internaldate_tz,
-            now.as_secs() as i64,
-            modseq as i64
-        ],
-    )?;
+    let mut uid = folder.uidnext;
+    let mut uids = Vec::with_capacity(staged.len());
+    let mut guards = Vec::with_capacity(staged.len());
+    for (index, item) in staged.into_iter().enumerate() {
+        uid = allocatable_uid(i64::try_from(uid).unwrap_or(i64::MAX))?;
+        let (internaldate, internaldate_tz) =
+            item.internal_date.unwrap_or((now.as_secs() as i64, 0));
+        let filename = format!(
+            "{}.{}.{}.{}.append",
+            now.as_nanos(),
+            std::process::id(),
+            index,
+            rand::random::<u64>()
+        );
+        set_file_mtime(&item.path, internaldate)?;
+        let new_path = directory.join("new").join(&filename);
+        fs::rename(&item.path, &new_path)?;
+        guards.push(FileMutationGuard::copied(new_path));
+        let modseq = next_modseq(&tx, folder_id)?;
+        tx.execute(
+            "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
+             VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                folder_id,
+                filename,
+                uid as i64,
+                flags_to_text(&item.flags)?,
+                metadata[index].len() as i64,
+                internaldate,
+                internaldate_tz,
+                now.as_secs() as i64,
+                modseq as i64
+            ],
+        )?;
+        uids.push(uid);
+        uid = uid.saturating_add(1);
+    }
     tx.execute(
         "UPDATE folders SET uidnext = ?1 WHERE id = ?2",
-        params![uid.saturating_add(1) as i64, folder_id],
+        params![uid as i64, folder_id],
     )?;
     tx.commit()?;
-    new_guard.commit();
-    Ok((folder.uidvalidity, uid))
+    for guard in guards {
+        guard.commit();
+    }
+    Ok((folder.uidvalidity, uids))
 }
 
 #[cfg(unix)]
@@ -2963,5 +3021,88 @@ mod tests {
         assert_eq!(messages[0].size, message.len() as u64);
         assert_eq!(messages[0].flags, vec!["\\Seen"]);
         assert_eq!(fs::read(&messages[0].path).unwrap(), message);
+    }
+
+    #[test]
+    fn staged_multiappend_publishes_ordered_uids_atomically() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let first = append_staging_path(td.path(), "example.test", "user").unwrap();
+        let second = append_staging_path(td.path(), "example.test", "user").unwrap();
+        fs::write(&first, b"Subject: first\r\n\r\none").unwrap();
+        fs::write(&second, b"Subject: second\r\n\r\ntwo").unwrap();
+
+        let (uidvalidity, uids) = publish_staged_appends(
+            td.path(),
+            "example.test",
+            "user",
+            "INBOX",
+            vec![
+                StagedAppend {
+                    path: first,
+                    flags: vec!["\\Seen".to_string()],
+                    internal_date: None,
+                },
+                StagedAppend {
+                    path: second,
+                    flags: Vec::new(),
+                    internal_date: None,
+                },
+            ],
+        )
+        .unwrap();
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(uidvalidity, folder.uidvalidity);
+        assert_eq!(uids.len(), 2);
+        assert_eq!(uids[1], uids[0] + 1);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.uid)
+                .collect::<Vec<_>>(),
+            uids
+        );
+    }
+
+    #[test]
+    fn staged_multiappend_rolls_back_every_message_on_publish_failure() {
+        let td = tempfile::tempdir().unwrap();
+        init_account(td.path(), "example.test", "user").unwrap();
+        let first = append_staging_path(td.path(), "example.test", "user").unwrap();
+        let second = append_staging_path(td.path(), "example.test", "user").unwrap();
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second_multiappend
+             BEFORE INSERT ON messages WHEN NEW.flags != '[]'
+             BEGIN SELECT RAISE(FAIL, 'injected MULTIAPPEND failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            publish_staged_appends(
+                td.path(),
+                "example.test",
+                "user",
+                "INBOX",
+                vec![
+                    StagedAppend {
+                        path: first,
+                        flags: Vec::new(),
+                        internal_date: None
+                    },
+                    StagedAppend {
+                        path: second,
+                        flags: vec!["\\Flagged".to_string()],
+                        internal_date: None,
+                    },
+                ],
+            )
+            .is_err()
+        );
+        let (_, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert!(messages.is_empty());
     }
 }

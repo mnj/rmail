@@ -1980,6 +1980,7 @@ mod tests {
                 "LITERAL+",
                 "LITERAL-",
                 "UIDPLUS",
+                "MULTIAPPEND",
                 "CATENATE",
                 "QUOTA",
                 "NAMESPACE",
@@ -5394,6 +5395,109 @@ mod tests {
             !rmail_common::imap_state::folder_exists(&mail_root, "example.test", "user", "Missing")
                 .expect("missing folder check")
         );
+    }
+
+    #[tokio::test]
+    async fn multiappend_streams_messages_atomically_and_returns_ordered_uids() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(
+            &db_path,
+            "user@example.test",
+            Some("plain:password"),
+            None,
+            None,
+        )
+        .expect("add mailbox");
+        let server_root = mail_root.clone();
+        let (client, server) = duplex(32 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream(
+                Box::new(server),
+                server_root.to_string_lossy().to_string(),
+                None::<Arc<super::tls::TlsContext>>,
+                Some(db_path.to_string_lossy().to_string()),
+                None,
+                true,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        let mut capability = String::new();
+        reader.read_line(&mut capability).await.unwrap();
+
+        let first = b"Subject: first\r\n\r\none";
+        let second = b"Subject: second\r\n\r\ntwo";
+        let third = b"Subject: third\r\n\r\nthree";
+        let fourth = b"Subject: fourth\r\n\r\nfour";
+        let mut commands = b"A001 LOGIN user@example.test password\r\n".to_vec();
+        commands.extend_from_slice(
+            format!("A002 APPEND INBOX (\\Seen) {{{}+}}\r\n", first.len()).as_bytes(),
+        );
+        commands.extend_from_slice(first);
+        commands.extend_from_slice(format!(" (\\Flagged) {{{}}}\r\n", second.len()).as_bytes());
+        commands.extend_from_slice(second);
+        commands.extend_from_slice(format!(" CATENATE (TEXT {{{}+}}\r\n", third.len()).as_bytes());
+        commands.extend_from_slice(third);
+        commands.extend_from_slice(b")\r\n");
+        commands.extend_from_slice(
+            format!("A003 APPEND INBOX CATENATE (TEXT {{{}+}}\r\n", third.len()).as_bytes(),
+        );
+        commands.extend_from_slice(third);
+        commands.extend_from_slice(format!(") (\\Draft) {{{}+}}\r\n", fourth.len()).as_bytes());
+        commands.extend_from_slice(fourth);
+        commands.extend_from_slice(b"\r\nA004 APPEND INBOX {0+}\r\n {1+}\r\nx\r\nA005 LOGOUT\r\n");
+        reader.get_mut().write_all(&commands).await.unwrap();
+        reader.get_mut().flush().await.unwrap();
+
+        let login = read_until_contains(&mut reader, "A001 OK").await;
+        assert!(login.iter().any(|line| line.contains("MULTIAPPEND")));
+        let appended = read_until_contains(&mut reader, "A002 OK").await;
+        let response = appended.join("");
+        assert!(response.contains("APPENDUID"));
+        assert!(response.contains(':'));
+        assert!(response.contains("+ Ready"));
+        let reverse_mix = read_until_contains(&mut reader, "A003 OK").await.join("");
+        assert!(reverse_mix.contains("APPENDUID"), "{reverse_mix:?}");
+        assert!(reverse_mix.contains(':'));
+        let cancelled = read_until_contains(&mut reader, "A004 NO").await;
+        assert!(cancelled.join("").contains("zero-length MULTIAPPEND"));
+        let _logout = read_until_contains(&mut reader, "A005 OK").await;
+        server_task.await.unwrap().unwrap();
+
+        let (_, mut messages) =
+            rmail_common::imap_state::load_folder(&mail_root, "example.test", "user", "INBOX")
+                .unwrap();
+        messages.sort_by_key(|message| message.uid);
+        assert_eq!(messages.len(), 5);
+        assert_eq!(std::fs::read(&messages[0].path).unwrap(), first);
+        assert_eq!(std::fs::read(&messages[1].path).unwrap(), second);
+        assert_eq!(std::fs::read(&messages[2].path).unwrap(), third);
+        assert_eq!(std::fs::read(&messages[3].path).unwrap(), third);
+        assert_eq!(std::fs::read(&messages[4].path).unwrap(), fourth);
+        assert!(
+            messages[0]
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Seen"))
+        );
+        assert!(
+            messages[1]
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Flagged"))
+        );
+        assert!(
+            messages[4]
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Draft"))
+        );
+        assert_eq!(messages[1].uid, messages[0].uid + 1);
     }
 
     #[tokio::test]
