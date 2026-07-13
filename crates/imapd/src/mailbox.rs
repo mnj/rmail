@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::AsyncStream;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader};
+
+const FETCH_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -377,6 +379,41 @@ fn apply_partial_range(data: &[u8], range: Option<(usize, usize)>) -> Vec<u8> {
     }
     let end = offset.saturating_add(count).min(data.len());
     data[offset..end].to_vec()
+}
+
+fn is_whole_message_literal(item: &str) -> bool {
+    if item == "RFC822" {
+        return true;
+    }
+    let upper = item.to_ascii_uppercase();
+    let Some(open) = upper.find('[') else {
+        return false;
+    };
+    let Some(close) = upper[open + 1..].find(']').map(|index| index + open + 1) else {
+        return false;
+    };
+    (upper.starts_with("BODY[") || upper.starts_with("BODY.PEEK[")) && close == open + 1
+}
+
+async fn stream_file_range<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    path: &Path,
+    offset: u64,
+    length: usize,
+) -> std::io::Result<usize> {
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut remaining = length;
+    let mut buffer = vec![0_u8; FETCH_STREAM_CHUNK_BYTES.min(length.max(1))];
+    let mut max_chunk = 0;
+    while remaining != 0 {
+        let chunk_len = remaining.min(buffer.len());
+        file.read_exact(&mut buffer[..chunk_len]).await?;
+        writer.write_all(&buffer[..chunk_len]).await?;
+        max_chunk = max_chunk.max(chunk_len);
+        remaining -= chunk_len;
+    }
+    Ok(max_chunk)
 }
 
 fn requested_header_fields(spec: &str) -> Option<(Vec<String>, bool)> {
@@ -949,6 +986,12 @@ pub(crate) async fn write_fetch_response(
     let include_bodystructure = requested
         .iter()
         .any(|i| i == "BODYSTRUCTURE" || i == "BODY");
+    let has_whole_message_literal = literal_items
+        .iter()
+        .any(|item| is_whole_message_literal(item));
+    let has_parsed_literal = literal_items
+        .iter()
+        .any(|item| !is_whole_message_literal(item));
     let need_data = include_size
         || !literal_items.is_empty()
         || !binary_size_items.is_empty()
@@ -956,7 +999,7 @@ pub(crate) async fn write_fetch_response(
         || include_bodystructure;
     let internal_date =
         include_internaldate.then(|| format_internal_date(internal_date.0, internal_date.1));
-    let metadata_len = if include_size || include_bodystructure {
+    let metadata_len = if include_size || include_bodystructure || has_whole_message_literal {
         Some(
             tokio::task::spawn_blocking({
                 let path = path.clone();
@@ -967,16 +1010,27 @@ pub(crate) async fn write_fetch_response(
     } else {
         None
     };
-    let data =
-        if !literal_items.is_empty() || !binary_size_items.is_empty() || include_bodystructure {
-            Some(tokio::task::spawn_blocking(move || std::fs::read(path)).await??)
-        } else if include_envelope {
-            Some(tokio::task::spawn_blocking(move || read_message_header(&path)).await??)
-        } else if need_data {
-            Some(Vec::new())
-        } else {
-            None
-        };
+    let data = if has_parsed_literal || !binary_size_items.is_empty() || include_bodystructure {
+        Some(
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || std::fs::read(path)
+            })
+            .await??,
+        )
+    } else if include_envelope {
+        Some(
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || read_message_header(&path)
+            })
+            .await??,
+        )
+    } else if need_data {
+        Some(Vec::new())
+    } else {
+        None
+    };
 
     let mut attrs: Vec<String> = Vec::new();
     if include_flags {
@@ -1056,6 +1110,20 @@ pub(crate) async fn write_fetch_response(
             (*item).clone()
         };
         let partial = partial_fetch_range(fetch_inner_spec(item));
+        if is_whole_message_literal(item) {
+            let file_len = metadata_len.unwrap_or(0);
+            let (offset, literal_len) = match partial {
+                Some((offset, count)) if offset < file_len => {
+                    (offset, count.min(file_len - offset))
+                }
+                Some((offset, _)) => (offset, 0),
+                None => (0, file_len),
+            };
+            w.write_all(format!("{} {{{}}}\r\n", response_name, literal_len).as_bytes())
+                .await?;
+            stream_file_range(w, &path, offset as u64, literal_len).await?;
+            continue;
+        }
         let literal = if item.starts_with("BINARY[") || item.starts_with("BINARY.PEEK[") {
             extract_binary_section(&data, item)
                 .map(|decoded| apply_partial_range(&decoded, partial))
@@ -1100,7 +1168,10 @@ pub(crate) async fn write_fetch_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{bodystructure_response, extract_binary_section, extract_mime_section};
+    use super::{
+        FETCH_STREAM_CHUNK_BYTES, bodystructure_response, extract_binary_section,
+        extract_mime_section, is_whole_message_literal, stream_file_range,
+    };
 
     const EMBEDDED_MESSAGE: &[u8] = b"From: outer@example.test\r\n\
 Content-Type: multipart/mixed; boundary=outer\r\n\r\n\
@@ -1165,5 +1236,41 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         );
         assert_eq!(extract_binary_section(message, "BINARY[3]"), None);
         assert_eq!(extract_binary_section(message, "BINARY[0]"), None);
+    }
+
+    #[test]
+    fn only_complete_message_fetch_items_use_direct_streaming() {
+        assert!(is_whole_message_literal("RFC822"));
+        assert!(is_whole_message_literal("BODY[]"));
+        assert!(is_whole_message_literal("BODY.PEEK[]<123.456>"));
+        assert!(!is_whole_message_literal("RFC822.HEADER"));
+        assert!(!is_whole_message_literal("BODY[TEXT]"));
+        assert!(!is_whole_message_literal("BODY[1]"));
+        assert!(!is_whole_message_literal("BINARY[]"));
+    }
+
+    #[tokio::test]
+    async fn file_ranges_stream_byte_exactly_in_bounded_chunks() {
+        let td = tempfile::tempdir().unwrap();
+        let source = td.path().join("source");
+        let output = td.path().join("output");
+        let data = (0..(2 * 1024 * 1024 + 97))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        tokio::fs::write(&source, &data).await.unwrap();
+        let mut writer = tokio::fs::File::create(&output).await.unwrap();
+        let offset = 37_123;
+        let length = 1024 * 1024 + 19;
+
+        let max_chunk = stream_file_range(&mut writer, &source, offset as u64, length)
+            .await
+            .unwrap();
+        writer.sync_all().await.unwrap();
+
+        assert_eq!(max_chunk, FETCH_STREAM_CHUNK_BYTES);
+        assert_eq!(
+            tokio::fs::read(output).await.unwrap(),
+            data[offset..offset + length]
+        );
     }
 }
