@@ -77,6 +77,8 @@ Important:
 - `rmail_web` currently binds to `127.0.0.1` by default, which is a safer default for admin access
 - port 25 listeners use MTA policy; port 587 and implicit-TLS port 465 use submission policy
 - submission requires TLS, authentication, and an envelope sender matching the authenticated mailbox
+- optional `global.listeners.lmtp` endpoints provide RFC 2033 local delivery; bind them only to
+  loopback or a private service network because LMTP deliberately has no authentication or relay
 
 SMTP resource limits are configured in the `[security]` section:
 
@@ -87,6 +89,20 @@ SMTP resource limits are configured in the `[security]` section:
 - `submission_max_recipients` — recipients per authenticated submission transaction (default: `50`)
 - `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
 - `submission_require_from_alignment` — when `true`, every parsed RFC 5322 `From` mailbox on authenticated submission must equal the authenticated mailbox; missing, malformed, or mismatched author fields are rejected (default: `false`)
+
+## LMTP local delivery
+
+LMTP is disabled by default. Enable a TCP endpoint with, for example,
+`lmtp = ["127.0.0.1:24"]` under `[global.listeners]`. The service requires `LHLO`, rejects SMTP
+`HELO`/`EHLO`, does not offer `AUTH` or `STARTTLS`, and never queues remote delivery. Exact local
+mailboxes, local catchalls, and aliases resolving to one local mailbox are accepted. Multi-target
+or remote aliases are rejected during `RCPT` to prevent partial delivery and duplicate mail when an
+upstream retries.
+
+After `DATA` or the final `BDAT`, rMail returns one enhanced-status reply for every accepted `RCPT`.
+This allows one mailbox to succeed while another reports a temporary condition such as quota
+exhaustion. LMTP deliveries use the same scanners, indexed Maildir publication, quota enforcement,
+tracking, and graceful shutdown as SMTP delivery.
 
 ## DKIM signing and inbound authentication
 

@@ -43,6 +43,7 @@ pub(crate) struct BdatArgs {
 pub(crate) enum Command<'a> {
     Helo(&'a str),
     Ehlo(&'a str),
+    Lhlo(&'a str),
     Mail(&'a str),
     Rcpt(&'a str),
     Data,
@@ -124,6 +125,7 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
     match verb_upper.as_str() {
         "HELO" if !args.is_empty() => Command::Helo(args),
         "EHLO" if !args.is_empty() => Command::Ehlo(args),
+        "LHLO" if !args.is_empty() => Command::Lhlo(args),
         "MAIL" if !args.is_empty() => Command::Mail(args),
         "RCPT" if !args.is_empty() => Command::Rcpt(args),
         "DATA" if args.is_empty() => Command::Data,
@@ -135,8 +137,8 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "AUTH" if !args.is_empty() => Command::Auth(args),
         "VRFY" if !args.is_empty() => Command::Vrfy,
         "EXPN" if !args.is_empty() => Command::Expn,
-        "HELO" | "EHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT" | "STARTTLS"
-        | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
+        "HELO" | "EHLO" | "LHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT"
+        | "STARTTLS" | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
         _ => Command::Unknown,
     }
 }
@@ -477,6 +479,15 @@ pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<RcptToAr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_lmtp_greeting_case_insensitively() {
+        assert_eq!(
+            parse_command("lHlO local.test"),
+            Command::Lhlo("local.test")
+        );
+        assert_eq!(parse_command("LHLO"), Command::BadSyntax);
+    }
 
     #[test]
     fn bdat_requires_a_decimal_size_and_optional_last() {

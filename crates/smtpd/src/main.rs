@@ -223,6 +223,7 @@ const STARTTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 enum SmtpService {
     Mta,
     Submission,
+    Lmtp,
 }
 
 fn is_forwarded_recipient(
@@ -233,6 +234,28 @@ fn is_forwarded_recipient(
     recipients
         .get(recipient)
         .is_some_and(|generation| *generation == transaction_generation)
+}
+
+async fn write_message_completion<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    service: SmtpService,
+    recipient_groups: &[(u64, String, Vec<String>)],
+    transaction_generation: u64,
+    status: &str,
+) -> std::io::Result<()> {
+    if service == SmtpService::Lmtp {
+        for (_, original, _) in recipient_groups
+            .iter()
+            .filter(|(generation, _, _)| *generation == transaction_generation)
+        {
+            writer
+                .write_all(format!("{status} <{original}>\r\n").as_bytes())
+                .await?;
+        }
+    } else {
+        writer.write_all(format!("{status}\r\n").as_bytes()).await?;
+    }
+    writer.flush().await
 }
 
 #[cfg(unix)]
@@ -433,6 +456,7 @@ async fn main() -> Result<()> {
     };
 
     let listen_addrs = cfg.global.smtp_listeners();
+    let lmtp_addrs = cfg.global.lmtp_listeners();
     let smtps_addrs = cfg.global.smtps_listeners();
     let submission_addrs = cfg.global.submission_listeners();
     let listener_config = cfg.global.tcp_listener.clone();
@@ -473,6 +497,37 @@ async fn main() -> Result<()> {
             .await
             {
                 eprintln!("Listener {} failed: {}", addr, e);
+            }
+        });
+    }
+
+    // RFC 2033 LMTP is an explicitly configured local-delivery ingress. It
+    // shares resource limits with SMTP but never authenticates or relays.
+    for addr in lmtp_addrs {
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)
+            .with_context(|| format!("starting LMTP listener on {addr}"))?;
+        let mail_root = mail_root.clone();
+        let tls_ctx = tls_receiver.clone();
+        let db_path = db_path.clone();
+        let security = security.clone();
+        let session_limit = session_limit.clone();
+        let listener_shutdown = shutdown.clone();
+        listeners.spawn(async move {
+            if let Err(error) = run_plain_listener(
+                addr.clone(),
+                listener,
+                mail_root,
+                tls_ctx,
+                db_path,
+                false,
+                security,
+                session_limit,
+                SmtpService::Lmtp,
+                listener_shutdown,
+            )
+            .await
+            {
+                eprintln!("LMTP listener {addr} failed: {error}");
             }
         });
     }
@@ -869,12 +924,15 @@ fn valid_text_message_form(data: &[u8]) -> bool {
 fn received_header(
     peer: Option<SocketAddr>,
     helo_name: Option<&str>,
+    service: SmtpService,
     extended_smtp: bool,
     encrypted: bool,
     authenticated: bool,
 ) -> Vec<u8> {
     let helo = helo_name.unwrap_or("unknown");
-    let protocol = if encrypted && authenticated {
+    let protocol = if service == SmtpService::Lmtp {
+        "LMTP"
+    } else if encrypted && authenticated {
         "ESMTPSA"
     } else if encrypted {
         "ESMTPS"
@@ -933,13 +991,18 @@ async fn process_stream(
     );
     if send_greeting {
         let w = reader.get_mut();
-        w.write_all(b"220 rMail SMTPD ready\r\n").await?;
+        w.write_all(if service == SmtpService::Lmtp {
+            b"220 rMail LMTP ready\r\n"
+        } else {
+            b"220 rMail SMTPD ready\r\n"
+        })
+        .await?;
         w.flush().await?;
     }
 
     // SMTP transaction state
     let max_recipients = match service {
-        SmtpService::Mta => security.smtp_max_recipients.max(1),
+        SmtpService::Mta | SmtpService::Lmtp => security.smtp_max_recipients.max(1),
         SmtpService::Submission => security.submission_max_recipients.max(1),
     };
     let command_limit = security.smtp_max_commands_per_minute.max(1);
@@ -957,6 +1020,9 @@ async fn process_stream(
     // Recipient -> SMTP transaction generation for aliases/catchalls. Keeping
     // the generation avoids stale forwarding state across transactions.
     let mut forwarded_recipient: HashMap<String, u64> = HashMap::new();
+    // LMTP must emit one final DATA reply for each accepted RCPT command, even
+    // when aliases expand to multiple delivery targets.
+    let mut lmtp_recipient_groups: Vec<(u64, String, Vec<String>)> = Vec::new();
     let mut bdat_buffer = Vec::new();
     let mut bdat_started = false;
     // track authenticated identity when AUTH is used (local mailbox address)
@@ -1073,6 +1139,46 @@ async fn process_stream(
             rcpts.len()
         );
 
+        if service == SmtpService::Lmtp {
+            if matches!(parsed_command, SmtpCommand::Helo(_) | SmtpCommand::Ehlo(_)) {
+                let writer = reader.get_mut();
+                writer
+                    .write_all(b"500 5.5.1 LMTP requires LHLO\r\n")
+                    .await?;
+                writer.flush().await?;
+                continue;
+            }
+            if matches!(parsed_command, SmtpCommand::Auth(_) | SmtpCommand::StartTls) {
+                let writer = reader.get_mut();
+                writer
+                    .write_all(b"502 5.5.1 Command not supported by LMTP\r\n")
+                    .await?;
+                writer.flush().await?;
+                continue;
+            }
+            if helo_name.is_none()
+                && matches!(
+                    parsed_command,
+                    SmtpCommand::Mail(_)
+                        | SmtpCommand::Rcpt(_)
+                        | SmtpCommand::Data
+                        | SmtpCommand::Bdat(_)
+                )
+            {
+                let writer = reader.get_mut();
+                writer.write_all(b"503 5.5.1 Send LHLO first\r\n").await?;
+                writer.flush().await?;
+                continue;
+            }
+        } else if matches!(parsed_command, SmtpCommand::Lhlo(_)) {
+            let writer = reader.get_mut();
+            writer
+                .write_all(b"500 5.5.1 LHLO is only valid for LMTP\r\n")
+                .await?;
+            writer.flush().await?;
+            continue;
+        }
+
         if service == SmtpService::Submission {
             if !session_encrypted
                 && !matches!(
@@ -1122,8 +1228,8 @@ async fn process_stream(
         }
 
         match parsed_command {
-            SmtpCommand::Helo(name) | SmtpCommand::Ehlo(name) => {
-                let is_ehlo = matches!(parsed_command, SmtpCommand::Ehlo(_));
+            SmtpCommand::Helo(name) | SmtpCommand::Ehlo(name) | SmtpCommand::Lhlo(name) => {
+                let is_ehlo = matches!(parsed_command, SmtpCommand::Ehlo(_) | SmtpCommand::Lhlo(_));
                 if !protocol::valid_helo_domain(name) {
                     let writer = reader.get_mut();
                     writer
@@ -1135,7 +1241,13 @@ async fn process_stream(
                 println!(
                     "SMTP greeting peer={:?} verb={}",
                     peer,
-                    if is_ehlo { "EHLO" } else { "HELO" }
+                    if matches!(parsed_command, SmtpCommand::Lhlo(_)) {
+                        "LHLO"
+                    } else if is_ehlo {
+                        "EHLO"
+                    } else {
+                        "HELO"
+                    }
                 );
                 helo_name = Some(name.to_string());
                 extended_smtp = is_ehlo;
@@ -1145,10 +1257,14 @@ async fn process_stream(
                     format!("250 2.0.0 rMail Hello {name}\r\n")
                 };
                 if is_ehlo {
-                    if !session_encrypted && tls_ctx.is_some() {
+                    if service != SmtpService::Lmtp && !session_encrypted && tls_ctx.is_some() {
                         resp.push_str("250-STARTTLS\r\n");
                     }
-                    if session_encrypted && db_path.is_some() && authenticated_user.is_none() {
+                    if service != SmtpService::Lmtp
+                        && session_encrypted
+                        && db_path.is_some()
+                        && authenticated_user.is_none()
+                    {
                         resp.push_str(&format!(
                             "250-AUTH {}\r\n",
                             protocol::advertised_sasl_mechanisms(&security.smtp_sasl_mechanisms)
@@ -1401,6 +1517,13 @@ async fn process_stream(
                                         w.flush().await?;
                                     } else {
                                         let target = mailbox.address.to_ascii_lowercase();
+                                        if service == SmtpService::Lmtp {
+                                            lmtp_recipient_groups.push((
+                                                dsn_generation,
+                                                addr.clone(),
+                                                vec![target.clone()],
+                                            ));
+                                        }
                                         recipient_dsn
                                             .insert(target.clone(), (dsn_generation, dsn.clone()));
                                         rcpts.push(target);
@@ -1434,7 +1557,44 @@ async fn process_stream(
                                                     "SMTP RCPT alias match peer={:?} rcpt={} targets={:?}",
                                                     peer, addr, targets
                                                 );
-                                                if targets.is_empty() {
+                                                let lmtp_targets_are_local = if service
+                                                    == SmtpService::Lmtp
+                                                    && !targets.is_empty()
+                                                {
+                                                    let db_path = dbp.clone();
+                                                    let targets = targets.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        targets.iter().all(|target| {
+                                                            rmail_common::db::get_mailbox(
+                                                                &db_path, target,
+                                                            )
+                                                            .is_ok_and(|mailbox| mailbox.is_some())
+                                                        })
+                                                    })
+                                                    .await
+                                                    .unwrap_or(false)
+                                                } else {
+                                                    true
+                                                };
+                                                if service == SmtpService::Lmtp
+                                                    && targets.len() != 1
+                                                {
+                                                    let writer = reader.get_mut();
+                                                    writer
+                                                        .write_all(
+                                                            b"550 5.1.1 LMTP alias must resolve to one local mailbox\r\n",
+                                                        )
+                                                        .await?;
+                                                    writer.flush().await?;
+                                                } else if !lmtp_targets_are_local {
+                                                    let writer = reader.get_mut();
+                                                    writer
+                                                        .write_all(
+                                                            b"550 5.1.1 LMTP alias has a non-local target\r\n",
+                                                        )
+                                                        .await?;
+                                                    writer.flush().await?;
+                                                } else if targets.is_empty() {
                                                     let writer = reader.get_mut();
                                                     writer
                                                         .write_all(
@@ -1453,8 +1613,18 @@ async fn process_stream(
                                                         .await?;
                                                     writer.flush().await?;
                                                 } else {
+                                                    let targets = targets
+                                                        .into_iter()
+                                                        .map(|target| target.to_ascii_lowercase())
+                                                        .collect::<Vec<_>>();
+                                                    if service == SmtpService::Lmtp {
+                                                        lmtp_recipient_groups.push((
+                                                            dsn_generation,
+                                                            addr.clone(),
+                                                            targets.clone(),
+                                                        ));
+                                                    }
                                                     for target in targets {
-                                                        let target = target.to_ascii_lowercase();
                                                         forwarded_recipient
                                                             .insert(target.clone(), dsn_generation);
                                                         recipient_dsn.insert(
@@ -1483,7 +1653,34 @@ async fn process_stream(
                                                             "SMTP RCPT catchall match peer={:?} rcpt={} target={}",
                                                             peer, addr, target
                                                         );
-                                                        if rcpts.len() >= max_recipients {
+                                                        let lmtp_target_is_local = if service
+                                                            == SmtpService::Lmtp
+                                                        {
+                                                            let db_path = dbp.clone();
+                                                            let target_copy = target.clone();
+                                                            tokio::task::spawn_blocking(move || {
+                                                                rmail_common::db::get_mailbox(
+                                                                    &db_path,
+                                                                    &target_copy,
+                                                                )
+                                                                .is_ok_and(|mailbox| {
+                                                                    mailbox.is_some()
+                                                                })
+                                                            })
+                                                            .await
+                                                            .unwrap_or(false)
+                                                        } else {
+                                                            true
+                                                        };
+                                                        if !lmtp_target_is_local {
+                                                            let writer = reader.get_mut();
+                                                            writer
+                                                                .write_all(
+                                                                    b"550 5.1.1 LMTP catchall has a non-local target\r\n",
+                                                                )
+                                                                .await?;
+                                                            writer.flush().await?;
+                                                        } else if rcpts.len() >= max_recipients {
                                                             let w = reader.get_mut();
                                                             w.write_all(
                                                                 b"452 4.5.3 Too many recipients\r\n",
@@ -1493,6 +1690,13 @@ async fn process_stream(
                                                         } else {
                                                             let target =
                                                                 target.to_ascii_lowercase();
+                                                            if service == SmtpService::Lmtp {
+                                                                lmtp_recipient_groups.push((
+                                                                    dsn_generation,
+                                                                    addr.clone(),
+                                                                    vec![target.clone()],
+                                                                ));
+                                                            }
                                                             forwarded_recipient.insert(
                                                                 target.clone(),
                                                                 dsn_generation,
@@ -1683,10 +1887,14 @@ async fn process_stream(
                         };
                         if !retain {
                             let writer = reader.get_mut();
-                            writer
-                                .write_all(b"552 5.3.4 Message size exceeds fixed maximum\r\n")
-                                .await?;
-                            writer.flush().await?;
+                            write_message_completion(
+                                writer,
+                                service,
+                                &lmtp_recipient_groups,
+                                dsn_generation,
+                                "552 5.3.4 Message size exceeds fixed maximum",
+                            )
+                            .await?;
                             rcpts.clear();
                             mail_from = None;
                             mail_from_seen = false;
@@ -1715,8 +1923,7 @@ async fn process_stream(
                             && !valid_text_message_form(&data)
                         {
                             let writer = reader.get_mut();
-                            writer.write_all(b"554 5.6.0 BDAT content requires canonical CRLF lines or BODY=BINARYMIME\r\n").await?;
-                            writer.flush().await?;
+                            write_message_completion(writer, service, &lmtp_recipient_groups, dsn_generation, "554 5.6.0 BDAT content requires canonical CRLF lines or BODY=BINARYMIME").await?;
                             rcpts.clear();
                             mail_from = None;
                             mail_from_seen = false;
@@ -1725,10 +1932,14 @@ async fn process_stream(
                         }
                         if data.contains(&0) && mail_body != protocol::MailBody::BinaryMime {
                             let writer = reader.get_mut();
-                            writer
-                                .write_all(b"554 5.6.3 NUL requires BINARYMIME\r\n")
-                                .await?;
-                            writer.flush().await?;
+                            write_message_completion(
+                                writer,
+                                service,
+                                &lmtp_recipient_groups,
+                                dsn_generation,
+                                "554 5.6.3 NUL requires BINARYMIME",
+                            )
+                            .await?;
                             rcpts.clear();
                             mail_from = None;
                             mail_from_seen = false;
@@ -1738,10 +1949,14 @@ async fn process_stream(
                             && data.iter().any(|byte| !byte.is_ascii())
                         {
                             let writer = reader.get_mut();
-                            writer
-                                .write_all(b"554 5.6.3 8-bit content requires BODY=8BITMIME\r\n")
-                                .await?;
-                            writer.flush().await?;
+                            write_message_completion(
+                                writer,
+                                service,
+                                &lmtp_recipient_groups,
+                                dsn_generation,
+                                "554 5.6.3 8-bit content requires BODY=8BITMIME",
+                            )
+                            .await?;
                             rcpts.clear();
                             mail_from = None;
                             mail_from_seen = false;
@@ -1753,10 +1968,14 @@ async fn process_stream(
                             .map_or(data.len(), |position| position + 4);
                         if !smtp_utf8 && data[..header_end].iter().any(|byte| !byte.is_ascii()) {
                             let writer = reader.get_mut();
-                            writer
-                                .write_all(b"554 5.6.7 UTF-8 headers require SMTPUTF8\r\n")
-                                .await?;
-                            writer.flush().await?;
+                            write_message_completion(
+                                writer,
+                                service,
+                                &lmtp_recipient_groups,
+                                dsn_generation,
+                                "554 5.6.7 UTF-8 headers require SMTPUTF8",
+                            )
+                            .await?;
                             rcpts.clear();
                             mail_from = None;
                             mail_from_seen = false;
@@ -1765,6 +1984,7 @@ async fn process_stream(
                         let mut traced = received_header(
                             peer,
                             helo_name.as_deref(),
+                            service,
                             extended_smtp,
                             session_encrypted,
                             authenticated_user.is_some(),
@@ -1774,9 +1994,14 @@ async fn process_stream(
                     }
                     DataReadResult::TooLarge => {
                         let w = reader.get_mut();
-                        w.write_all(b"552 5.3.4 Message size exceeds fixed maximum\r\n")
-                            .await?;
-                        w.flush().await?;
+                        write_message_completion(
+                            w,
+                            service,
+                            &lmtp_recipient_groups,
+                            dsn_generation,
+                            "552 5.3.4 Message size exceeds fixed maximum",
+                        )
+                        .await?;
                         rcpts.clear();
                         mail_from = None;
                         mail_from_seen = false;
@@ -1784,8 +2009,14 @@ async fn process_stream(
                     }
                     DataReadResult::LineTooLong => {
                         let w = reader.get_mut();
-                        w.write_all(b"500 5.5.2 Line too long in data\r\n").await?;
-                        w.flush().await?;
+                        write_message_completion(
+                            w,
+                            service,
+                            &lmtp_recipient_groups,
+                            dsn_generation,
+                            "500 5.5.2 Line too long in data",
+                        )
+                        .await?;
                         rcpts.clear();
                         mail_from = None;
                         mail_from_seen = false;
@@ -1793,10 +2024,14 @@ async fn process_stream(
                     }
                     DataReadResult::InvalidLineEnding => {
                         let writer = reader.get_mut();
-                        writer
-                            .write_all(b"554 5.6.0 DATA lines must end with CRLF\r\n")
-                            .await?;
-                        writer.flush().await?;
+                        write_message_completion(
+                            writer,
+                            service,
+                            &lmtp_recipient_groups,
+                            dsn_generation,
+                            "554 5.6.0 DATA lines must end with CRLF",
+                        )
+                        .await?;
                         rcpts.clear();
                         mail_from = None;
                         mail_from_seen = false;
@@ -1878,9 +2113,14 @@ async fn process_stream(
                                     peer, verdict.reason
                                 );
                                 let w = reader.get_mut();
-                                w.write_all(b"554 5.7.1 Message rejected: malware detected\r\n")
-                                    .await?;
-                                w.flush().await?;
+                                write_message_completion(
+                                    w,
+                                    service,
+                                    &lmtp_recipient_groups,
+                                    dsn_generation,
+                                    "554 5.7.1 Message rejected: malware detected",
+                                )
+                                .await?;
                                 rcpts.clear();
                                 mail_from = None;
                                 mail_from_seen = false;
@@ -1893,20 +2133,28 @@ async fn process_stream(
                             match security.scanner_failure_action {
                                 ScannerFailureAction::Accept => {}
                                 ScannerFailureAction::Reject => {
-                                    w.write_all(
-                                        b"554 5.7.1 Message rejected: scanner unavailable\r\n",
+                                    write_message_completion(
+                                        w,
+                                        service,
+                                        &lmtp_recipient_groups,
+                                        dsn_generation,
+                                        "554 5.7.1 Message rejected: scanner unavailable",
                                     )
                                     .await?;
-                                    w.flush().await?;
                                     rcpts.clear();
                                     mail_from = None;
                                     mail_from_seen = false;
                                     continue;
                                 }
                                 ScannerFailureAction::Tempfail => {
-                                    w.write_all(b"451 4.7.1 Message scanner unavailable\r\n")
-                                        .await?;
-                                    w.flush().await?;
+                                    write_message_completion(
+                                        w,
+                                        service,
+                                        &lmtp_recipient_groups,
+                                        dsn_generation,
+                                        "451 4.7.1 Message scanner unavailable",
+                                    )
+                                    .await?;
                                     rcpts.clear();
                                     mail_from = None;
                                     mail_from_seen = false;
@@ -1975,10 +2223,14 @@ async fn process_stream(
                     }
                     if enforce_dmarc && dmarc_res.as_deref() == Some("reject") {
                         let writer = reader.get_mut();
-                        writer
-                            .write_all(b"554 5.7.1 Message rejected by DMARC policy\r\n")
-                            .await?;
-                        writer.flush().await?;
+                        write_message_completion(
+                            writer,
+                            service,
+                            &lmtp_recipient_groups,
+                            dsn_generation,
+                            "554 5.7.1 Message rejected by DMARC policy",
+                        )
+                        .await?;
                         rcpts.clear();
                         mail_from = None;
                         mail_from_seen = false;
@@ -1988,6 +2240,12 @@ async fn process_stream(
                     let mut any_rejected = false;
                     let mut any_quota_exceeded = false;
                     let mut arc_sealed_data: Option<Vec<u8>> = None;
+                    let mut lmtp_status = rcpts
+                        .iter()
+                        .map(|recipient| {
+                            (recipient.clone(), "451 4.3.0 Temporary delivery failure")
+                        })
+                        .collect::<HashMap<_, _>>();
                     for rcpt in &rcpts {
                         if let Some(at) = rcpt.find('@') {
                             let local = rcpt[..at].to_string();
@@ -2021,6 +2279,7 @@ async fn process_stream(
                                         Ok(path) => {
                                             any_accepted = true;
                                             local_delivered = true;
+                                            lmtp_status.insert(rcpt.clone(), "250 2.1.5 Delivered");
                                             let elapsed_us = start.elapsed().as_micros() as u64;
                                             // update metrics
                                             rmail_common::metrics::inc_deliveries();
@@ -2069,6 +2328,7 @@ async fn process_stream(
                                         Ok((_uidvalidity, uid)) => {
                                             any_accepted = true;
                                             local_delivered = true;
+                                            lmtp_status.insert(rcpt.clone(), "250 2.1.5 Delivered");
                                             let elapsed_us = start.elapsed().as_micros() as u64;
                                             // update metrics
                                             rmail_common::metrics::inc_deliveries();
@@ -2094,9 +2354,16 @@ async fn process_stream(
                                         }
                                         Err(e) => {
                                             any_rejected = true;
-                                            any_quota_exceeded |= e
+                                            let quota_exceeded = e
                                                 .downcast_ref::<rmail_common::imap_state::StorageQuotaExceeded>()
                                                 .is_some();
+                                            any_quota_exceeded |= quota_exceeded;
+                                            if quota_exceeded {
+                                                lmtp_status.insert(
+                                                    rcpt.clone(),
+                                                    "452 4.2.2 Mailbox storage limit exceeded",
+                                                );
+                                            }
                                             rmail_common::metrics::inc_failed_deliveries();
                                             eprintln!("deliver error for {}: {}", rcpt, e);
                                         }
@@ -2114,6 +2381,14 @@ async fn process_stream(
                                     );
                                 }
                             } else {
+                                if service == SmtpService::Lmtp {
+                                    any_rejected = true;
+                                    lmtp_status.insert(
+                                        rcpt.clone(),
+                                        "550 5.1.1 LMTP recipient is not a local mailbox",
+                                    );
+                                    continue;
+                                }
                                 // Queue direct authenticated relay as-is. Remote
                                 // alias/catchall targets are server-side
                                 // forwarding and receive one ARC set per message.
@@ -2202,9 +2477,59 @@ async fn process_stream(
                         }
                     }
 
-                    // Finalize DATA response based on per-recipient outcomes
+                    // LMTP reports final delivery independently for every
+                    // accepted RCPT command. Alias targets are aggregated back
+                    // to the original recipient group.
                     let w = reader.get_mut();
-                    if any_accepted {
+                    if service == SmtpService::Lmtp {
+                        if any_accepted {
+                            let mut accepted_event = TrackingEvent::new(
+                                "smtpd", &trace.id, "inbound", "message", "accepted",
+                            );
+                            accepted_event.message_id = tracking_message_id.clone();
+                            accepted_event.peer_addr = peer.map(|address| address.to_string());
+                            accepted_event.local_addr =
+                                trace.local_addr.map(|address| address.to_string());
+                            accepted_event.detail = Some(format!(
+                                "lmtp recipients={} partial_failures={any_rejected}",
+                                lmtp_recipient_groups
+                                    .iter()
+                                    .filter(|(generation, _, _)| { *generation == dsn_generation })
+                                    .count()
+                            ));
+                            accepted_event.smtp_code = Some(250);
+                            accepted_event.bytes_in = trace.state.bytes_in.load(Ordering::Relaxed);
+                            accepted_event.bytes_out =
+                                trace.state.bytes_out.load(Ordering::Relaxed);
+                            emit_tracking(accepted_event);
+                            metrics::inc_lmtp_message_received(peer);
+                        }
+                        for (_, original, targets) in lmtp_recipient_groups
+                            .iter()
+                            .filter(|(generation, _, _)| *generation == dsn_generation)
+                        {
+                            let statuses = targets
+                                .iter()
+                                .filter_map(|target| lmtp_status.get(target))
+                                .copied()
+                                .collect::<Vec<_>>();
+                            let status = if !statuses.is_empty()
+                                && statuses.iter().all(|status| status.starts_with("250 "))
+                            {
+                                "250 2.1.5 Delivered"
+                            } else if let Some(status) = statuses
+                                .iter()
+                                .find(|status| status.starts_with(['4', '5']))
+                            {
+                                status
+                            } else {
+                                "451 4.3.0 Temporary delivery failure"
+                            };
+                            w.write_all(format!("{status} <{original}>\r\n").as_bytes())
+                                .await?;
+                        }
+                        w.flush().await?;
+                    } else if any_accepted {
                         let mut accepted_event = TrackingEvent::new(
                             "smtpd", &trace.id, "inbound", "message", "accepted",
                         );
@@ -2988,13 +3313,37 @@ mod tests {
 
     #[test]
     fn received_trace_identifies_smtp_transport_and_authentication_phase() {
-        let smtp =
-            String::from_utf8(received_header(None, Some("client"), false, false, false)).unwrap();
+        let smtp = String::from_utf8(received_header(
+            None,
+            Some("client"),
+            SmtpService::Mta,
+            false,
+            false,
+            false,
+        ))
+        .unwrap();
         assert!(smtp.contains(" with SMTP;"));
-        let submission =
-            String::from_utf8(received_header(None, Some("client"), true, true, true)).unwrap();
+        let submission = String::from_utf8(received_header(
+            None,
+            Some("client"),
+            SmtpService::Submission,
+            true,
+            true,
+            true,
+        ))
+        .unwrap();
         assert!(submission.contains(" with ESMTPSA;"));
         assert!(!submission.contains(" id local"));
+        let lmtp = String::from_utf8(received_header(
+            None,
+            Some("local-mta"),
+            SmtpService::Lmtp,
+            true,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert!(lmtp.contains(" with LMTP;"));
     }
 
     #[tokio::test]
@@ -3319,6 +3668,61 @@ mod tests {
             message.matches("ARC-Authentication-Results: i=1;").count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn lmtp_requires_lhlo_and_reports_each_recipient_delivery() {
+        let (td, mail_root, db_path) = setup_mailbox();
+        rmail_common::db::add_alias(
+            &db_path,
+            "remote-alias@example.test",
+            &["recipient@example.net"],
+        )
+        .unwrap();
+        rmail_common::db::set_mailbox_quota(&db_path, "postmaster@example.test", Some(1)).unwrap();
+        let (responses, td) = run_prepared_session(
+            b"EHLO localhost\r\nLHLO localhost\r\nMAIL FROM:<sender@example.test>\r\nRCPT TO:<user@example.test>\r\nRCPT TO:<postmaster@example.test>\r\nRCPT TO:<remote-alias@example.test>\r\nDATA\r\nFrom: sender@example.test\r\nSubject: LMTP\r\n\r\nmessage\r\n.\r\nQUIT\r\n"
+                .to_vec(),
+            32 * 1024,
+            SecurityConfig::default(),
+            false,
+            SmtpService::Lmtp,
+            td,
+            mail_root,
+            db_path,
+        )
+        .await;
+
+        assert!(
+            responses
+                .iter()
+                .any(|line| line == "500 5.5.1 LMTP requires LHLO\r\n")
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|line| line.starts_with("250-rMail Hello"))
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|line| { line == "250 2.1.5 Delivered <user@example.test>\r\n" })
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|line| { line == "550 5.1.1 LMTP alias has a non-local target\r\n" })
+        );
+        assert!(responses.iter().any(|line| {
+            line == "452 4.2.2 Mailbox storage limit exceeded <postmaster@example.test>\r\n"
+        }));
+        assert_eq!(
+            std::fs::read_dir(td.path().join("mail/example.test/user/Maildir/new"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(!td.path().join("mail/outbound/maildrop/queue").exists());
     }
 
     #[tokio::test]

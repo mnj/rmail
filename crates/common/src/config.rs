@@ -132,6 +132,8 @@ fn default_tracking_prune_batch_size() -> u32 {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct ListenerEndpoints {
     pub smtp: Option<Vec<String>>,
+    /// Local Mail Transfer Protocol endpoints. Empty by default.
+    pub lmtp: Option<Vec<String>>,
     pub submission: Option<Vec<String>>,
     pub smtps: Option<Vec<String>>,
     pub imap: Option<Vec<String>>,
@@ -147,6 +149,10 @@ impl Global {
             .clone()
             .or_else(|| self.listen_addrs.clone())
             .unwrap_or_else(|| vec!["127.0.0.1:2525".to_string(), "[::1]:2525".to_string()])
+    }
+
+    pub fn lmtp_listeners(&self) -> Vec<String> {
+        self.listeners.lmtp.clone().unwrap_or_default()
     }
 
     pub fn submission_listeners(&self) -> Vec<String> {
@@ -468,6 +474,7 @@ backlog = 256
 
 [global.listeners]
 smtp = ["[::]:25"]
+lmtp = ["127.0.0.1:24"]
 submission = ["127.0.0.1:587"]
 imap = ["[::1]:143"]
 imaps = []
@@ -476,6 +483,7 @@ imaps = []
         .expect("config");
 
         assert_eq!(cfg.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(cfg.global.lmtp_listeners(), ["127.0.0.1:24"]);
         assert_eq!(cfg.global.submission_listeners(), ["127.0.0.1:587"]);
         assert_eq!(cfg.global.imap_listeners(), ["[::1]:143"]);
         assert!(cfg.global.imaps_listeners().is_empty());

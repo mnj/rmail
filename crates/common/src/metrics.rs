@@ -133,6 +133,7 @@ pub static ARC_PASS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static ARC_FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static ARC_SEALED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SMTP_MESSAGES_RECEIVED: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static LMTP_MESSAGES_RECEIVED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static SMTP_RESPONSES: [AtomicU64; 1_200] = [const { AtomicU64::new(0) }; 1_200];
 
 #[derive(Clone, Copy)]
@@ -233,6 +234,11 @@ pub fn inc_smtp_message_received(
         .fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn inc_lmtp_message_received(peer: Option<SocketAddr>) {
+    let ip_index = usize::from(peer.is_some_and(|address| address.is_ipv6()));
+    LMTP_MESSAGES_RECEIVED[ip_index].fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn gather_prometheus() -> String {
     let mut out = String::new();
     out.push_str("# HELP rmail_deliveries_total Total number of successful deliveries\n");
@@ -304,6 +310,10 @@ pub fn gather_prometheus() -> String {
                 ));
             }
         }
+        out.push_str(&format!(
+            "rmail_smtp_messages_received_total{{ip_version=\"{ip_version}\",transport=\"plain\",protocol=\"lmtp\"}} {}\n",
+            LMTP_MESSAGES_RECEIVED[ip_index].load(Ordering::Relaxed)
+        ));
     }
     out.push_str("# HELP rmail_smtp_responses_total SMTP replies by direction and status code\n");
     out.push_str("# TYPE rmail_smtp_responses_total counter\n");
@@ -485,6 +495,7 @@ mod tests {
     #[test]
     fn smtp_message_metrics_include_ip_transport_and_protocol_dimensions() {
         inc_smtp_message_received(Some("[2001:db8::1]:25".parse().unwrap()), false, true, true);
+        inc_lmtp_message_received(Some("127.0.0.1:24".parse().unwrap()));
         let metrics = gather_prometheus();
 
         assert!(metrics.contains(
@@ -492,6 +503,9 @@ mod tests {
         ));
         assert!(metrics.contains(
             "rmail_smtp_messages_received_total{ip_version=\"4\",transport=\"plain\",protocol=\"smtp\"} 0"
+        ));
+        assert!(metrics.contains(
+            "rmail_smtp_messages_received_total{ip_version=\"4\",transport=\"plain\",protocol=\"lmtp\"} 1"
         ));
     }
 

@@ -41,6 +41,8 @@ ipv6_only = false
 #   Separate IPv4+IPv6 sockets: set ipv6_only=true and list both addresses.
 # The active example uses one wildcard dual-stack socket.
 smtp = ["[::]:25"]
+# LMTP is local-only and disabled by default. Bind loopback or a private address.
+lmtp = []
 submission = ["[::]:587"]
 smtps = ["[::]:465"]
 imap = ["[::]:143"]
