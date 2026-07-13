@@ -2,6 +2,7 @@ use anyhow::Context;
 use chrono::Utc;
 use native_tls::TlsConnector as NativeTlsConnector;
 use once_cell::sync::Lazy;
+use rmail_common::tracking::{TrackingEvent, TrackingHub, new_tracking_id};
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -172,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&inflight_dir).await?;
     tokio::fs::create_dir_all(&sent_dir).await?;
     tokio::fs::create_dir_all(&failed_dir).await?;
+    let tracking = Arc::new(TrackingHub::start(&base, "outbound")?);
 
     let recovered = tokio::task::spawn_blocking({
         let maildrop_dir = maildrop_dir.clone();
@@ -244,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
                 sent_dir.clone(),
                 failed_dir.clone(),
                 connections.clone(),
+                tracking.clone(),
             ));
         }
 
@@ -361,6 +364,7 @@ async fn move_spool_message(source: &Path, destination: &Path) -> anyhow::Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_claim(
     inflight_eml: PathBuf,
     inflight_json: PathBuf,
@@ -369,6 +373,7 @@ async fn process_claim(
     sent_dir: PathBuf,
     failed_dir: PathBuf,
     connections: ConnectionPool,
+    tracking: Arc<TrackingHub>,
 ) {
     let fname = inflight_eml
         .file_name()
@@ -381,6 +386,21 @@ async fn process_claim(
         Err(_) => rmail_common::outbound::QueueControl::default_with_timestamp(0),
     };
     control.attempts = control.attempts.saturating_add(1);
+    let connection_id = new_tracking_id("outbound");
+    let tracking_message_id = control.tracking_id.clone();
+    let emit = |kind: &str, phase: &str, detail: Option<String>, code: Option<u16>| {
+        let mut event = TrackingEvent::new("outbound", &connection_id, "outbound", kind, phase);
+        event.message_id = Some(tracking_message_id.clone());
+        event.detail = detail;
+        event.smtp_code = code;
+        tracking.emit(event);
+    };
+    emit(
+        "delivery",
+        "attempting",
+        Some(format!("attempt {} for {fname}", control.attempts)),
+        None,
+    );
     if let Err(error) = write_control(&inflight_json, &control).await {
         eprintln!("failed to persist attempt for {fname}: {error}");
         let destination = queue_dir.join(&fname);
@@ -392,6 +412,7 @@ async fn process_claim(
 
     match process_file(&inflight_eml, &base, &connections).await {
         Ok(()) => {
+            emit("delivery", "delivered", Some(fname.clone()), Some(250));
             let destination = sent_dir.join(&fname);
             if let Err(error) = move_spool_message(&inflight_eml, &destination).await {
                 eprintln!("failed to move delivered message {fname} to sent: {error}");
@@ -415,6 +436,16 @@ async fn process_claim(
             eprintln!("delivery failed for {fname}: {error_message}");
 
             let terminal = permanent || control.attempts >= control.max_attempts;
+            emit(
+                "delivery",
+                if terminal {
+                    "failed"
+                } else {
+                    "retry_scheduled"
+                },
+                Some(error_message.clone()),
+                control.last_smtp_code,
+            );
             let destination = if terminal {
                 control.next_try = None;
                 failed_dir.join(&fname)
