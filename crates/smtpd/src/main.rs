@@ -33,7 +33,7 @@ mod authenticate;
 mod protocol;
 mod tls;
 use protocol::{Command as SmtpCommand, parse_command, parse_mail_from_args, parse_rcpt_to_args};
-use tls::load_tls_context;
+use tls::{load_tls_context_with_policy, reload_tls_context};
 
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
 // so that boxed trait objects can be used with tokio::io::BufReader.
@@ -225,6 +225,29 @@ enum SmtpService {
     Submission,
 }
 
+#[cfg(unix)]
+fn spawn_tls_reloader(
+    sender: tokio::sync::watch::Sender<Option<Arc<tls::TlsContext>>>,
+    cert_path: String,
+    key_path: String,
+    policy: rmail_common::config::TlsPolicy,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("installing SMTP SIGHUP handler")?;
+    Ok(tokio::spawn(async move {
+        while signal.recv().await.is_some() {
+            match reload_tls_context(&sender, &cert_path, &key_path, &policy) {
+                Ok(()) => {
+                    println!("SMTP TLS certificate and policy reloaded");
+                }
+                Err(error) => {
+                    eprintln!("SMTP TLS reload failed; keeping current context: {error}");
+                }
+            }
+        }
+    }))
+}
+
 /// Increment an on-disk counter for delivered messages. Uses an atomic write via a temporary file
 /// so that concurrent processes won't corrupt the counter file. This is intentionally simple and
 /// avoids pulling in heavier metrics crates — it's a lightweight local metric for the Web UI.
@@ -376,14 +399,25 @@ async fn main() -> Result<()> {
     }
 
     // build TLS context if certificate paths present (includes acceptor and channel-binding info)
-    let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
-        match load_tls_context(cert, key) {
-            Ok(ctx) => Some(ctx),
-            Err(e) => {
-                eprintln!("Failed to load TLS config: {}", e);
-                None
-            }
-        }
+    let tls_context = match (&cfg.global.tls_cert, &cfg.global.tls_key) {
+        (Some(cert), Some(key)) => Some(
+            load_tls_context_with_policy(cert, key, &cfg.global.tls)
+                .context("loading SMTP TLS certificate and policy")?,
+        ),
+        (None, None) => None,
+        _ => anyhow::bail!("global.tls_cert and global.tls_key must be configured together"),
+    };
+    let (tls_sender, tls_receiver) = tokio::sync::watch::channel(tls_context.clone());
+    #[cfg(unix)]
+    let _tls_reload_task = if let (Some(cert), Some(key)) =
+        (cfg.global.tls_cert.clone(), cfg.global.tls_key.clone())
+    {
+        Some(spawn_tls_reloader(
+            tls_sender,
+            cert,
+            key,
+            cfg.global.tls.clone(),
+        )?)
     } else {
         None
     };
@@ -407,7 +441,7 @@ async fn main() -> Result<()> {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)
             .with_context(|| format!("starting SMTP listener on {addr}"))?;
         let mail_root_clone = mail_root.clone();
-        let acceptor_clone = tls_context.clone();
+        let acceptor_clone = tls_receiver.clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
         let security = security.clone();
@@ -434,12 +468,12 @@ async fn main() -> Result<()> {
     }
 
     // spawn SMTPS listener (implicit TLS) if configured
-    if let Some(s_ctx) = tls_context.clone() {
+    if tls_context.is_some() {
         for addr in smtps_addrs {
             let listener = bind_tcp_listener_with_config(&addr, &listener_config)
                 .with_context(|| format!("starting SMTPS listener on {addr}"))?;
             let mail_root_clone = mail_root.clone();
-            let ctx_clone = s_ctx.clone();
+            let ctx_clone = tls_receiver.clone();
             let db_clone = db_path.clone();
             let enforce = enforce_dmarc;
             let security = security.clone();
@@ -474,7 +508,7 @@ async fn main() -> Result<()> {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)
             .with_context(|| format!("starting submission listener on {addr}"))?;
         let mail_root = mail_root.clone();
-        let tls_ctx = tls_context.clone();
+        let tls_ctx = tls_receiver.clone();
         let db_path = db_path.clone();
         let security = security.clone();
         let session_limit = session_limit.clone();
@@ -520,7 +554,7 @@ async fn run_plain_listener(
     addr: String,
     listener: tokio::net::TcpListener,
     mail_root: String,
-    tls_ctx: Option<Arc<tls::TlsContext>>,
+    tls_ctx: tokio::sync::watch::Receiver<Option<Arc<tls::TlsContext>>>,
     db_path: Option<String>,
     enforce_dmarc: bool,
     security: Arc<SecurityConfig>,
@@ -545,7 +579,7 @@ async fn run_plain_listener(
             "Accepted SMTP plaintext connection on {} from {} (starttls_available={})",
             addr,
             peer,
-            tls_ctx.is_some()
+            tls_ctx.borrow().is_some()
         );
         let trace = ConnectionTrace {
             id: new_tracking_id("smtp-conn"),
@@ -558,7 +592,7 @@ async fn run_plain_listener(
         connected.local_addr = trace.local_addr.map(|address| address.to_string());
         emit_tracking(connected);
         let mail_root = mail_root.clone();
-        let acceptor = tls_ctx.clone();
+        let acceptor = tls_ctx.borrow().clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
         let security = security.clone();
@@ -607,7 +641,7 @@ async fn run_plain_listener(
 async fn run_smtps_listener(
     addr: String,
     listener: tokio::net::TcpListener,
-    ctx: Arc<tls::TlsContext>,
+    ctx: tokio::sync::watch::Receiver<Option<Arc<tls::TlsContext>>>,
     mail_root: String,
     db_path: Option<String>,
     enforce_dmarc: bool,
@@ -641,7 +675,10 @@ async fn run_smtps_listener(
         connected.local_addr = trace.local_addr.map(|address| address.to_string());
         connected.detail = Some("implicit TLS listener".to_string());
         emit_tracking(connected);
-        let ctx = ctx.clone();
+        let Some(ctx) = ctx.borrow().clone() else {
+            eprintln!("SMTPS connection rejected because no TLS context is loaded");
+            continue;
+        };
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;

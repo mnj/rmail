@@ -8,6 +8,7 @@ EnvironmentFile=-/etc/default/rmail
 Environment=RMAIL_CONFIG=/etc/rmail/config.toml
 WorkingDirectory=/opt/rmail
 ExecStart=/usr/bin/rmail_web
+ExecReload=/bin/kill -HUP $MAINPID
 User=rmail
 Group=rmail
 StateDirectory=rmail

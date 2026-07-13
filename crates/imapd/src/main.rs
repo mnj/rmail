@@ -26,7 +26,7 @@ mod thread;
 mod tls;
 mod transport;
 use mailbox::SelectedMailbox;
-use tls::load_tls_context;
+use tls::{load_tls_context_with_policy, reload_tls_context};
 use transport::{AsyncStream, RawStream, SwitchableStream};
 
 const MAX_APPEND_LITERAL_BYTES: usize = 100 * 1024 * 1024;
@@ -199,6 +199,29 @@ async fn read_textual_command_literals(
     }
 }
 
+#[cfg(unix)]
+fn spawn_tls_reloader(
+    sender: tokio::sync::watch::Sender<Option<Arc<tls::TlsContext>>>,
+    cert_path: String,
+    key_path: String,
+    policy: rmail_common::config::TlsPolicy,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("installing IMAP SIGHUP handler")?;
+    Ok(tokio::spawn(async move {
+        while signal.recv().await.is_some() {
+            match reload_tls_context(&sender, &cert_path, &key_path, &policy) {
+                Ok(()) => {
+                    println!("IMAP TLS certificate and policy reloaded");
+                }
+                Err(error) => {
+                    eprintln!("IMAP TLS reload failed; keeping current context: {error}");
+                }
+            }
+        }
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg_path =
@@ -226,14 +249,25 @@ async fn main() -> Result<()> {
     }
 
     // TLS context if certs present
-    let tls_context = if let (Some(cert), Some(key)) = (&cfg.global.tls_cert, &cfg.global.tls_key) {
-        match load_tls_context(cert, key) {
-            Ok(ctx) => Some(ctx),
-            Err(e) => {
-                eprintln!("Failed to load TLS: {}", e);
-                None
-            }
-        }
+    let tls_context = match (&cfg.global.tls_cert, &cfg.global.tls_key) {
+        (Some(cert), Some(key)) => Some(
+            load_tls_context_with_policy(cert, key, &cfg.global.tls)
+                .context("loading IMAP TLS certificate and policy")?,
+        ),
+        (None, None) => None,
+        _ => anyhow::bail!("global.tls_cert and global.tls_key must be configured together"),
+    };
+    let (tls_sender, tls_receiver) = tokio::sync::watch::channel(tls_context.clone());
+    #[cfg(unix)]
+    let _tls_reload_task = if let (Some(cert), Some(key)) =
+        (cfg.global.tls_cert.clone(), cfg.global.tls_key.clone())
+    {
+        Some(spawn_tls_reloader(
+            tls_sender,
+            cert,
+            key,
+            cfg.global.tls.clone(),
+        )?)
     } else {
         None
     };
@@ -250,7 +284,7 @@ async fn main() -> Result<()> {
         println!("rMail IMAPD listening on {}", addr);
         listener_count += 1;
         let mail_root_clone = mail_root.clone();
-        let acceptor_clone = tls_context.clone();
+        let acceptor_clone = tls_receiver.clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
         let listener_shutdown = shutdown.clone();
@@ -272,14 +306,14 @@ async fn main() -> Result<()> {
     }
 
     // IMAPS (implicit TLS) listener
-    if let Some(ctx) = tls_context.clone() {
+    if tls_context.is_some() {
         for addr in imaps_addrs {
             let listener = bind_tcp_listener_with_config(&addr, &listener_config)
                 .with_context(|| format!("starting IMAPS listener on {addr}"))?;
             println!("rMail IMAPD (IMAPS) listening on {}", addr);
             listener_count += 1;
             let mail_root_clone = mail_root.clone();
-            let ctx_clone = ctx.clone();
+            let ctx_clone = tls_receiver.clone();
             let db_clone = db_path.clone();
             let auth_policy = auth_policy.clone();
             let listener_shutdown = shutdown.clone();
@@ -328,7 +362,7 @@ async fn run_plain_listener(
     addr: String,
     listener: tokio::net::TcpListener,
     mail_root: String,
-    tls_ctx: Option<Arc<tls::TlsContext>>,
+    tls_ctx: tokio::sync::watch::Receiver<Option<Arc<tls::TlsContext>>>,
     db_path: Option<String>,
     auth_policy: Arc<auth::AuthPolicy>,
     shutdown: GracefulShutdown,
@@ -349,10 +383,10 @@ async fn run_plain_listener(
             "Accepted IMAP plaintext connection on {} from {} (starttls_available={})",
             addr,
             peer,
-            tls_ctx.is_some()
+            tls_ctx.borrow().is_some()
         );
         let mail_root = mail_root.clone();
-        let acceptor = tls_ctx.clone();
+        let acceptor = tls_ctx.borrow().clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
         let session = shutdown.start_session();
@@ -378,7 +412,7 @@ async fn run_plain_listener(
 async fn run_imaps_listener(
     addr: String,
     listener: tokio::net::TcpListener,
-    ctx: Arc<tls::TlsContext>,
+    ctx: tokio::sync::watch::Receiver<Option<Arc<tls::TlsContext>>>,
     mail_root: String,
     db_path: Option<String>,
     auth_policy: Arc<auth::AuthPolicy>,
@@ -397,7 +431,10 @@ async fn run_imaps_listener(
             accepted = listener.accept() => accepted?,
         };
         println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
-        let ctx = ctx.clone();
+        let Some(ctx) = ctx.borrow().clone() else {
+            eprintln!("IMAPS connection rejected because no TLS context is loaded");
+            continue;
+        };
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();

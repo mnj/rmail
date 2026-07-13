@@ -17,6 +17,7 @@ pub mod outbound;
 pub mod runtime;
 pub mod scanner;
 pub mod sqlite_pool;
+pub mod tls;
 pub mod tracking;
 pub mod transport;
 

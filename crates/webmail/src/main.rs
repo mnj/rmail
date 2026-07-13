@@ -16,8 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     task::JoinSet,
 };
 
@@ -138,6 +137,7 @@ async fn main() -> Result<()> {
             webmail_session_secret: None,
             tls_cert: None,
             tls_key: None,
+            tls: rmail_common::config::TlsPolicy::default(),
             log_level: None,
             db_path: None,
             web_admin_user: None,
@@ -175,6 +175,14 @@ async fn main() -> Result<()> {
         session_secret,
     });
     let bind_addrs = cfg.global.webmail_listeners();
+    let tls = rmail_common::tls::web_tls_channel(&cfg.global)?;
+    rmail_common::tls::spawn_web_tls_reloader(
+        tls.0.clone(),
+        cfg.global.tls_cert.clone(),
+        cfg.global.tls_key.clone(),
+        cfg.global.tls.clone(),
+        "webmail",
+    );
     let listener_config = cfg.global.tcp_listener.clone();
     let shutdown = GracefulShutdown::new();
     let mut listeners = JoinSet::new();
@@ -183,6 +191,7 @@ async fn main() -> Result<()> {
         println!("rMail webmail listening on {}", addr);
         let state = state.clone();
         let listener_shutdown = shutdown.clone();
+        let tls = tls.1.clone();
         listeners.spawn(async move {
             let mut shutdown_signal = listener_shutdown.subscribe();
             loop {
@@ -196,10 +205,19 @@ async fn main() -> Result<()> {
                 match accepted {
                     Ok((stream, _)) => {
                         let state = state.clone();
+                        let tls_context = tls.borrow().clone();
                         let session = listener_shutdown.start_session();
                         tokio::spawn(async move {
                             let _session = session;
-                            if let Err(err) = handle_connection(stream, state).await {
+                            let result = if let Some(context) = tls_context {
+                                match context.acceptor.accept(stream).await {
+                                    Ok(stream) => handle_connection(stream, state).await,
+                                    Err(error) => Err(error.into()),
+                                }
+                            } else {
+                                handle_connection(stream, state).await
+                            };
+                            if let Err(err) = result {
                                 eprintln!("webmail connection error: {err:#}");
                             }
                         });
@@ -229,7 +247,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
+async fn handle_connection<S>(mut stream: S, state: Arc<AppState>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request = read_request(&mut stream).await?;
     let response = match request {
         Some(request) => route(request, &state).await,
@@ -238,7 +259,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
     write_response(&mut stream, response).await
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end;
@@ -292,7 +313,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
     }))
 }
 
-async fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
+async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, response: Response) -> Result<()> {
     let reason = match response.status {
         200 => "OK",
         204 => "No Content",

@@ -15,6 +15,14 @@ db_path = "config/rmail.db"
 # directory used to serve ACME http-01 challenges (used by automated cert managers)
 acme_challenge_dir = "config/acme-challenges"
 
+[global.tls]
+minimum_version = "1.2"
+# Empty uses Rustls safe defaults. To pin suites, use Rustls names such as:
+# cipher_suites = ["TLS13_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
+cipher_suites = []
+# Set true when a reverse proxy terminates HTTPS for both web services.
+web_http_only = false
+
 [global.tcp_listener]
 # SO_REUSEADDR is always enabled for clean restarts. Enable reuse_port only
 # when intentionally running multiple processes on the same sockets.

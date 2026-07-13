@@ -1,6 +1,6 @@
 // rmail_web: minimal tokio-based HTTP UI for stats and logs (no hyper/axum)
 
-#![allow(clippy::ptr_arg, clippy::type_complexity)]
+#![allow(clippy::ptr_arg, clippy::too_many_arguments, clippy::type_complexity)]
 
 use anyhow::{Context, Result};
 use argon2::{
@@ -21,7 +21,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -1169,19 +1169,18 @@ fn delete_single_sync(
     Ok(())
 }
 
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    stream: S,
+    peer: String,
     mail_root: PathBuf,
     admin_user: Option<String>,
     admin_hash: Option<String>,
     db_path: Option<String>,
     acme_challenge_dir: Option<String>,
     readiness: ReadinessConfig,
-) {
-    let peer = match stream.peer_addr() {
-        Ok(p) => p.to_string(),
-        Err(_) => "unknown".to_string(),
-    };
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
     // read request line
@@ -2259,6 +2258,7 @@ async fn main() -> Result<()> {
                 webmail_session_secret: None,
                 tls_cert: None,
                 tls_key: None,
+                tls: rmail_common::config::TlsPolicy::default(),
                 log_level: None,
                 web_admin_user: None,
                 web_admin_password_hash: None,
@@ -2283,6 +2283,14 @@ async fn main() -> Result<()> {
         check_dns: true,
     };
     let bind_addrs = cfg.global.admin_listeners();
+    let tls = rmail_common::tls::web_tls_channel(&cfg.global)?;
+    rmail_common::tls::spawn_web_tls_reloader(
+        tls.0.clone(),
+        cfg.global.tls_cert.clone(),
+        cfg.global.tls_key.clone(),
+        cfg.global.tls.clone(),
+        "web admin",
+    );
     let listener_config = cfg.global.tcp_listener.clone();
     let shutdown = GracefulShutdown::new();
     let mut listeners = JoinSet::new();
@@ -2296,13 +2304,14 @@ async fn main() -> Result<()> {
         let acme_dir = acme_dir.clone();
         let readiness = readiness.clone();
         let listener_shutdown = shutdown.clone();
+        let tls = tls.1.clone();
         listeners.spawn(async move {
             let mut shutdown_signal = listener_shutdown.subscribe();
             loop {
                 if *shutdown_signal.borrow() {
                     break;
                 }
-                let (stream, _) = tokio::select! {
+                let (stream, peer) = tokio::select! {
                     _ = shutdown_signal.changed() => break,
                     accepted = listener.accept() => match accepted {
                         Ok(value) => value,
@@ -2319,12 +2328,39 @@ async fn main() -> Result<()> {
                 let acme_dir = acme_dir.clone();
                 let readiness = readiness.clone();
                 let session = listener_shutdown.start_session();
+                let tls_context = tls.borrow().clone();
                 tokio::spawn(async move {
                     let _session = session;
-                    handle_connection(
-                        stream, mr, admin_user, admin_hash, db_path, acme_dir, readiness,
-                    )
-                    .await;
+                    if let Some(context) = tls_context {
+                        match context.acceptor.accept(stream).await {
+                            Ok(stream) => {
+                                handle_connection(
+                                    stream,
+                                    peer.to_string(),
+                                    mr,
+                                    admin_user,
+                                    admin_hash,
+                                    db_path,
+                                    acme_dir,
+                                    readiness,
+                                )
+                                .await
+                            }
+                            Err(error) => eprintln!("web TLS handshake failed: {error}"),
+                        }
+                    } else {
+                        handle_connection(
+                            stream,
+                            peer.to_string(),
+                            mr,
+                            admin_user,
+                            admin_hash,
+                            db_path,
+                            acme_dir,
+                            readiness,
+                        )
+                        .await;
+                    }
                 });
             }
         });
@@ -2377,7 +2413,17 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_connection(stream, mail_root, None, None, db_path, None, readiness).await;
+            handle_connection(
+                stream,
+                "test-client".to_string(),
+                mail_root,
+                None,
+                None,
+                db_path,
+                None,
+                readiness,
+            )
+            .await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");

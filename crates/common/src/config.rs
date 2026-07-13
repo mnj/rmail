@@ -42,6 +42,8 @@ pub struct Global {
     pub webmail_session_secret: Option<String>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    #[serde(default)]
+    pub tls: TlsPolicy,
     pub log_level: Option<String>,
     /// Optional SQLite database path for mailboxes/catchalls
     pub db_path: Option<String>,
@@ -53,6 +55,37 @@ pub struct Global {
     pub acme_challenge_dir: Option<String>,
     /// If true, enforce DMARC policies (reject/quarantine) at SMTP time for inbound mail
     pub enforce_dmarc: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct TlsPolicy {
+    #[serde(default)]
+    pub minimum_version: TlsMinimumVersion,
+    /// Rustls cipher-suite names. Empty uses the safe Rustls defaults.
+    #[serde(default)]
+    pub cipher_suites: Vec<String>,
+    /// Keep admin web and webmail on HTTP when a reverse proxy terminates TLS.
+    #[serde(default)]
+    pub web_http_only: bool,
+}
+
+impl Default for TlsPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_version: TlsMinimumVersion::Tls12,
+            cipher_suites: Vec::new(),
+            web_http_only: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMinimumVersion {
+    #[default]
+    #[serde(rename = "1.2")]
+    Tls12,
+    #[serde(rename = "1.3")]
+    Tls13,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -337,7 +370,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ScannerFailureAction};
+    use super::{Config, ScannerFailureAction, TlsMinimumVersion};
 
     #[test]
     fn security_defaults_when_absent() {
@@ -366,6 +399,8 @@ mod tests {
         );
         assert!(!cfg.security.rspamd_enabled);
         assert!(!cfg.security.scanners_enabled());
+        assert_eq!(cfg.global.tls.minimum_version, TlsMinimumVersion::Tls12);
+        assert!(cfg.global.tls.cipher_suites.is_empty());
     }
 
     #[test]
@@ -462,6 +497,7 @@ imap_port = 1143
             toml::from_str(include_str!("../../../config/test.toml")).expect("test config");
 
         assert_eq!(example.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(example.global.tls.minimum_version, TlsMinimumVersion::Tls12);
         assert_eq!(example.global.imap_listeners(), ["[::]:143"]);
         assert_eq!(test.global.smtp_listeners().len(), 2);
         assert_eq!(test.global.tcp_listener.backlog, 128);

@@ -151,6 +151,22 @@ Outbound transport security:
 - MTA-STS policies are discovered through `_mta-sts.<domain>` TXT records, fetched over authenticated HTTPS, cached for `max_age`, and enforced against MX names and TLS certificate validation
 - TLS failures are reported to valid `mailto:` destinations in `_smtp._tls.<domain>` RFC 8460 records using `application/tlsrpt+json`; reports themselves use a null reverse path to prevent loops
 
+TLS policy is configured once under `[global.tls]`. `minimum_version` accepts
+`"1.2"` (the default, enabling TLS 1.2 and 1.3) or `"1.3"`. `cipher_suites` may be left empty for
+Rustls safe defaults or set to an allow-list of Rustls cipher-suite names. Unknown suites, a suite
+set incompatible with the selected protocol versions, partial cert/key configuration, and invalid
+replacement certificates fail validation.
+
+When `tls_cert` and `tls_key` are configured, SMTP, IMAP, admin web, and webmail share those
+credentials and the web services serve HTTPS. Set `web_http_only = true` when a reverse proxy
+terminates TLS; this affects only admin web and webmail and leaves mail-protocol TLS enabled.
+Without configured credentials, the web services remain available over HTTP.
+
+`systemctl reload rmail_smtpd rmail_imapd rmail_web rmail_webmail` sends SIGHUP. Each daemon parses and validates the
+replacement certificate, private key, version policy, and cipher policy before atomically swapping
+the context used by new connections. Existing TLS sessions continue uninterrupted; a failed reload
+keeps the previous context. OCSP stapling is not currently served by the Rustls listeners.
+
 Health probes are exposed by `rmail_web` without authentication so an orchestrator can use them:
 
 - `GET /healthz` (also `/health`) is a process-liveness check and returns `200` while the HTTP service is responsive.
