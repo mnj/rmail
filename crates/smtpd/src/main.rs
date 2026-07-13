@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, VecDeque},
@@ -19,7 +22,9 @@ use rmail_common::{
     scanner::{ScanAction, ScanEnvelope},
     tracking::{TrackingEvent, TrackingHub, new_tracking_id},
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -53,14 +58,152 @@ static SUBMISSION_MESSAGES: Lazy<Mutex<HashMap<String, VecDeque<Instant>>>> =
 static CONNECTION_ATTEMPTS: Lazy<Mutex<HashMap<IpAddr, VecDeque<Instant>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static TRACKING_HUB: once_cell::sync::OnceCell<Arc<TrackingHub>> = once_cell::sync::OnceCell::new();
+#[cfg(test)]
+static TRACKING_TEST_EVENTS: Lazy<Mutex<Vec<TrackingEvent>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 #[derive(Clone)]
 struct ConnectionTrace {
     id: String,
     local_addr: Option<SocketAddr>,
+    state: Arc<ReplyTraceState>,
+}
+
+#[derive(Default)]
+struct ReplyTraceState {
+    message_id: Mutex<Option<String>>,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
+impl ConnectionTrace {
+    fn set_message_id(&self, message_id: Option<String>) {
+        if let Ok(mut current) = self.state.message_id.lock() {
+            *current = message_id;
+        }
+    }
+}
+
+struct ReplyTrackingStream {
+    inner: Box<dyn AsyncStream + Send + 'static>,
+    trace: ConnectionTrace,
+    peer: Option<SocketAddr>,
+    enabled: bool,
+    reply_line: Vec<u8>,
+}
+
+impl ReplyTrackingStream {
+    fn new(
+        inner: Box<dyn AsyncStream + Send + 'static>,
+        trace: ConnectionTrace,
+        peer: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            inner,
+            trace,
+            peer,
+            enabled: true,
+            reply_line: Vec::with_capacity(512),
+        }
+    }
+
+    fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    fn record_written(&mut self, bytes: &[u8]) {
+        if !self.enabled {
+            return;
+        }
+        self.trace
+            .state
+            .bytes_out
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        for byte in bytes {
+            self.reply_line.push(*byte);
+            if self.reply_line.ends_with(b"\r\n") {
+                if self.reply_line.len() >= 5
+                    && self.reply_line[..3].iter().all(u8::is_ascii_digit)
+                    && matches!(self.reply_line[3], b' ' | b'-')
+                {
+                    let code = std::str::from_utf8(&self.reply_line[..3])
+                        .ok()
+                        .and_then(|value| value.parse().ok());
+                    let mut event = TrackingEvent::new(
+                        "smtpd",
+                        &self.trace.id,
+                        "inbound",
+                        "reply",
+                        "smtp_reply",
+                    );
+                    event.message_id = self
+                        .trace
+                        .state
+                        .message_id
+                        .lock()
+                        .ok()
+                        .and_then(|value| value.clone());
+                    event.peer_addr = self.peer.map(|address| address.to_string());
+                    event.local_addr = self.trace.local_addr.map(|address| address.to_string());
+                    event.detail =
+                        Some(String::from_utf8_lossy(&self.reply_line).trim().to_string());
+                    event.smtp_code = code;
+                    event.bytes_in = self.trace.state.bytes_in.load(Ordering::Relaxed);
+                    event.bytes_out = self.trace.state.bytes_out.load(Ordering::Relaxed);
+                    emit_tracking(event);
+                }
+                self.reply_line.clear();
+            } else if self.reply_line.len() > 4096 {
+                self.reply_line.clear();
+            }
+        }
+    }
+}
+
+impl AsyncRead for ReplyTrackingStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buffer);
+        if this.enabled && matches!(result, Poll::Ready(Ok(()))) {
+            this.trace
+                .state
+                .bytes_in
+                .fetch_add((buffer.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for ReplyTrackingStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, bytes) {
+            Poll::Ready(Ok(written)) => {
+                this.record_written(&bytes[..written]);
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 fn emit_tracking(event: TrackingEvent) {
+    #[cfg(test)]
+    TRACKING_TEST_EVENTS.lock().unwrap().push(event.clone());
     if let Some(hub) = TRACKING_HUB.get() {
         let _ = hub.emit(event);
     }
@@ -398,6 +541,7 @@ async fn run_plain_listener(
         let trace = ConnectionTrace {
             id: new_tracking_id("smtp-conn"),
             local_addr: stream.local_addr().ok(),
+            state: Arc::new(ReplyTraceState::default()),
         };
         let mut connected =
             TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "connected");
@@ -480,6 +624,7 @@ async fn run_smtps_listener(
         let trace = ConnectionTrace {
             id: new_tracking_id("smtp-conn"),
             local_addr: stream.local_addr().ok(),
+            state: Arc::new(ReplyTraceState::default()),
         };
         let mut connected =
             TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "connected");
@@ -712,14 +857,14 @@ async fn process_stream(
     service: SmtpService,
     trace: Option<ConnectionTrace>,
 ) -> Result<()> {
-    let mut reader = BufReader::new(stream);
     let implicit_tls = session_encrypted;
     let trace = trace.unwrap_or_else(|| ConnectionTrace {
         id: new_tracking_id("smtp-conn"),
         local_addr: None,
+        state: Arc::new(ReplyTraceState::default()),
     });
+    let mut reader = BufReader::new(ReplyTrackingStream::new(stream, trace.clone(), peer));
     let mut tracking_message_id: Option<String> = None;
-    let mut tracked_bytes_in = 0_u64;
     println!(
         "Starting SMTP session peer={:?} encrypted={} tls_configured={} enforce_dmarc={}",
         peer,
@@ -832,8 +977,8 @@ async fn process_stream(
         };
         if matches!(parsed_command, SmtpCommand::Mail(_)) {
             tracking_message_id = Some(new_tracking_id("message"));
+            trace.set_message_id(tracking_message_id.clone());
         }
-        tracked_bytes_in = tracked_bytes_in.saturating_add(line.len() as u64);
         let mut command_event = TrackingEvent::new(
             "smtpd",
             &trace.id,
@@ -849,7 +994,8 @@ async fn process_stream(
         command_event.peer_addr = peer.map(|address| address.to_string());
         command_event.local_addr = trace.local_addr.map(|address| address.to_string());
         command_event.detail = Some(logged_cmd.clone());
-        command_event.bytes_in = tracked_bytes_in;
+        command_event.bytes_in = trace.state.bytes_in.load(Ordering::Relaxed);
+        command_event.bytes_out = trace.state.bytes_out.load(Ordering::Relaxed);
         emit_tracking(command_event);
         println!(
             "SMTP peer={:?} encrypted={} cmd={:?} authed={:?} mail_from={:?} rcpt_count={}",
@@ -964,6 +1110,7 @@ async fn process_stream(
                 bdat_started = false;
                 rcpts.clear();
                 tracking_message_id = None;
+                trace.set_message_id(None);
             }
             SmtpCommand::Auth(auth_args) => {
                 let Some(parsed_auth) = protocol::parse_auth_args(auth_args) else {
@@ -1564,7 +1711,6 @@ async fn process_stream(
                 let mut data = bytes::Bytes::from(data);
 
                 let mut scanner_quarantine = false;
-                tracked_bytes_in = tracked_bytes_in.saturating_add(data.len() as u64);
                 let mut content_event = TrackingEvent::new(
                     "smtpd",
                     &trace.id,
@@ -1576,7 +1722,8 @@ async fn process_stream(
                 content_event.peer_addr = peer.map(|address| address.to_string());
                 content_event.local_addr = trace.local_addr.map(|address| address.to_string());
                 content_event.detail = Some(format!("{} recipients", rcpts.len()));
-                content_event.bytes_in = tracked_bytes_in;
+                content_event.bytes_in = trace.state.bytes_in.load(Ordering::Relaxed);
+                content_event.bytes_out = trace.state.bytes_out.load(Ordering::Relaxed);
                 emit_tracking(content_event);
                 if service == SmtpService::Submission
                     && security.submission_require_from_alignment
@@ -1891,7 +2038,8 @@ async fn process_stream(
                             rcpts.len()
                         ));
                         accepted_event.smtp_code = Some(250);
-                        accepted_event.bytes_in = tracked_bytes_in;
+                        accepted_event.bytes_in = trace.state.bytes_in.load(Ordering::Relaxed);
+                        accepted_event.bytes_out = trace.state.bytes_out.load(Ordering::Relaxed);
                         emit_tracking(accepted_event);
                         metrics::inc_smtp_message_received(
                             peer,
@@ -1942,6 +2090,7 @@ async fn process_stream(
                 bdat_buffer.clear();
                 bdat_started = false;
                 tracking_message_id = None;
+                trace.set_message_id(None);
             }
             SmtpCommand::Rset => {
                 mail_from = None;
@@ -1953,6 +2102,7 @@ async fn process_stream(
                 bdat_started = false;
                 rcpts.clear();
                 tracking_message_id = None;
+                trace.set_message_id(None);
                 let w = reader.get_mut();
                 w.write_all(b"250 2.0.0 Reset state\r\n").await?;
                 w.flush().await?;
@@ -1996,6 +2146,8 @@ async fn process_stream(
                     let w = reader.get_mut();
                     w.write_all(b"220 2.0.0 Ready to start TLS\r\n").await?;
                     w.flush().await?;
+                    trace.set_message_id(None);
+                    reader.get_mut().disable();
                     // take ownership of the underlying stream and perform TLS accept
                     let inner = reader.into_inner();
                     match timeout(
@@ -2064,7 +2216,8 @@ async fn process_stream(
     disconnected.message_id = tracking_message_id;
     disconnected.peer_addr = peer.map(|address| address.to_string());
     disconnected.local_addr = trace.local_addr.map(|address| address.to_string());
-    disconnected.bytes_in = tracked_bytes_in;
+    disconnected.bytes_in = trace.state.bytes_in.load(Ordering::Relaxed);
+    disconnected.bytes_out = trace.state.bytes_out.load(Ordering::Relaxed);
     emit_tracking(disconnected);
     Ok(())
 }
@@ -2072,7 +2225,8 @@ async fn process_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE_BYTES, SmtpService, parse_mail_from_arg, process_stream, received_header,
+        ConnectionTrace, MAX_MESSAGE_BYTES, ReplyTraceState, ReplyTrackingStream, SmtpService,
+        TRACKING_TEST_EVENTS, parse_mail_from_arg, process_stream, received_header,
     };
     use crate::protocol;
     use base64::Engine;
@@ -2080,6 +2234,7 @@ mod tests {
     use rmail_common::config::{ScannerFailureAction, SecurityConfig};
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, duplex};
     use tokio::net::UnixListener;
 
@@ -2099,6 +2254,57 @@ mod tests {
                 return output;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reply_tracking_counts_wire_bytes_and_stops_below_starttls() {
+        let (server, mut client) = duplex(4096);
+        let trace = ConnectionTrace {
+            id: "reply-tracking-test".into(),
+            local_addr: Some("192.0.2.10:25".parse().unwrap()),
+            state: Arc::new(ReplyTraceState::default()),
+        };
+        trace.set_message_id(Some("message-reply-test".into()));
+        let mut tracked = ReplyTrackingStream::new(
+            Box::new(server),
+            trace.clone(),
+            Some("192.0.2.20:40000".parse().unwrap()),
+        );
+
+        client.write_all(b"NOOP\r\n").await.unwrap();
+        let mut command = [0_u8; 6];
+        tracked.read_exact(&mut command).await.unwrap();
+        tracked.write_all(b"250-first line\r\n250 ").await.unwrap();
+        tracked.write_all(b"2.0.0 OK\r\n").await.unwrap();
+        tracked.flush().await.unwrap();
+        let mut replies = vec![0_u8; 30];
+        client.read_exact(&mut replies).await.unwrap();
+
+        assert_eq!(trace.state.bytes_in.load(Ordering::Relaxed), 6);
+        assert_eq!(trace.state.bytes_out.load(Ordering::Relaxed), 30);
+        {
+            let events = TRACKING_TEST_EVENTS.lock().unwrap();
+            let replies = events
+                .iter()
+                .filter(|event| event.connection_id == "reply-tracking-test")
+                .collect::<Vec<_>>();
+            assert_eq!(replies.len(), 2);
+            assert!(replies.iter().all(|event| event.smtp_code == Some(250)));
+            assert!(
+                replies
+                    .iter()
+                    .all(|event| event.message_id.as_deref() == Some("message-reply-test"))
+            );
+            assert_eq!(replies.last().unwrap().bytes_in, 6);
+            assert_eq!(replies.last().unwrap().bytes_out, 30);
+        }
+
+        tracked.disable();
+        tracked
+            .write_all(b"encrypted transport bytes")
+            .await
+            .unwrap();
+        assert_eq!(trace.state.bytes_out.load(Ordering::Relaxed), 30);
     }
 
     fn scram_client_final(password: &str, client_first_bare: &str, server_first: &str) -> String {

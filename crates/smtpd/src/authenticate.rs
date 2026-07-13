@@ -5,18 +5,18 @@ use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use rmail_common::auth::{
     LoginExchange, PasswordAuthResult, PasswordSaslExchange, PasswordSaslProgress, PlainExchange,
 };
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use crate::{AUTH_CONTINUATION_TIMEOUT, AsyncStream, protocol};
+use crate::{AUTH_CONTINUATION_TIMEOUT, protocol};
 
 pub(crate) struct Outcome {
     pub(crate) authenticated_user: Option<String>,
     pub(crate) disconnected: bool,
 }
 
-pub(crate) async fn handle_password(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+pub(crate) async fn handle_password<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
     mechanism: &str,
     initial_response: Option<&str>,
     db_path: Option<&String>,
@@ -110,8 +110,8 @@ pub(crate) async fn handle_password(
     }
 }
 
-pub(crate) async fn handle_scram(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
     initial_response: Option<&str>,
     db_path: Option<&String>,
     peer: Option<SocketAddr>,
@@ -244,8 +244,8 @@ fn decode_sasl_message(response: &str) -> Option<String> {
     String::from_utf8(BASE64_ENGINE.decode(response).ok()?).ok()
 }
 
-async fn run_exchange(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+async fn run_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
     exchange: &mut dyn PasswordSaslExchange,
     initial_response: Option<&str>,
 ) -> Result<rmail_common::auth::SaslCredentials, ExchangeError> {
@@ -268,8 +268,8 @@ async fn run_exchange(
     }
 }
 
-async fn read_response(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+async fn read_response<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
 ) -> Result<String, ExchangeError> {
     let line = match timeout(
         AUTH_CONTINUATION_TIMEOUT,
@@ -294,16 +294,16 @@ async fn read_response(
     }
 }
 
-async fn write_reply(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+async fn write_reply<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
     reply: &[u8],
 ) -> std::io::Result<()> {
     reader.get_mut().write_all(reply).await?;
     reader.get_mut().flush().await
 }
 
-async fn failure(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+async fn failure<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
     reply: &[u8],
 ) -> Outcome {
     let disconnected = write_reply(reader, reply).await.is_err();
@@ -320,8 +320,8 @@ fn disconnected() -> Outcome {
     }
 }
 
-async fn exchange_failure(
-    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+async fn exchange_failure<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
     error: ExchangeError,
 ) -> Outcome {
     match error {
