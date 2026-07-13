@@ -7,6 +7,7 @@ listen_addrs = ["0.0.0.0:25", "[::]:25"]
 smtps_listen_addrs = ["0.0.0.0:465", "[::]:465"]
 smtps_port = 465
 submission_port = 587
+submission_listen_addrs = ["0.0.0.0:587", "[::]:587"]
 # Optional explicit IMAPS listeners; if unset, imaps_port binds wildcard v4 only
 imaps_listen_addrs = ["0.0.0.0:993", "[::]:993"]
 imaps_port = 993
@@ -33,6 +34,13 @@ db_path = "config/rmail.db"
 acme_challenge_dir = "config/acme-challenges"
 
 [security]
+# Resource-exhaustion controls shared by SMTP, SMTPS, and submission listeners.
+smtp_max_concurrent_sessions = 1000
+smtp_max_connections_per_minute = 60
+smtp_max_commands_per_minute = 120
+smtp_max_recipients = 100
+submission_max_recipients = 50
+submission_max_messages_per_minute = 30
 # PLAIN and LOGIN are advertised only over TLS. SCRAM-SHA-256 remains available pre-TLS.
 imap_sasl_mechanisms = ["PLAIN", "LOGIN", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
 smtp_sasl_mechanisms = ["PLAIN", "LOGIN", "SCRAM-SHA-256"]

@@ -74,6 +74,17 @@ Important:
 
 - `rmail_outbound` reads `RMAIL_MAIL_ROOT`; it does not read the TOML file directly
 - `rmail_web` currently binds to `127.0.0.1` by default, which is a safer default for admin access
+- port 25 listeners use MTA policy; port 587 and implicit-TLS port 465 use submission policy
+- submission requires TLS, authentication, and an envelope sender matching the authenticated mailbox
+
+SMTP resource limits are configured in the `[security]` section:
+
+- `smtp_max_concurrent_sessions` — process-wide concurrent SMTP sessions (default: `1000`)
+- `smtp_max_connections_per_minute` — accepted TCP connections per source IP in a rolling minute (default: `60`)
+- `smtp_max_commands_per_minute` — per-session rolling command limit (default: `120`)
+- `smtp_max_recipients` — recipients per port-25 transaction (default: `100`)
+- `submission_max_recipients` — recipients per authenticated submission transaction (default: `50`)
+- `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
 
 Optional outbound-worker tuning in `/etc/default/rmail`:
 

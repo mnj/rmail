@@ -1997,6 +1997,7 @@ async fn main() -> Result<()> {
                 smtps_listen_addrs: None,
                 smtps_port: None,
                 submission_port: None,
+                submission_listen_addrs: None,
                 imaps_listen_addrs: None,
                 imaps_port: None,
                 imap_listen_addrs: None,

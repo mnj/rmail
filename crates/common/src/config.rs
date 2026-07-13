@@ -11,6 +11,8 @@ pub struct Global {
     pub smtps_listen_addrs: Option<Vec<String>>,
     pub smtps_port: Option<u16>,
     pub submission_port: Option<u16>,
+    /// Explicit message-submission bind addresses; defaults to wildcard v4+v6 for submission_port.
+    pub submission_listen_addrs: Option<Vec<String>>,
     /// IMAPS bind addresses; if unset, imaps_port binds wildcard v4 only for compatibility
     pub imaps_listen_addrs: Option<Vec<String>>,
     pub imaps_port: Option<u16>,
@@ -57,6 +59,18 @@ pub enum ScannerFailureAction {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SecurityConfig {
+    #[serde(default = "default_smtp_max_concurrent_sessions")]
+    pub smtp_max_concurrent_sessions: usize,
+    #[serde(default = "default_smtp_max_connections_per_minute")]
+    pub smtp_max_connections_per_minute: usize,
+    #[serde(default = "default_smtp_max_commands_per_minute")]
+    pub smtp_max_commands_per_minute: usize,
+    #[serde(default = "default_smtp_max_recipients")]
+    pub smtp_max_recipients: usize,
+    #[serde(default = "default_submission_max_recipients")]
+    pub submission_max_recipients: usize,
+    #[serde(default = "default_submission_max_messages_per_minute")]
+    pub submission_max_messages_per_minute: usize,
     #[serde(default = "default_imap_sasl_mechanisms")]
     pub imap_sasl_mechanisms: Vec<String>,
     #[serde(default = "default_smtp_sasl_mechanisms")]
@@ -84,6 +98,12 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            smtp_max_concurrent_sessions: default_smtp_max_concurrent_sessions(),
+            smtp_max_connections_per_minute: default_smtp_max_connections_per_minute(),
+            smtp_max_commands_per_minute: default_smtp_max_commands_per_minute(),
+            smtp_max_recipients: default_smtp_max_recipients(),
+            submission_max_recipients: default_submission_max_recipients(),
+            submission_max_messages_per_minute: default_submission_max_messages_per_minute(),
             imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             smtp_sasl_mechanisms: default_smtp_sasl_mechanisms(),
             scanner_failure_action: default_scanner_failure_action(),
@@ -97,6 +117,30 @@ impl Default for SecurityConfig {
             rspamd_reject_actions: Vec::new(),
         }
     }
+}
+
+fn default_smtp_max_concurrent_sessions() -> usize {
+    1_000
+}
+
+fn default_smtp_max_connections_per_minute() -> usize {
+    60
+}
+
+fn default_smtp_max_commands_per_minute() -> usize {
+    120
+}
+
+fn default_smtp_max_recipients() -> usize {
+    100
+}
+
+fn default_submission_max_recipients() -> usize {
+    50
+}
+
+fn default_submission_max_messages_per_minute() -> usize {
+    30
 }
 
 fn default_imap_sasl_mechanisms() -> Vec<String> {
@@ -171,6 +215,12 @@ mod tests {
         );
         assert_eq!(cfg.security.scanner_timeout_ms, 5000);
         assert_eq!(cfg.security.scanner_max_message_bytes, 10 * 1024 * 1024);
+        assert_eq!(cfg.security.smtp_max_concurrent_sessions, 1_000);
+        assert_eq!(cfg.security.smtp_max_connections_per_minute, 60);
+        assert_eq!(cfg.security.smtp_max_commands_per_minute, 120);
+        assert_eq!(cfg.security.smtp_max_recipients, 100);
+        assert_eq!(cfg.security.submission_max_recipients, 50);
+        assert_eq!(cfg.security.submission_max_messages_per_minute, 30);
         assert!(!cfg.security.clamav_enabled);
         assert_eq!(
             cfg.security.imap_sasl_mechanisms,

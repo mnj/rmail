@@ -5,7 +5,11 @@ use once_cell::sync::Lazy;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use rmail_common::{
     config::{Config, ScannerFailureAction, SecurityConfig},
@@ -14,6 +18,7 @@ use rmail_common::{
     scanner::{ScanAction, ScanEnvelope},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 mod authenticate;
@@ -40,6 +45,10 @@ struct AuthFailInfo {
 
 static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static SUBMISSION_MESSAGES: Lazy<Mutex<HashMap<String, VecDeque<Instant>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static CONNECTION_ATTEMPTS: Lazy<Mutex<HashMap<IpAddr, VecDeque<Instant>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DATA_LINE_BYTES: usize = 1000;
@@ -47,6 +56,12 @@ const COMMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const AUTH_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(60);
 const DATA_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const STARTTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmtpService {
+    Mta,
+    Submission,
+}
 
 /// Increment an on-disk counter for delivered messages. Uses an atomic write via a temporary file
 /// so that concurrent processes won't corrupt the counter file. This is intentionally simple and
@@ -107,6 +122,58 @@ fn reset_auth_failures(ip: IpAddr) {
     m.remove(&ip);
 }
 
+fn submission_quota_available(user: &str, limit: usize) -> bool {
+    let now = Instant::now();
+    let mut all = SUBMISSION_MESSAGES.lock().unwrap();
+    let messages = all.entry(user.to_ascii_lowercase()).or_default();
+    while messages
+        .front()
+        .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
+    {
+        messages.pop_front();
+    }
+    messages.len() < limit.max(1)
+}
+
+fn record_submission_message(user: &str) {
+    SUBMISSION_MESSAGES
+        .lock()
+        .unwrap()
+        .entry(user.to_ascii_lowercase())
+        .or_default()
+        .push_back(Instant::now());
+}
+
+fn accept_connection_from(ip: IpAddr, limit: usize) -> bool {
+    const MAX_TRACKED_SOURCE_IPS: usize = 10_000;
+    let now = Instant::now();
+    let mut all = CONNECTION_ATTEMPTS.lock().unwrap();
+    all.retain(|_, attempts| {
+        while attempts
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
+        {
+            attempts.pop_front();
+        }
+        !attempts.is_empty()
+    });
+    if !all.contains_key(&ip)
+        && all.len() >= MAX_TRACKED_SOURCE_IPS
+        && let Some(oldest) = all
+            .iter()
+            .min_by_key(|(_, attempts)| attempts.back().copied())
+            .map(|(address, _)| *address)
+    {
+        all.remove(&oldest);
+    }
+    let attempts = all.entry(ip).or_default();
+    if attempts.len() >= limit.max(1) {
+        return false;
+    }
+    attempts.push_back(now);
+    true
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // load config (example path)
@@ -157,6 +224,7 @@ async fn main() -> Result<()> {
     let security = Arc::new(cfg.security.clone());
     protocol::validate_sasl_mechanisms(&security.smtp_sasl_mechanisms)
         .context("validating security.smtp_sasl_mechanisms")?;
+    let session_limit = Arc::new(Semaphore::new(security.smtp_max_concurrent_sessions.max(1)));
 
     // spawn plain SMTP listeners
     for addr in listen_addrs.iter() {
@@ -166,6 +234,7 @@ async fn main() -> Result<()> {
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
         let security = security.clone();
+        let session_limit = session_limit.clone();
         tokio::spawn(async move {
             if let Err(e) = run_plain_listener(
                 &addr,
@@ -174,6 +243,8 @@ async fn main() -> Result<()> {
                 db_clone,
                 enforce,
                 security,
+                session_limit,
+                SmtpService::Mta,
             )
             .await
             {
@@ -197,6 +268,7 @@ async fn main() -> Result<()> {
                 let db_clone = db_path.clone();
                 let enforce = enforce_dmarc;
                 let security = security.clone();
+                let session_limit = session_limit.clone();
                 tokio::spawn(async move {
                     if let Err(e) = run_smtps_listener(
                         &addr,
@@ -205,6 +277,8 @@ async fn main() -> Result<()> {
                         db_clone,
                         enforce,
                         security,
+                        session_limit,
+                        SmtpService::Submission,
                     )
                     .await
                     {
@@ -215,6 +289,39 @@ async fn main() -> Result<()> {
         }
     } else {
         println!("TLS not configured; SMTPS disabled (implicit TLS)");
+    }
+
+    // RFC 6409 message submission: STARTTLS and authentication are enforced by
+    // the session policy before any MAIL transaction is accepted.
+    if let Some(port) = cfg.global.submission_port {
+        let addrs = cfg
+            .global
+            .submission_listen_addrs
+            .clone()
+            .unwrap_or_else(|| vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")]);
+        for addr in addrs {
+            let mail_root = mail_root.clone();
+            let tls_ctx = tls_context.clone();
+            let db_path = db_path.clone();
+            let security = security.clone();
+            let session_limit = session_limit.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_plain_listener(
+                    &addr,
+                    mail_root,
+                    tls_ctx,
+                    db_path,
+                    false,
+                    security,
+                    session_limit,
+                    SmtpService::Submission,
+                )
+                .await
+                {
+                    eprintln!("Submission listener {addr} failed: {error}");
+                }
+            });
+        }
     }
 
     // keep running
@@ -230,6 +337,8 @@ async fn run_plain_listener(
     db_path: Option<String>,
     enforce_dmarc: bool,
     security: Arc<SecurityConfig>,
+    session_limit: Arc<Semaphore>,
+    service: SmtpService,
 ) -> Result<()> {
     let listener = bind_tcp_listener(addr)?;
     println!("rMail SMTPD listening on {}", addr);
@@ -246,7 +355,25 @@ async fn run_plain_listener(
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
         let security = security.clone();
+        if !accept_connection_from(peer.ip(), security.smtp_max_connections_per_minute) {
+            let mut stream = stream;
+            let _ = stream
+                .write_all(b"421 4.7.0 Connection rate limit exceeded\r\n")
+                .await;
+            continue;
+        }
+        let permit = match session_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut stream = stream;
+                let _ = stream
+                    .write_all(b"421 4.3.2 Too many concurrent sessions\r\n")
+                    .await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = process_stream(
                 Box::new(stream),
                 mail_root,
@@ -257,6 +384,7 @@ async fn run_plain_listener(
                 enforce,
                 true,
                 security,
+                service,
             )
             .await
             {
@@ -273,6 +401,8 @@ async fn run_smtps_listener(
     db_path: Option<String>,
     enforce_dmarc: bool,
     security: Arc<SecurityConfig>,
+    session_limit: Arc<Semaphore>,
+    service: SmtpService,
 ) -> Result<()> {
     let listener = bind_tcp_listener(addr)?;
     println!("rMail SMTPS listening on {}", addr);
@@ -284,7 +414,25 @@ async fn run_smtps_listener(
         let db_clone = db_path.clone();
         let enforce = enforce_dmarc;
         let security = security.clone();
+        if !accept_connection_from(peer.ip(), security.smtp_max_connections_per_minute) {
+            let mut stream = stream;
+            let _ = stream
+                .write_all(b"421 4.7.0 Connection rate limit exceeded\r\n")
+                .await;
+            continue;
+        }
+        let permit = match session_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut stream = stream;
+                let _ = stream
+                    .write_all(b"421 4.3.2 Too many concurrent sessions\r\n")
+                    .await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             match ctx.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     println!("SMTPS TLS handshake success peer={}", peer);
@@ -298,6 +446,7 @@ async fn run_smtps_listener(
                         enforce,
                         true,
                         security,
+                        service,
                     )
                     .await
                     {
@@ -479,6 +628,7 @@ async fn process_stream(
     enforce_dmarc: bool,
     send_greeting: bool,
     security: Arc<SecurityConfig>,
+    service: SmtpService,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     println!(
@@ -495,7 +645,12 @@ async fn process_stream(
     }
 
     // SMTP transaction state
-    const MAX_RCPT: usize = 100; // limit recipients per transaction to mitigate abuse
+    let max_recipients = match service {
+        SmtpService::Mta => security.smtp_max_recipients.max(1),
+        SmtpService::Submission => security.submission_max_recipients.max(1),
+    };
+    let command_limit = security.smtp_max_commands_per_minute.max(1);
+    let mut recent_commands = VecDeque::with_capacity(command_limit.min(1_024));
     let mut rcpts: Vec<String> = Vec::new();
     let mut mail_from: Option<String> = None;
     let mut mail_from_seen = false;
@@ -554,6 +709,22 @@ async fn process_stream(
             continue;
         }
         let parsed_command = parse_command(cmd);
+        let now = Instant::now();
+        while recent_commands
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
+        {
+            recent_commands.pop_front();
+        }
+        if recent_commands.len() >= command_limit {
+            let writer = reader.get_mut();
+            writer
+                .write_all(b"421 4.7.0 Command rate limit exceeded\r\n")
+                .await?;
+            writer.flush().await?;
+            break;
+        }
+        recent_commands.push_back(now);
         if line.len() > protocol::MAX_COMMAND_LINE_BYTES
             && !matches!(parsed_command, SmtpCommand::Auth(_))
         {
@@ -578,6 +749,37 @@ async fn process_stream(
             mail_from,
             rcpts.len()
         );
+
+        if service == SmtpService::Submission {
+            if !session_encrypted
+                && !matches!(
+                    parsed_command,
+                    SmtpCommand::Ehlo(_)
+                        | SmtpCommand::Helo(_)
+                        | SmtpCommand::StartTls
+                        | SmtpCommand::Noop
+                        | SmtpCommand::Quit
+                )
+            {
+                let writer = reader.get_mut();
+                writer
+                    .write_all(b"530 5.7.0 Must issue STARTTLS first\r\n")
+                    .await?;
+                writer.flush().await?;
+                continue;
+            }
+            if session_encrypted
+                && authenticated_user.is_none()
+                && matches!(parsed_command, SmtpCommand::Mail(_))
+            {
+                let writer = reader.get_mut();
+                writer
+                    .write_all(b"530 5.7.0 Authentication required\r\n")
+                    .await?;
+                writer.flush().await?;
+                continue;
+            }
+        }
 
         if let Some(reply) = protocol::preflight(
             &parsed_command,
@@ -757,6 +959,41 @@ async fn process_stream(
                         mail_body = parsed.body;
                         smtp_utf8 = parsed.smtp_utf8;
                         mail_from = parsed.sender;
+                        if service == SmtpService::Submission {
+                            let sender_matches_identity =
+                                mail_from.as_deref().is_some_and(|sender| {
+                                    authenticated_user
+                                        .as_deref()
+                                        .is_some_and(|user| sender.eq_ignore_ascii_case(user))
+                                });
+                            if !sender_matches_identity {
+                                mail_from = None;
+                                mail_from_seen = false;
+                                let writer = reader.get_mut();
+                                writer
+                                    .write_all(b"553 5.7.1 Sender address not owned by authenticated user\r\n")
+                                    .await?;
+                                writer.flush().await?;
+                                continue;
+                            }
+                            if authenticated_user.as_deref().is_some_and(|user| {
+                                !submission_quota_available(
+                                    user,
+                                    security.submission_max_messages_per_minute,
+                                )
+                            }) {
+                                mail_from = None;
+                                mail_from_seen = false;
+                                let writer = reader.get_mut();
+                                writer
+                                    .write_all(
+                                        b"452 4.7.0 Submission message rate limit exceeded\r\n",
+                                    )
+                                    .await?;
+                                writer.flush().await?;
+                                continue;
+                            }
+                        }
                         mail_from_seen = true;
                         bdat_buffer.clear();
                         bdat_started = false;
@@ -816,7 +1053,7 @@ async fn process_stream(
                             .await
                             {
                                 Ok(Ok(Some(mailbox))) => {
-                                    if rcpts.len() >= MAX_RCPT {
+                                    if rcpts.len() >= max_recipients {
                                         let w = reader.get_mut();
                                         w.write_all(b"452 4.5.3 Too many recipients\r\n").await?;
                                         w.flush().await?;
@@ -861,7 +1098,7 @@ async fn process_stream(
                                                         .await?;
                                                     writer.flush().await?;
                                                 } else if rcpts.len().saturating_add(targets.len())
-                                                    > MAX_RCPT
+                                                    > max_recipients
                                                 {
                                                     let writer = reader.get_mut();
                                                     writer
@@ -896,7 +1133,7 @@ async fn process_stream(
                                                             "SMTP RCPT catchall match peer={:?} rcpt={} target={}",
                                                             peer, addr, target
                                                         );
-                                                        if rcpts.len() >= MAX_RCPT {
+                                                        if rcpts.len() >= max_recipients {
                                                             let w = reader.get_mut();
                                                             w.write_all(
                                                                 b"452 4.5.3 Too many recipients\r\n",
@@ -917,7 +1154,7 @@ async fn process_stream(
                                                         // Not a local recipient and no catchall configured for domain.
                                                         // Allow relay to remote recipients only if the client has authenticated.
                                                         if authenticated_user.is_some() {
-                                                            if rcpts.len() >= MAX_RCPT {
+                                                            if rcpts.len() >= max_recipients {
                                                                 let w = reader.get_mut();
                                                                 w.write_all(
                                                                     b"452 4.5.3 Too many recipients\r\n",
@@ -1492,6 +1729,11 @@ async fn process_stream(
                     // Finalize DATA response based on per-recipient outcomes
                     let w = reader.get_mut();
                     if any_accepted {
+                        if service == SmtpService::Submission
+                            && let Some(user) = authenticated_user.as_deref()
+                        {
+                            record_submission_message(user);
+                        }
                         println!(
                             "SMTP DATA completed peer={:?} accepted=true rejected={}",
                             peer, any_rejected
@@ -1601,6 +1843,7 @@ async fn process_stream(
                                 enforce_dmarc,
                                 false,
                                 security.clone(),
+                                service,
                             ));
                             return fut.await;
                         }
@@ -1646,7 +1889,9 @@ async fn process_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MESSAGE_BYTES, parse_mail_from_arg, process_stream, received_header};
+    use super::{
+        MAX_MESSAGE_BYTES, SmtpService, parse_mail_from_arg, process_stream, received_header,
+    };
     use crate::protocol;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
@@ -1751,6 +1996,16 @@ mod tests {
         capacity: usize,
         security: SecurityConfig,
     ) -> (Vec<String>, tempfile::TempDir) {
+        run_session_with_policy(input, capacity, security, false, SmtpService::Mta).await
+    }
+
+    async fn run_session_with_policy(
+        input: Vec<u8>,
+        capacity: usize,
+        security: SecurityConfig,
+        encrypted: bool,
+        service: SmtpService,
+    ) -> (Vec<String>, tempfile::TempDir) {
         let (td, mail_root, db_path) = setup_mailbox();
         let (client, server) = duplex(capacity);
         let server_task = tokio::spawn(async move {
@@ -1760,10 +2015,11 @@ mod tests {
                 None,
                 Some(db_path.to_string_lossy().to_string()),
                 None,
-                false,
+                encrypted,
                 false,
                 true,
                 Arc::new(security),
+                service,
             )
             .await
         });
@@ -1792,6 +2048,86 @@ mod tests {
         (responses, td)
     }
 
+    #[tokio::test]
+    async fn submission_requires_tls_authentication_and_sender_ownership() {
+        let (plaintext, _) = run_session_with_policy(
+            b"EHLO localhost\r\nAUTH PLAIN =\r\nQUIT\r\n".to_vec(),
+            4096,
+            SecurityConfig::default(),
+            false,
+            SmtpService::Submission,
+        )
+        .await;
+        assert!(
+            plaintext
+                .iter()
+                .any(|line| line.starts_with("530 5.7.0 Must issue STARTTLS"))
+        );
+
+        let (encrypted, _) = run_session_with_policy(
+            b"EHLO localhost\r\nMAIL FROM:<user@example.test>\r\nAUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\nMAIL FROM:<other@example.test>\r\nMAIL FROM:<user@example.test>\r\nQUIT\r\n".to_vec(),
+            8192,
+            SecurityConfig::default(),
+            true,
+            SmtpService::Submission,
+        )
+        .await;
+        assert!(
+            encrypted
+                .iter()
+                .any(|line| line.starts_with("530 5.7.0 Authentication required"))
+        );
+        assert!(encrypted.iter().any(|line| line.starts_with("235 2.7.0")));
+        assert!(
+            encrypted
+                .iter()
+                .any(|line| line.starts_with("553 5.7.1 Sender address not owned"))
+        );
+        assert!(
+            encrypted
+                .iter()
+                .any(|line| line.starts_with("250 2.1.0 Sender OK"))
+        );
+    }
+
+    #[tokio::test]
+    async fn command_rate_limit_closes_abusive_sessions() {
+        let security = SecurityConfig {
+            smtp_max_commands_per_minute: 2,
+            ..SecurityConfig::default()
+        };
+        let (responses, _) = run_session_with_security(
+            b"EHLO localhost\r\nNOOP\r\nNOOP\r\n".to_vec(),
+            4096,
+            security,
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .any(|line| line.starts_with("421 4.7.0 Command rate limit"))
+        );
+    }
+
+    #[test]
+    fn submission_message_quota_is_account_keyed() {
+        let first = "quota-first@example.test";
+        let second = "quota-second@example.test";
+        assert!(super::submission_quota_available(first, 1));
+        super::record_submission_message(first);
+        assert!(!super::submission_quota_available(first, 1));
+        assert!(super::submission_quota_available(second, 1));
+    }
+
+    #[test]
+    fn connection_rate_limit_is_source_keyed() {
+        let first: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let second: std::net::IpAddr = "192.0.2.11".parse().unwrap();
+        assert!(super::accept_connection_from(first, 1));
+        assert!(!super::accept_connection_from(first, 1));
+        assert!(super::accept_connection_from(second, 1));
+    }
+
     async fn run_encrypted_session(input: Vec<u8>, capacity: usize) -> Vec<String> {
         let (_td, mail_root, db_path) = setup_mailbox();
         let (client, server) = duplex(capacity);
@@ -1806,6 +2142,7 @@ mod tests {
                 false,
                 true,
                 Arc::new(SecurityConfig::default()),
+                SmtpService::Mta,
             )
             .await
         });
@@ -2397,6 +2734,7 @@ mod tests {
             false,
             true,
             Arc::new(SecurityConfig::default()),
+            SmtpService::Mta,
         ));
         let mut reader = BufReader::new(client);
         let mut greeting = String::new();
@@ -2488,6 +2826,7 @@ mod tests {
             false,
             true,
             Arc::new(SecurityConfig::default()),
+            SmtpService::Mta,
         ));
         let mut plaintext = BufReader::new(client);
         let mut greeting = String::new();
@@ -2600,6 +2939,7 @@ mod tests {
             false,
             true,
             Arc::new(SecurityConfig::default()),
+            SmtpService::Mta,
         ));
         let mut reader = BufReader::new(client);
         let mut greeting = String::new();
