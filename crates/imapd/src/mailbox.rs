@@ -308,6 +308,9 @@ fn header_section_response_name(spec: &str) -> Option<String> {
     if section.to_uppercase().starts_with("BODY.PEEK[") {
         section = format!("BODY[{}", &section["BODY.PEEK[".len()..]);
     }
+    section = section
+        .replace("HEADER.FIELDS.NOT(", "HEADER.FIELDS.NOT (")
+        .replace("HEADER.FIELDS(", "HEADER.FIELDS (");
     Some(section)
 }
 
@@ -433,13 +436,15 @@ async fn stream_file_range<W: AsyncWrite + Unpin>(
 
 fn requested_header_fields(spec: &str) -> Option<(Vec<String>, bool)> {
     let upper = spec.to_uppercase();
-    let (marker, exclude) = if upper.contains("HEADER.FIELDS.NOT (") {
-        ("HEADER.FIELDS.NOT (", true)
+    let (marker, exclude) = if upper.contains("HEADER.FIELDS.NOT") {
+        ("HEADER.FIELDS.NOT", true)
     } else {
-        ("HEADER.FIELDS (", false)
+        ("HEADER.FIELDS", false)
     };
     let start = upper.find(marker)?;
-    let after = &spec[start + marker.len()..];
+    let after = spec[start + marker.len()..]
+        .trim_start()
+        .strip_prefix('(')?;
     let end = after.find(')')?;
     let fields = after[..end]
         .split_whitespace()

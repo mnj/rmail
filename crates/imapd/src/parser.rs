@@ -1506,17 +1506,22 @@ fn validate_body_fetch_item(item: &str) -> bool {
     if section.is_empty() || matches!(section, "HEADER" | "TEXT") {
         return true;
     }
-    if section.starts_with("HEADER.FIELDS (") || section.starts_with("HEADER.FIELDS.NOT (") {
-        return section.ends_with(')')
-            && section.rsplit_once('(').is_some_and(|(_, fields)| {
-                let fields = fields[..fields.len() - 1]
-                    .split_whitespace()
-                    .collect::<Vec<_>>();
-                !fields.is_empty()
-                    && fields
-                        .iter()
-                        .all(|field| !field.is_empty() && !field.contains(['(', ')']))
-            });
+    let header_fields = section
+        .strip_prefix("HEADER.FIELDS.NOT")
+        .or_else(|| section.strip_prefix("HEADER.FIELDS"));
+    if let Some(header_fields) = header_fields {
+        let Some(fields) = header_fields
+            .trim_start()
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+        else {
+            return false;
+        };
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        return !fields.is_empty()
+            && fields
+                .iter()
+                .all(|field| !field.is_empty() && !field.contains(['(', ')']));
     }
     let (path, suffix) = section
         .rsplit_once('.')
@@ -2494,6 +2499,22 @@ mod tests {
             "(UID",
         ] {
             assert!(parse_fetch_request(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn accepts_geary_compact_header_fields_fetch_items() {
+        for field in ["references", "message-id", "in-reply-to"] {
+            let request =
+                parse_fetch_command_request(&format!("1 body.peek[header.fields({field})]"))
+                    .expect("Geary UID FETCH form");
+            assert_eq!(
+                request.items,
+                [format!(
+                    "BODY.PEEK[HEADER.FIELDS({})]",
+                    field.to_uppercase()
+                )]
+            );
         }
     }
 
