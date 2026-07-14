@@ -35,6 +35,26 @@ mod tls;
 use protocol::{Command as SmtpCommand, parse_command, parse_mail_from_args, parse_rcpt_to_args};
 use tls::{load_tls_context_with_policy, reload_tls_context};
 
+macro_rules! smtp_log {
+    ($level:expr, $event:expr, $fields:tt) => {
+        rmail_common::structured_log!($level, "smtpd", $event, $fields)
+    };
+}
+
+// Keep low-frequency diagnostics machine-readable while their call sites are
+// gradually promoted to more specific event names and fields.
+macro_rules! println {
+    ($($argument:tt)*) => {
+        smtp_log!("info", "operational_message", { "message": format!($($argument)*) })
+    };
+}
+
+macro_rules! eprintln {
+    ($($argument:tt)*) => {
+        smtp_log!("error", "operational_error", { "message": format!($($argument)*) })
+    };
+}
+
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
 // so that boxed trait objects can be used with tokio::io::BufReader.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
@@ -226,6 +246,16 @@ enum SmtpService {
     Lmtp,
 }
 
+impl SmtpService {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mta => "smtp",
+            Self::Submission => "submission",
+            Self::Lmtp => "lmtp",
+        }
+    }
+}
+
 fn is_forwarded_recipient(
     recipients: &HashMap<String, u64>,
     recipient: &str,
@@ -271,10 +301,10 @@ fn spawn_tls_reloader(
         while signal.recv().await.is_some() {
             match reload_tls_context(&sender, &cert_path, &key_path, &policy) {
                 Ok(()) => {
-                    println!("SMTP TLS certificate, key, OCSP response, and policy reloaded");
+                    smtp_log!("info", "tls_reloaded", {});
                 }
                 Err(error) => {
-                    eprintln!("SMTP TLS reload failed; keeping current TLS bundle: {error}");
+                    smtp_log!("error", "tls_reload_failed", { "error": error.to_string() });
                 }
             }
         }
@@ -420,14 +450,14 @@ async fn main() -> Result<()> {
     // SQLite DB is the authoritative source for mailboxes and catchalls
     let db_path = cfg.global.db_path.clone();
     if db_path.is_none() {
-        eprintln!("No db_path configured in global; SQLite DB is required");
+        smtp_log!("error", "configuration_invalid", { "field": "global.db_path" });
         std::process::exit(1);
     }
     // initialize DB schema if missing
     if let Some(ref dbp) = db_path
         && let Err(e) = rmail_common::db::init_db(dbp)
     {
-        eprintln!("Failed to initialize database {}: {}", dbp, e);
+        smtp_log!("error", "database_initialization_failed", { "path": dbp, "error": e.to_string() });
         std::process::exit(1);
     }
 
@@ -496,7 +526,7 @@ async fn main() -> Result<()> {
             )
             .await
             {
-                eprintln!("Listener {} failed: {}", addr, e);
+                smtp_log!("error", "listener_failed", { "address": addr, "service": "smtp", "error": e.to_string() });
             }
         });
     }
@@ -527,7 +557,7 @@ async fn main() -> Result<()> {
             )
             .await
             {
-                eprintln!("LMTP listener {addr} failed: {error}");
+                smtp_log!("error", "listener_failed", { "address": addr, "service": "lmtp", "error": error.to_string() });
             }
         });
     }
@@ -559,12 +589,12 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    eprintln!("SMTPS {} failed: {}", addr, e);
+                    smtp_log!("error", "listener_failed", { "address": addr, "service": "smtps", "error": e.to_string() });
                 }
             });
         }
     } else if !smtps_addrs.is_empty() {
-        println!("TLS not configured; SMTPS disabled (implicit TLS)");
+        smtp_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
     }
 
     // RFC 6409 message submission: STARTTLS and authentication are enforced by
@@ -593,24 +623,21 @@ async fn main() -> Result<()> {
             )
             .await
             {
-                eprintln!("Submission listener {addr} failed: {error}");
+                smtp_log!("error", "listener_failed", { "address": addr, "service": "submission", "error": error.to_string() });
             }
         });
     }
 
     rmail_common::runtime::wait_for_shutdown_signal().await?;
-    println!("SMTP shutdown requested; draining listeners and active sessions");
+    smtp_log!("info", "shutdown_requested", { "active_sessions": shutdown.active_sessions() });
     shutdown.request();
     while let Some(result) = listeners.join_next().await {
         if let Err(error) = result {
-            eprintln!("SMTP listener task failed during shutdown: {error}");
+            smtp_log!("error", "shutdown_listener_join_failed", { "error": error.to_string() });
         }
     }
     if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
-        eprintln!(
-            "SMTP shutdown drain timed out with {} active sessions",
-            shutdown.active_sessions()
-        );
+        smtp_log!("warn", "shutdown_drain_timed_out", { "active_sessions": shutdown.active_sessions() });
     }
     Ok(())
 }
@@ -627,7 +654,7 @@ async fn run_plain_listener(
     service: SmtpService,
     shutdown: GracefulShutdown,
 ) -> Result<()> {
-    println!("rMail SMTPD listening on {}", addr);
+    smtp_log!("info", "listener_started", { "address": addr, "service": service.as_str(), "tls": false });
     let mut shutdown_signal = shutdown.subscribe();
     loop {
         if *shutdown_signal.borrow() {
@@ -640,17 +667,12 @@ async fn run_plain_listener(
             }
             accepted = listener.accept() => accepted?,
         };
-        println!(
-            "Accepted SMTP plaintext connection on {} from {} (starttls_available={})",
-            addr,
-            peer,
-            tls_ctx.borrow().is_some()
-        );
         let trace = ConnectionTrace {
             id: new_tracking_id("smtp-conn"),
             local_addr: stream.local_addr().ok(),
             state: Arc::new(ReplyTraceState::default()),
         };
+        smtp_log!("info", "connection_accepted", { "connection_id": trace.id, "listener": addr, "peer": peer.to_string(), "service": service.as_str(), "tls": false, "starttls_available": tls_ctx.borrow().is_some() });
         let mut connected =
             TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "connected");
         connected.peer_addr = Some(peer.to_string());
@@ -682,6 +704,7 @@ async fn run_plain_listener(
         tokio::spawn(async move {
             let _session = session;
             let _permit = permit;
+            let connection_id = trace.id.clone();
             if let Err(e) = process_stream(
                 Box::new(stream),
                 mail_root,
@@ -697,7 +720,7 @@ async fn run_plain_listener(
             )
             .await
             {
-                eprintln!("client error: {}", e);
+                smtp_log!("error", "session_failed", { "connection_id": connection_id, "peer": peer.to_string(), "tls": false, "error": e.to_string() });
             }
         });
     }
@@ -715,7 +738,7 @@ async fn run_smtps_listener(
     service: SmtpService,
     shutdown: GracefulShutdown,
 ) -> Result<()> {
-    println!("rMail SMTPS listening on {}", addr);
+    smtp_log!("info", "listener_started", { "address": addr, "service": service.as_str(), "tls": true });
     let mut shutdown_signal = shutdown.subscribe();
     loop {
         if *shutdown_signal.borrow() {
@@ -728,12 +751,12 @@ async fn run_smtps_listener(
             }
             accepted = listener.accept() => accepted?,
         };
-        println!("Accepted SMTPS TCP connection on {} from {}", addr, peer);
         let trace = ConnectionTrace {
             id: new_tracking_id("smtp-conn"),
             local_addr: stream.local_addr().ok(),
             state: Arc::new(ReplyTraceState::default()),
         };
+        smtp_log!("info", "connection_accepted", { "connection_id": trace.id, "listener": addr, "peer": peer.to_string(), "service": service.as_str(), "tls": true });
         let mut connected =
             TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "connected");
         connected.peer_addr = Some(peer.to_string());
@@ -741,7 +764,7 @@ async fn run_smtps_listener(
         connected.detail = Some("implicit TLS listener".to_string());
         emit_tracking(connected);
         let Some(ctx) = ctx.borrow().clone() else {
-            eprintln!("SMTPS connection rejected because no TLS context is loaded");
+            smtp_log!("warn", "connection_rejected", { "connection_id": trace.id, "peer": peer.to_string(), "reason": "TLS context unavailable" });
             continue;
         };
         let mail_root = mail_root.clone();
@@ -769,12 +792,13 @@ async fn run_smtps_listener(
         tokio::spawn(async move {
             let _session = session;
             let _permit = permit;
+            let connection_id = trace.id.clone();
             let started = Instant::now();
             let handshake = ctx.acceptor.accept(stream).await;
             metrics::observe_tls_handshake_duration(started.elapsed());
             match handshake {
                 Ok(tls_stream) => {
-                    println!("SMTPS TLS handshake success peer={}", peer);
+                    smtp_log!("info", "tls_handshake_succeeded", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true });
                     if let Err(e) = process_stream(
                         Box::new(tls_stream),
                         mail_root,
@@ -790,10 +814,12 @@ async fn run_smtps_listener(
                     )
                     .await
                     {
-                        eprintln!("tls client error: {}", e);
+                        smtp_log!("error", "session_failed", { "connection_id": connection_id, "peer": peer.to_string(), "tls": true, "error": e.to_string() });
                     }
                 }
-                Err(e) => eprintln!("SMTPS TLS accept error from {}: {}", peer, e),
+                Err(e) => {
+                    smtp_log!("error", "tls_handshake_failed", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true, "error": e.to_string() })
+                }
             }
         });
     }
@@ -988,13 +1014,7 @@ async fn process_stream(
     });
     let mut reader = BufReader::new(ReplyTrackingStream::new(stream, trace.clone(), peer));
     let mut tracking_message_id: Option<String> = None;
-    println!(
-        "Starting SMTP session peer={:?} encrypted={} tls_configured={} enforce_dmarc={}",
-        peer,
-        session_encrypted,
-        tls_ctx.is_some(),
-        enforce_dmarc
-    );
+    smtp_log!("info", "session_started", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "service": service.as_str(), "encrypted": session_encrypted, "tls_configured": tls_ctx.is_some(), "dmarc_enforced": enforce_dmarc });
     if send_greeting {
         let w = reader.get_mut();
         w.write_all(if service == SmtpService::Lmtp {
@@ -1135,15 +1155,7 @@ async fn process_stream(
         command_event.bytes_in = trace.state.bytes_in.load(Ordering::Relaxed);
         command_event.bytes_out = trace.state.bytes_out.load(Ordering::Relaxed);
         emit_tracking(command_event);
-        println!(
-            "SMTP peer={:?} encrypted={} cmd={:?} authed={:?} mail_from={:?} rcpt_count={}",
-            peer,
-            session_encrypted,
-            logged_cmd,
-            authenticated_user,
-            mail_from,
-            rcpts.len()
-        );
+        smtp_log!("info", "command_received", { "connection_id": trace.id, "message_id": tracking_message_id, "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "command": logged_cmd, "authenticated_user": authenticated_user, "mail_from": mail_from, "recipient_count": rcpts.len() });
 
         if service == SmtpService::Lmtp {
             if matches!(parsed_command, SmtpCommand::Helo(_) | SmtpCommand::Ehlo(_)) {
@@ -1244,17 +1256,13 @@ async fn process_stream(
                     writer.flush().await?;
                     continue;
                 }
-                println!(
-                    "SMTP greeting peer={:?} verb={}",
-                    peer,
-                    if matches!(parsed_command, SmtpCommand::Lhlo(_)) {
+                smtp_log!("info", "greeting_received", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "verb": if matches!(parsed_command, SmtpCommand::Lhlo(_)) {
                         "LHLO"
                     } else if is_ehlo {
                         "EHLO"
                     } else {
                         "HELO"
-                    }
-                );
+                    } });
                 helo_name = Some(name.to_string());
                 extended_smtp = is_ehlo;
                 let mut resp = if is_ehlo {
@@ -1312,10 +1320,7 @@ async fn process_stream(
                 };
                 let mech = parsed_auth.mechanism.to_ascii_uppercase();
                 let initial = parsed_auth.initial_response;
-                println!(
-                    "SMTP AUTH attempt peer={:?} encrypted={} mechanism={}",
-                    peer, session_encrypted, mech
-                );
+                smtp_log!("info", "authentication_attempted", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "mechanism": mech });
                 if !security
                     .smtp_sasl_mechanisms
                     .iter()
@@ -1365,7 +1370,7 @@ async fn process_stream(
                         break;
                     }
                     if let Some(user) = outcome.authenticated_user {
-                        println!("SMTP AUTH success peer={peer:?} user={user}");
+                        smtp_log!("info", "authentication_succeeded", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "user": user });
                         authenticated_user = Some(user);
                     }
                     continue;
@@ -1378,7 +1383,7 @@ async fn process_stream(
                         break;
                     }
                     if let Some(user) = outcome.authenticated_user {
-                        println!("SMTP AUTH success peer={peer:?} user={user}");
+                        smtp_log!("info", "authentication_succeeded", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "user": user });
                         authenticated_user = Some(user);
                     }
                     continue;
@@ -1405,7 +1410,7 @@ async fn process_stream(
                         break;
                     }
                     if let Some(user) = outcome.authenticated_user {
-                        println!("SMTP AUTH success peer={peer:?} user={user}");
+                        smtp_log!("info", "authentication_succeeded", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "user": user });
                         authenticated_user = Some(user);
                     }
                     continue;

@@ -98,12 +98,9 @@ pub(crate) async fn handle_password<S: AsyncRead + AsyncWrite + Unpin>(
             failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await
         }
         PasswordAuthResult::Unavailable { mailbox, message } => {
-            eprintln!(
-                "SMTP AUTH {mechanism} verification error peer={peer:?} mailbox={} err={message}",
-                mailbox
-                    .as_ref()
-                    .map(|mailbox| mailbox.address.as_str())
-                    .unwrap_or("-")
+            rmail_common::structured_log!(
+                "error", "smtpd", "sasl_verification_failed",
+                { "peer": peer.map(|address| address.to_string()), "mechanism": mechanism, "mailbox": mailbox.as_ref().map(|mailbox| mailbox.address.as_str()), "error": message }
             );
             failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await
         }
@@ -152,7 +149,7 @@ pub(crate) async fn handle_oauth<S: AsyncRead + AsyncWrite + Unpin>(
             .await;
         }
         rmail_common::oauth::OAuthValidation::Unavailable(error) => {
-            eprintln!("SMTP AUTH {mechanism} introspection error peer={peer:?}: {error}");
+            rmail_common::structured_log!("error", "smtpd", "oauth_introspection_failed", { "peer": peer.map(|address| address.to_string()), "mechanism": mechanism, "error": error });
             return oauth_failure_exchange(
                 reader,
                 b"454 4.7.0 Temporary authentication failure\r\n",
@@ -171,7 +168,7 @@ pub(crate) async fn handle_oauth<S: AsyncRead + AsyncWrite + Unpin>(
             .await;
         }
         Err(error) => {
-            eprintln!("SMTP AUTH {mechanism} mailbox lookup error peer={peer:?}: {error}");
+            rmail_common::structured_log!("error", "smtpd", "oauth_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "mechanism": mechanism, "error": error.to_string() });
             return oauth_failure_exchange(
                 reader,
                 b"454 4.7.0 Temporary authentication failure\r\n",
@@ -257,7 +254,7 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
             return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
         }
         Err(error) => {
-            eprintln!("SMTP SCRAM mailbox lookup error peer={peer:?}: {error}");
+            rmail_common::structured_log!("error", "smtpd", "scram_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
             return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
         }
     };
@@ -268,9 +265,9 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
     let (salt, iterations) = match rmail_common::auth::parse_scram_verifier(verifier) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!(
-                "SMTP SCRAM verifier parse error peer={peer:?} mailbox={} err={error}",
-                mailbox.address
+            rmail_common::structured_log!(
+                "error", "smtpd", "scram_verifier_parse_failed",
+                { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
             );
             return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
         }
@@ -314,9 +311,9 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(signature) => signature,
         Err(error) => {
             record_failure(peer);
-            eprintln!(
-                "SMTP SCRAM proof error peer={peer:?} mailbox={} err={error}",
-                mailbox.address
+            rmail_common::structured_log!(
+                "error", "smtpd", "scram_proof_failed",
+                { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
             );
             return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
         }
