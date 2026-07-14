@@ -22,6 +22,9 @@ pub mod tls;
 pub mod tracking;
 pub mod transport;
 
+#[doc(hidden)]
+pub use serde_json;
+
 pub fn hello() -> &'static str {
     "rmail_common"
 }

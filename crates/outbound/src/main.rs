@@ -243,10 +243,20 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("joining inflight recovery task")??;
     if recovered != 0 {
-        println!("recovered {} abandoned inflight messages", recovered);
+        rmail_common::structured_log!(
+            "info",
+            "outbound",
+            "inflight_recovered",
+            { "messages": recovered }
+        );
     }
 
-    println!("Using on-disk outbound queue: {}", queue_dir.display());
+    rmail_common::structured_log!(
+        "info",
+        "outbound",
+        "queue_opened",
+        { "path": queue_dir.display().to_string() }
+    );
     let per_dest_limit = positive_env("RMAIL_PER_DEST_LIMIT", 5);
     let max_concurrent_deliveries = positive_env("RMAIL_OUTBOUND_CONCURRENCY", 20);
     let max_idle_per_destination = positive_env("RMAIL_IDLE_CONNECTIONS_PER_DEST", 2);
@@ -257,9 +267,16 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
     let dead_letter_secs = (dead_letter_days.saturating_mul(24 * 3600)) as i64;
-    println!(
-        "outbound delivery concurrency={} per_destination_limit={} idle_connections={}/destination, {} total",
-        max_concurrent_deliveries, per_dest_limit, max_idle_per_destination, max_idle_connections
+    rmail_common::structured_log!(
+        "info",
+        "outbound",
+        "worker_started",
+        {
+            "max_concurrent_deliveries": max_concurrent_deliveries,
+            "per_destination_limit": per_dest_limit,
+            "max_idle_per_destination": max_idle_per_destination,
+            "max_idle_connections": max_idle_connections
+        }
     );
 
     let mut deliveries = JoinSet::new();
@@ -273,11 +290,20 @@ async fn main() -> anyhow::Result<()> {
         if now >= next_metrics {
             let md = maildrop_dir.clone();
             tokio::task::spawn_blocking(move || match rmail_queue_manager::collect_metrics(&md) {
-                Ok(metrics) => println!(
-                    "metrics queued={} inflight={} sent={} failed={} dead={}",
-                    metrics.queued, metrics.inflight, metrics.sent, metrics.failed, metrics.dead
+                Ok(metrics) => rmail_common::structured_log!(
+                    "info", "outbound", "queue_metrics",
+                    {
+                        "queued": metrics.queued,
+                        "inflight": metrics.inflight,
+                        "sent": metrics.sent,
+                        "failed": metrics.failed,
+                        "dead": metrics.dead
+                    }
                 ),
-                Err(e) => eprintln!("metrics collection error: {}", e),
+                Err(error) => rmail_common::structured_log!(
+                    "error", "outbound", "metrics_collection_failed",
+                    { "error": error.to_string() }
+                ),
             });
             next_metrics = now + Duration::from_secs(60);
         }
@@ -286,8 +312,14 @@ async fn main() -> anyhow::Result<()> {
             let secs = dead_letter_secs;
             tokio::task::spawn_blocking(move || {
                 match rmail_queue_manager::dead_letter_cleanup(&md, secs) {
-                    Ok(moved) => println!("dead-letter cleanup moved {} messages", moved),
-                    Err(e) => eprintln!("dead-letter cleanup error: {}", e),
+                    Ok(moved) => rmail_common::structured_log!(
+                        "info", "outbound", "dead_letter_cleanup",
+                        { "messages_moved": moved }
+                    ),
+                    Err(error) => rmail_common::structured_log!(
+                        "error", "outbound", "dead_letter_cleanup_failed",
+                        { "error": error.to_string() }
+                    ),
                 }
             });
             next_dead_letter_cleanup = now + Duration::from_secs(60);
@@ -330,30 +362,36 @@ async fn main() -> anyhow::Result<()> {
             }
             completed = deliveries.join_next() => {
                 if let Some(Err(error)) = completed {
-                    eprintln!("outbound delivery task failed to join: {error}");
+                    rmail_common::structured_log!(
+                        "error", "outbound", "delivery_task_join_failed",
+                        { "error": error.to_string() }
+                    );
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_maintenance)) => {}
         }
     }
 
-    println!(
-        "outbound shutdown requested; draining {} active deliveries",
-        deliveries.len()
+    rmail_common::structured_log!(
+        "info", "outbound", "shutdown_requested",
+        { "active_deliveries": deliveries.len() }
     );
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(completed) = deliveries.join_next().await {
             if let Err(error) = completed {
-                eprintln!("outbound delivery task failed during shutdown: {error}");
+                rmail_common::structured_log!(
+                    "error", "outbound", "shutdown_delivery_join_failed",
+                    { "error": error.to_string() }
+                );
             }
         }
     })
     .await
     .is_ok();
     if !drained {
-        eprintln!(
-            "outbound shutdown drain timed out with {} recoverable inflight deliveries",
-            deliveries.len()
+        rmail_common::structured_log!(
+            "warn", "outbound", "shutdown_drain_timed_out",
+            { "recoverable_inflight_deliveries": deliveries.len() }
         );
         deliveries.abort_all();
         while deliveries.join_next().await.is_some() {}
@@ -392,11 +430,17 @@ async fn claim_one(maildrop_dir: &Path, per_dest_limit: usize) -> Option<(PathBu
     {
         Ok(Ok(claimed)) => claimed,
         Ok(Err(error)) => {
-            eprintln!("queue-manager claim_one failed: {error}");
+            rmail_common::structured_log!(
+                "error", "outbound", "queue_claim_failed",
+                { "error": error.to_string() }
+            );
             None
         }
         Err(error) => {
-            eprintln!("claim task join failed: {error}");
+            rmail_common::structured_log!(
+                "error", "outbound", "queue_claim_join_failed",
+                { "error": error.to_string() }
+            );
             None
         }
     }
@@ -472,10 +516,26 @@ async fn process_claim(
         None,
     );
     if let Err(error) = write_control(&inflight_json, &control).await {
-        eprintln!("failed to persist attempt for {fname}: {error}");
+        rmail_common::structured_log!(
+            "error", "outbound", "attempt_persist_failed",
+            {
+                "connection_id": connection_id,
+                "message_id": tracking_message_id,
+                "spool_file": fname,
+                "error": error.to_string()
+            }
+        );
         let destination = queue_dir.join(&fname);
         if let Err(error) = move_spool_message(&inflight_eml, &destination).await {
-            eprintln!("failed to return {fname} to queue after control-write failure: {error}");
+            rmail_common::structured_log!(
+                "error", "outbound", "queue_return_failed",
+                {
+                    "connection_id": connection_id,
+                    "message_id": tracking_message_id,
+                    "spool_file": fname,
+                    "error": error.to_string()
+                }
+            );
         }
         return;
     }
@@ -499,11 +559,27 @@ async fn process_claim(
             )
             .await
             {
-                eprintln!("failed to queue success notification for {fname}: {error}");
+                rmail_common::structured_log!(
+                    "error", "outbound", "success_dsn_queue_failed",
+                    {
+                        "connection_id": connection_id,
+                        "message_id": tracking_message_id,
+                        "spool_file": fname,
+                        "error": error.to_string()
+                    }
+                );
             }
             let destination = sent_dir.join(&fname);
             if let Err(error) = move_spool_message(&inflight_eml, &destination).await {
-                eprintln!("failed to move delivered message {fname} to sent: {error}");
+                rmail_common::structured_log!(
+                    "error", "outbound", "sent_transition_failed",
+                    {
+                        "connection_id": connection_id,
+                        "message_id": tracking_message_id,
+                        "spool_file": fname,
+                        "error": error.to_string()
+                    }
+                );
             }
         }
         Err(failure) => {
@@ -521,7 +597,18 @@ async fn process_claim(
                 .or_else(|| policy_failure.and_then(|failure| failure.enhanced_status.clone()));
             let error_message = failure.to_string();
             control.last_error = Some(error_message.clone());
-            eprintln!("delivery failed for {fname}: {error_message}");
+            rmail_common::structured_log!(
+                "warn", "outbound", "delivery_failed",
+                {
+                    "connection_id": connection_id,
+                    "message_id": tracking_message_id,
+                    "spool_file": fname,
+                    "attempt": control.attempts,
+                    "smtp_code": control.last_smtp_code,
+                    "enhanced_status": control.last_enhanced_status,
+                    "error": error_message
+                }
+            );
 
             let terminal = permanent || control.attempts >= control.max_attempts;
             emit(
@@ -557,7 +644,15 @@ async fn process_claim(
             }
 
             if let Err(error) = write_control(&inflight_json, &control).await {
-                eprintln!("failed to persist failure state for {fname}: {error}");
+                rmail_common::structured_log!(
+                    "error", "outbound", "failure_state_persist_failed",
+                    {
+                        "connection_id": connection_id,
+                        "message_id": tracking_message_id,
+                        "spool_file": fname,
+                        "error": error.to_string()
+                    }
+                );
                 return;
             }
             if send_delay_notification
@@ -569,19 +664,43 @@ async fn process_claim(
                 )
                 .await
             {
-                eprintln!("failed to queue delay notification for {fname}: {error}");
+                rmail_common::structured_log!(
+                    "error", "outbound", "delay_dsn_queue_failed",
+                    {
+                        "connection_id": connection_id,
+                        "message_id": tracking_message_id,
+                        "spool_file": fname,
+                        "error": error.to_string()
+                    }
+                );
             }
             match move_spool_message(&inflight_eml, &destination).await {
                 Ok(()) if terminal => {
                     if let Err(error) =
                         queue_failure_notification(&base, &destination, &control).await
                     {
-                        eprintln!("failed to queue delivery notification for {fname}: {error}");
+                        rmail_common::structured_log!(
+                            "error", "outbound", "failure_dsn_queue_failed",
+                            {
+                                "connection_id": connection_id,
+                                "message_id": tracking_message_id,
+                                "spool_file": fname,
+                                "error": error.to_string()
+                            }
+                        );
                     }
                 }
                 Ok(()) => {}
                 Err(error) => {
-                    eprintln!("failed to transition {fname} after delivery failure: {error}");
+                    rmail_common::structured_log!(
+                        "error", "outbound", "failure_transition_failed",
+                        {
+                            "connection_id": connection_id,
+                            "message_id": tracking_message_id,
+                            "spool_file": fname,
+                            "error": error.to_string()
+                        }
+                    );
                 }
             }
         }
@@ -929,10 +1048,12 @@ async fn queue_delivery_notification(
         match read_returned_content(queued_message, message.body_offset, return_full).await {
             Ok(content) => content,
             Err(error) => {
-                eprintln!(
-                    "unable to include original content in delivery notification for {}: {}",
-                    queued_message.display(),
-                    error
+                rmail_common::structured_log!(
+                    "warn", "outbound", "dsn_original_content_unavailable",
+                    {
+                        "spool_file": queued_message.display().to_string(),
+                        "error": error.to_string()
+                    }
                 );
                 Vec::new()
             }
@@ -2022,8 +2143,14 @@ async fn queue_tls_failure_report(
         .await;
         match result {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("failed to queue TLS-RPT report: {error}"),
-            Err(error) => eprintln!("failed to join TLS-RPT queue operation: {error}"),
+            Ok(Err(error)) => rmail_common::structured_log!(
+                "error", "outbound", "tls_report_queue_failed",
+                { "domain": domain, "error": error.to_string() }
+            ),
+            Err(error) => rmail_common::structured_log!(
+                "error", "outbound", "tls_report_queue_join_failed",
+                { "domain": domain, "error": error.to_string() }
+            ),
         }
     }
 }
@@ -2114,7 +2241,10 @@ async fn deliver_to_remote(
             )));
         }
         Err(e) => {
-            eprintln!("transport map lookup failed for {}: {}", domain, e);
+            rmail_common::structured_log!(
+                "warn", "outbound", "transport_map_lookup_failed",
+                { "domain": domain, "error": e.to_string() }
+            );
         }
     }
 
@@ -2179,9 +2309,9 @@ async fn deliver_to_remote(
                 anyhow::bail!(diagnostic);
             }
         } else if !mismatched.is_empty() {
-            eprintln!(
-                "MTA-STS testing policy mismatch for {domain}: {}",
-                mismatched.join(", ")
+            rmail_common::structured_log!(
+                "warn", "outbound", "mta_sts_testing_mismatch",
+                { "domain": domain, "mx_hosts": mismatched }
             );
         }
     }
@@ -2212,9 +2342,15 @@ async fn deliver_to_remote(
                 match smtp_noop(&mut connection, Some(&mut noop_trace)).await {
                     Ok(()) => Ok(connection),
                     Err(error) => {
-                        eprintln!(
-                            "discarding stale SMTP session for {}:{}: {}",
-                            key.host, key.port, error
+                        rmail_common::structured_log!(
+                            "warn", "outbound", "smtp_session_discarded",
+                            {
+                                "connection_id": pooled_connection_id,
+                                "message_id": tracking_id,
+                                "host": key.host,
+                                "port": key.port,
+                                "error": error.to_string()
+                            }
                         );
                         establish_smtp_connection(
                             resolver,

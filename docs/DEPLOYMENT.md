@@ -184,6 +184,12 @@ not consume additional quota.
 mail root. Events are also stored in `_tracking/events.sqlite`; watch mode consumes the IPC feed
 directly and does not tail text logs.
 
+The outbound worker writes one JSON object per operational log event. Every record includes
+`timestamp_unix_ms`, `level`, `component`, `event`, and a `fields` object. Delivery-related records
+include stable `connection_id` and `message_id` fields where available, so operators can filter and
+join events without parsing human-readable messages. Other daemons retain their existing logs while
+they are migrated to this shared schema; live SMTP tracking already uses the structured IPC stream.
+
 ```bash
 sudo rmail_ctl watch
 sudo rmail_ctl watch --plain

@@ -1,8 +1,48 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
+
+pub fn structured_log(level: &str, component: &str, event: &str, fields: serde_json::Value) {
+    let encoded = structured_log_value(level, component, event, fields).to_string();
+    if matches!(level, "error" | "warn") {
+        eprintln!("{encoded}");
+    } else {
+        println!("{encoded}");
+    }
+}
+
+fn structured_log_value(
+    level: &str,
+    component: &str,
+    event: &str,
+    fields: serde_json::Value,
+) -> serde_json::Value {
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    serde_json::json!({
+        "timestamp_unix_ms": timestamp_unix_ms,
+        "level": level,
+        "component": component,
+        "event": event,
+        "fields": fields,
+    })
+}
+
+#[macro_export]
+macro_rules! structured_log {
+    ($level:expr, $component:expr, $event:expr, $fields:tt) => {
+        $crate::runtime::structured_log(
+            $level,
+            $component,
+            $event,
+            $crate::serde_json::json!($fields),
+        )
+    };
+}
 
 #[derive(Clone)]
 pub struct GracefulShutdown {
@@ -143,7 +183,7 @@ pub fn redirect_stdio_to_log(mail_root: &Path, component: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::GracefulShutdown;
+    use super::{GracefulShutdown, structured_log_value};
     use std::time::Duration;
 
     #[tokio::test]
@@ -161,5 +201,21 @@ mod tests {
         assert!(!shutdown.wait_for_sessions(Duration::from_millis(5)).await);
         drop(second);
         assert!(shutdown.wait_for_sessions(Duration::from_millis(50)).await);
+    }
+
+    #[test]
+    fn structured_events_have_stable_machine_readable_context() {
+        let event = structured_log_value(
+            "warn",
+            "outbound",
+            "delivery_failed",
+            serde_json::json!({"connection_id": "c-1", "message_id": "m-1"}),
+        );
+        assert_eq!(event["level"], "warn");
+        assert_eq!(event["component"], "outbound");
+        assert_eq!(event["event"], "delivery_failed");
+        assert_eq!(event["fields"]["connection_id"], "c-1");
+        assert_eq!(event["fields"]["message_id"], "m-1");
+        assert!(event["timestamp_unix_ms"].as_u64().is_some());
     }
 }
