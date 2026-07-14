@@ -1035,7 +1035,7 @@ async fn process_stream_inner(
                     args,
                     &mail_root,
                     authed_mailbox.as_ref().unwrap(),
-                    session_state.feature_enabled("UTF8=ACCEPT"),
+                    session_state.utf8_enabled(),
                 )
                 .encode();
                 let writer = reader.get_mut();
@@ -1066,7 +1066,7 @@ async fn process_stream_inner(
                     args,
                     &mail_root,
                     authed_mailbox.as_ref().unwrap(),
-                    session_state.feature_enabled("UTF8=ACCEPT"),
+                    session_state.utf8_enabled(),
                     selected.as_ref().map(|mailbox| mailbox.mailbox.as_str()),
                 )
                 .await?;
@@ -1095,7 +1095,7 @@ async fn process_stream_inner(
                 let address = authed_mailbox.as_ref().unwrap().clone();
                 let raw_args = args.to_string();
                 let tag_owned = tag.to_string();
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let utf8_accept = session_state.utf8_enabled();
                 let response = tokio::task::spawn_blocking(move || {
                     commands::list::handle(
                         &tag_owned,
@@ -1168,7 +1168,7 @@ async fn process_stream_inner(
                 let root = mail_root.clone();
                 let raw_args = args.to_string();
                 let tag_owned = tag.to_string();
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let utf8_accept = session_state.utf8_enabled();
                 let outcome = tokio::task::spawn_blocking(move || {
                     commands::mailboxes::handle(
                         operation,
@@ -1240,7 +1240,7 @@ async fn process_stream_inner(
                     args,
                     &mail_root,
                     authed_mailbox.as_ref().unwrap(),
-                    session_state.feature_enabled("UTF8=ACCEPT"),
+                    session_state.utf8_enabled(),
                     session_state.feature_enabled("CONDSTORE"),
                     session_state.feature_enabled("QRESYNC"),
                     selected.is_some(),
@@ -1260,7 +1260,7 @@ async fn process_stream_inner(
                 let address = authed_mailbox.as_ref().unwrap().clone();
                 let raw_args = args.to_string();
                 let tag_owned = tag.to_string();
-                let utf8_accept = session_state.feature_enabled("UTF8=ACCEPT");
+                let utf8_accept = session_state.utf8_enabled();
                 let selected_name = selected.as_ref().map(|mailbox| mailbox.mailbox.clone());
                 let response = tokio::task::spawn_blocking(move || {
                     commands::status::handle(
@@ -1352,7 +1352,7 @@ async fn process_stream_inner(
                         .expect("preflight requires selected mailbox"),
                     session_state.saved_search_uids(),
                     false,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
+                    session_state.utf8_enabled(),
                 )
                 .await;
                 if outcome.refresh_selected {
@@ -1449,7 +1449,7 @@ async fn process_stream_inner(
                             .expect("preflight requires selected mailbox"),
                         session_state.saved_search_uids(),
                         true,
-                        session_state.feature_enabled("UTF8=ACCEPT"),
+                        session_state.utf8_enabled(),
                     )
                     .await;
                     if let Some(saved_uids) = outcome.saved_uids {
@@ -1544,7 +1544,7 @@ async fn process_stream_inner(
                             .expect("preflight requires selected mailbox"),
                         session_state.saved_search_uids(),
                         true,
-                        session_state.feature_enabled("UTF8=ACCEPT"),
+                        session_state.utf8_enabled(),
                     )
                     .await;
                     if outcome.refresh_selected {
@@ -1580,7 +1580,7 @@ async fn process_stream_inner(
                         .expect("preflight requires selected mailbox"),
                     session_state.saved_search_uids(),
                     false,
-                    session_state.feature_enabled("UTF8=ACCEPT"),
+                    session_state.utf8_enabled(),
                 )
                 .await;
                 if let Some(saved_uids) = outcome.saved_uids {
@@ -2076,6 +2076,7 @@ mod tests {
             plain_tokens,
             HashSet::from([
                 "IMAP4rev1",
+                "IMAP4rev2",
                 "ID",
                 "ENABLE",
                 "IDLE",
@@ -2127,6 +2128,7 @@ mod tests {
             authenticated_tokens,
             HashSet::from([
                 "IMAP4rev1",
+                "IMAP4rev2",
                 "ID",
                 "ENABLE",
                 "IDLE",
@@ -6431,7 +6433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn utf8_accept_switches_mailbox_wire_format_append_and_search_rules() {
+    async fn imap4rev2_switches_mailbox_wire_format_append_and_search_rules() {
         let td = tempfile::tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");
         let db_path = td.path().join("config.db");
@@ -6465,7 +6467,7 @@ mod tests {
         reader
             .get_mut()
             .write_all(
-                "A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 ENABLE UTF8=ACCEPT\r\nA004 CREATE \"旅行 & Stuff\"\r\nA005 LIST \"\" \"旅行 & Stuff\"\r\nA006 SELECT \"旅行 & Stuff\"\r\nA007 SEARCH CHARSET UTF-8 ALL\r\n"
+                "A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 ENABLE IMAP4rev2\r\nA004 CREATE \"旅行 & Stuff\"\r\nA005 LIST \"\" \"旅行 & Stuff\"\r\nA006 SELECT \"旅行 & Stuff\"\r\nA007 SEARCH CHARSET UTF-8 ALL\r\n"
                     .as_bytes(),
             )
             .await
@@ -6473,9 +6475,10 @@ mod tests {
         reader.get_mut().flush().await.expect("flush");
         let _login = read_until_contains(&mut reader, "A001 OK").await;
         let caps = read_until_contains(&mut reader, "A002 OK").await.join("");
+        assert!(caps.contains("IMAP4rev2"));
         assert!(caps.contains("UTF8=ACCEPT"));
         let enabled = read_until_contains(&mut reader, "A003 OK").await.join("");
-        assert!(enabled.contains("* ENABLED UTF8=ACCEPT"));
+        assert!(enabled.contains("* ENABLED IMAP4REV2"));
         let _create = read_until_contains(&mut reader, "A004 OK").await;
         let list = read_until_contains(&mut reader, "A005 OK").await.join("");
         assert!(list.contains("\"旅行 & Stuff\""));

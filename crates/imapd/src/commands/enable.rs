@@ -28,10 +28,11 @@ pub(crate) fn handle(
     newly_enabled.dedup();
 
     let condstore_enabled = newly_enabled.iter().any(|feature| feature == "CONDSTORE");
-    let mut response = Response::new();
-    if !newly_enabled.is_empty() {
-        response = response.data(format!("ENABLED {}", newly_enabled.join(" ")));
-    }
+    let mut response = Response::new().data(
+        format!("ENABLED {}", newly_enabled.join(" "))
+            .trim_end()
+            .to_string(),
+    );
     if condstore_enabled && let Some(highest_modseq) = selected_highest_modseq {
         response = response.status(
             StatusLine::untagged(Status::Ok, "Highest")
@@ -73,5 +74,19 @@ mod tests {
             Err(ParseError::InvalidAtom)
         );
         assert!(!session.feature_enabled("CONDSTORE"));
+    }
+
+    #[test]
+    fn rev2_enables_utf8_behavior_and_empty_enable_still_responds() {
+        let mut session = SessionState::default();
+        assert_eq!(
+            handle("A1", "unknown", &mut session, None)
+                .unwrap()
+                .encode(),
+            "* ENABLED\r\nA1 OK ENABLE completed\r\n"
+        );
+        assert!(!session.utf8_enabled());
+        assert!(handle("A2", "IMAP4rev2", &mut session, None).is_ok());
+        assert!(session.utf8_enabled());
     }
 }

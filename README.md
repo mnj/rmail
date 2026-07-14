@@ -62,7 +62,7 @@ an OAuth token-introspection authority is configured under `security.oauth`.
 
 ## IMAP standards support
 
-rMail advertises `IMAP4rev1` and implements the core mailbox, message, search,
+rMail advertises `IMAP4rev1` and `IMAP4rev2` and implements the core mailbox, message, search,
 state-transition, literal, and response behavior required by RFC 3501. Its IMAP
 implementation also includes the extensions listed below. Capabilities are
 phase-aware: authentication mechanisms, `STARTTLS`, and post-authentication
@@ -77,6 +77,7 @@ or conformance-validation gaps.
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
 | RFC 3501 | IMAP4rev1 core | 95% | No formal protocol test-suite certification or exhaustive live-client matrix yet. |
+| RFC 9051 | IMAP4rev2 core | 90% | Dual-advertised compatibility mode and rev2 UTF-8 behavior are implemented; no external rev2 conformance certification yet. |
 | RFC 2595 | IMAP `STARTTLS` and `LOGINDISABLED` | 95% | A real TLS upgrade and resumed IMAP session are integration-tested, but not yet against an external conformance harness. |
 | RFC 2177 | `IDLE` | 100% | Implemented with mailbox synchronization, keepalives, fragmented `DONE`, and bounded input. |
 | RFC 2342 | `NAMESPACE` | 100% | Complete for rMail's single personal Maildir namespace. |
@@ -106,8 +107,9 @@ or conformance-validation gaps.
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
 | RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
 
-IMAP4rev2 (RFC 9051) is not currently advertised. OAuth mechanisms can be
-enabled with a configured token-introspection authority. The
+IMAP4rev2 is dual-advertised with IMAP4rev1 for compatibility; clients enable
+rev2 UTF-8 behavior with `ENABLE IMAP4rev2`. OAuth mechanisms can be enabled
+with a configured token-introspection authority. The
 deprecated draft `SNIPPET=FUZZY` dialect is available as a compatibility alias
 for RFC 8970 previews. RFC 3502 `MULTIAPPEND` provides atomic streamed batch appends and
 ordered `APPENDUID` sets. RFC 8970 `PREVIEW`, including its `LAZY` priority

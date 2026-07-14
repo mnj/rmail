@@ -27,6 +27,10 @@ impl SessionState {
             .contains(&feature.to_ascii_uppercase())
     }
 
+    pub(crate) fn utf8_enabled(&self) -> bool {
+        self.feature_enabled("UTF8=ACCEPT") || self.feature_enabled("IMAP4REV2")
+    }
+
     pub(crate) fn saved_search_uids(&self) -> &[u64] {
         &self.saved_search_uids
     }
@@ -41,6 +45,6 @@ impl SessionState {
 fn supported_enable_feature(feature: &str) -> bool {
     matches!(
         feature,
-        "IMAP4REV1" | "CONDSTORE" | "QRESYNC" | "UTF8=ACCEPT"
+        "IMAP4REV1" | "IMAP4REV2" | "CONDSTORE" | "QRESYNC" | "UTF8=ACCEPT"
     )
 }

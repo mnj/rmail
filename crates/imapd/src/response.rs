@@ -183,6 +183,7 @@ pub(crate) fn capability_tokens_with_policy(
 ) -> String {
     let mut caps = vec![
         "IMAP4rev1",
+        "IMAP4rev2",
         "ID",
         "ENABLE",
         "IDLE",
