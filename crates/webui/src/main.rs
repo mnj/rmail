@@ -14,6 +14,7 @@ use rmail_common::config::Config;
 use rmail_common::net::bind_tcp_listener_with_config;
 use rmail_common::outbound::QueueControl;
 use rmail_common::runtime::GracefulShutdown;
+use rmail_common::tracking::new_tracking_id;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -25,6 +26,12 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::{TcpStream, UnixStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+
+macro_rules! web_log {
+    ($level:expr, $event:expr, $fields:tt) => {
+        rmail_common::structured_log!($level, "web", $event, $fields)
+    };
+}
 
 #[derive(Serialize)]
 struct Stats {
@@ -1194,6 +1201,7 @@ async fn handle_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let request_id = new_tracking_id("admin-http");
     let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
     // read request line
@@ -1434,7 +1442,7 @@ async fn handle_connection<S>(
                             metrics_text.push_str(&format!("rmail_outbound_pending {}\n", n));
                         }
                         Err(e) => {
-                            eprintln!("failed to read outbound queue size: {}", e);
+                            web_log!("error", "queue_metrics_failed", { "request_id": request_id, "peer": peer, "error": e.to_string() });
                         }
                     }
                     content_type = "text/plain".to_string();
@@ -1471,7 +1479,7 @@ async fn handle_connection<S>(
                                         );
                                     }
                                     Err(e) => {
-                                        eprintln!("failed to fetch events for {}: {}", d, e);
+                                        web_log!("error", "dmarc_events_fetch_failed", { "request_id": request_id, "peer": peer, "domain": d, "error": e.to_string() });
                                     }
                                 }
                             }
@@ -2240,7 +2248,7 @@ async fn handle_connection<S>(
     let mut stream = reader.into_inner();
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
-    println!("Served {} {} -> {}", peer, path_q, status);
+    web_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method, "path": path_q, "status": status, "response_bytes": body.len() });
 }
 
 #[tokio::main]
@@ -2310,7 +2318,7 @@ async fn main() -> Result<()> {
     let mut listeners = JoinSet::new();
     for addr in bind_addrs {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
-        println!("rMail web UI listening on {}", addr);
+        web_log!("info", "listener_started", { "address": addr, "tls_configured": tls.1.borrow().is_some() });
         let mr = mail_root.clone();
         let admin_user = admin_user.clone();
         let admin_hash = admin_hash.clone();
@@ -2330,7 +2338,7 @@ async fn main() -> Result<()> {
                     accepted = listener.accept() => match accepted {
                         Ok(value) => value,
                         Err(e) => {
-                        eprintln!("web listener {} accept error: {}", addr, e);
+                        web_log!("error", "listener_accept_failed", { "address": addr, "error": e.to_string() });
                         break;
                         }
                     },
@@ -2360,7 +2368,7 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                             }
-                            Err(error) => eprintln!("web TLS handshake failed: {error}"),
+                            Err(error) => web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() }),
                         }
                     } else {
                         handle_connection(
@@ -2380,18 +2388,15 @@ async fn main() -> Result<()> {
         });
     }
     rmail_common::runtime::wait_for_shutdown_signal().await?;
-    println!("Web admin shutdown requested; draining active requests");
+    web_log!("info", "shutdown_requested", { "active_requests": shutdown.active_sessions() });
     shutdown.request();
     while let Some(result) = listeners.join_next().await {
         if let Err(error) = result {
-            eprintln!("web listener task failed during shutdown: {error}");
+            web_log!("error", "shutdown_listener_join_failed", { "error": error.to_string() });
         }
     }
     if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
-        eprintln!(
-            "web shutdown drain timed out with {} active requests",
-            shutdown.active_sessions()
-        );
+        web_log!("warn", "shutdown_drain_timed_out", { "active_requests": shutdown.active_sessions() });
     }
     Ok(())
 }

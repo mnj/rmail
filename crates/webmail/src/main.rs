@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use rmail_common::{
     auth, config::Config, db, imap_state, net::bind_tcp_listener_with_config,
-    runtime::GracefulShutdown,
+    runtime::GracefulShutdown, tracking::new_tracking_id,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -23,6 +23,12 @@ use tokio::{
 type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE: &str = "rmail_webmail";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+
+macro_rules! webmail_log {
+    ($level:expr, $event:expr, $fields:tt) => {
+        rmail_common::structured_log!($level, "webmail", $event, $fields)
+    };
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -161,7 +167,7 @@ async fn main() -> Result<()> {
         .webmail_session_secret
         .clone()
         .unwrap_or_else(|| {
-            eprintln!("warning: webmail_session_secret is not configured; using ephemeral secret");
+            webmail_log!("warn", "ephemeral_session_secret", { "reason": "webmail_session_secret is not configured" });
             format!("ephemeral-{}", randish())
         })
         .into_bytes();
@@ -188,7 +194,7 @@ async fn main() -> Result<()> {
     let mut listeners = JoinSet::new();
     for addr in bind_addrs {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
-        println!("rMail webmail listening on {}", addr);
+        webmail_log!("info", "listener_started", { "address": addr, "tls_configured": tls.1.borrow().is_some() });
         let state = state.clone();
         let listener_shutdown = shutdown.clone();
         let tls = tls.1.clone();
@@ -203,7 +209,7 @@ async fn main() -> Result<()> {
                     accepted = listener.accept() => accepted,
                 };
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer)) => {
                         let state = state.clone();
                         let tls_context = tls.borrow().clone();
                         let session = listener_shutdown.start_session();
@@ -211,19 +217,19 @@ async fn main() -> Result<()> {
                             let _session = session;
                             let result = if let Some(context) = tls_context {
                                 match context.acceptor.accept(stream).await {
-                                    Ok(stream) => handle_connection(stream, state).await,
+                                    Ok(stream) => handle_connection(stream, state, Some(peer.to_string())).await,
                                     Err(error) => Err(error.into()),
                                 }
                             } else {
-                                handle_connection(stream, state).await
+                                handle_connection(stream, state, Some(peer.to_string())).await
                             };
                             if let Err(err) = result {
-                                eprintln!("webmail connection error: {err:#}");
+                                webmail_log!("error", "connection_failed", { "peer": peer.to_string(), "error": format!("{err:#}") });
                             }
                         });
                     }
                     Err(err) => {
-                        eprintln!("webmail listener {addr} accept error: {err}");
+                        webmail_log!("error", "listener_accept_failed", { "address": addr, "error": err.to_string() });
                         break;
                     }
                 }
@@ -231,31 +237,36 @@ async fn main() -> Result<()> {
         });
     }
     rmail_common::runtime::wait_for_shutdown_signal().await?;
-    println!("Webmail shutdown requested; draining active requests");
+    webmail_log!("info", "shutdown_requested", { "active_requests": shutdown.active_sessions() });
     shutdown.request();
     while let Some(result) = listeners.join_next().await {
         if let Err(error) = result {
-            eprintln!("webmail listener task failed during shutdown: {error}");
+            webmail_log!("error", "shutdown_listener_join_failed", { "error": error.to_string() });
         }
     }
     if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
-        eprintln!(
-            "webmail shutdown drain timed out with {} active requests",
-            shutdown.active_sessions()
-        );
+        webmail_log!("warn", "shutdown_drain_timed_out", { "active_requests": shutdown.active_sessions() });
     }
     Ok(())
 }
 
-async fn handle_connection<S>(mut stream: S, state: Arc<AppState>) -> Result<()>
+async fn handle_connection<S>(
+    mut stream: S,
+    state: Arc<AppState>,
+    peer: Option<String>,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let request_id = new_tracking_id("webmail-http");
     let request = read_request(&mut stream).await?;
+    let method = request.as_ref().map(|request| request.method.clone());
+    let path = request.as_ref().map(|request| request.path.clone());
     let response = match request {
         Some(request) => route(request, &state).await,
         None => Response::empty(400),
     };
+    webmail_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method, "path": path, "status": response.status, "response_bytes": response.body.len() });
     write_response(&mut stream, response).await
 }
 

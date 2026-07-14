@@ -184,13 +184,15 @@ not consume additional quota.
 mail root. Events are also stored in `_tracking/events.sqlite`; watch mode consumes the IPC feed
 directly and does not tail text logs.
 
-The outbound worker, IMAP service, and SMTP/LMTP service write one JSON object per operational log event. Every record includes
+The outbound worker, IMAP, SMTP/LMTP, admin web, and webmail services write one JSON object per
+operational log event. Every record includes
 `timestamp_unix_ms`, `level`, `component`, `event`, and a `fields` object. Delivery-related records
 include stable `connection_id` and `message_id` fields where available, so operators can filter and
 join events without parsing human-readable messages. IMAP events separately expose peer, transport,
 command, tag, and session-state context while redacting authentication payloads. SMTP session events
 include the same connection IDs used by live tracking, plus message IDs when a transaction has one;
 low-frequency subsystem diagnostics retain their original message under a structured `message` field.
+HTTP completion events expose a request ID, peer, method, path, status, and response size.
 
 ```bash
 sudo rmail_ctl watch
