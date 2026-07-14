@@ -17,7 +17,7 @@ rustls = "0.21"
 rustls-pemfile = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 unicode-normalization = "0.1"
-async-compression = { version = "0.4", features = ["tokio", "zlib"] }
+async-compression = { version = "0.4", features = ["tokio", "deflate"] }
 
 [dev-dependencies]
 tempfile = "3.5"

@@ -557,6 +557,17 @@ fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &str {
     mailbox::selected_mailbox_for_log(selected)
 }
 
+fn logged_command_args<'a>(command: &str, args: &'a str) -> &'a str {
+    if matches!(
+        command.to_ascii_uppercase().as_str(),
+        "AUTHENTICATE" | "LOGIN"
+    ) {
+        "[REDACTED]"
+    } else {
+        args
+    }
+}
+
 fn log_unsupported_imap(
     peer: Option<SocketAddr>,
     selected: &Option<SelectedMailbox>,
@@ -810,11 +821,7 @@ async fn process_stream_inner(
         let tag = request.tag;
         let cmd = request.command_name().to_string();
         let args = request.raw_args();
-        let logged_args = if cmd.eq_ignore_ascii_case("AUTHENTICATE") {
-            "[REDACTED]"
-        } else {
-            args
-        };
+        let logged_args = logged_command_args(&cmd, args);
         imap_log!("info", "command_received", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "tag": tag, "command": cmd, "args": logged_args, "authenticated": session_state.authenticated_mailbox.is_some(), "selected": session_state.selected_mailbox.is_some() });
         let command_spec = commands::command_spec(&request.command);
         if let Some(reason) = commands::preflight(
@@ -1823,8 +1830,8 @@ async fn sync_account_storage_quota(
 mod tests {
     use super::{process_stream, process_stream_inner, process_stream_with_policy};
     use crate::response::{CapabilityPhase, capability_tokens};
-    use async_compression::tokio::bufread::ZlibDecoder;
-    use async_compression::tokio::write::ZlibEncoder;
+    use async_compression::tokio::bufread::DeflateDecoder;
+    use async_compression::tokio::write::DeflateEncoder;
     use base64::Engine;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -2266,6 +2273,19 @@ mod tests {
         assert!(super::accept_connection_from(second, 2));
     }
 
+    #[test]
+    fn authentication_command_arguments_are_never_logged() {
+        assert_eq!(
+            super::logged_command_args("LOGIN", "\"user\" \"secret\""),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            super::logged_command_args("authenticate", "PLAIN payload"),
+            "[REDACTED]"
+        );
+        assert_eq!(super::logged_command_args("NOOP", "trailing"), "trailing");
+    }
+
     #[tokio::test]
     async fn compress_deflate_round_trip_and_rejects_duplicate_activation() {
         let td = tempfile::tempdir().expect("tempdir");
@@ -2318,8 +2338,8 @@ mod tests {
         assert!(switched.contains("Begin compression"));
 
         let (read, write) = tokio::io::split(reader.into_inner());
-        let mut compressed_reader = BufReader::new(ZlibDecoder::new(BufReader::new(read)));
-        let mut compressed_writer = ZlibEncoder::new(write);
+        let mut compressed_reader = BufReader::new(DeflateDecoder::new(BufReader::new(read)));
+        let mut compressed_writer = DeflateEncoder::new(write);
         compressed_writer
             .write_all(b"A004 NOOP\r\nA005 CAPABILITY\r\nA006 COMPRESS DEFLATE\r\nA007 LOGOUT\r\n")
             .await

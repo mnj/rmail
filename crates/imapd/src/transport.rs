@@ -1,7 +1,7 @@
 use crate::tls::TlsContext;
 use anyhow::{Result, anyhow};
-use async_compression::tokio::bufread::ZlibDecoder;
-use async_compression::tokio::write::ZlibEncoder;
+use async_compression::tokio::bufread::DeflateDecoder;
+use async_compression::tokio::write::DeflateEncoder;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,8 +19,8 @@ pub(crate) trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
 enum SwitchableState {
     Raw(Box<dyn RawStream + Send + 'static>),
     Deflate {
-        reader: ZlibDecoder<BufReader<tokio::io::ReadHalf<Box<dyn RawStream + Send + 'static>>>>,
-        writer: ZlibEncoder<tokio::io::WriteHalf<Box<dyn RawStream + Send + 'static>>>,
+        reader: DeflateDecoder<BufReader<tokio::io::ReadHalf<Box<dyn RawStream + Send + 'static>>>>,
+        writer: DeflateEncoder<tokio::io::WriteHalf<Box<dyn RawStream + Send + 'static>>>,
     },
     Transition,
 }
@@ -44,8 +44,8 @@ impl AsyncStream for SwitchableStream {
             SwitchableState::Raw(stream) => {
                 let (read, write) = tokio::io::split(stream);
                 self.state = SwitchableState::Deflate {
-                    reader: ZlibDecoder::new(BufReader::new(read)),
-                    writer: ZlibEncoder::new(write),
+                    reader: DeflateDecoder::new(BufReader::new(read)),
+                    writer: DeflateEncoder::new(write),
                 };
                 Ok(())
             }
