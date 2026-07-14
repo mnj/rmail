@@ -7,12 +7,18 @@
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
+use once_cell::sync::Lazy;
 use rmail_common::{config::Config, net::bind_tcp_listener_with_config, runtime::GracefulShutdown};
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::time::Duration;
-use std::{net::SocketAddr, sync::Arc};
+use std::time::{Duration, Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 mod auth;
@@ -33,6 +39,39 @@ const MAX_APPEND_LITERAL_BYTES: usize = 100 * 1024 * 1024;
 const MAX_PREAUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTHENTICATED_LINE_BYTES: usize = 64 * 1024;
 const MAX_SASL_RESPONSE_BYTES: usize = 64 * 1024;
+
+static CONNECTION_ATTEMPTS: Lazy<Mutex<HashMap<IpAddr, VecDeque<Instant>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn accept_connection_from(ip: IpAddr, limit: usize) -> bool {
+    const MAX_TRACKED_SOURCE_IPS: usize = 10_000;
+    let now = Instant::now();
+    let mut all = CONNECTION_ATTEMPTS.lock().unwrap();
+    all.retain(|_, attempts| {
+        while attempts
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
+        {
+            attempts.pop_front();
+        }
+        !attempts.is_empty()
+    });
+    if !all.contains_key(&ip)
+        && all.len() >= MAX_TRACKED_SOURCE_IPS
+        && let Some(oldest) = all
+            .iter()
+            .min_by_key(|(_, attempts)| attempts.back().copied())
+            .map(|(address, _)| *address)
+    {
+        all.remove(&oldest);
+    }
+    let attempts = all.entry(ip).or_default();
+    if attempts.len() >= limit.max(1) {
+        return false;
+    }
+    attempts.push_back(now);
+    true
+}
 
 enum BoundedLine {
     Eof,
@@ -242,6 +281,10 @@ async fn main() -> Result<()> {
     // SQLite DB is the authoritative source for mailboxes/catchalls
     let db_path = cfg.global.db_path.clone();
     let shutdown = GracefulShutdown::new();
+    let session_limit = Arc::new(Semaphore::new(
+        cfg.security.imap_max_concurrent_sessions.max(1),
+    ));
+    let connection_rate_limit = cfg.security.imap_max_connections_per_minute.max(1);
     let mut listeners = JoinSet::new();
     if db_path.is_none() {
         eprintln!("No db_path configured; SQLite DB is required");
@@ -288,6 +331,7 @@ async fn main() -> Result<()> {
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
         let listener_shutdown = shutdown.clone();
+        let session_limit = session_limit.clone();
         listeners.spawn(async move {
             if let Err(e) = run_plain_listener(
                 addr,
@@ -296,6 +340,8 @@ async fn main() -> Result<()> {
                 acceptor_clone,
                 db_clone,
                 auth_policy,
+                session_limit,
+                connection_rate_limit,
                 listener_shutdown,
             )
             .await
@@ -317,6 +363,7 @@ async fn main() -> Result<()> {
             let db_clone = db_path.clone();
             let auth_policy = auth_policy.clone();
             let listener_shutdown = shutdown.clone();
+            let session_limit = session_limit.clone();
             listeners.spawn(async move {
                 if let Err(e) = run_imaps_listener(
                     addr,
@@ -325,6 +372,8 @@ async fn main() -> Result<()> {
                     mail_root_clone,
                     db_clone,
                     auth_policy,
+                    session_limit,
+                    connection_rate_limit,
                     listener_shutdown,
                 )
                 .await
@@ -365,6 +414,8 @@ async fn run_plain_listener(
     tls_ctx: tokio::sync::watch::Receiver<Option<Arc<tls::TlsContext>>>,
     db_path: Option<String>,
     auth_policy: Arc<auth::AuthPolicy>,
+    session_limit: Arc<Semaphore>,
+    connection_rate_limit: usize,
     shutdown: GracefulShutdown,
 ) -> Result<()> {
     let mut shutdown_signal = shutdown.subscribe();
@@ -385,13 +436,31 @@ async fn run_plain_listener(
             peer,
             tls_ctx.borrow().is_some()
         );
+        if !accept_connection_from(peer.ip(), connection_rate_limit) {
+            let mut stream = stream;
+            let _ = stream
+                .write_all(b"* BYE Connection rate limit exceeded\r\n")
+                .await;
+            continue;
+        }
         let mail_root = mail_root.clone();
         let acceptor = tls_ctx.borrow().clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
+        let permit = match session_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut stream = stream;
+                let _ = stream
+                    .write_all(b"* BYE Too many concurrent sessions\r\n")
+                    .await;
+                continue;
+            }
+        };
         let session = shutdown.start_session();
         tokio::spawn(async move {
             let _session = session;
+            let _permit = permit;
             if let Err(e) = process_stream_with_policy(
                 Box::new(stream),
                 mail_root,
@@ -416,6 +485,8 @@ async fn run_imaps_listener(
     mail_root: String,
     db_path: Option<String>,
     auth_policy: Arc<auth::AuthPolicy>,
+    session_limit: Arc<Semaphore>,
+    connection_rate_limit: usize,
     shutdown: GracefulShutdown,
 ) -> Result<()> {
     let mut shutdown_signal = shutdown.subscribe();
@@ -431,6 +502,9 @@ async fn run_imaps_listener(
             accepted = listener.accept() => accepted?,
         };
         println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
+        if !accept_connection_from(peer.ip(), connection_rate_limit) {
+            continue;
+        }
         let Some(ctx) = ctx.borrow().clone() else {
             eprintln!("IMAPS connection rejected because no TLS context is loaded");
             continue;
@@ -438,9 +512,14 @@ async fn run_imaps_listener(
         let mail_root = mail_root.clone();
         let db_clone = db_path.clone();
         let auth_policy = auth_policy.clone();
+        let permit = match session_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
         let session = shutdown.start_session();
         tokio::spawn(async move {
             let _session = session;
+            let _permit = permit;
             let started = std::time::Instant::now();
             let handshake = ctx.acceptor.accept(stream).await;
             rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
@@ -624,6 +703,7 @@ async fn process_stream_inner(
     let mut authed_mailbox: Option<String> = None; // store address lowercase
     // current mailbox selection state (set by SELECT)
     let mut selected: Option<SelectedMailbox> = None;
+    let mut command_times = VecDeque::new();
 
     loop {
         let line_limit = if session_state.authenticated_mailbox.is_some() {
@@ -714,6 +794,21 @@ async fn process_stream_inner(
         if input.is_empty() {
             continue;
         }
+        let now = Instant::now();
+        while command_times
+            .front()
+            .is_some_and(|timestamp| now.duration_since(*timestamp) >= Duration::from_secs(60))
+        {
+            command_times.pop_front();
+        }
+        if command_times.len() >= auth_policy.max_commands_per_minute() {
+            let w = reader.get_mut();
+            w.write_all(b"* BYE Command rate limit exceeded\r\n")
+                .await?;
+            w.flush().await?;
+            break;
+        }
+        command_times.push_back(now);
         let request = match parser::parse_request_line(input) {
             Ok(request) => request,
             Err(error) => {
@@ -2195,6 +2290,18 @@ mod tests {
         assert!(!configured.contains("AUTH=SCRAM-SHA-256-PLUS"));
     }
 
+    #[test]
+    fn connection_rate_limit_is_source_keyed() {
+        let first: std::net::IpAddr = "192.0.2.201".parse().unwrap();
+        let second: std::net::IpAddr = "192.0.2.202".parse().unwrap();
+        super::CONNECTION_ATTEMPTS.lock().unwrap().remove(&first);
+        super::CONNECTION_ATTEMPTS.lock().unwrap().remove(&second);
+        assert!(super::accept_connection_from(first, 2));
+        assert!(super::accept_connection_from(first, 2));
+        assert!(!super::accept_connection_from(first, 2));
+        assert!(super::accept_connection_from(second, 2));
+    }
+
     #[tokio::test]
     async fn compress_deflate_round_trip_and_rejects_duplicate_activation() {
         let td = tempfile::tempdir().expect("tempdir");
@@ -2587,6 +2694,53 @@ mod tests {
         assert!(recovered.contains("NOOP completed"));
         let _logout = read_until_contains(&mut reader, "A005 OK").await;
         server_task.await.expect("join").expect("server");
+    }
+
+    #[tokio::test]
+    async fn command_rate_limit_closes_abusive_imap_sessions() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        let security = rmail_common::config::SecurityConfig {
+            imap_max_commands_per_minute: 2,
+            ..Default::default()
+        };
+        let policy = Arc::new(crate::auth::AuthPolicy::from_security(&security).unwrap());
+        let (client, server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            process_stream_with_policy(
+                Box::new(server),
+                mail_root.to_string_lossy().into_owned(),
+                None,
+                Some(db_path.to_string_lossy().into_owned()),
+                None,
+                false,
+                policy,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        reader.read_line(&mut greeting).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(b"A1 NOOP\r\nA2 NOOP\r\nA3 NOOP\r\n")
+            .await
+            .unwrap();
+        reader.get_mut().flush().await.unwrap();
+        let responses = read_until_contains_bounded(&mut reader, "Command rate limit exceeded")
+            .await
+            .join("");
+        assert!(responses.contains("A1 OK NOOP completed"), "{responses}");
+        assert!(responses.contains("A2 OK NOOP completed"), "{responses}");
+        assert!(
+            responses.contains("* BYE Command rate limit exceeded"),
+            "{responses}"
+        );
+        assert!(!responses.contains("A3 OK"), "{responses}");
+        server_task.await.unwrap().unwrap();
     }
 
     #[test]

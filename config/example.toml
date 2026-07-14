@@ -58,7 +58,10 @@ prune_interval_seconds = 3600
 prune_batch_size = 10000
 
 [security]
-# Resource-exhaustion controls shared by SMTP, SMTPS, and submission listeners.
+# Resource-exhaustion controls for IMAP/IMAPS and SMTP-family listeners.
+imap_max_concurrent_sessions = 1000
+imap_max_connections_per_minute = 60
+imap_max_commands_per_minute = 300
 smtp_max_concurrent_sessions = 1000
 smtp_max_connections_per_minute = 60
 smtp_max_commands_per_minute = 120

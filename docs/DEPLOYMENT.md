@@ -80,7 +80,11 @@ Important:
 - optional `global.listeners.lmtp` endpoints provide RFC 2033 local delivery; bind them only to
   loopback or a private service network because LMTP deliberately has no authentication or relay
 
-SMTP resource limits are configured in the `[security]` section:
+Mail-protocol resource limits are configured in the `[security]` section:
+
+- `imap_max_concurrent_sessions` — process-wide concurrent IMAP/IMAPS sessions (default: `1000`)
+- `imap_max_connections_per_minute` — accepted IMAP/IMAPS connections per source IP in a rolling minute (default: `60`)
+- `imap_max_commands_per_minute` — per-session rolling IMAP command limit (default: `300`)
 
 - `smtp_max_concurrent_sessions` — process-wide concurrent SMTP sessions (default: `1000`)
 - `smtp_max_connections_per_minute` — accepted TCP connections per source IP in a rolling minute (default: `60`)

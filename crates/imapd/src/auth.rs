@@ -67,6 +67,7 @@ const SASL_MECHANISMS: &[SaslMechanism] = &[
 pub(crate) struct AuthPolicy {
     mechanisms: Vec<SaslMechanism>,
     oauth: Option<rmail_common::oauth::OAuthValidator>,
+    max_commands_per_minute: usize,
 }
 
 impl Default for AuthPolicy {
@@ -78,6 +79,7 @@ impl Default for AuthPolicy {
                 .filter(|mechanism| mechanism.security != SaslSecurity::BearerToken)
                 .collect(),
             oauth: None,
+            max_commands_per_minute: 300,
         }
     }
 }
@@ -109,6 +111,7 @@ impl AuthPolicy {
         Ok(Self {
             mechanisms,
             oauth: None,
+            max_commands_per_minute: 300,
         })
     }
 
@@ -130,6 +133,7 @@ impl AuthPolicy {
             anyhow::bail!("OAuth SASL mechanisms require security.oauth configuration");
         }
         policy.oauth = oauth;
+        policy.max_commands_per_minute = security.imap_max_commands_per_minute.max(1);
         Ok(policy)
     }
 
@@ -152,6 +156,7 @@ impl AuthPolicy {
         Ok(Self {
             mechanisms,
             oauth: None,
+            max_commands_per_minute: 300,
         })
     }
 
@@ -177,6 +182,10 @@ impl AuthPolicy {
 
     pub(crate) fn oauth(&self) -> Option<&rmail_common::oauth::OAuthValidator> {
         self.oauth.as_ref()
+    }
+
+    pub(crate) fn max_commands_per_minute(&self) -> usize {
+        self.max_commands_per_minute
     }
 }
 

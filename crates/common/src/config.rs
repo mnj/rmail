@@ -230,6 +230,12 @@ pub enum ScannerFailureAction {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SecurityConfig {
+    #[serde(default = "default_imap_max_concurrent_sessions")]
+    pub imap_max_concurrent_sessions: usize,
+    #[serde(default = "default_imap_max_connections_per_minute")]
+    pub imap_max_connections_per_minute: usize,
+    #[serde(default = "default_imap_max_commands_per_minute")]
+    pub imap_max_commands_per_minute: usize,
     #[serde(default = "default_smtp_max_concurrent_sessions")]
     pub smtp_max_concurrent_sessions: usize,
     #[serde(default = "default_smtp_max_connections_per_minute")]
@@ -276,6 +282,9 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            imap_max_concurrent_sessions: default_imap_max_concurrent_sessions(),
+            imap_max_connections_per_minute: default_imap_max_connections_per_minute(),
+            imap_max_commands_per_minute: default_imap_max_commands_per_minute(),
             smtp_max_concurrent_sessions: default_smtp_max_concurrent_sessions(),
             smtp_max_connections_per_minute: default_smtp_max_connections_per_minute(),
             smtp_max_commands_per_minute: default_smtp_max_commands_per_minute(),
@@ -350,6 +359,18 @@ fn default_oauth_timeout_ms() -> u64 {
 
 fn default_smtp_max_concurrent_sessions() -> usize {
     1_000
+}
+
+fn default_imap_max_concurrent_sessions() -> usize {
+    1_000
+}
+
+fn default_imap_max_connections_per_minute() -> usize {
+    60
+}
+
+fn default_imap_max_commands_per_minute() -> usize {
+    300
 }
 
 fn default_smtp_max_connections_per_minute() -> usize {
@@ -445,6 +466,9 @@ mod tests {
         assert_eq!(cfg.security.scanner_timeout_ms, 5000);
         assert_eq!(cfg.security.scanner_max_message_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.security.smtp_max_concurrent_sessions, 1_000);
+        assert_eq!(cfg.security.imap_max_concurrent_sessions, 1_000);
+        assert_eq!(cfg.security.imap_max_connections_per_minute, 60);
+        assert_eq!(cfg.security.imap_max_commands_per_minute, 300);
         assert_eq!(cfg.security.smtp_max_connections_per_minute, 60);
         assert_eq!(cfg.security.smtp_max_commands_per_minute, 120);
         assert_eq!(cfg.security.smtp_max_recipients, 100);
