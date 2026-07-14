@@ -1,3 +1,5 @@
+use unicode_normalization::UnicodeNormalization;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ImapArg {
     Atom(String),
@@ -1304,10 +1306,12 @@ fn message_sent_date(data: &[u8]) -> Option<chrono::NaiveDate> {
         .map(|dt| dt.date_naive())
 }
 
-fn contains_ascii_casefold(haystack: &[u8], needle: &str) -> bool {
-    String::from_utf8_lossy(haystack)
-        .to_lowercase()
-        .contains(&needle.to_lowercase())
+fn normalized_casefold(value: &str) -> String {
+    value.nfkd().flat_map(char::to_lowercase).collect()
+}
+
+fn contains_unicode_casefold(haystack: &[u8], needle: &str) -> bool {
+    normalized_casefold(&String::from_utf8_lossy(haystack)).contains(&normalized_casefold(needle))
 }
 
 fn has_flag(flags: &[String], wanted: &str) -> bool {
@@ -1375,12 +1379,12 @@ pub(crate) fn search_matches(
         SearchCriterion::Larger(size) => msg.size > *size,
         SearchCriterion::Smaller(size) => msg.size < *size,
         SearchCriterion::Header(name, value) => crate::mailbox::header_value(msg.data, name)
-            .map(|header| header.to_lowercase().contains(&value.to_lowercase()))
+            .map(|header| normalized_casefold(&header).contains(&normalized_casefold(value)))
             .unwrap_or(false),
         SearchCriterion::Body(value) => {
-            contains_ascii_casefold(crate::mailbox::body_after_header(msg.data), value)
+            contains_unicode_casefold(crate::mailbox::body_after_header(msg.data), value)
         }
-        SearchCriterion::Text(value) => contains_ascii_casefold(msg.data, value),
+        SearchCriterion::Text(value) => contains_unicode_casefold(msg.data, value),
         SearchCriterion::Not(inner) => !search_matches(inner, msg, total),
         SearchCriterion::Or(left, right) => {
             search_matches(left, msg, total) || search_matches(right, msg, total)
@@ -2155,6 +2159,38 @@ fn mailbox_pattern_match_bytes(name: &[u8], pattern: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_matches_unicode_case_and_canonical_equivalence() {
+        let data = "Subject: RÉSUMÉ\r\n\r\nΚαλημέρα, Ångström".as_bytes();
+        let flags = Vec::new();
+        let message = SearchMessage {
+            seq: 1,
+            uid: 1,
+            flags: &flags,
+            internal_date: 0,
+            in_saved_result: false,
+            now: 0,
+            size: data.len(),
+            data,
+        };
+
+        assert!(search_matches(
+            &SearchCriterion::Header("Subject".into(), "re\u{301}sume\u{301}".into()),
+            &message,
+            1,
+        ));
+        assert!(search_matches(
+            &SearchCriterion::Body("καλημέρα".into()),
+            &message,
+            1,
+        ));
+        assert!(search_matches(
+            &SearchCriterion::Text("ÅNGSTRÖM".into()),
+            &message,
+            1,
+        ));
+    }
 
     #[test]
     fn parses_atoms_quoted_strings_nil_lists_and_literal_markers() {
