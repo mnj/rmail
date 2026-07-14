@@ -13,6 +13,7 @@ use std::{
 pub(crate) enum SaslSecurity {
     PlaintextPassword,
     ChallengeResponse,
+    BearerToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,22 +49,41 @@ const SASL_MECHANISMS: &[SaslMechanism] = &[
         security: SaslSecurity::ChallengeResponse,
         channel_binding_required: true,
     },
+    SaslMechanism {
+        name: "OAUTHBEARER",
+        capability: "AUTH=OAUTHBEARER",
+        security: SaslSecurity::BearerToken,
+        channel_binding_required: false,
+    },
+    SaslMechanism {
+        name: "XOAUTH2",
+        capability: "AUTH=XOAUTH2",
+        security: SaslSecurity::BearerToken,
+        channel_binding_required: false,
+    },
 ];
 
 #[derive(Debug, Clone)]
 pub(crate) struct AuthPolicy {
     mechanisms: Vec<SaslMechanism>,
+    oauth: Option<rmail_common::oauth::OAuthValidator>,
 }
 
 impl Default for AuthPolicy {
     fn default() -> Self {
         Self {
-            mechanisms: SASL_MECHANISMS.to_vec(),
+            mechanisms: SASL_MECHANISMS
+                .iter()
+                .copied()
+                .filter(|mechanism| mechanism.security != SaslSecurity::BearerToken)
+                .collect(),
+            oauth: None,
         }
     }
 }
 
 impl AuthPolicy {
+    #[cfg(test)]
     pub(crate) fn from_names(names: &[String]) -> anyhow::Result<Self> {
         if names.is_empty() {
             anyhow::bail!("security.imap_sasl_mechanisms must not be empty");
@@ -80,7 +100,59 @@ impl AuthPolicy {
             }
             mechanisms.push(mechanism);
         }
-        Ok(Self { mechanisms })
+        if mechanisms
+            .iter()
+            .any(|mechanism| mechanism.security == SaslSecurity::BearerToken)
+        {
+            anyhow::bail!("OAuth SASL mechanisms require security.oauth configuration");
+        }
+        Ok(Self {
+            mechanisms,
+            oauth: None,
+        })
+    }
+
+    pub(crate) fn from_security(
+        security: &rmail_common::config::SecurityConfig,
+    ) -> anyhow::Result<Self> {
+        let mut policy = Self::from_names_without_oauth(&security.imap_sasl_mechanisms)?;
+        let oauth = security
+            .oauth
+            .clone()
+            .map(rmail_common::oauth::OAuthValidator::new)
+            .transpose()?;
+        if policy
+            .mechanisms
+            .iter()
+            .any(|mechanism| mechanism.security == SaslSecurity::BearerToken)
+            && oauth.is_none()
+        {
+            anyhow::bail!("OAuth SASL mechanisms require security.oauth configuration");
+        }
+        policy.oauth = oauth;
+        Ok(policy)
+    }
+
+    fn from_names_without_oauth(names: &[String]) -> anyhow::Result<Self> {
+        if names.is_empty() {
+            anyhow::bail!("security.imap_sasl_mechanisms must not be empty");
+        }
+        let mut mechanisms = Vec::with_capacity(names.len());
+        for name in names {
+            let mechanism = sasl_mechanism(name)
+                .ok_or_else(|| anyhow::anyhow!("unsupported IMAP SASL mechanism {name:?}"))?;
+            if mechanisms
+                .iter()
+                .any(|configured: &SaslMechanism| configured.name == mechanism.name)
+            {
+                anyhow::bail!("duplicate IMAP SASL mechanism {:?}", mechanism.name);
+            }
+            mechanisms.push(mechanism);
+        }
+        Ok(Self {
+            mechanisms,
+            oauth: None,
+        })
     }
 
     pub(crate) fn mechanism(&self, name: &str) -> Option<SaslMechanism> {
@@ -96,10 +168,15 @@ impl AuthPolicy {
         channel_binding_available: bool,
     ) -> impl Iterator<Item = SaslMechanism> + '_ {
         self.mechanisms.iter().filter_map(move |mechanism| {
-            ((encrypted || mechanism.security != SaslSecurity::PlaintextPassword)
+            ((encrypted || mechanism.security == SaslSecurity::ChallengeResponse)
+                && (mechanism.security != SaslSecurity::BearerToken || self.oauth.is_some())
                 && (!mechanism.channel_binding_required || channel_binding_available))
                 .then_some(*mechanism)
         })
+    }
+
+    pub(crate) fn oauth(&self) -> Option<&rmail_common::oauth::OAuthValidator> {
+        self.oauth.as_ref()
     }
 }
 

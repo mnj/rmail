@@ -464,7 +464,7 @@ async fn main() -> Result<()> {
     // DMARC enforcement flag
     let enforce_dmarc = cfg.global.enforce_dmarc.unwrap_or(false);
     let security = Arc::new(cfg.security.clone());
-    protocol::validate_sasl_mechanisms(&security.smtp_sasl_mechanisms)
+    protocol::validate_sasl_mechanisms(&security.smtp_sasl_mechanisms, security.oauth.is_some())
         .context("validating security.smtp_sasl_mechanisms")?;
     let session_limit = Arc::new(Semaphore::new(security.smtp_max_concurrent_sessions.max(1)));
     let shutdown = GracefulShutdown::new();
@@ -974,6 +974,12 @@ async fn process_stream(
     service: SmtpService,
     trace: Option<ConnectionTrace>,
 ) -> Result<()> {
+    let oauth_validator = security
+        .oauth
+        .clone()
+        .map(rmail_common::oauth::OAuthValidator::new)
+        .transpose()
+        .context("initializing OAuth token introspection")?;
     let implicit_tls = session_encrypted;
     let trace = trace.unwrap_or_else(|| ConnectionTrace {
         id: new_tracking_id("smtp-conn"),
@@ -1368,6 +1374,33 @@ async fn process_stream(
                     let outcome =
                         authenticate::handle_scram(&mut reader, initial, db_path.as_ref(), peer)
                             .await;
+                    if outcome.disconnected {
+                        break;
+                    }
+                    if let Some(user) = outcome.authenticated_user {
+                        println!("SMTP AUTH success peer={peer:?} user={user}");
+                        authenticated_user = Some(user);
+                    }
+                    continue;
+                }
+                if matches!(mech.as_str(), "OAUTHBEARER" | "XOAUTH2") {
+                    let Some(validator) = oauth_validator.as_ref() else {
+                        let writer = reader.get_mut();
+                        writer
+                            .write_all(b"454 4.7.0 OAuth authentication is unavailable\r\n")
+                            .await?;
+                        writer.flush().await?;
+                        continue;
+                    };
+                    let outcome = authenticate::handle_oauth(
+                        &mut reader,
+                        &mech,
+                        initial,
+                        db_path.as_ref(),
+                        peer,
+                        validator,
+                    )
+                    .await;
                     if outcome.disconnected {
                         break;
                     }
@@ -2849,6 +2882,46 @@ mod tests {
         }
     }
 
+    async fn oauth_introspection_server(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8_lossy(&request);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut form = vec![0; length];
+            stream.read_exact(&mut form).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(form).unwrap()
+        });
+        (format!("http://{address}/introspect"), task)
+    }
+
     #[tokio::test]
     async fn reply_tracking_counts_wire_bytes_and_stops_below_starttls() {
         let (server, mut client) = duplex(4096);
@@ -3102,6 +3175,43 @@ mod tests {
             encrypted
                 .iter()
                 .any(|line| line.starts_with("250 2.1.0 Sender OK"))
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_xoauth2_authenticates_through_the_configured_authority() {
+        let (introspection_url, introspection) =
+            oauth_introspection_server(r#"{"active":true,"username":"user@example.test"}"#).await;
+        let security = SecurityConfig {
+            smtp_sasl_mechanisms: vec!["XOAUTH2".into()],
+            oauth: Some(rmail_common::config::OAuthConfig {
+                introspection_url,
+                client_id: None,
+                client_secret: None,
+                required_scopes: Vec::new(),
+                identity_claim: "username".into(),
+                issuer: None,
+                audience: None,
+                timeout_ms: 2_000,
+                allow_insecure_http: true,
+            }),
+            ..Default::default()
+        };
+        let response =
+            BASE64_ENGINE.encode(b"user=user@example.test\x01auth=Bearer good-token\x01\x01");
+        let (responses, _) = run_session_with_policy(
+            format!("EHLO localhost\r\nAUTH XOAUTH2 {response}\r\nQUIT\r\n").into_bytes(),
+            16 * 1024,
+            security,
+            true,
+            SmtpService::Submission,
+        )
+        .await;
+        assert!(responses.iter().any(|line| line.contains("AUTH XOAUTH2")));
+        assert!(responses.iter().any(|line| line.starts_with("235 2.7.0")));
+        assert_eq!(
+            introspection.await.unwrap(),
+            "token=good-token&token_type_hint=access_token"
         );
     }
 

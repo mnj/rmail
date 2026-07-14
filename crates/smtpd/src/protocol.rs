@@ -701,22 +701,29 @@ mod tests {
     #[test]
     fn sasl_capabilities_are_validated_and_follow_configuration_order() {
         let configured = vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()];
-        validate_sasl_mechanisms(&configured).unwrap();
+        validate_sasl_mechanisms(&configured, false).unwrap();
         assert_eq!(
             advertised_sasl_mechanisms(&configured),
             "SCRAM-SHA-256 PLAIN"
         );
-        assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()]).is_err());
-        assert!(validate_sasl_mechanisms(&["PLAIN".to_string(), "plain".to_string()]).is_err());
+        assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()], false).is_err());
+        assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()], true).is_ok());
+        assert!(
+            validate_sasl_mechanisms(&["PLAIN".to_string(), "plain".to_string()], false).is_err()
+        );
     }
 }
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub(crate) const MAX_COMMAND_LINE_BYTES: usize = 512;
 pub(crate) const MAX_AUTH_LINE_BYTES: usize = 12 * 1024;
-pub(crate) const SMTP_SASL_MECHANISMS: &[&str] = &["PLAIN", "LOGIN", "SCRAM-SHA-256"];
+pub(crate) const SMTP_SASL_MECHANISMS: &[&str] =
+    &["PLAIN", "LOGIN", "SCRAM-SHA-256", "OAUTHBEARER", "XOAUTH2"];
 
-pub(crate) fn validate_sasl_mechanisms(configured: &[String]) -> anyhow::Result<()> {
+pub(crate) fn validate_sasl_mechanisms(
+    configured: &[String],
+    oauth_configured: bool,
+) -> anyhow::Result<()> {
     if configured.is_empty() {
         anyhow::bail!("security.smtp_sasl_mechanisms must not be empty");
     }
@@ -731,6 +738,13 @@ pub(crate) fn validate_sasl_mechanisms(configured: &[String]) -> anyhow::Result<
             anyhow::bail!("duplicate SMTP SASL mechanism {canonical:?}");
         }
         seen.push(canonical);
+    }
+    if !oauth_configured
+        && seen
+            .iter()
+            .any(|mechanism| matches!(*mechanism, "OAUTHBEARER" | "XOAUTH2"))
+    {
+        anyhow::bail!("OAuth SMTP SASL mechanisms require security.oauth configuration");
     }
     Ok(())
 }

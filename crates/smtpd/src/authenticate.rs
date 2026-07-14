@@ -110,6 +110,107 @@ pub(crate) async fn handle_password<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+pub(crate) async fn handle_oauth<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    mechanism: &str,
+    initial_response: Option<&str>,
+    db_path: Option<&String>,
+    peer: Option<SocketAddr>,
+    validator: &rmail_common::oauth::OAuthValidator,
+) -> Outcome {
+    let wire = match initial_response {
+        Some(response) => response.to_string(),
+        None => {
+            if write_reply(reader, b"334 \r\n").await.is_err() {
+                return disconnected();
+            }
+            match read_response(reader).await {
+                Ok(response) => response,
+                Err(error) => return exchange_failure(reader, error).await,
+            }
+        }
+    };
+    let decoded = match BASE64_ENGINE.decode(wire.as_bytes()) {
+        Ok(decoded) => decoded,
+        Err(_) => return failure(reader, b"501 5.5.2 Invalid OAuth SASL response\r\n").await,
+    };
+    let credentials = match rmail_common::oauth::parse_oauth_sasl_response(mechanism, &decoded) {
+        Ok(credentials) => credentials,
+        Err(_) => return failure(reader, b"501 5.5.2 Invalid OAuth SASL response\r\n").await,
+    };
+    let identity = match validator
+        .validate(&credentials.token, credentials.asserted_identity.as_deref())
+        .await
+    {
+        rmail_common::oauth::OAuthValidation::Active { identity } => identity,
+        rmail_common::oauth::OAuthValidation::Rejected => {
+            record_failure(peer);
+            return oauth_failure_exchange(
+                reader,
+                b"535 5.7.8 Authentication credentials invalid\r\n",
+            )
+            .await;
+        }
+        rmail_common::oauth::OAuthValidation::Unavailable(error) => {
+            eprintln!("SMTP AUTH {mechanism} introspection error peer={peer:?}: {error}");
+            return oauth_failure_exchange(
+                reader,
+                b"454 4.7.0 Temporary authentication failure\r\n",
+            )
+            .await;
+        }
+    };
+    let mailbox = match rmail_common::auth::lookup_mailbox(db_path, &identity).await {
+        Ok(Some(mailbox)) => mailbox,
+        Ok(None) => {
+            record_failure(peer);
+            return oauth_failure_exchange(
+                reader,
+                b"535 5.7.8 Authentication credentials invalid\r\n",
+            )
+            .await;
+        }
+        Err(error) => {
+            eprintln!("SMTP AUTH {mechanism} mailbox lookup error peer={peer:?}: {error}");
+            return oauth_failure_exchange(
+                reader,
+                b"454 4.7.0 Temporary authentication failure\r\n",
+            )
+            .await;
+        }
+    };
+    if let Some(peer) = peer {
+        crate::reset_auth_failures(peer.ip());
+    }
+    if write_reply(reader, b"235 2.7.0 Authentication succeeded\r\n")
+        .await
+        .is_err()
+    {
+        return disconnected();
+    }
+    Outcome {
+        authenticated_user: Some(mailbox.address.to_ascii_lowercase()),
+        disconnected: false,
+    }
+}
+
+async fn oauth_failure_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    terminal_reply: &[u8],
+) -> Outcome {
+    let challenge = BASE64_ENGINE.encode(br#"{"status":"401","schemes":"bearer","scope":""}"#);
+    if write_reply(reader, format!("334 {challenge}\r\n").as_bytes())
+        .await
+        .is_err()
+    {
+        return disconnected();
+    }
+    match read_response(reader).await {
+        Ok(_) | Err(ExchangeError::Cancelled) => failure(reader, terminal_reply).await,
+        Err(error) => exchange_failure(reader, error).await,
+    }
+}
+
 pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     initial_response: Option<&str>,

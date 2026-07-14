@@ -114,6 +114,117 @@ pub(crate) async fn handle_password(
     }
 }
 
+pub(crate) async fn handle_oauth(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+    tag: &str,
+    mechanism: &str,
+    initial: Option<&str>,
+    db_path: Option<&String>,
+    peer: Option<SocketAddr>,
+    validator: &rmail_common::oauth::OAuthValidator,
+    authenticated_capabilities: &str,
+) -> Outcome {
+    let wire = match initial {
+        Some(initial) => initial.to_string(),
+        None => {
+            if write_continuation(reader, "").await.is_err() {
+                return disconnected();
+            }
+            match read_response(reader).await {
+                Ok(response) => response,
+                Err(error) => return protocol_failure(tag, error, "OAuth initial response"),
+            }
+        }
+    };
+    let decoded = match BASE64_ENGINE.decode(wire.as_bytes()) {
+        Ok(decoded) => decoded,
+        Err(_) => return terminal(tag, Status::Bad, "Invalid OAuth SASL response", None),
+    };
+    let credentials = match rmail_common::oauth::parse_oauth_sasl_response(mechanism, &decoded) {
+        Ok(credentials) => credentials,
+        Err(_) => return terminal(tag, Status::Bad, "Invalid OAuth SASL response", None),
+    };
+    let identity = match validator
+        .validate(&credentials.token, credentials.asserted_identity.as_deref())
+        .await
+    {
+        rmail_common::oauth::OAuthValidation::Active { identity } => identity,
+        rmail_common::oauth::OAuthValidation::Rejected => {
+            record_failure(peer);
+            return oauth_failure_exchange(
+                reader,
+                tag,
+                "Authentication failed",
+                "AUTHENTICATIONFAILED",
+            )
+            .await;
+        }
+        rmail_common::oauth::OAuthValidation::Unavailable(error) => {
+            eprintln!("IMAP AUTHENTICATE {mechanism} introspection error peer={peer:?}: {error}");
+            return oauth_failure_exchange(
+                reader,
+                tag,
+                "Authentication service unavailable",
+                "UNAVAILABLE",
+            )
+            .await;
+        }
+    };
+    let mailbox = match auth::lookup_mailbox(db_path, &identity).await {
+        Ok(Some(mailbox)) => mailbox,
+        Ok(None) => {
+            record_failure(peer);
+            return oauth_failure_exchange(
+                reader,
+                tag,
+                "Authentication failed",
+                "AUTHENTICATIONFAILED",
+            )
+            .await;
+        }
+        Err(error) => {
+            eprintln!("IMAP AUTHENTICATE {mechanism} mailbox lookup error peer={peer:?}: {error}");
+            return oauth_failure_exchange(
+                reader,
+                tag,
+                "Authentication service unavailable",
+                "UNAVAILABLE",
+            )
+            .await;
+        }
+    };
+    if let Some(peer) = peer {
+        auth::reset_auth_failures(peer.ip());
+    }
+    Outcome {
+        response: Some(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::Ok, "AUTHENTICATE completed")
+                    .with_code(format!("CAPABILITY {authenticated_capabilities}")),
+            ),
+        ),
+        authenticated_mailbox: Some(mailbox.address.to_ascii_lowercase()),
+        disconnected: false,
+    }
+}
+
+async fn oauth_failure_exchange(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+    tag: &str,
+    text: &str,
+    code: &str,
+) -> Outcome {
+    let challenge = BASE64_ENGINE.encode(br#"{"status":"401","schemes":"bearer","scope":""}"#);
+    if write_continuation(reader, &challenge).await.is_err() {
+        return disconnected();
+    }
+    match read_response(reader).await {
+        Ok(_) | Err(ProtocolError::Cancelled) => terminal(tag, Status::No, text, Some(code)),
+        Err(ProtocolError::Eof) => disconnected(),
+        Err(_) => terminal(tag, Status::Bad, "Invalid OAuth error acknowledgment", None),
+    }
+}
+
 pub(crate) async fn handle_scram(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     tag: &str,

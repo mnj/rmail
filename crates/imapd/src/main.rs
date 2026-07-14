@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
     let auth_policy = Arc::new(
-        auth::AuthPolicy::from_names(&cfg.security.imap_sasl_mechanisms)
+        auth::AuthPolicy::from_security(&cfg.security)
             .context("validating security.imap_sasl_mechanisms")?,
     );
     let mail_root = cfg.global.mail_root.clone();
@@ -739,13 +739,18 @@ async fn process_stream_inner(
         let tag = request.tag;
         let cmd = request.command_name().to_string();
         let args = request.raw_args();
+        let logged_args = if cmd.eq_ignore_ascii_case("AUTHENTICATE") {
+            "[REDACTED]"
+        } else {
+            args
+        };
         println!(
             "IMAP peer={:?} encrypted={} tag={} cmd={} args={:?} authed={} selected={}",
             peer,
             session_encrypted,
             tag,
             cmd,
-            args,
+            logged_args,
             session_state.authenticated_mailbox.is_some(),
             session_state.selected_mailbox.is_some()
         );
@@ -870,7 +875,7 @@ async fn process_stream_inner(
                     continue;
                 }
                 if !session_encrypted
-                    && mechanism_metadata.security == auth::SaslSecurity::PlaintextPassword
+                    && mechanism_metadata.security != auth::SaslSecurity::ChallengeResponse
                 {
                     let w = reader.get_mut();
                     w.write_all(
@@ -908,6 +913,48 @@ async fn process_stream_inner(
                         initial_response.as_deref(),
                         db_path.as_ref(),
                         peer,
+                        &authenticated_capabilities,
+                    )
+                    .await;
+                    if outcome.disconnected {
+                        return Ok(());
+                    }
+                    if let Some(mailbox) = outcome.authenticated_mailbox {
+                        authed_mailbox = Some(mailbox.clone());
+                        session_state.authenticated_mailbox = Some(mailbox);
+                    }
+                    if let Some(response) = outcome.response {
+                        let response = response.encode();
+                        log_imap_response(peer, tag, &cmd, &response);
+                        let w = reader.get_mut();
+                        w.write_all(response.as_bytes()).await?;
+                        w.flush().await?;
+                    }
+                    continue;
+                }
+                if matches!(mechanism.as_str(), "OAUTHBEARER" | "XOAUTH2") {
+                    let authenticated_capabilities = response::capability_tokens_with_policy(
+                        response::CapabilityPhase::Authenticated,
+                        tls_ctx.is_some(),
+                        auth_policy.as_ref(),
+                    );
+                    let Some(validator) = auth_policy.oauth() else {
+                        let w = reader.get_mut();
+                        w.write_all(
+                            format!("{tag} NO OAuth authentication is unavailable\r\n").as_bytes(),
+                        )
+                        .await?;
+                        w.flush().await?;
+                        continue;
+                    };
+                    let outcome = commands::authenticate::handle_oauth(
+                        &mut reader,
+                        tag,
+                        &mechanism,
+                        initial_response.as_deref(),
+                        db_path.as_ref(),
+                        peer,
+                        validator,
                         &authenticated_capabilities,
                     )
                     .await;
@@ -1715,14 +1762,121 @@ async fn sync_account_storage_quota(
 
 #[cfg(test)]
 mod tests {
-    use super::{process_stream, process_stream_inner};
+    use super::{process_stream, process_stream_inner, process_stream_with_policy};
     use crate::response::{CapabilityPhase, capability_tokens};
     use async_compression::tokio::bufread::ZlibDecoder;
     use async_compression::tokio::write::ZlibEncoder;
     use base64::Engine;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, duplex};
+
+    async fn oauth_introspection_server(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8_lossy(&request);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut form = vec![0; length];
+            stream.read_exact(&mut form).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(form).unwrap()
+        });
+        (format!("http://{address}/introspect"), task)
+    }
+
+    #[tokio::test]
+    async fn xoauth2_authenticates_through_the_configured_authority() {
+        let (introspection_url, introspection) =
+            oauth_introspection_server(r#"{"active":true,"username":"user@example.test"}"#).await;
+        let td = tempfile::tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        rmail_common::db::add_mailbox(&db_path, "user@example.test", None, None, None)
+            .expect("add mailbox");
+        let security = rmail_common::config::SecurityConfig {
+            imap_sasl_mechanisms: vec!["XOAUTH2".into()],
+            oauth: Some(rmail_common::config::OAuthConfig {
+                introspection_url,
+                client_id: None,
+                client_secret: None,
+                required_scopes: Vec::new(),
+                identity_claim: "username".into(),
+                issuer: None,
+                audience: None,
+                timeout_ms: 2_000,
+                allow_insecure_http: true,
+            }),
+            ..Default::default()
+        };
+        let policy = Arc::new(crate::auth::AuthPolicy::from_security(&security).unwrap());
+        let response = base64::engine::general_purpose::STANDARD
+            .encode(b"user=user@example.test\x01auth=Bearer good-token\x01\x01");
+        let (client, server) = duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            process_stream_with_policy(
+                Box::new(server),
+                mail_root.to_string_lossy().into_owned(),
+                None,
+                Some(db_path.to_string_lossy().into_owned()),
+                None,
+                true,
+                policy,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        let mut capabilities = String::new();
+        reader.read_line(&mut capabilities).await.unwrap();
+        assert!(capabilities.contains("AUTH=XOAUTH2"), "{capabilities:?}");
+        assert!(
+            !capabilities.contains("AUTH=OAUTHBEARER"),
+            "{capabilities:?}"
+        );
+        reader
+            .get_mut()
+            .write_all(format!("A1 AUTHENTICATE XOAUTH2 {response}\r\nA2 LOGOUT\r\n").as_bytes())
+            .await
+            .unwrap();
+        reader.get_mut().flush().await.unwrap();
+        let authenticated = read_until_contains_bounded(&mut reader, "A1 OK").await;
+        assert!(authenticated.iter().any(|line| line.contains("A1 OK")));
+        read_until_contains_bounded(&mut reader, "A2 OK").await;
+        server_task.await.unwrap().unwrap();
+        assert_eq!(
+            introspection.await.unwrap(),
+            "token=good-token&token_type_hint=access_token"
+        );
+    }
 
     async fn read_until_contains<R>(reader: &mut R, needle: &str) -> Vec<String>
     where

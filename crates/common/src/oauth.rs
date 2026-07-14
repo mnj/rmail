@@ -6,6 +6,14 @@ use crate::config::OAuthConfig;
 
 pub const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthSaslCredentials {
+    pub asserted_identity: Option<String>,
+    pub token: String,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OAuthValidator {
     client: reqwest::Client,
@@ -103,6 +111,116 @@ impl OAuthValidator {
         };
         validate_response(&self.config, response, asserted_identity)
     }
+}
+
+pub fn parse_oauth_sasl_response(
+    mechanism: &str,
+    decoded: &[u8],
+) -> anyhow::Result<OAuthSaslCredentials> {
+    let response = std::str::from_utf8(decoded).map_err(|_| anyhow::anyhow!("invalid UTF-8"))?;
+    if !response.ends_with("\x01\x01") {
+        anyhow::bail!("missing SASL terminator");
+    }
+    match mechanism.to_ascii_uppercase().as_str() {
+        "OAUTHBEARER" => parse_oauthbearer(response),
+        "XOAUTH2" => parse_xoauth2(response),
+        _ => anyhow::bail!("unsupported OAuth SASL mechanism"),
+    }
+}
+
+fn parse_oauthbearer(response: &str) -> anyhow::Result<OAuthSaslCredentials> {
+    let (gs2, fields) = response
+        .split_once('\x01')
+        .ok_or_else(|| anyhow::anyhow!("missing GS2 separator"))?;
+    if !gs2.starts_with("n,") || !gs2.ends_with(',') {
+        anyhow::bail!("invalid OAUTHBEARER GS2 header");
+    }
+    let asserted_identity = gs2
+        .strip_prefix("n,")
+        .and_then(|value| value.strip_suffix(','))
+        .and_then(|value| value.strip_prefix("a="))
+        .map(decode_gs2_name)
+        .transpose()?;
+    parse_oauth_fields(fields, asserted_identity, false)
+}
+
+fn parse_xoauth2(response: &str) -> anyhow::Result<OAuthSaslCredentials> {
+    parse_oauth_fields(response, None, true)
+}
+
+fn parse_oauth_fields(
+    fields: &str,
+    mut asserted_identity: Option<String>,
+    xoauth2: bool,
+) -> anyhow::Result<OAuthSaslCredentials> {
+    let mut token = None;
+    let mut host = None;
+    let mut port = None;
+    for field in fields.split('\x01').filter(|field| !field.is_empty()) {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid OAuth SASL field"))?;
+        match key {
+            "auth" if token.is_none() => {
+                let (scheme, value) = value
+                    .split_once(' ')
+                    .ok_or_else(|| anyhow::anyhow!("invalid OAuth authorization field"))?;
+                if !scheme.eq_ignore_ascii_case("Bearer")
+                    || value.is_empty()
+                    || value.len() > MAX_ACCESS_TOKEN_BYTES
+                    || value.chars().any(char::is_whitespace)
+                {
+                    anyhow::bail!("invalid bearer token");
+                }
+                token = Some(value.to_string());
+            }
+            "user" if xoauth2 && asserted_identity.is_none() && !value.is_empty() => {
+                asserted_identity = Some(value.to_string());
+            }
+            "host" if !xoauth2 && host.is_none() && !value.is_empty() => {
+                host = Some(value.to_ascii_lowercase());
+            }
+            "port" if !xoauth2 && port.is_none() => {
+                port = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid SASL port"))?,
+                );
+            }
+            // RFC 7628 requires unknown key/value pairs to be ignored.
+            _ if !matches!(key, "auth" | "user" | "host" | "port") => {}
+            _ => anyhow::bail!("duplicate or invalid OAuth SASL field"),
+        }
+    }
+    if xoauth2 && asserted_identity.is_none() {
+        anyhow::bail!("XOAUTH2 user is required");
+    }
+    Ok(OAuthSaslCredentials {
+        asserted_identity,
+        token: token.ok_or_else(|| anyhow::anyhow!("bearer token is required"))?,
+        host,
+        port,
+    })
+}
+
+fn decode_gs2_name(value: &str) -> anyhow::Result<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '=' {
+            decoded.push(ch);
+            continue;
+        }
+        match (chars.next(), chars.next()) {
+            (Some('2'), Some('C' | 'c')) => decoded.push(','),
+            (Some('3'), Some('D' | 'd')) => decoded.push('='),
+            _ => anyhow::bail!("invalid GS2 authorization identity escape"),
+        }
+    }
+    if decoded.is_empty() {
+        anyhow::bail!("empty GS2 authorization identity");
+    }
+    Ok(decoded)
 }
 
 fn validate_config(config: &OAuthConfig) -> anyhow::Result<()> {
@@ -264,5 +382,39 @@ mod tests {
             validate_response(&no_scope, make_response(), Some("other@example.test")),
             OAuthValidation::Rejected
         );
+    }
+
+    #[test]
+    fn oauthbearer_and_xoauth2_sasl_payloads_are_strictly_parsed() {
+        assert_eq!(
+            parse_oauth_sasl_response(
+                "OAUTHBEARER",
+                b"n,a=user@example.test,\x01host=mail.example.test\x01port=993\x01auth=Bearer token-1\x01\x01",
+            )
+            .unwrap(),
+            OAuthSaslCredentials {
+                asserted_identity: Some("user@example.test".to_string()),
+                token: "token-1".to_string(),
+                host: Some("mail.example.test".to_string()),
+                port: Some(993),
+            }
+        );
+        assert_eq!(
+            parse_oauth_sasl_response(
+                "XOAUTH2",
+                b"user=user@example.test\x01auth=Bearer token-2\x01\x01",
+            )
+            .unwrap()
+            .asserted_identity
+            .as_deref(),
+            Some("user@example.test")
+        );
+        for invalid in [
+            b"n,,\x01auth=Basic token\x01\x01".as_slice(),
+            b"n,,\x01auth=Bearer token\x01auth=Bearer duplicate\x01\x01".as_slice(),
+            b"n,,\x01auth=Bearer token".as_slice(),
+        ] {
+            assert!(parse_oauth_sasl_response("OAUTHBEARER", invalid).is_err());
+        }
     }
 }

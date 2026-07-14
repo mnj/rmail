@@ -57,7 +57,8 @@ certification results.
 | RFC 7489 | DMARC policy | 90% | Alignment, policy outcomes, quarantine, optional rejection, and aggregate RUA report generation are implemented; forensic reporting is not implemented. |
 
 SMTP AUTH mechanisms are configured independently with
-`security.smtp_sasl_mechanisms`. OAuth mechanisms are not currently advertised.
+`security.smtp_sasl_mechanisms`. `OAUTHBEARER` and `XOAUTH2` can be enabled when
+an OAuth token-introspection authority is configured under `security.oauth`.
 
 ## IMAP standards support
 
@@ -105,7 +106,8 @@ or conformance-validation gaps.
 | RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
 | RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
 
-IMAP4rev2 (RFC 9051) and OAuth mechanisms are not currently advertised. The
+IMAP4rev2 (RFC 9051) is not currently advertised. OAuth mechanisms can be
+enabled with a configured token-introspection authority. The
 deprecated draft `SNIPPET=FUZZY` dialect is available as a compatibility alias
 for RFC 8970 previews. RFC 3502 `MULTIAPPEND` provides atomic streamed batch appends and
 ordered `APPENDUID` sets. RFC 8970 `PREVIEW`, including its `LAZY` priority
