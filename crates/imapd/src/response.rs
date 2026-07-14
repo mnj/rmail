@@ -153,13 +153,15 @@ fn sanitize_code(value: &str) -> String {
 
 pub(crate) fn log_imap_response(peer: Option<SocketAddr>, tag: &str, cmd: &str, response: &str) {
     let escaped = response.replace("\r", "\\r").replace("\n", "\\n");
-    println!(
-        "IMAP response peer={:?} tag={} cmd={} bytes={} data={:?}",
-        peer,
-        tag,
-        cmd,
-        response.len(),
-        escaped
+    rmail_common::structured_log!(
+        "info", "imapd", "response_sent",
+        {
+            "peer": peer.map(|address| address.to_string()),
+            "tag": tag,
+            "command": cmd,
+            "bytes": response.len(),
+            "data": escaped
+        }
     );
 }
 

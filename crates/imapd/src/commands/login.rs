@@ -41,9 +41,9 @@ pub(crate) async fn handle(
         }
     };
 
-    println!(
-        "IMAP LOGIN attempt peer={peer:?} user={user:?} password_len={}",
-        password.len()
+    rmail_common::structured_log!(
+        "info", "imapd", "login_attempted",
+        { "peer": peer.map(|address| address.to_string()), "user": user, "credential_bytes": password.len() }
     );
     match auth::verify_password(db_path, &user, &password).await {
         PasswordAuthResult::Success(mailbox) => {
@@ -51,7 +51,7 @@ pub(crate) async fn handle(
                 auth::reset_auth_failures(peer.ip());
             }
             let address = mailbox.address.to_ascii_lowercase();
-            println!("IMAP LOGIN success peer={peer:?} mailbox={address}");
+            rmail_common::structured_log!("info", "imapd", "login_succeeded", { "peer": peer.map(|address| address.to_string()), "mailbox": address });
             Outcome {
                 response: Response::new().status(
                     StatusLine::tagged(tag, Status::Ok, "LOGIN completed")
@@ -71,12 +71,13 @@ pub(crate) async fn handle(
         }
         PasswordAuthResult::Unavailable { mailbox, message } => {
             record_failure(peer);
-            eprintln!(
-                "IMAP LOGIN verification error peer={peer:?} mailbox={} err={message}",
-                mailbox
-                    .as_ref()
-                    .map(|mailbox| mailbox.address.as_str())
-                    .unwrap_or("-")
+            rmail_common::structured_log!(
+                "error", "imapd", "login_verification_failed",
+                {
+                    "peer": peer.map(|address| address.to_string()),
+                    "mailbox": mailbox.as_ref().map(|mailbox| mailbox.address.as_str()),
+                    "error": message
+                }
             );
             failure(tag, Status::No, "Authentication error", Some("UNAVAILABLE"))
         }

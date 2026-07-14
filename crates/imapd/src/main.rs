@@ -35,6 +35,12 @@ use mailbox::SelectedMailbox;
 use tls::{load_tls_context_with_policy, reload_tls_context};
 use transport::{AsyncStream, RawStream, SwitchableStream};
 
+macro_rules! imap_log {
+    ($level:expr, $event:expr, $fields:tt) => {
+        rmail_common::structured_log!($level, "imapd", $event, $fields)
+    };
+}
+
 const MAX_APPEND_LITERAL_BYTES: usize = 100 * 1024 * 1024;
 const MAX_PREAUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTHENTICATED_LINE_BYTES: usize = 64 * 1024;
@@ -251,10 +257,10 @@ fn spawn_tls_reloader(
         while signal.recv().await.is_some() {
             match reload_tls_context(&sender, &cert_path, &key_path, &policy) {
                 Ok(()) => {
-                    println!("IMAP TLS certificate, key, OCSP response, and policy reloaded");
+                    imap_log!("info", "tls_reloaded", {});
                 }
                 Err(error) => {
-                    eprintln!("IMAP TLS reload failed; keeping current TLS bundle: {error}");
+                    imap_log!("error", "tls_reload_failed", { "error": error.to_string() });
                 }
             }
         }
@@ -287,7 +293,7 @@ async fn main() -> Result<()> {
     let connection_rate_limit = cfg.security.imap_max_connections_per_minute.max(1);
     let mut listeners = JoinSet::new();
     if db_path.is_none() {
-        eprintln!("No db_path configured; SQLite DB is required");
+        imap_log!("error", "configuration_invalid", { "field": "global.db_path" });
         std::process::exit(1);
     }
 
@@ -324,7 +330,7 @@ async fn main() -> Result<()> {
     for addr in imap_addrs {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)
             .with_context(|| format!("starting IMAP plain listener on {addr}"))?;
-        println!("rMail IMAPD listening on {}", addr);
+        imap_log!("info", "listener_started", { "address": addr, "tls": false });
         listener_count += 1;
         let mail_root_clone = mail_root.clone();
         let acceptor_clone = tls_receiver.clone();
@@ -346,7 +352,7 @@ async fn main() -> Result<()> {
             )
             .await
             {
-                eprintln!("IMAP plain listener failed: {}", e);
+                imap_log!("error", "listener_failed", { "tls": false, "error": e.to_string() });
             }
         });
     }
@@ -356,7 +362,7 @@ async fn main() -> Result<()> {
         for addr in imaps_addrs {
             let listener = bind_tcp_listener_with_config(&addr, &listener_config)
                 .with_context(|| format!("starting IMAPS listener on {addr}"))?;
-            println!("rMail IMAPD (IMAPS) listening on {}", addr);
+            imap_log!("info", "listener_started", { "address": addr, "tls": true });
             listener_count += 1;
             let mail_root_clone = mail_root.clone();
             let ctx_clone = tls_receiver.clone();
@@ -378,12 +384,12 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    eprintln!("IMAPS listener failed: {}", e);
+                    imap_log!("error", "listener_failed", { "tls": true, "error": e.to_string() });
                 }
             });
         }
     } else if !imaps_addrs.is_empty() {
-        eprintln!("IMAPS listener not started because TLS certificate/key could not be loaded");
+        imap_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
     }
 
     if listener_count == 0 {
@@ -391,18 +397,15 @@ async fn main() -> Result<()> {
     }
 
     rmail_common::runtime::wait_for_shutdown_signal().await?;
-    println!("IMAP shutdown requested; draining listeners and active sessions");
+    imap_log!("info", "shutdown_requested", { "active_sessions": shutdown.active_sessions() });
     shutdown.request();
     while let Some(result) = listeners.join_next().await {
         if let Err(error) = result {
-            eprintln!("IMAP listener task failed during shutdown: {error}");
+            imap_log!("error", "shutdown_listener_join_failed", { "error": error.to_string() });
         }
     }
     if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
-        eprintln!(
-            "IMAP shutdown drain timed out with {} active sessions",
-            shutdown.active_sessions()
-        );
+        imap_log!("warn", "shutdown_drain_timed_out", { "active_sessions": shutdown.active_sessions() });
     }
     Ok(())
 }
@@ -430,12 +433,7 @@ async fn run_plain_listener(
             }
             accepted = listener.accept() => accepted?,
         };
-        println!(
-            "Accepted IMAP plaintext connection on {} from {} (starttls_available={})",
-            addr,
-            peer,
-            tls_ctx.borrow().is_some()
-        );
+        imap_log!("info", "connection_accepted", { "listener": addr, "peer": peer.to_string(), "tls": false, "starttls_available": tls_ctx.borrow().is_some() });
         if !accept_connection_from(peer.ip(), connection_rate_limit) {
             let mut stream = stream;
             let _ = stream
@@ -472,7 +470,7 @@ async fn run_plain_listener(
             )
             .await
             {
-                eprintln!("IMAP client error: {}", e);
+                imap_log!("error", "session_failed", { "peer": peer.to_string(), "tls": false, "error": e.to_string() });
             }
         });
     }
@@ -501,12 +499,12 @@ async fn run_imaps_listener(
             }
             accepted = listener.accept() => accepted?,
         };
-        println!("Accepted IMAPS TCP connection on {} from {}", addr, peer);
+        imap_log!("info", "connection_accepted", { "listener": addr, "peer": peer.to_string(), "tls": true });
         if !accept_connection_from(peer.ip(), connection_rate_limit) {
             continue;
         }
         let Some(ctx) = ctx.borrow().clone() else {
-            eprintln!("IMAPS connection rejected because no TLS context is loaded");
+            imap_log!("warn", "connection_rejected", { "peer": peer.to_string(), "reason": "TLS context unavailable" });
             continue;
         };
         let mail_root = mail_root.clone();
@@ -536,10 +534,12 @@ async fn run_imaps_listener(
                     )
                     .await
                     {
-                        eprintln!("IMAPS client error: {}", e);
+                        imap_log!("error", "session_failed", { "peer": peer.to_string(), "tls": true, "error": e.to_string() });
                     }
                 }
-                Err(e) => eprintln!("IMAPS TLS accept error from {}: {}", peer, e),
+                Err(e) => {
+                    imap_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": e.to_string() })
+                }
             }
         });
     }
@@ -564,14 +564,7 @@ fn log_unsupported_imap(
     command: &str,
     raw_args: &str,
 ) {
-    eprintln!(
-        "imap_unsupported peer={:?} selected_mailbox={} tag={} command={} raw_args={:?}",
-        peer,
-        selected_mailbox_for_log(selected),
-        tag,
-        command,
-        raw_args
-    );
+    imap_log!("warn", "unsupported_command", { "peer": peer.map(|address| address.to_string()), "selected_mailbox": selected_mailbox_for_log(selected), "tag": tag, "command": command, "raw_args": raw_args });
 }
 
 #[cfg(test)]
@@ -677,12 +670,7 @@ async fn process_stream_inner(
 ) -> Result<()> {
     let stream: Box<dyn AsyncStream + Send + 'static> = Box::new(SwitchableStream::new(stream));
     let mut reader = BufReader::new(stream);
-    println!(
-        "Starting IMAP session peer={:?} encrypted={} tls_configured={}",
-        peer,
-        session_encrypted,
-        tls_ctx.is_some()
-    );
+    imap_log!("info", "session_started", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "tls_configured": tls_ctx.is_some() });
     if send_greeting {
         let w = reader.get_mut();
         let phase = if session_encrypted {
@@ -692,10 +680,7 @@ async fn process_stream_inner(
         };
         let caps =
             response::capability_tokens_with_policy(phase, tls_ctx.is_some(), auth_policy.as_ref());
-        println!(
-            "Greeting peer={:?} encrypted={} capabilities={}",
-            peer, session_encrypted, caps
-        );
+        imap_log!("info", "greeting_sent", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "capabilities": caps });
         w.write_all(response::greeting(&caps).as_bytes()).await?;
         w.flush().await?;
     }
@@ -714,10 +699,7 @@ async fn process_stream_inner(
         let mut line = match read_bounded_line(&mut reader, line_limit).await {
             Ok(BoundedLine::Line(line)) => line,
             Ok(BoundedLine::Eof) => {
-                println!(
-                    "IMAP session peer={:?} encrypted={} closed by client",
-                    peer, session_encrypted
-                );
+                imap_log!("info", "session_closed", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "reason": "client_eof" });
                 break;
             }
             Ok(BoundedLine::TooLong) => {
@@ -728,16 +710,10 @@ async fn process_stream_inner(
             }
             Err(e) => {
                 if e.kind() == ErrorKind::UnexpectedEof {
-                    println!(
-                        "IMAP session peer={:?} encrypted={} closed by client without TLS close_notify",
-                        peer, session_encrypted
-                    );
+                    imap_log!("info", "session_closed", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "reason": "missing_tls_close_notify" });
                     break;
                 }
-                eprintln!(
-                    "IMAP read error peer={:?} encrypted={} err={}",
-                    peer, session_encrypted, e
-                );
+                imap_log!("error", "session_read_failed", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "error": e.to_string() });
                 return Err(e.into());
             }
         };
@@ -839,16 +815,7 @@ async fn process_stream_inner(
         } else {
             args
         };
-        println!(
-            "IMAP peer={:?} encrypted={} tag={} cmd={} args={:?} authed={} selected={}",
-            peer,
-            session_encrypted,
-            tag,
-            cmd,
-            logged_args,
-            session_state.authenticated_mailbox.is_some(),
-            session_state.selected_mailbox.is_some()
-        );
+        imap_log!("info", "command_received", { "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted, "tag": tag, "command": cmd, "args": logged_args, "authenticated": session_state.authenticated_mailbox.is_some(), "selected": session_state.selected_mailbox.is_some() });
         let command_spec = commands::command_spec(&request.command);
         if let Some(reason) = commands::preflight(
             command_spec,
@@ -1209,7 +1176,7 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::Namespace => {
-                println!("IMAP NAMESPACE peer={:?}", peer);
+                imap_log!("info", "namespace_requested", { "peer": peer.map(|address| address.to_string()) });
                 let w = reader.get_mut();
                 let response = commands::basic::namespace(tag).encode();
                 log_imap_response(peer, tag, &cmd, &response);
@@ -1318,10 +1285,7 @@ async fn process_stream_inner(
             parser::Command::Id => {
                 let outcome = commands::id::handle(tag, args);
                 if !outcome.field_keys.is_empty() {
-                    println!(
-                        "IMAP ID peer={:?} field_keys={:?}",
-                        peer, outcome.field_keys
-                    );
+                    imap_log!("info", "client_identified", { "peer": peer.map(|address| address.to_string()), "field_keys": outcome.field_keys });
                 }
                 let response = outcome.response.encode();
                 let w = reader.get_mut();
@@ -1375,14 +1339,14 @@ async fn process_stream_inner(
                 w.flush().await?;
             }
             parser::Command::StartTls => {
-                println!("IMAP STARTTLS begin peer={:?}", peer);
+                imap_log!("info", "starttls_started", { "peer": peer.map(|address| address.to_string()) });
                 match transport::start_tls(reader, tag, tls_ctx.clone()).await {
                     Ok(transport::StartTlsOutcome::Rejected(returned_reader)) => {
                         reader = returned_reader;
                         continue;
                     }
                     Ok(transport::StartTlsOutcome::Upgraded(tls_stream)) => {
-                        println!("IMAP STARTTLS handshake success peer={:?}", peer);
+                        imap_log!("info", "starttls_succeeded", { "peer": peer.map(|address| address.to_string()) });
                         let fut = Box::pin(process_stream_inner(
                             tls_stream,
                             mail_root,
@@ -1396,7 +1360,7 @@ async fn process_stream_inner(
                         return fut.await;
                     }
                     Err(error) => {
-                        eprintln!("IMAP STARTTLS handshake failed peer={:?}: {error}", peer);
+                        imap_log!("error", "starttls_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
                         return Err(error);
                     }
                 }

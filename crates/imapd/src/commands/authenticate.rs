@@ -102,12 +102,9 @@ pub(crate) async fn handle_password(
         }
         auth::PasswordAuthResult::Unavailable { mailbox, message } => {
             record_failure(peer);
-            eprintln!(
-                "IMAP AUTHENTICATE {mechanism} verification error peer={peer:?} mailbox={} err={message}",
-                mailbox
-                    .as_ref()
-                    .map(|mailbox| mailbox.address.as_str())
-                    .unwrap_or("-")
+            rmail_common::structured_log!(
+                "error", "imapd", "sasl_verification_failed",
+                { "peer": peer.map(|address| address.to_string()), "mechanism": mechanism, "mailbox": mailbox.as_ref().map(|mailbox| mailbox.address.as_str()), "error": message }
             );
             terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"))
         }
@@ -160,7 +157,7 @@ pub(crate) async fn handle_oauth(
             .await;
         }
         rmail_common::oauth::OAuthValidation::Unavailable(error) => {
-            eprintln!("IMAP AUTHENTICATE {mechanism} introspection error peer={peer:?}: {error}");
+            rmail_common::structured_log!("error", "imapd", "oauth_introspection_failed", { "peer": peer.map(|address| address.to_string()), "mechanism": mechanism, "error": error });
             return oauth_failure_exchange(
                 reader,
                 tag,
@@ -183,7 +180,7 @@ pub(crate) async fn handle_oauth(
             .await;
         }
         Err(error) => {
-            eprintln!("IMAP AUTHENTICATE {mechanism} mailbox lookup error peer={peer:?}: {error}");
+            rmail_common::structured_log!("error", "imapd", "oauth_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "mechanism": mechanism, "error": error.to_string() });
             return oauth_failure_exchange(
                 reader,
                 tag,
@@ -278,7 +275,7 @@ pub(crate) async fn handle_scram(
             );
         }
         Err(error) => {
-            eprintln!("IMAP SCRAM mailbox lookup error peer={peer:?}: {error}");
+            rmail_common::structured_log!("error", "imapd", "scram_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
             return terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"));
         }
     };
@@ -294,9 +291,9 @@ pub(crate) async fn handle_scram(
     let (salt, iterations) = match rmail_common::auth::parse_scram_verifier(verifier) {
         Ok(verifier) => verifier,
         Err(error) => {
-            eprintln!(
-                "IMAP SCRAM verifier parse error peer={peer:?} mailbox={} err={error}",
-                mailbox.address
+            rmail_common::structured_log!(
+                "error", "imapd", "scram_verifier_parse_failed",
+                { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
             );
             return terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"));
         }
@@ -350,9 +347,9 @@ pub(crate) async fn handle_scram(
         Ok(signature) => signature,
         Err(error) => {
             record_failure(peer);
-            eprintln!(
-                "IMAP SCRAM verification error peer={peer:?} mailbox={} err={error}",
-                mailbox.address
+            rmail_common::structured_log!(
+                "error", "imapd", "scram_verification_failed",
+                { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
             );
             return terminal(
                 tag,
