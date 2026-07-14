@@ -1330,7 +1330,10 @@ pub(crate) async fn write_fetch_response(
             .await?;
         w.write_all(&literal).await?;
     }
-    w.write_all(b"\r\n)\r\n").await?;
+    // A literal's octets are followed immediately by the next FETCH token.
+    // Adding CRLF here creates an untagged blank response line, which strict
+    // clients treat as malformed and commonly answer by closing the socket.
+    w.write_all(b")\r\n").await?;
     w.flush().await?;
     Ok(())
 }
@@ -1487,7 +1490,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         client.read_to_string(&mut response).await.unwrap();
         assert_eq!(
             response,
-            "* 1 FETCH (UID 9 PREVIEW {13}\r\nHello preview\r\n)\r\n"
+            "* 1 FETCH (UID 9 PREVIEW {13}\r\nHello preview)\r\n"
         );
     }
 
@@ -1524,7 +1527,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
         client.read_to_string(&mut response).await.unwrap();
         assert_eq!(
             response,
-            "* 2 FETCH (UID 10 SNIPPET (FUZZY {13}\r\nHello snippet)\r\n)\r\n"
+            "* 2 FETCH (UID 10 SNIPPET (FUZZY {13}\r\nHello snippet))\r\n"
         );
     }
 

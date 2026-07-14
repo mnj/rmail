@@ -3937,6 +3937,8 @@ mod tests {
         assert!(joined.contains("Subject: one"));
         assert!(!joined.contains("Date:"));
         assert!(!joined.contains("\r\n\r\nfirst"));
+        assert!(joined.contains("Subject: one\r\n\r\n)\r\n"));
+        assert!(!joined.contains("Subject: one\r\n\r\n\r\n)\r\n"));
 
         let _logout_lines = read_until_contains(&mut reader, "A004 OK").await;
         server_task.await.expect("join").expect("server");
