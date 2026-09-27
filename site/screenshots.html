@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rMail screenshots</title>
+  <meta name="description" content="Screenshots of the rMail admin console and webmail on desktop and mobile.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <nav class="nav">
+        <a class="brand" href="./"><span class="logo">rM</span><strong>rMail</strong></a>
+        <div class="nav-links">
+          <a href="./#features">Features</a>
+          <a href="./#tour">Tour</a>
+          <a href="./#standards">Standards</a>
+          <a href="./#install">Install</a>
+          <a href="screenshots.html" aria-current="page">Screenshots</a>
+          <a href="https://github.com/mnj/rmail">GitHub</a>
+        </div>
+      </nav>
+      <div class="page-hero">
+        <h1>Screenshots</h1>
+        <p>Every page of the admin console and webmail, from a demo instance filled with sample mail. Click an image to see it full size.</p>
+        <div class="jump">
+          <a href="#admin">Admin console</a>
+          <a href="#webmail">Webmail</a>
+          <a href="#mobile">Mobile</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="block" id="admin">
+      <div class="section-head">
+        <p class="eyebrow">Admin console</p>
+        <h2>Run the server from a browser</h2>
+        <p>Served by <code>rmail_web</code>. It binds to loopback until admin credentials exist.</p>
+      </div>
+      <div class="gallery">
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-overview.webp" width="2880" height="1800" loading="lazy" alt="Overview: mailbox, message, delivery and queue counters with health status"></button>
+          <h3>Overview</h3>
+          <figcaption>Mailboxes, stored and unread messages, deliveries and the outbound pipeline at a glance, plus anything that needs an operator.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-mailboxes.webp" width="2880" height="1800" loading="lazy" alt="Mailboxes: list of accounts with sign-in type, storage, folders and messages"></button>
+          <h3>Mailboxes</h3>
+          <figcaption>Create mailboxes, reset passwords and manage account-wide quotas.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-routing.webp" width="2880" height="1800" loading="lazy" alt="Routing: aliases and per-domain catchalls"></button>
+          <h3>Routing</h3>
+          <figcaption>Aliases to one or more mailboxes, and a catchall for each domain.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-settings.webp" width="2880" height="1800" loading="lazy" alt="Settings: listeners, TLS, authentication and other categories stored in the database"></button>
+          <h3>Settings</h3>
+          <figcaption>54 settings in nine categories, stored in the database, with the services each one affects.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-observability.webp" width="2880" height="1800" loading="lazy" alt="Logs and metrics: structured daemon log events with filtering"></button>
+          <h3>Logs &amp; metrics</h3>
+          <figcaption>Structured daemon logs, filtered by service, level or ID, alongside Prometheus metrics.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-system.webp" width="2880" height="1800" loading="lazy" alt="System: dependency readiness cards, running services and admin account"></button>
+          <h3>System</h3>
+          <figcaption>Live readiness checks for certificates, DNS, the database, the queue and optional scanners, plus the services that are running.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-login.webp" width="2880" height="1800" loading="lazy" alt="Admin console sign-in screen"></button>
+          <h3>Sign in</h3>
+          <figcaption>Session sign-in with lockout after repeated failures. Scripts and Prometheus can use HTTP Basic auth.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="block" id="webmail">
+      <div class="section-head">
+        <p class="eyebrow">Webmail</p>
+        <h2>Mail for your users</h2>
+        <p>Served by <code>rmail_webmail</code>, reading the same Maildir storage as IMAP.</p>
+      </div>
+      <div class="gallery">
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-inbox.webp" width="2880" height="1800" loading="lazy" alt="Webmail inbox with folders and a message list"></button>
+          <h3>Inbox</h3>
+          <figcaption>Special-use folders with unread counts, search and a message list with previews.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-message.webp" width="2880" height="1800" loading="lazy" alt="Webmail reading pane showing a plain-text message"></button>
+          <h3>Reading a message</h3>
+          <figcaption>Archive, delete and mark read or unread from the reading pane.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-remote-blocked.webp" width="2880" height="1800" loading="lazy" alt="Webmail showing an HTML newsletter with remote images blocked"></button>
+          <h3>Remote content blocked</h3>
+          <figcaption>HTML mail renders in a sandbox, and remote images load only when the reader asks.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-login.webp" width="2880" height="1800" loading="lazy" alt="Webmail sign-in screen"></button>
+          <h3>Sign in</h3>
+          <figcaption>Users sign in with their mailbox address and password.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="block" id="mobile">
+      <div class="section-head">
+        <p class="eyebrow">Mobile</p>
+        <h2>On a phone</h2>
+        <p>Below 820 px wide, the webmail switches to a single-pane layout.</p>
+      </div>
+      <div class="gallery mobile">
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/mobile-inbox.webp" width="1170" height="2532" loading="lazy" alt="Mobile webmail inbox"></button>
+          <h3>Inbox</h3>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/mobile-message.webp" width="1170" height="2532" loading="lazy" alt="Mobile webmail message view"></button>
+          <h3>Message</h3>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/mobile-remote-blocked.webp" width="1170" height="2532" loading="lazy" alt="Mobile webmail with remote images blocked"></button>
+          <h3>Remote content blocked</h3>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>Regenerate these with <code>scripts/screenshots/capture.sh</code>.</span>
+      <span><a href="https://github.com/mnj/rmail">Source</a> · <a href="https://github.com/mnj/rmail/releases">Releases</a> · <a href="https://github.com/mnj/rmail/issues">Issues</a></span>
+    </div>
+  </footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
