@@ -23,6 +23,7 @@ pub(crate) async fn handle(
     qresync_enabled: bool,
     had_selected_mailbox: bool,
     imap4rev2: bool,
+    uidonly: bool,
 ) -> Outcome {
     let request = match parser::parse_select_request(raw_args) {
         Ok(request) => request,
@@ -30,6 +31,15 @@ pub(crate) async fn handle(
     };
     if request.qresync.is_some() && !qresync_enabled {
         return failure(bad(tag, "QRESYNC is not enabled".to_string()));
+    }
+    // RFC 9586 §3.7: the message sequence match data is not allowed.
+    if uidonly
+        && request
+            .qresync
+            .as_ref()
+            .is_some_and(|qresync| qresync.sample.is_some())
+    {
+        return failure(Response::new().status(crate::commands::uid_required(tag)));
     }
     let mailbox_name = match mailbox::decode_wire_mailbox_name(&request.mailbox, utf8_accept) {
         Ok(name) => name,
@@ -155,11 +165,15 @@ pub(crate) async fn handle(
         .status(
             StatusLine::untagged(Status::Ok, "Mailbox ID")
                 .with_code(format!("MAILBOXID ({})", selected.mailbox_id)),
-        )
-        .status(
+        );
+    // UNSEEN carries a message sequence number, which UIDONLY forbids
+    // (RFC 9586 §3).
+    if !uidonly {
+        response = response.status(
             StatusLine::untagged(Status::Ok, "First unseen")
                 .with_code(format!("UNSEEN {}", mailbox::first_unseen(&selected))),
         );
+    }
     if condstore_requested {
         response = response.status(
             StatusLine::untagged(Status::Ok, "Highest")
@@ -179,13 +193,22 @@ pub(crate) async fn handle(
                 .iter()
                 .position(|(uid, _, _, _)| *uid == message.uid)
             {
-                response = response.data(format!(
-                    "{} FETCH (UID {} FLAGS ({}) MODSEQ ({}))",
-                    sequence + 1,
-                    message.uid,
-                    message.flags.join(" "),
-                    message.modseq
-                ));
+                response = response.data(if uidonly {
+                    format!(
+                        "{} UIDFETCH (FLAGS ({}) MODSEQ ({}))",
+                        message.uid,
+                        message.flags.join(" "),
+                        message.modseq
+                    )
+                } else {
+                    format!(
+                        "{} FETCH (UID {} FLAGS ({}) MODSEQ ({}))",
+                        sequence + 1,
+                        message.uid,
+                        message.flags.join(" "),
+                        message.modseq
+                    )
+                });
             }
         }
     }
@@ -288,6 +311,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         )
         .await;
         assert!(outcome.selected.is_none());
@@ -306,6 +330,7 @@ mod tests {
             "INBOX",
             temp.path().to_str().unwrap(),
             "user@example.test",
+            false,
             false,
             false,
             false,

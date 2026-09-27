@@ -334,6 +334,7 @@ impl Session {
             self.state.feature_enabled("QRESYNC"),
             self.selected.is_some(),
             self.state.imap4rev2_enabled(),
+            self.state.uidonly_enabled(),
         )
         .await;
         if outcome.condstore_activated {

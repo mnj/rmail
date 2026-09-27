@@ -46,6 +46,8 @@ pub(crate) struct SyncOptions {
     pub(crate) condstore: bool,
     /// IMAP4rev2 has no RECENT response and no \Recent flag.
     pub(crate) imap4rev2: bool,
+    /// RFC 9586: UIDFETCH replaces FETCH and VANISHED replaces EXPUNGE.
+    pub(crate) uidonly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +71,7 @@ impl MailboxSyncEvent {
         match self {
             MailboxSyncEvent::Exists(count) => format!("* {} EXISTS\r\n", count),
             MailboxSyncEvent::Expunge { seq, uid } => {
-                if options.qresync {
+                if options.qresync || options.uidonly {
                     format!("* VANISHED {}\r\n", uid)
                 } else {
                     format!("* {} EXPUNGE\r\n", seq)
@@ -81,7 +83,20 @@ impl MailboxSyncEvent {
                 flags,
                 modseq,
             } => {
-                if options.condstore {
+                if options.uidonly {
+                    // RFC 9586 §3.6: the UID leads the response instead.
+                    let modseq = if options.condstore {
+                        format!(" MODSEQ ({modseq})")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "* {} UIDFETCH (FLAGS ({}){})\r\n",
+                        uid,
+                        flags.join(" "),
+                        modseq
+                    )
+                } else if options.condstore {
                     format!(
                         "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
                         seq,
@@ -1185,6 +1200,16 @@ fn bodystructure_response(data: &[u8]) -> String {
     }
 }
 
+/// The start of a FETCH response up to its opening parenthesis: `* seq
+/// FETCH (`, or `* uid UIDFETCH (` once UIDONLY is enabled (RFC 9586).
+pub(crate) fn fetch_response_prefix(seq: usize, uid: u64, uidonly: bool) -> String {
+    if uidonly {
+        format!("* {uid} UIDFETCH (")
+    } else {
+        format!("* {seq} FETCH (")
+    }
+}
+
 pub(crate) async fn write_fetch_response(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     seq: usize,
@@ -1198,8 +1223,11 @@ pub(crate) async fn write_fetch_response(
     requested: &[String],
     _raw_spec: &str,
     force_uid: bool,
+    uidonly: bool,
 ) -> Result<()> {
-    let include_uid = force_uid || requested.iter().any(|i| i == "UID");
+    // RFC 9586 §3.3: a UIDFETCH response starts with the UID, so the UID
+    // item is only included when asked for.
+    let include_uid = (force_uid && !uidonly) || requested.iter().any(|i| i == "UID");
     let include_flags = requested.iter().any(|i| i == "FLAGS");
     let include_modseq = requested.iter().any(|i| i == "MODSEQ");
     let include_size = requested.iter().any(|i| i == "RFC822.SIZE");
@@ -1341,14 +1369,15 @@ pub(crate) async fn write_fetch_response(
     }
 
     let w = reader.get_mut();
+    let mut prefix = fetch_response_prefix(seq, uid, uidonly);
     if literal_items.is_empty() {
-        w.write_all(format!("* {} FETCH ({})\r\n", seq, attrs.join(" ")).as_bytes())
-            .await?;
+        prefix.push_str(&attrs.join(" "));
+        prefix.push_str(")\r\n");
+        w.write_all(prefix.as_bytes()).await?;
         w.flush().await?;
         return Ok(());
     }
 
-    let mut prefix = format!("* {} FETCH (", seq);
     if !attrs.is_empty() {
         prefix.push_str(&attrs.join(" "));
         prefix.push(' ');
@@ -1610,6 +1639,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
             &["PREVIEW (LAZY)".to_string(), "UID".to_string()],
             "(PREVIEW (LAZY) UID)",
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1647,6 +1677,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
             path,
             &["SNIPPET (LAZY=FUZZY)".to_string(), "UID".to_string()],
             "(SNIPPET (LAZY=FUZZY) UID)",
+            false,
             false,
         )
         .await

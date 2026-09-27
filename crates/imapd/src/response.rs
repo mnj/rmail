@@ -260,6 +260,7 @@ pub(crate) fn capability_tokens_with_policy(
             "OBJECTID",
             "METADATA",
             "NOTIFY",
+            "UIDONLY",
         ]),
     }
     let mut caps = caps.join(" ");

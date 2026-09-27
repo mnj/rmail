@@ -44,6 +44,17 @@ impl SessionState {
         self.feature_enabled("IMAP4REV2")
     }
 
+    /// RFC 9586: message sequence numbers are neither accepted nor sent.
+    pub(crate) fn uidonly_enabled(&self) -> bool {
+        self.feature_enabled("UIDONLY")
+    }
+
+    /// Expunges go out as VANISHED instead of EXPUNGE: after ENABLE QRESYNC
+    /// (RFC 7162 §3.2.10) or ENABLE UIDONLY (RFC 9586 §3.4).
+    pub(crate) fn vanished_enabled(&self) -> bool {
+        self.feature_enabled("QRESYNC") || self.uidonly_enabled()
+    }
+
     pub(crate) fn utf8_enabled(&self) -> bool {
         self.feature_enabled("UTF8=ACCEPT") || self.feature_enabled("IMAP4REV2")
     }
@@ -63,6 +74,6 @@ fn supported_enable_feature(feature: &str) -> bool {
     matches!(
         feature,
         // IMAP4rev1 is the base protocol, not an ENABLE-able extension.
-        "IMAP4REV2" | "CONDSTORE" | "QRESYNC" | "UTF8=ACCEPT"
+        "IMAP4REV2" | "CONDSTORE" | "QRESYNC" | "UTF8=ACCEPT" | "UIDONLY"
     )
 }

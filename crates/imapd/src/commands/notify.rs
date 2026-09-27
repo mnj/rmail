@@ -951,6 +951,7 @@ async fn write_new_messages(
             &items,
             &fetch.raw,
             options.condstore,
+            options.uidonly,
         )
         .await?;
     }

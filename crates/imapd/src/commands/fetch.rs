@@ -17,6 +17,8 @@ pub(crate) struct FetchContext {
     pub(crate) qresync: bool,
     pub(crate) condstore: bool,
     pub(crate) imap4rev2: bool,
+    /// RFC 9586: responses are UIDFETCH.
+    pub(crate) uidonly: bool,
 }
 
 #[derive(Default)]
@@ -224,6 +226,7 @@ pub(crate) async fn handle(
             items,
             &request.raw_items,
             uid_mode || condstore,
+            context.uidonly,
         )
         .await
         {

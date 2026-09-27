@@ -302,6 +302,15 @@ async fn run_session(
             .await?;
             continue;
         }
+        // RFC 9586 §3.2: FETCH, STORE, SEARCH, COPY, MOVE (and SORT and
+        // THREAD, §3.8) are refused before any synchronization.
+        if session.state.uidonly_enabled() && spec.is_some_and(|spec| spec.uses_sequences) {
+            let response = response::Response::new()
+                .status(commands::uid_required(call.tag))
+                .encode();
+            write(&mut reader, response.as_bytes()).await?;
+            continue;
+        }
         if call.command.requires_empty_arguments() && !call.args.is_empty() {
             write(
                 &mut reader,
@@ -612,6 +621,7 @@ impl Session {
             qresync: self.state.feature_enabled("QRESYNC"),
             condstore: self.state.condstore_enabled(),
             imap4rev2: self.state.imap4rev2_enabled(),
+            uidonly: self.state.uidonly_enabled(),
         }
     }
 
