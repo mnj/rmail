@@ -186,7 +186,8 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
         | Command::Thread
         | Command::Store
         | Command::Copy
-        | Command::Move => Some(SELECTED_USES_SEQS),
+        | Command::Move
+        | Command::Replace => Some(SELECTED_USES_SEQS),
         Command::Close | Command::Expunge => Some(SELECTED_BREAKS_SEQS),
         Command::Idle => Some(CommandSpec {
             requires_sync: true,
@@ -205,7 +206,8 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
             | UidCommand::Thread
             | UidCommand::Store
             | UidCommand::Copy
-            | UidCommand::Move => Some(CommandSpec {
+            | UidCommand::Move
+            | UidCommand::Replace => Some(CommandSpec {
                 auth: CommandAuth::Selected,
                 tls_required: false,
                 uses_sequences: false,
@@ -258,6 +260,7 @@ mod tests {
             "UNSELECT",
             "UNAUTHENTICATE",
             "APPEND INBOX {1}",
+            "REPLACE 1 INBOX {1}",
             "LIST \"\" \"*\"",
             "XLIST \"\" \"*\"",
             "LSUB \"\" \"*\"",
@@ -296,6 +299,7 @@ mod tests {
             "EXPUNGE 1",
             "FETCH 1 FLAGS",
             "MOVE 1 Trash",
+            "REPLACE 1 Drafts {1}",
             "SEARCH ALL",
             "SORT (DATE) UTF-8 ALL",
             "STORE 1 +FLAGS (\\Seen)",
@@ -382,6 +386,7 @@ mod tests {
             "THREAD REFERENCES UTF-8 ALL",
             "COPY 1 Archive",
             "MOVE 1 Archive",
+            "REPLACE 1 Drafts {1}",
         ] {
             let line = format!("A1 {command}");
             let request = parse_request_line(&line).unwrap();
@@ -432,6 +437,7 @@ pub(crate) mod mailboxes;
 pub(crate) mod metadata;
 pub(crate) mod notify;
 pub(crate) mod quota;
+pub(crate) mod replace;
 pub(crate) mod search;
 pub(crate) mod select;
 pub(crate) mod session;

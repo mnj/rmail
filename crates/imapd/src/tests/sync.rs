@@ -89,6 +89,16 @@ impl Fixture {
         read_until_contains_bounded(&mut self.reader, done).await
     }
 
+    /// Write raw bytes (no CRLF is added), e.g. literal data.
+    pub(super) async fn send(&mut self, bytes: &[u8]) {
+        self.reader
+            .get_mut()
+            .write_all(bytes)
+            .await
+            .expect("write bytes");
+        self.reader.get_mut().flush().await.expect("flush");
+    }
+
     /// Read unsolicited responses until one contains `needle`.
     pub(super) async fn expect(&mut self, needle: &str) -> Vec<String> {
         read_until_contains_bounded(&mut self.reader, needle).await

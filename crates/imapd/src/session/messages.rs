@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use super::{Flow, ImapReader, Invocation, Session};
+use super::{Flow, ImapReader, Invocation, Session, write};
 use crate::commands::{self, expunge::SelectionEffect};
 use crate::parser;
 
@@ -54,6 +54,7 @@ impl Session {
                 let name = format!("UID {subcommand}");
                 self.transfer(reader, tag, &name, args, true).await
             }
+            "REPLACE" => self.replace(reader, tag, "UID REPLACE", args, true).await,
             _ => {
                 self.send(reader, format!("{tag} BAD Unsupported UID subcommand\r\n"))
                     .await
@@ -214,6 +215,77 @@ impl Session {
         }
         self.respond(reader, tag, name, outcome.response.encode())
             .await
+    }
+
+    /// REPLACE and UID REPLACE (RFC 8508). Reported like MOVE: the new
+    /// message's APPENDUID in an untagged OK, EXISTS when it went to the
+    /// selected mailbox, then EXPUNGE (or VANISHED) for the old message.
+    pub(super) async fn replace(
+        &mut self,
+        reader: &mut ImapReader,
+        tag: &str,
+        name: &str,
+        args: &str,
+        uid: bool,
+    ) -> Result<Flow> {
+        self.sync_quota().await?;
+        let outcome = commands::replace::handle(
+            reader,
+            tag,
+            name,
+            args,
+            commands::replace::Context {
+                mail_root: &self.mail_root,
+                address: self.address(),
+                selected: self.selected(),
+                uid_mode: uid,
+                utf8_accept: self.state.utf8_enabled(),
+            },
+        )
+        .await?;
+        let replaced = match outcome {
+            commands::replace::Outcome::Failed { close_connection } => {
+                return Ok(if close_connection {
+                    Flow::Close
+                } else {
+                    Flow::Continue
+                });
+            }
+            commands::replace::Outcome::Replaced(replaced) => replaced,
+        };
+        write(
+            reader,
+            format!(
+                "* OK [APPENDUID {} {}] Replacement message stored\r\n",
+                replaced.uidvalidity, replaced.uid
+            )
+            .as_bytes(),
+        )
+        .await?;
+        if replaced.target_is_selected {
+            // Report the new message now; expunges by others wait, as the
+            // old message's sequence number must stay valid until its own
+            // EXPUNGE below.
+            let options = self.sync_options(false);
+            super::sync_selected_mailbox(reader, &self.mail_root, &mut self.selected, options)
+                .await?;
+        }
+        let vanished = self.state.vanished_enabled();
+        let mut response = String::new();
+        if let (Some(old_uid), Some(selected)) = (replaced.expunged_uid, self.selected.as_mut()) {
+            if vanished {
+                response.push_str(&format!("* VANISHED {old_uid}\r\n"));
+            } else if let Some(index) = selected
+                .msgs
+                .iter()
+                .position(|message| message.0 == old_uid)
+            {
+                response.push_str(&format!("* {} EXPUNGE\r\n", index + 1));
+            }
+            selected.remove_reported(&[old_uid]);
+        }
+        response.push_str(&format!("{tag} OK {name} completed\r\n"));
+        self.respond(reader, tag, name, response).await
     }
 
     /// EXPUNGE and CLOSE.
