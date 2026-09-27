@@ -72,6 +72,10 @@ pub(crate) struct SessionContext {
 pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Option<&'static [u8]> {
     match command {
         Command::Mail(_) if !session.greeted => Some(b"503 5.5.1 Send HELO/EHLO first\r\n"),
+        // RFC 5321 section 4.1.4: MAIL must not be sent inside a transaction.
+        Command::Mail(_) if session.transaction_active => {
+            Some(b"503 5.5.1 Nested MAIL command\r\n")
+        }
         Command::Rcpt(_) if !session.greeted => Some(b"503 5.5.1 Send HELO/EHLO first\r\n"),
         Command::Rcpt(_) if !session.transaction_active => {
             Some(b"503 5.5.1 MAIL required before RCPT\r\n")
@@ -550,6 +554,17 @@ mod tests {
         };
         assert!(preflight(&Command::Auth("PLAIN"), ready).is_none());
         assert!(preflight(&Command::Data, ready).is_some());
+        assert!(preflight(&Command::Mail("FROM:<a@b>"), ready).is_none());
+        assert_eq!(
+            preflight(
+                &Command::Mail("FROM:<a@b>"),
+                SessionContext {
+                    transaction_active: true,
+                    ..ready
+                }
+            ),
+            Some(&b"503 5.5.1 Nested MAIL command\r\n"[..])
+        );
         assert!(
             preflight(
                 &Command::Auth("PLAIN"),

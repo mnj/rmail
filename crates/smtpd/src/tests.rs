@@ -1191,6 +1191,42 @@ async fn smtp_smuggling_with_non_canonical_end_of_data_is_not_delivered() {
 }
 
 #[tokio::test]
+async fn nested_mail_is_rejected_and_a_rejected_mail_leaves_no_transaction() {
+    let (responses, td) = run_session(
+        b"EHLO localhost\r\nMAIL FROM:<a..b@example.test>\r\nMAIL FROM:<first@example.test>\r\nMAIL FROM:<second@example.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: x\r\n\r\nbody\r\n.\r\nMAIL FROM:<third@example.test>\r\nRSET\r\nMAIL FROM:<fourth@example.test>\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    let replies = responses
+        .iter()
+        .filter(|response| !response.starts_with("250-") && !response.starts_with("250 ENH"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replies,
+        [
+            "501 5.5.2 Syntax: MAIL FROM:<address>\r\n",
+            "250 2.1.0 Sender OK\r\n",
+            "503 5.5.1 Nested MAIL command\r\n",
+            "250 2.1.5 Recipient OK\r\n",
+            "354 End data with <CR><LF>.<CR><LF>\r\n",
+            "250 2.0.0 Message accepted\r\n",
+            "250 2.1.0 Sender OK\r\n",
+            "250 2.0.0 Reset state\r\n",
+            "250 2.1.0 Sender OK\r\n",
+            "221 2.0.0 Bye\r\n",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_dir(td.path().join("mail/example.test/user/Maildir/new"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn strict_commands_and_mail_parameters() {
     let (responses, _td) = run_session(
             b"EHLO localhost\r\nDATA junk\r\nQUITzzz\r\nMAIL FROM:<user@example.test> SIZE=42 BODY=8BITMIME SMTPUTF8\r\nQUIT\r\n".to_vec(),
