@@ -132,6 +132,7 @@ fn execute(
             in_saved_result: saved_search_uids.binary_search(uid).is_ok(),
             now,
             size: selected.sizes.get(uid).copied().unwrap_or(0) as usize,
+            email_id: selected.email_ids.get(uid).map_or("", String::as_str),
             data: &data,
         };
         if parser::search_matches(criterion, &message, selected.msgs.len()) {
@@ -248,11 +249,13 @@ mod tests {
             uidvalidity: 1,
             uidnext: 1,
             highest_modseq: 1,
+            mailbox_id: "Ftest".to_string(),
             read_only: false,
             msgs: Vec::new(),
             internal_dates: Default::default(),
             save_dates: Default::default(),
             sizes: Default::default(),
+            email_ids: Default::default(),
             recent_uids: Default::default(),
             expunged: Default::default(),
         };
@@ -283,11 +286,13 @@ mod tests {
             uidvalidity: 1,
             uidnext: 8,
             highest_modseq: 1,
+            mailbox_id: "Ftest".to_string(),
             read_only: false,
             msgs: vec![(7, missing, vec!["\\Seen".to_string()], 1)],
             internal_dates: [(7, (1_700_000_000, 0))].into(),
             save_dates: Default::default(),
             sizes: [(7, 12_345)].into(),
+            email_ids: Default::default(),
             recent_uids: Default::default(),
             expunged: Default::default(),
         };

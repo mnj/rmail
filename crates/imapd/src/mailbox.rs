@@ -18,11 +18,15 @@ pub(crate) struct SelectedMailbox {
     pub(crate) uidvalidity: u64,
     pub(crate) uidnext: u64,
     pub(crate) highest_modseq: u64,
+    /// RFC 8474 MAILBOXID.
+    pub(crate) mailbox_id: String,
     pub(crate) read_only: bool,
     pub(crate) msgs: Vec<(u64, PathBuf, Vec<String>, u64)>,
     pub(crate) internal_dates: HashMap<u64, (i64, i32)>,
     pub(crate) save_dates: HashMap<u64, i64>,
     pub(crate) sizes: HashMap<u64, u64>,
+    /// RFC 8474 EMAILID by UID.
+    pub(crate) email_ids: HashMap<u64, String>,
     pub(crate) recent_uids: HashSet<u64>,
     /// Messages expunged elsewhere whose EXPUNGE is still pending.
     pub(crate) expunged: HashSet<u64>,
@@ -126,6 +130,7 @@ impl SelectedMailbox {
             self.internal_dates.remove(uid);
             self.save_dates.remove(uid);
             self.sizes.remove(uid);
+            self.email_ids.remove(uid);
             self.recent_uids.remove(uid);
             self.expunged.remove(uid);
         }
@@ -165,6 +170,10 @@ pub(crate) async fn load_selected_mailbox(
             .iter()
             .map(|message| (message.uid, message.size))
             .collect();
+        let email_ids = state_msgs
+            .iter()
+            .map(|message| (message.uid, message.email_id.clone()))
+            .collect();
         let msgs = state_msgs
             .into_iter()
             .map(|message| (message.uid, message.path, message.flags, message.modseq))
@@ -176,11 +185,13 @@ pub(crate) async fn load_selected_mailbox(
             uidvalidity: folder.uidvalidity,
             uidnext: folder.uidnext,
             highest_modseq: folder.highest_modseq,
+            mailbox_id: folder.mailbox_id,
             read_only: false,
             msgs,
             internal_dates,
             save_dates,
             sizes,
+            email_ids,
             recent_uids: HashSet::new(),
             expunged: HashSet::new(),
         })
@@ -261,6 +272,9 @@ pub(crate) fn reconcile(
             }
             if let Some(size) = selected.sizes.get(uid) {
                 fresh.sizes.insert(*uid, *size);
+            }
+            if let Some(email_id) = selected.email_ids.get(uid) {
+                fresh.email_ids.insert(*uid, email_id.clone());
             }
             fresh.expunged.insert(*uid);
         }
@@ -1179,6 +1193,7 @@ pub(crate) async fn write_fetch_response(
     modseq: u64,
     internal_date: (i64, i32),
     save_date: i64,
+    email_id: &str,
     path: PathBuf,
     requested: &[String],
     _raw_spec: &str,
@@ -1190,6 +1205,8 @@ pub(crate) async fn write_fetch_response(
     let include_size = requested.iter().any(|i| i == "RFC822.SIZE");
     let include_internaldate = requested.iter().any(|i| i == "INTERNALDATE");
     let include_savedate = requested.iter().any(|i| i == "SAVEDATE");
+    let include_emailid = requested.iter().any(|i| i == "EMAILID");
+    let include_threadid = requested.iter().any(|i| i == "THREADID");
     let literal_items = requested
         .iter()
         .filter(|item| {
@@ -1295,6 +1312,14 @@ pub(crate) async fn write_fetch_response(
             "SAVEDATE \"{}\"",
             format_internal_date(save_date, 0)
         ));
+    }
+    if include_emailid {
+        attrs.push(format!("EMAILID ({email_id})"));
+    }
+    if include_threadid {
+        // RFC 8474 §5.2: THREADID is NIL when the server does not assign
+        // permanent thread identifiers.
+        attrs.push("THREADID NIL".to_string());
     }
     for item in binary_size_items {
         match extract_binary_section(data.as_deref().unwrap_or_default(), item) {
@@ -1580,6 +1605,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
             1,
             (0, 0),
             0,
+            "",
             path,
             &["PREVIEW (LAZY)".to_string(), "UID".to_string()],
             "(PREVIEW (LAZY) UID)",
@@ -1617,6 +1643,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
             1,
             (0, 0),
             0,
+            "",
             path,
             &["SNIPPET (LAZY=FUZZY)".to_string(), "UID".to_string()],
             "(SNIPPET (LAZY=FUZZY) UID)",

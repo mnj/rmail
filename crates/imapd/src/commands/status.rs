@@ -87,6 +87,9 @@ pub(crate) fn status_values(
     if requested(parser::StatusItem::Deleted) {
         values.push(format!("DELETED {}", summary.deleted));
     }
+    if requested(parser::StatusItem::MailboxId) {
+        values.push(format!("MAILBOXID ({})", summary.folder.mailbox_id));
+    }
     values
 }
 

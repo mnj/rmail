@@ -19,6 +19,9 @@ pub struct Folder {
     pub uidvalidity: u64,
     pub uidnext: u64,
     pub highest_modseq: u64,
+    /// RFC 8474 MAILBOXID: assigned at creation, kept across RENAME, never
+    /// reused.
+    pub mailbox_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +34,8 @@ pub struct Message {
     pub internaldate_tz: i32,
     pub save_date: i64,
     pub modseq: u64,
+    /// RFC 8474 EMAILID: kept across COPY and MOVE, never reused.
+    pub email_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +117,8 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             highest_modseq INTEGER NOT NULL DEFAULT 1,
             new_generation INTEGER NOT NULL DEFAULT 0,
             cur_generation INTEGER NOT NULL DEFAULT 0,
-            reconcile_count INTEGER NOT NULL DEFAULT 0
+            reconcile_count INTEGER NOT NULL DEFAULT 0,
+            mailbox_id TEXT
         );
         CREATE TABLE IF NOT EXISTS messages(
             id INTEGER PRIMARY KEY,
@@ -127,6 +133,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             save_date INTEGER NOT NULL DEFAULT 0,
             modseq INTEGER NOT NULL DEFAULT 1,
             recent INTEGER NOT NULL DEFAULT 0,
+            email_id TEXT,
             FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_folder_filename
@@ -191,6 +198,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "internaldate_tz",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_object_ids(conn)?;
     let invalid_uidvalidity_ids = {
         let mut statement = conn
             .prepare("SELECT id FROM folders WHERE uidvalidity <= 0 OR uidvalidity > 4294967295")?;
@@ -203,6 +211,72 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             "UPDATE folders SET uidvalidity = ?1 WHERE id = ?2",
             params![new_uidvalidity() as i64, folder_id],
         )?;
+    }
+    Ok(())
+}
+
+/// Prefix of generated MAILBOXID values. Object IDs start with a letter so
+/// they are never mistaken for numbers or `NIL` (RFC 8474 §3).
+const MAILBOX_ID_PREFIX: &str = "F";
+/// Prefix of generated EMAILID values.
+const EMAIL_ID_PREFIX: &str = "M";
+
+/// Give every folder and message a permanent RFC 8474 object ID.
+///
+/// Row ids are not usable for this: SQLite reuses the largest rowid after a
+/// delete, and a copied message gets a new row. The IDs are 96 random bits,
+/// so they are never reused. Rows inserted without an ID get one from the
+/// triggers; COPY and MOVE insert the source message's EMAILID explicitly.
+fn ensure_object_ids(conn: &Connection) -> Result<()> {
+    const OBJECT_ID_SCHEMA_VERSION: i64 = 2;
+    let current_version = |conn: &Connection| -> Result<i64> {
+        Ok(
+            conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })?,
+        )
+    };
+    if current_version(conn)? >= OBJECT_ID_SCHEMA_VERSION {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migrated = (|| -> Result<()> {
+        // Another process may have migrated while this one waited.
+        if current_version(conn)? >= OBJECT_ID_SCHEMA_VERSION {
+            return Ok(());
+        }
+        add_column_if_missing(conn, "folders", "mailbox_id", "TEXT")?;
+        add_column_if_missing(conn, "messages", "email_id", "TEXT")?;
+        conn.execute_batch(&format!(
+            "
+            UPDATE folders SET mailbox_id = '{MAILBOX_ID_PREFIX}' || lower(hex(randomblob(12)))
+                WHERE mailbox_id IS NULL;
+            UPDATE messages SET email_id = '{EMAIL_ID_PREFIX}' || lower(hex(randomblob(12)))
+                WHERE email_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_mailbox_id ON folders(mailbox_id);
+            CREATE TRIGGER IF NOT EXISTS folders_assign_mailbox_id
+                AFTER INSERT ON folders WHEN NEW.mailbox_id IS NULL
+            BEGIN
+                UPDATE folders SET mailbox_id = '{MAILBOX_ID_PREFIX}' || lower(hex(randomblob(12)))
+                    WHERE id = NEW.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_assign_email_id
+                AFTER INSERT ON messages WHEN NEW.email_id IS NULL
+            BEGIN
+                UPDATE messages SET email_id = '{EMAIL_ID_PREFIX}' || lower(hex(randomblob(12)))
+                    WHERE id = NEW.id;
+            END;
+            UPDATE schema_version SET version = {OBJECT_ID_SCHEMA_VERSION};
+            "
+        ))?;
+        Ok(())
+    })();
+    match migrated {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -361,7 +435,7 @@ fn allocatable_uid(value: i64) -> Result<u64> {
 pub fn list_folders(maildir_root: &Path, domain: &str, localpart: &str) -> Result<Vec<Folder>> {
     let conn = open_account(maildir_root, domain, localpart)?;
     let mut stmt = conn.prepare(
-        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq
+        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq, mailbox_id
          FROM folders ORDER BY CASE WHEN name = 'INBOX' THEN 0 ELSE 1 END, name COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -373,6 +447,7 @@ pub fn list_folders(maildir_root: &Path, domain: &str, localpart: &str) -> Resul
             uidvalidity: row.get::<_, i64>(4)? as u64,
             uidnext: row.get::<_, i64>(5)? as u64,
             highest_modseq: row.get::<_, i64>(6)? as u64,
+            mailbox_id: row.get(7)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -972,9 +1047,9 @@ pub fn transfer_messages_by_uid(
     let mut guards = Vec::new();
     let mut mappings = Vec::new();
     for uid in requested {
-        let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
+        let Some((filename, subdir, flags, size, internaldate, internaldate_tz, email_id)) = tx
             .query_row(
-                "SELECT filename, subdir, flags, size, internaldate, internaldate_tz
+                "SELECT filename, subdir, flags, size, internaldate, internaldate_tz, email_id
                  FROM messages WHERE folder_id = ?1 AND uid = ?2",
                 params![source_id, uid as i64],
                 |row| {
@@ -985,6 +1060,7 @@ pub fn transfer_messages_by_uid(
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, i32>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
@@ -1022,8 +1098,8 @@ pub fn transfer_messages_by_uid(
         let destination_modseq = next_modseq(&tx, destination_id)?;
         allocatable_uid(destination_uid)?;
         tx.execute(
-            "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq, email_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 destination_id,
                 destination_filename,
@@ -1034,7 +1110,8 @@ pub fn transfer_messages_by_uid(
                 internaldate,
                 internaldate_tz,
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
-                destination_modseq as i64
+                destination_modseq as i64,
+                email_id
             ],
         )?;
         mappings.push((uid, destination_uid as u64));
@@ -1076,9 +1153,9 @@ pub fn move_message_by_uid(
     let tx = conn.transaction()?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
-    let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
+    let Some((filename, subdir, flags, size, internaldate, internaldate_tz, email_id)) = tx
         .query_row(
-            "SELECT filename, subdir, flags, size, internaldate, internaldate_tz
+            "SELECT filename, subdir, flags, size, internaldate, internaldate_tz, email_id
              FROM messages WHERE folder_id = ?1 AND uid = ?2",
             params![source_id, uid as i64],
             |row| {
@@ -1089,6 +1166,7 @@ pub fn move_message_by_uid(
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i32>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
@@ -1134,8 +1212,8 @@ pub fn move_message_by_uid(
     allocatable_uid(uidnext)?;
     let destination_modseq = next_modseq(&tx, destination_id)?;
     tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq, email_id)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             destination_id,
             destination_filename,
@@ -1146,7 +1224,8 @@ pub fn move_message_by_uid(
             internaldate,
             internaldate_tz,
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
-            destination_modseq as i64
+            destination_modseq as i64,
+            email_id
         ],
     )?;
     tx.execute(
@@ -1180,9 +1259,9 @@ pub fn copy_message_by_uid(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
-    let Some((filename, subdir, flags, size, internaldate, internaldate_tz)) = tx
+    let Some((filename, subdir, flags, size, internaldate, internaldate_tz, email_id)) = tx
         .query_row(
-            "SELECT filename, subdir, flags, size, internaldate, internaldate_tz
+            "SELECT filename, subdir, flags, size, internaldate, internaldate_tz, email_id
              FROM messages WHERE folder_id = ?1 AND uid = ?2",
             params![source_id, uid as i64],
             |row| {
@@ -1193,6 +1272,7 @@ pub fn copy_message_by_uid(
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i32>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
@@ -1229,8 +1309,8 @@ pub fn copy_message_by_uid(
 
     let destination_modseq = next_modseq(&tx, destination_id)?;
     tx.execute(
-        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq, email_id)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             destination_id,
             destination_filename,
@@ -1241,7 +1321,8 @@ pub fn copy_message_by_uid(
             internaldate,
             internaldate_tz,
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
-            destination_modseq as i64
+            destination_modseq as i64,
+            email_id
         ],
     )?;
     tx.execute(
@@ -1759,7 +1840,7 @@ fn folder_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
 
 fn get_folder(conn: &Connection, name: &str) -> Result<Option<Folder>> {
     conn.query_row(
-        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq
+        "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq, mailbox_id
          FROM folders WHERE name = ?1",
         params![name],
         |row| {
@@ -1771,6 +1852,7 @@ fn get_folder(conn: &Connection, name: &str) -> Result<Option<Folder>> {
                 uidvalidity: row.get::<_, i64>(4)? as u64,
                 uidnext: row.get::<_, i64>(5)? as u64,
                 highest_modseq: row.get::<_, i64>(6)? as u64,
+                mailbox_id: row.get(7)?,
             })
         },
     )
@@ -1948,7 +2030,8 @@ fn list_messages_for_folder(
     let dir = mailbox_dir(maildir_root, domain, localpart, &folder.name)?;
     let folder_id = folder_id(conn, &folder.name)?.context("missing folder")?;
     let mut stmt = conn.prepare(
-        "SELECT uid, filename, subdir, flags, size, internaldate, internaldate_tz, save_date, modseq
+        "SELECT uid, filename, subdir, flags, size, internaldate, internaldate_tz, save_date, modseq,
+                email_id
          FROM messages WHERE folder_id = ?1 ORDER BY filename",
     )?;
     let rows = stmt.query_map(params![folder_id], |row| {
@@ -1963,6 +2046,7 @@ fn list_messages_for_folder(
             row.get::<_, i32>(6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, i64>(8)? as u64,
+            row.get::<_, String>(9)?,
         ))
     })?;
 
@@ -1978,6 +2062,7 @@ fn list_messages_for_folder(
             internaldate_tz,
             save_date,
             modseq,
+            email_id,
         ) = row?;
         messages.push(Message {
             uid,
@@ -1988,6 +2073,7 @@ fn list_messages_for_folder(
             internaldate_tz,
             save_date,
             modseq,
+            email_id,
         });
     }
     Ok(messages)
@@ -2123,6 +2209,115 @@ mod tests {
         let (folder, _) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
         assert!((1..=u64::from(u32::MAX)).contains(&folder.uidvalidity));
         assert_ne!(folder.uidvalidity, 1_u64 << 40);
+    }
+
+    #[test]
+    fn migration_backfills_object_ids_for_existing_rows() {
+        let td = tempfile::tempdir().unwrap();
+        let inbox = account_maildir(td.path(), "example.test", "user");
+        write_msg(&inbox, "a", b"Subject: a\r\n\r\n");
+        write_msg(&inbox, "b", b"Subject: b\r\n\r\n");
+        load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        // Roll the database back to the pre-OBJECTID schema.
+        let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER folders_assign_mailbox_id;
+             DROP TRIGGER messages_assign_email_id;
+             DROP INDEX idx_folders_mailbox_id;
+             ALTER TABLE folders DROP COLUMN mailbox_id;
+             ALTER TABLE messages DROP COLUMN email_id;
+             UPDATE schema_version SET version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let (folder, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert!(folder.mailbox_id.starts_with(MAILBOX_ID_PREFIX));
+        assert_eq!(folder.mailbox_id.len(), 25);
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.email_id.starts_with(EMAIL_ID_PREFIX))
+        );
+        assert_ne!(messages[0].email_id, messages[1].email_id);
+        let mailbox_ids = list_folders(td.path(), "example.test", "user")
+            .unwrap()
+            .into_iter()
+            .map(|folder| folder.mailbox_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(mailbox_ids.len(), STANDARD_FOLDERS.len());
+
+        // Reopening keeps the assigned IDs.
+        let (again, messages_again) =
+            load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
+        assert_eq!(again.mailbox_id, folder.mailbox_id);
+        assert_eq!(messages_again, messages);
+    }
+
+    #[test]
+    fn object_ids_survive_rename_copy_and_move_but_not_recreation() {
+        let td = tempfile::tempdir().unwrap();
+        let (root, domain, user) = (td.path(), "example.test", "user");
+        create_folder(root, domain, user, "Projects").unwrap();
+        let (projects, _) = load_folder(root, domain, user, "Projects").unwrap();
+        rename_folder(root, domain, user, "Projects", "Renamed").unwrap();
+        let (renamed, _) = load_folder(root, domain, user, "Renamed").unwrap();
+        assert_eq!(renamed.mailbox_id, projects.mailbox_id);
+        delete_folder(root, domain, user, "Renamed").unwrap();
+        create_folder(root, domain, user, "Renamed").unwrap();
+        let (recreated, _) = load_folder(root, domain, user, "Renamed").unwrap();
+        assert_ne!(recreated.mailbox_id, projects.mailbox_id);
+
+        let (_, first) =
+            append_message(root, domain, user, "INBOX", b"Subject: 1\r\n\r\n", vec![]).unwrap();
+        let (_, second) =
+            append_message(root, domain, user, "INBOX", b"Subject: 2\r\n\r\n", vec![]).unwrap();
+        let (_, inbox) = load_folder(root, domain, user, "INBOX").unwrap();
+        let email_id = |messages: &[Message], uid| {
+            messages
+                .iter()
+                .find(|message| message.uid == uid)
+                .unwrap()
+                .email_id
+                .clone()
+        };
+        let first_id = email_id(&inbox, first);
+        let second_id = email_id(&inbox, second);
+        assert_ne!(first_id, second_id);
+
+        let copied = copy_message_by_uid(root, domain, user, "INBOX", first, "Renamed")
+            .unwrap()
+            .unwrap();
+        let moved = move_message_by_uid(root, domain, user, "INBOX", second, "Renamed")
+            .unwrap()
+            .unwrap();
+        let (_, destination) = load_folder(root, domain, user, "Renamed").unwrap();
+        assert_eq!(email_id(&destination, copied), first_id);
+        assert_eq!(email_id(&destination, moved), second_id);
+
+        let transferred = transfer_messages_by_uid(
+            root,
+            domain,
+            user,
+            "Renamed",
+            &[copied, moved],
+            "Archive",
+            true,
+        )
+        .unwrap();
+        let (_, archive) = load_folder(root, domain, user, "Archive").unwrap();
+        assert_eq!(email_id(&archive, transferred[0].1), first_id);
+        assert_eq!(email_id(&archive, transferred[1].1), second_id);
+
+        // A new message never reuses an expunged message's ID.
+        delete_message_by_uid(root, domain, user, "INBOX", first).unwrap();
+        let (_, third) =
+            append_message(root, domain, user, "INBOX", b"Subject: 3\r\n\r\n", vec![]).unwrap();
+        let (_, inbox) = load_folder(root, domain, user, "INBOX").unwrap();
+        let third_id = email_id(&inbox, third);
+        assert_ne!(third_id, first_id);
+        assert_ne!(third_id, second_id);
     }
 
     #[test]

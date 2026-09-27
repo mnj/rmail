@@ -242,6 +242,7 @@ pub(crate) fn capability_tokens_with_policy(
             "UNSELECT",
             "UNAUTHENTICATE",
             "CREATE-SPECIAL-USE",
+            "OBJECTID",
         ]),
     }
     let mut caps = caps.join(" ");

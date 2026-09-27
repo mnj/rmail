@@ -154,6 +154,7 @@ impl Session {
         let args = call.args.to_string();
         let tag = call.tag.to_string();
         let utf8_accept = self.state.utf8_enabled();
+        let imap4rev2 = self.state.imap4rev2_enabled();
         let outcome = tokio::task::spawn_blocking(move || {
             commands::mailboxes::handle(
                 operation,
@@ -162,6 +163,7 @@ impl Session {
                 Path::new(&root),
                 &address,
                 utf8_accept,
+                imap4rev2,
             )
         })
         .await?;

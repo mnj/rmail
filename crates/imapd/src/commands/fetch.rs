@@ -35,6 +35,7 @@ struct Target {
     modseq: u64,
     internal_date: (i64, i32),
     save_date: i64,
+    email_id: String,
 }
 
 pub(crate) async fn handle(
@@ -218,6 +219,7 @@ pub(crate) async fn handle(
             target.modseq,
             target.internal_date,
             target.save_date,
+            &target.email_id,
             target.path,
             items,
             &request.raw_items,
@@ -297,6 +299,7 @@ fn collect_targets(
             modseq: *modseq,
             internal_date: selected.internal_dates.get(uid).copied().unwrap_or((0, 0)),
             save_date: selected.save_dates.get(uid).copied().unwrap_or(0),
+            email_id: selected.email_ids.get(uid).cloned().unwrap_or_default(),
         })
         .collect();
     (targets, expunged_requested)
