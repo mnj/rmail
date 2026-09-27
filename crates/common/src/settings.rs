@@ -51,6 +51,8 @@ const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
 const CLASSIFIER: &[&str] = &["classifier"];
 const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail", "classifier"];
+/// Read on every use; no restart needed.
+const LIVE: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -107,6 +109,11 @@ pub const GROUPS: &[SettingGroup] = &[
         id: "tls",
         label: "TLS",
         description: "Certificates and protocol policy shared by every TLS listener.",
+    },
+    SettingGroup {
+        id: "acme",
+        label: "Certificates (ACME)",
+        description: "Automatic certificates from Let's Encrypt or another ACME CA. Managed on the Certificates page; changes apply without a restart.",
     },
     SettingGroup {
         id: "auth",
@@ -264,6 +271,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         WEBMAIL,
     ),
     spec(
+        "global.listeners.http",
+        "network",
+        "Plain HTTP",
+        "Usually [::]:80. Answers ACME http-01 challenges and redirects every other request to HTTPS.",
+        SettingKind::AddressList,
+        WEB,
+    ),
+    spec(
+        "global.http_redirect_url",
+        "network",
+        "HTTP redirect target",
+        "Base URL plain-HTTP requests are redirected to, e.g. https://mail.example.com. Empty keeps the requested host and switches to https://.",
+        SettingKind::Text,
+        WEB,
+    ),
+    spec(
         "global.tcp_listener.ipv6_only",
         "network",
         "IPv6-only wildcards",
@@ -338,12 +361,163 @@ pub const SETTINGS: &[SettingSpec] = &[
         &["web", "webmail"],
     ),
     spec(
-        "global.acme_challenge_dir",
-        "tls",
-        "ACME challenge directory",
-        "Directory served at /.well-known/acme-challenge/ by the admin listener.",
+        "acme.enabled",
+        "acme",
+        "Automatic certificates",
+        "Request the TLS certificate from the CA below and renew it automatically. It is written to the certificate and key paths (or <mail_root>/tls/ when unset) and every service reloads it when it changes.",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "acme.domains",
+        "acme",
+        "Certificate names",
+        "One name per line; the first becomes the subject. Empty uses the server hostname. Wildcards (*.example.com) need the DNS challenge.",
+        SettingKind::List,
+        LIVE,
+    ),
+    spec(
+        "acme.email",
+        "acme",
+        "Contact email",
+        "Registered with the CA for account and policy notices. Optional.",
         SettingKind::Text,
-        WEB,
+        LIVE,
+    ),
+    spec(
+        "acme.ca",
+        "acme",
+        "Certificate authority",
+        "Let's Encrypt staging issues untrusted test certificates.",
+        SettingKind::Choice {
+            options: &["letsencrypt", "letsencrypt-staging", "zerossl", "custom"],
+        },
+        LIVE,
+    ),
+    spec(
+        "acme.directory_url",
+        "acme",
+        "Directory URL",
+        "ACME directory of a custom CA, e.g. https://ca.internal/acme/acme/directory.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "acme.eab_kid",
+        "acme",
+        "EAB key ID",
+        "External account binding key ID. Required by ZeroSSL.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "acme.eab_hmac_key",
+        "acme",
+        "EAB HMAC key",
+        "External account binding HMAC key (base64url), used once when the account is registered.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "acme.challenge",
+        "acme",
+        "Challenge",
+        "http-01 needs port 80 reachable from the internet; dns-01 publishes a TXT record through the DNS provider.",
+        SettingKind::Choice {
+            options: &["http-01", "dns-01"],
+        },
+        LIVE,
+    ),
+    spec(
+        "acme.dns.provider",
+        "acme",
+        "DNS provider",
+        "Where the _acme-challenge TXT records are published.",
+        SettingKind::Choice {
+            options: &[
+                "cloudflare",
+                "digitalocean",
+                "desec",
+                "gandi",
+                "route53",
+                "rfc2136",
+            ],
+        },
+        LIVE,
+    ),
+    spec(
+        "acme.dns.api_token",
+        "acme",
+        "API token",
+        "Cloudflare (Zone:Read and DNS:Edit), DigitalOcean, deSEC or Gandi personal access token.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.zone",
+        "acme",
+        "DNS zone",
+        "Zone that holds the challenge records. Empty finds it from DNS.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.aws_access_key_id",
+        "acme",
+        "AWS access key ID",
+        "Route 53 credentials; the key needs route53:ListHostedZonesByName and route53:ChangeResourceRecordSets.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.aws_secret_access_key",
+        "acme",
+        "AWS secret access key",
+        "",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.rfc2136_server",
+        "acme",
+        "Update server",
+        "Primary name server accepting RFC 2136 updates, as host or host:port.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.tsig_key_name",
+        "acme",
+        "TSIG key name",
+        "",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.tsig_secret",
+        "acme",
+        "TSIG secret",
+        "Base64 secret, as in the BIND key file.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "acme.dns.tsig_algorithm",
+        "acme",
+        "TSIG algorithm",
+        "",
+        SettingKind::Choice {
+            options: &["hmac-sha256", "hmac-sha512"],
+        },
+        LIVE,
+    ),
+    spec(
+        "acme.dns.propagation_timeout_seconds",
+        "acme",
+        "Propagation timeout (s)",
+        "How long to wait for the TXT record on every authoritative name server.",
+        int(10, 3_600),
+        LIVE,
     ),
     spec(
         "security.imap_sasl_mechanisms",
@@ -988,6 +1162,12 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
     if let Some(oauth) = &config.security.oauth {
         crate::oauth::validate_config(oauth).context("OAuth settings")?;
     }
+    if let Some(url) = config.global.http_redirect_url.as_deref()
+        && !(url.starts_with("https://") || url.starts_with("http://"))
+    {
+        bail!("global.http_redirect_url must start with https://");
+    }
+    crate::acme::validate_config(config)?;
     Ok(())
 }
 
@@ -1610,8 +1790,20 @@ mod tests {
                         | "global.hostname"
                         | "global.tls_key"
                         | "global.tls.ocsp_response"
-                        | "global.acme_challenge_dir"
+                        | "global.http_redirect_url"
                         | "global.enforce_dmarc"
+                        | "acme.email"
+                        | "acme.directory_url"
+                        | "acme.eab_kid"
+                        | "acme.eab_hmac_key"
+                        | "acme.dns.provider"
+                        | "acme.dns.api_token"
+                        | "acme.dns.zone"
+                        | "acme.dns.aws_access_key_id"
+                        | "acme.dns.aws_secret_access_key"
+                        | "acme.dns.rfc2136_server"
+                        | "acme.dns.tsig_key_name"
+                        | "acme.dns.tsig_secret"
                 )
                 || spec.key.starts_with("global.listeners.")
             {

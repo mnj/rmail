@@ -58,8 +58,10 @@ pub struct Global {
     pub web_admin_user: Option<String>,
     /// Argon2 password hash for administrative web UI access (optional)
     pub web_admin_password_hash: Option<String>,
-    /// Directory to serve ACME http-01 challenges from (for production TLS automation)
-    pub acme_challenge_dir: Option<String>,
+    /// Base URL that plain-HTTP requests on `listeners.http` are redirected
+    /// to. Empty redirects to `https://` on the requested host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_redirect_url: Option<String>,
     /// If true, enforce DMARC policies (reject/quarantine) at SMTP time for inbound mail
     pub enforce_dmarc: Option<bool>,
 }
@@ -151,6 +153,9 @@ pub struct ListenerEndpoints {
     pub imaps: Option<Vec<String>>,
     pub admin: Option<Vec<String>>,
     pub webmail: Option<Vec<String>>,
+    /// Plain-HTTP listeners (usually port 80) served by the admin daemon:
+    /// ACME http-01 challenges, and a redirect to HTTPS for everything else.
+    pub http: Option<Vec<String>>,
 }
 
 /// The kernel's hostname, canonicalized as a DNS name, or `localhost` when
@@ -234,6 +239,10 @@ impl Global {
             .unwrap_or_else(|| vec![format!("127.0.0.1:{}", self.web_port.unwrap_or(8080))])
     }
 
+    pub fn http_listeners(&self) -> Vec<String> {
+        self.listeners.http.clone().unwrap_or_default()
+    }
+
     pub fn webmail_listeners(&self) -> Vec<String> {
         self.listeners
             .webmail
@@ -251,10 +260,152 @@ pub struct Config {
     /// Local-model mail organization (the `rmail_classifier` daemon).
     #[serde(default)]
     pub classifier: ClassifierConfig,
+    /// Automatic certificates from an ACME CA such as Let's Encrypt.
+    #[serde(default)]
+    pub acme: AcmeConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
     pub settings_revision: u64,
+}
+
+/// A configuration value that must never appear in logs or `Debug` output.
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct SecretString(pub String);
+
+impl SecretString {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum AcmeCa {
+    #[default]
+    #[serde(rename = "letsencrypt")]
+    LetsEncrypt,
+    #[serde(rename = "letsencrypt-staging")]
+    LetsEncryptStaging,
+    #[serde(rename = "zerossl")]
+    ZeroSsl,
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum AcmeChallenge {
+    #[default]
+    #[serde(rename = "http-01")]
+    Http01,
+    #[serde(rename = "dns-01")]
+    Dns01,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProviderKind {
+    Cloudflare,
+    DigitalOcean,
+    Desec,
+    Gandi,
+    Route53,
+    Rfc2136,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum TsigAlgorithm {
+    #[default]
+    #[serde(rename = "hmac-sha256")]
+    HmacSha256,
+    #[serde(rename = "hmac-sha512")]
+    HmacSha512,
+}
+
+/// Automatic certificate management (RFC 8555). Certificates are written to
+/// `global.tls_cert` / `global.tls_key`, which every TLS service reloads when
+/// the files change.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AcmeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Names on the certificate. Empty uses the server hostname.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Contact address registered with the CA for account notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub ca: AcmeCa,
+    /// ACME directory URL when `ca` is `custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_url: Option<String>,
+    /// External account binding (required by ZeroSSL and some private CAs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eab_kid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eab_hmac_key: Option<SecretString>,
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+    #[serde(default)]
+    pub dns: AcmeDnsConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AcmeDnsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<DnsProviderKind>,
+    /// API token for Cloudflare, DigitalOcean, deSEC and Gandi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<SecretString>,
+    /// Zone holding the challenge records. Empty discovers it from DNS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_access_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_secret_access_key: Option<SecretString>,
+    /// Primary name server accepting RFC 2136 updates, as `host` or `host:port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rfc2136_server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsig_key_name: Option<String>,
+    /// Base64 TSIG secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsig_secret: Option<SecretString>,
+    #[serde(default)]
+    pub tsig_algorithm: TsigAlgorithm,
+    /// How long to wait for the TXT record to appear on every authoritative
+    /// name server before asking the CA to validate.
+    #[serde(default = "default_dns_propagation_timeout_seconds")]
+    pub propagation_timeout_seconds: u64,
+}
+
+impl Default for AcmeDnsConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            api_token: None,
+            zone: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            rfc2136_server: None,
+            tsig_key_name: None,
+            tsig_secret: None,
+            tsig_algorithm: TsigAlgorithm::default(),
+            propagation_timeout_seconds: default_dns_propagation_timeout_seconds(),
+        }
+    }
+}
+
+fn default_dns_propagation_timeout_seconds() -> u64 {
+    180
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -783,10 +934,7 @@ imap_port = 1143
             second.security.smtp_max_recipients,
             first.security.smtp_max_recipients
         );
-        assert_eq!(
-            second.global.acme_challenge_dir,
-            first.global.acme_challenge_dir
-        );
+        assert_eq!(second.global.tls_cert, first.global.tls_cert);
     }
 
     #[test]

@@ -234,18 +234,54 @@ credentials and the web services serve HTTPS. Set `web_http_only = true` when a 
 terminates TLS; this affects only admin web and webmail and leaves mail-protocol TLS enabled.
 Without configured credentials, the web services remain available over HTTP.
 
-`systemctl reload rmail_smtpd rmail_imapd rmail_web rmail_webmail` sends SIGHUP. Each daemon parses and validates the
-replacement certificate, private key, version policy, and cipher policy before atomically swapping
-the context used by new connections. Existing TLS sessions continue uninterrupted; a failed reload
+Each TLS daemon reloads its certificate when the certificate, key or OCSP file changes on disk
+(checked every 30 seconds, after the files have stopped changing) and on SIGHUP
+(`systemctl reload rmail_smtpd rmail_imapd rmail_web rmail_webmail`). The replacement certificate,
+private key, version policy, and cipher policy are parsed and validated before the context used by
+new connections is swapped atomically. Existing TLS sessions continue uninterrupted; a failed reload
 keeps the previous context. Validation also requires a configured OCSP response to remain readable
-and structurally usable.
+and structurally usable. An external ACME client therefore only needs to replace the files.
 
-`rmail_ctl obtain-cert` and `rmail_ctl renew` validate the certificate/key bundle before installing
-each file with a same-filesystem atomic rename, then reload the services. When OCSP stapling is
-configured, the renewal hook must fetch the response for the renewed certificate, write it to a
-temporary file, and atomically rename it to `ocsp_response` before reloading. This ordering prevents
-new connections from observing a partially written certificate or staple. The built-in renewal
-command does not fetch an OCSP response itself.
+### Automatic certificates (ACME / Let's Encrypt)
+
+rMail requests and renews certificates itself; no certbot or other ACME client is needed. Configure
+it on the admin console's **Certificates** page, or with `rmail_ctl settings set acme.<key> ...`
+(settings database required). Changes apply to the next request without a restart.
+
+- `acme.domains` lists the certificate names (empty uses `global.hostname`); `acme.email` is the
+  optional account contact.
+- `acme.ca` is `letsencrypt` (default), `letsencrypt-staging`, `zerossl` (needs `acme.eab_kid` and
+  `acme.eab_hmac_key`), or `custom` with `acme.directory_url` (for example step-ca).
+- `acme.challenge = "http-01"` needs the names to reach this server on port 80. Add
+  `global.listeners.http = ["[::]:80"]`: `rmail_web` then answers challenges there and redirects every
+  other request to HTTPS (to `global.http_redirect_url` when set, otherwise the requested host). The
+  packaged unit grants `rmail_web` `CAP_NET_BIND_SERVICE` for this. If another web server owns port 80,
+  forward `/.well-known/acme-challenge/` to the admin listener instead, which answers the same paths.
+- `acme.challenge = "dns-01"` publishes `_acme-challenge` TXT records through `acme.dns.provider`:
+  `cloudflare` (API token with Zone:Read and DNS:Edit), `digitalocean`, `desec`, `gandi` (personal
+  access token) — all via `acme.dns.api_token` — `route53` (`acme.dns.aws_access_key_id` /
+  `aws_secret_access_key`, allowed `route53:ListHostedZonesByName` and
+  `route53:ChangeResourceRecordSets`), or `rfc2136` (`acme.dns.rfc2136_server`, `tsig_key_name`,
+  base64 `tsig_secret`, `tsig_algorithm`) for BIND, PowerDNS, Knot and other servers accepting dynamic
+  updates. The zone is found from DNS unless `acme.dns.zone` is set. Before asking the CA to validate,
+  rMail waits (up to `acme.dns.propagation_timeout_seconds`) until every authoritative name server
+  serves the records. DNS validation is required for wildcard names.
+
+The certificate is written with atomic renames to `global.tls_cert` / `global.tls_key`. When those are
+unset, it goes to `<mail_root>/tls/fullchain.pem` and `privkey.pem` (key mode 0600) and the settings
+are pointed there; restart the services once so they start serving TLS. Later renewals are picked up
+by the file watch above. The key is ECDSA P-256. OCSP stapling (`global.tls.ocsp_response`) cannot
+be combined with ACME certificates.
+
+`rmail_web` checks hourly and renews when the CA's ACME Renewal Information (RFC 9773) window opens,
+or after two thirds of the certificate's lifetime when the CA offers none; renewal orders name the
+certificate they replace. Failed attempts are retried after one hour, doubling up to a day. Account
+keys, pending challenges and the last run's log live in the settings database, so the Certificates
+page and `rmail_ctl acme status` show exactly what happened.
+
+- `rmail_ctl acme issue` requests a certificate now (`--test` issues from Let's Encrypt staging and
+  installs nothing). When run as root, installed files are handed to the owner of their directory.
+- `rmail_ctl acme renew` renews only if due; `rmail_ctl acme status` shows the certificate and last run.
 
 Health probes are exposed by `rmail_web` without authentication so an orchestrator can use them:
 
@@ -257,7 +293,7 @@ probe paths at the reverse proxy or firewall because readiness details are inten
 operators.
 
 The admin console uses dedicated browser routes for its main operating areas: `/` (overview),
-`/accounts`, `/routing`, `/delivery`, `/settings`, `/observability`, and `/system`. These routes are
+`/accounts`, `/routing`, `/delivery`, `/settings`, `/certificates`, `/observability`, and `/system`. These routes are
 served through the same single-page frontend, so a reverse proxy should pass unknown non-API paths to
 `rmail_web` rather than returning its own 404 page.
 

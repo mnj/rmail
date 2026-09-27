@@ -126,7 +126,34 @@ export type SettingsView =
       services: ServiceState[];
     };
 
-export type ModelKind = 'embedding' | 'chat';
+export type CertificateInfo = { subject: string; names: string[]; issuer: string; not_before: number; not_after: number; serial: string; self_signed: boolean };
+export type AcmeRun = { trigger: string; dry_run: boolean; started_at: number; finished_at: number | null; ok: boolean | null; error: string | null; names: string[]; log: { at: number; message: string }[] };
+export type Certificates = {
+  managed: boolean;
+  enabled: boolean;
+  names: string[];
+  names_error: string | null;
+  challenge: 'http-01' | 'dns-01';
+  directory: string | null;
+  cert_path: string;
+  key_path: string;
+  certificate: CertificateInfo | null;
+  certificate_error: string | null;
+  renewal: { due: boolean; reason: string; due_at: number | null } | null;
+  running: boolean;
+  status: {
+    last_run: AcmeRun | null;
+    last_success_at: number | null;
+    issued_by: string | null;
+    consecutive_failures: number;
+    retry_after: number | null;
+    renewal_window: [number, number] | null;
+  };
+  http_listeners: string[];
+  warnings: string[];
+};
+
+export type ModelKind ='embedding' | 'chat';
 export type CatalogModel = { id: string; name: string; kind: ModelKind; file: string; url: string; sha256: string | null; size_mb: number; ram_mb: number; license: string; prefix: string; notes: string };
 export type InstalledModel = { file: string; size: number; meta: { kind: ModelKind; url: string; sha256: string; size: number; downloaded_at: number } | null };
 export type ModelDownload = { file: string; received: number; total: number; status: { state: 'running' } | { state: 'done'; sha256: string } | { state: 'failed'; error: string } };

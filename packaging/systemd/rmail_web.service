@@ -10,6 +10,8 @@ WorkingDirectory=/opt/rmail
 ExecStart=/usr/bin/rmail_web
 ExecReload=/bin/kill -HUP $MAINPID
 User=rmail
+# Lets rmail_web bind port 80 for ACME http-01 challenges (global.listeners.http).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 Group=rmail
 StateDirectory=rmail
 LogsDirectory=rmail

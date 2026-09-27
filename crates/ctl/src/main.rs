@@ -6,7 +6,6 @@ use argon2::{
 use clap::{Parser, Subcommand};
 use rand::rngs::OsRng;
 use rmail_common::{config::Config, maildir};
-use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,27 +69,12 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// Obtain TLS certificates via ACME (Let's Encrypt certbot) using webroot challenge
-    ObtainCert {
-        /// Domains, comma-separated (e.g. example.com,www.example.com)
-        domains: String,
-        /// Email address for registration with ACME server
-        #[arg(long)]
-        email: Option<String>,
-        /// Use LetsEncrypt staging endpoint for testing
-        #[arg(long)]
-        staging: bool,
+    /// Automatic TLS certificates (ACME / Let's Encrypt), configured with the acme.* settings
+    Acme {
+        #[command(subcommand)]
+        action: AcmeAction,
         /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
-        #[arg(long)]
-        config: Option<String>,
-    },
-    /// Renew certificates via certbot and reload services
-    Renew {
-        /// Use LetsEncrypt staging endpoint for testing
-        #[arg(long)]
-        staging: bool,
-        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
-        #[arg(long)]
+        #[arg(long, global = true)]
         config: Option<String>,
     },
     /// Aggregate and enqueue DMARC RUA reports for unreported events in the DB
@@ -157,6 +141,20 @@ enum SettingsAction {
     Set { key: String, value: String },
     /// Remove a stored setting so its default applies
     Unset { key: String },
+}
+
+#[derive(Subcommand)]
+enum AcmeAction {
+    /// Request a certificate now and install it; services reload it automatically
+    Issue {
+        /// Test against Let's Encrypt staging (or the configured CA) without installing anything
+        #[arg(long)]
+        test: bool,
+    },
+    /// Renew the certificate if it is due (rmail_web also does this hourly)
+    Renew,
+    /// Show the installed certificate and the last ACME run
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -529,217 +527,110 @@ async fn main() -> Result<()> {
             ServiceAction::Reload(opts) => reload_services(opts)?,
             ServiceAction::Status(opts) => run_service_action("status", opts)?,
         },
-        Commands::ObtainCert {
-            domains,
-            email,
-            staging,
-            config,
-        } => {
+        Commands::Acme { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
             let cfg = Config::load(&cfg_path)?;
-            let acme_dir = cfg.global.acme_challenge_dir.clone().ok_or_else(|| {
-                anyhow::anyhow!("No acme_challenge_dir configured in global config")
-            })?;
-            // ensure webroot exists
-            if !Path::new(&acme_dir).exists() {
-                fs::create_dir_all(&acme_dir)?;
-            }
-            // Build certbot command
-            let mut cmd = Command::new("certbot");
-            cmd.arg("certonly")
-                .arg("--non-interactive")
-                .arg("--agree-tos")
-                .arg("--webroot")
-                .arg("-w")
-                .arg(&acme_dir)
-                .arg("--rsa-key-size")
-                .arg("2048");
-            if staging {
-                cmd.arg("--staging");
-            }
-            if let Some(e) = email.as_ref() {
-                cmd.arg("--email").arg(e);
-            } else {
-                cmd.arg("--register-unsafely-without-email");
-            }
-            for d in domains
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-            {
-                cmd.arg("-d").arg(d);
-            }
-            println!("Running certbot to obtain certificate for {}", domains);
-            let status = cmd
-                .status()
-                .map_err(|e| anyhow::anyhow!(format!("failed to run certbot: {}", e)))?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(format!(
-                    "certbot exited with status {}",
-                    status
-                )));
-            }
-            // Copy certs for primary domain
-            let primary_domain = domains.split(',').next().unwrap().trim();
-            let live_dir = Path::new("/etc/letsencrypt/live").join(primary_domain);
-            let fullchain = live_dir.join("fullchain.pem");
-            let privkey = live_dir.join("privkey.pem");
-            if !fullchain.exists() || !privkey.exists() {
-                return Err(anyhow::anyhow!(format!(
-                    "expected cert files not found in {}",
-                    live_dir.display()
-                )));
-            }
-            let out_cert = cfg
-                .global
-                .tls_cert
-                .clone()
-                .unwrap_or(format!("config/certs/{}.crt", primary_domain));
-            let out_key = cfg
-                .global
-                .tls_key
-                .clone()
-                .unwrap_or(format!("config/certs/{}.key", primary_domain));
-            if let Some(parent) = Path::new(&out_cert).parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if let Some(parent) = Path::new(&out_key).parent() {
-                fs::create_dir_all(parent)?;
-            }
-            validate_tls_bundle(&fullchain, &privkey, &cfg.global.tls)?;
-            atomic_copy(&fullchain, Path::new(&out_cert))?;
-            atomic_copy(&privkey, Path::new(&out_key))?;
-            println!(
-                "Obtained cert for {} -> {} / {}",
-                primary_domain, out_cert, out_key
-            );
+            run_acme(action, &cfg).await?;
         }
-        Commands::Renew { staging, config } => {
-            let cfg_path = config.unwrap_or_else(|| {
-                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
-            });
-            let cfg = Config::load(&cfg_path)?;
-            println!("Running certbot renew...");
-            let mut cmd = Command::new("certbot");
-            cmd.arg("renew").arg("--non-interactive");
-            if staging {
-                cmd.arg("--staging");
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| anyhow::anyhow!(format!("failed to run certbot renew: {}", e)))?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(format!(
-                    "certbot renew exited with status {}",
-                    status
-                )));
-            }
-            // Determine primary domain to copy (prefer tls_cert filename stem)
-            let primary_domain_opt = cfg.global.tls_cert.as_ref().and_then(|p| {
-                std::path::Path::new(p)
-                    .file_stem()
-                    .and_then(|os| os.to_str())
-                    .map(|s| s.to_string())
-            });
-            let primary_domain = if let Some(d) = primary_domain_opt {
-                d
-            } else {
-                // fallback: pick first dir under /etc/letsencrypt/live
-                let live_root = Path::new("/etc/letsencrypt/live");
+    }
+    Ok(())
+}
 
-                std::fs::read_dir(live_root)?
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("no live certs found to copy"))?
+async fn run_acme(action: AcmeAction, cfg: &Config) -> Result<()> {
+    use rmail_common::acme;
+    // Progress is printed as text; keep the JSON log for problems only.
+    rmail_common::runtime::set_log_level(Some("warn"));
+    match action {
+        AcmeAction::Issue { test } => {
+            if !test && !cfg.acme.enabled {
+                anyhow::bail!(
+                    "automatic certificates are off; enable them with `rmail_ctl settings set acme.enabled true` (or run with --test)"
+                );
+            }
+            let outcome = acme::run(
+                cfg,
+                acme::RunOptions {
+                    trigger: "cli".into(),
+                    dry_run: test,
+                    echo: true,
+                },
+            )
+            .await?;
+            if outcome.settings_updated {
+                println!("Restart the services once to enable TLS: rmail_ctl service restart");
+            }
+        }
+        AcmeAction::Renew => match acme::renew_if_due(cfg, "cli").await? {
+            Some(outcome) => println!(
+                "Renewed; valid until {}",
+                acme::format_time(outcome.not_after)
+            ),
+            None if !cfg.acme.enabled => println!("Automatic certificates are off"),
+            None => {
+                let db_path = cfg.global.db_path.as_deref().unwrap_or_default();
+                let status = acme::load_status(db_path)?;
+                match status.retry_after {
+                    Some(at) if at > now_secs() => println!(
+                        "Waiting until {} after {} failed attempt(s); use `rmail_ctl acme issue` to retry now",
+                        acme::format_time(at),
+                        status.consecutive_failures
+                    ),
+                    _ => println!("Not due: {}", acme::renewal_check(cfg, &status).reason),
+                }
+            }
+        },
+        AcmeAction::Status => {
+            let (cert_path, key_path, _) = acme::certificate_paths(cfg);
+            println!(
+                "Automatic certificates: {}",
+                if cfg.acme.enabled { "on" } else { "off" }
+            );
+            match acme::certificate_names(cfg) {
+                Ok(names) => println!("Names: {}", names.join(", ")),
+                Err(error) => println!("Names: {error:#}"),
+            }
+            println!("Certificate: {}", cert_path.display());
+            println!("Private key: {}", key_path.display());
+            match acme::cert::inspect_file(&cert_path) {
+                Ok(info) => {
+                    println!("  names:   {}", info.names.join(", "));
+                    println!("  issuer:  {}", info.issuer);
+                    println!("  expires: {}", acme::format_time(info.not_after));
+                }
+                Err(error) => println!("  {error:#}"),
+            }
+            let Some(db_path) = cfg.global.db_path.as_deref() else {
+                return Ok(());
             };
-            let live_dir = Path::new("/etc/letsencrypt/live").join(&primary_domain);
-            let fullchain = live_dir.join("fullchain.pem");
-            let privkey = live_dir.join("privkey.pem");
-            if !fullchain.exists() || !privkey.exists() {
-                return Err(anyhow::anyhow!(format!(
-                    "expected cert files not found in {}",
-                    live_dir.display()
-                )));
+            let status = acme::load_status(db_path)?;
+            if cfg.acme.enabled {
+                println!("Renewal: {}", acme::renewal_check(cfg, &status).reason);
             }
-            let out_cert = cfg
-                .global
-                .tls_cert
-                .clone()
-                .unwrap_or(format!("config/certs/{}.crt", primary_domain));
-            let out_key = cfg
-                .global
-                .tls_key
-                .clone()
-                .unwrap_or(format!("config/certs/{}.key", primary_domain));
-            if let Some(parent) = Path::new(&out_cert).parent() {
-                fs::create_dir_all(parent)?;
+            if let Some(run) = status.last_run {
+                println!(
+                    "Last run ({}{}): {} at {}",
+                    run.trigger,
+                    if run.dry_run { ", test" } else { "" },
+                    match run.ok {
+                        Some(true) => "succeeded".to_string(),
+                        Some(false) => format!("failed: {}", run.error.unwrap_or_default()),
+                        None => "in progress".to_string(),
+                    },
+                    acme::format_time(run.started_at)
+                );
             }
-            if let Some(parent) = Path::new(&out_key).parent() {
-                fs::create_dir_all(parent)?;
-            }
-            validate_tls_bundle(&fullchain, &privkey, &cfg.global.tls)?;
-            atomic_copy(&fullchain, Path::new(&out_cert))?;
-            atomic_copy(&privkey, Path::new(&out_key))?;
-            println!(
-                "Renewed cert for {} -> {} / {}",
-                primary_domain, out_cert, out_key
-            );
-            reload_services(ServiceCommandOptions {
-                units: vec![
-                    "smtpd".to_string(),
-                    "imapd".to_string(),
-                    "web".to_string(),
-                    "webmail".to_string(),
-                ],
-                dry_run: false,
-            })?;
         }
     }
     Ok(())
 }
 
-fn validate_tls_bundle(
-    certificate: &Path,
-    private_key: &Path,
-    policy: &rmail_common::config::TlsPolicy,
-) -> Result<()> {
-    let material = rmail_common::tls::load_server_tls_material(
-        certificate.to_string_lossy().as_ref(),
-        private_key.to_string_lossy().as_ref(),
-        policy.ocsp_response.as_deref(),
-    )?;
-    rmail_common::tls::build_server_config(material, policy)?;
-    Ok(())
-}
-
-fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("destination has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let filename = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("destination filename is not valid UTF-8"))?;
-    let temporary = parent.join(format!(
-        ".{filename}.rmail-rotate.{}.{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    let result = (|| -> Result<()> {
-        fs::copy(source, &temporary)?;
-        fs::File::open(&temporary)?.sync_all()?;
-        fs::rename(&temporary, destination)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn selected_units(opts: &ServiceCommandOptions, reverse: bool) -> Result<Vec<&'static str>> {
@@ -884,7 +775,12 @@ fn run_settings(
                 conn,
                 &std::collections::BTreeMap::from([(key.clone(), parsed)]),
             )?;
-            println!("{key} updated (revision {revision}); restart affected services to apply");
+            match settings::spec_for(&key).map(|spec| spec.services) {
+                Some([]) => println!("{key} updated (revision {revision}); applies immediately"),
+                _ => println!(
+                    "{key} updated (revision {revision}); restart affected services to apply"
+                ),
+            }
         }
         SettingsAction::Unset { key } => {
             let revision = settings::update(
@@ -899,9 +795,7 @@ fn run_settings(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use super::{ServiceCommandOptions, atomic_copy, normalize_unit_name, selected_units};
+    use super::{ServiceCommandOptions, normalize_unit_name, selected_units};
 
     #[test]
     fn normalizes_service_short_names() {
@@ -922,23 +816,5 @@ mod tests {
         let units = selected_units(&opts, true).unwrap();
         assert_eq!(units.first().copied(), Some("rmail_classifier.service"));
         assert_eq!(units.last().copied(), Some("rmail_smtpd.service"));
-    }
-
-    #[test]
-    fn atomic_copy_replaces_destination_without_leaving_temporary_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source.pem");
-        let destination = directory.path().join("destination.pem");
-        fs::write(&source, b"new bundle").unwrap();
-        fs::write(&destination, b"old bundle").unwrap();
-
-        atomic_copy(&source, &destination).unwrap();
-
-        assert_eq!(fs::read(&destination).unwrap(), b"new bundle");
-        let names = fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(names.len(), 2);
     }
 }

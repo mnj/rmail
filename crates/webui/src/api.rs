@@ -26,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::*;
 
+pub(crate) mod certificates;
 mod organization;
 
 pub(crate) const SESSION_COOKIE: &str = "rmail_admin";
@@ -45,7 +46,8 @@ pub(crate) struct AdminState {
     /// Credentials from the configuration file; used when the settings
     /// database holds none (file-only deployments).
     pub file_admin: Option<(String, String)>,
-    pub acme_dir: Option<String>,
+    /// Where the plain-HTTP listener redirects to; `None` keeps the host.
+    pub http_redirect_url: Option<String>,
     pub readiness: ReadinessConfig,
     /// Re-read readiness settings from here so edits show up without restart.
     pub config_path: Option<String>,
@@ -62,7 +64,6 @@ impl AdminState {
         mail_root: PathBuf,
         db_path: Option<String>,
         file_admin: Option<(String, String)>,
-        acme_dir: Option<String>,
         readiness: ReadinessConfig,
     ) -> Self {
         let mut session_key = vec![0u8; 32];
@@ -71,7 +72,7 @@ impl AdminState {
             mail_root,
             db_path,
             file_admin,
-            acme_dir,
+            http_redirect_url: None,
             readiness,
             config_path: None,
             secure_cookies: false,
@@ -113,9 +114,13 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/settings", get(settings).put(update_settings))
         .route("/api/admin/credentials", post(change_credentials))
         .merge(organization::routes())
+        .merge(certificates::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let app = Router::new()
-        .route("/.well-known/acme-challenge/{*token}", get(acme_challenge))
+        .route(
+            "/.well-known/acme-challenge/{*token}",
+            get(certificates::challenge),
+        )
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/ready", get(ready))
@@ -463,26 +468,6 @@ fn clear_cookie(state: &AdminState) -> String {
 
 // ---------------------------------------------------------------------------
 // Public endpoints
-
-fn is_acme_token(token: &str) -> bool {
-    !token.is_empty()
-        && token.len() <= 256
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
-/// ACME http-01 challenges. Tokens are a single URL-safe segment, so paths
-/// can never leave the challenge directory.
-async fn acme_challenge(State(state): State<Shared>, UrlPath(token): UrlPath<String>) -> Response {
-    let (Some(dir), true) = (state.acme_dir.as_ref(), is_acme_token(&token)) else {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-    match tokio::fs::read(PathBuf::from(dir).join(&token)).await {
-        Ok(body) => ([(header::CONTENT_TYPE, "text/plain")], body).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
-    }
-}
 
 async fn health() -> &'static str {
     "ok"

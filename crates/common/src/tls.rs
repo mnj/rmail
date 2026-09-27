@@ -50,22 +50,113 @@ pub fn spawn_web_tls_reloader(
     let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
         return;
     };
-    #[cfg(unix)]
+    let Ok(mut trigger) = ReloadTrigger::new(&cert_path, &key_path, &policy) else {
+        crate::structured_log!("error", component, "tls_reload_handler_failed", {});
+        return;
+    };
     tokio::spawn(async move {
-        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        else {
-            crate::structured_log!("error", component, "tls_reload_handler_failed", {});
-            return;
-        };
-        while signal.recv().await.is_some() {
+        loop {
+            let reason = trigger.next().await;
             match reload_server_tls_context(&sender, &cert_path, &key_path, &policy) {
-                Ok(()) => crate::structured_log!("info", component, "tls_reloaded", {}),
+                Ok(()) => {
+                    crate::structured_log!("info", component, "tls_reloaded", { "reason": reason })
+                }
                 Err(error) => {
-                    crate::structured_log!("error", component, "tls_reload_failed", { "error": format!("{error:#}"), "action": "keeping current TLS bundle" })
+                    crate::structured_log!("error", component, "tls_reload_failed", { "reason": reason, "error": format!("{error:#}"), "action": "keeping current TLS bundle" })
                 }
             }
         }
     });
+}
+
+/// How often certificate files are checked for changes.
+const TLS_FILE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+/// A change must hold still this long before it is loaded, so a certificate
+/// and key replaced one after the other are picked up together.
+const TLS_FILE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+type FileFingerprint = Option<(std::time::SystemTime, u64, u64)>;
+
+fn fingerprint(path: &std::path::Path) -> FileFingerprint {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some((meta.modified().ok()?, meta.len(), inode))
+}
+
+/// Tells a TLS service when to reload its certificate: on SIGHUP, or when
+/// the certificate, key or OCSP file changes (for example after an ACME
+/// renewal).
+pub struct ReloadTrigger {
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
+    files: Vec<std::path::PathBuf>,
+    seen: Vec<FileFingerprint>,
+    poll: tokio::time::Interval,
+}
+
+impl ReloadTrigger {
+    pub fn new(cert_path: &str, key_path: &str, policy: &TlsPolicy) -> std::io::Result<Self> {
+        let files = [
+            Some(cert_path),
+            Some(key_path),
+            policy.ocsp_response.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+        let seen = files.iter().map(|path| fingerprint(path)).collect();
+        let mut poll = tokio::time::interval(TLS_FILE_POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Ok(Self {
+            #[cfg(unix)]
+            hangup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
+            files,
+            seen,
+            poll,
+        })
+    }
+
+    fn current(&self) -> Vec<FileFingerprint> {
+        self.files.iter().map(|path| fingerprint(path)).collect()
+    }
+
+    /// Wait for the next reason to reload: `"signal"` or `"files_changed"`.
+    pub async fn next(&mut self) -> &'static str {
+        loop {
+            #[cfg(unix)]
+            let signalled = tokio::select! {
+                _ = self.hangup.recv() => true,
+                _ = self.poll.tick() => false,
+            };
+            #[cfg(not(unix))]
+            let signalled = {
+                self.poll.tick().await;
+                false
+            };
+            if signalled {
+                self.seen = self.current();
+                return "signal";
+            }
+            let mut current = self.current();
+            if current == self.seen {
+                continue;
+            }
+            loop {
+                tokio::time::sleep(TLS_FILE_SETTLE).await;
+                let settled = self.current();
+                if settled == current {
+                    break;
+                }
+                current = settled;
+            }
+            self.seen = current;
+            return "files_changed";
+        }
+    }
 }
 
 pub fn load_server_tls_context(
@@ -183,6 +274,33 @@ fn cipher_suites(policy: &TlsPolicy) -> anyhow::Result<Vec<SupportedCipherSuite>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_trigger_fires_once_replaced_files_settle() {
+        let temp = tempfile::tempdir().unwrap();
+        let cert = temp.path().join("cert.pem");
+        let key = temp.path().join("key.pem");
+        fs::write(&cert, "one").unwrap();
+        fs::write(&key, "one").unwrap();
+        let mut trigger = ReloadTrigger::new(
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+            &TlsPolicy::default(),
+        )
+        .unwrap();
+        let unchanged =
+            tokio::time::timeout(std::time::Duration::from_secs(95), trigger.next()).await;
+        assert!(unchanged.is_err(), "no change must not trigger a reload");
+
+        fs::write(&key, "two, longer").unwrap();
+        fs::write(&cert, "two, longer").unwrap();
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(60), trigger.next())
+            .await
+            .expect("changed files trigger a reload");
+        assert_eq!(reason, "files_changed");
+        let again = tokio::time::timeout(std::time::Duration::from_secs(95), trigger.next()).await;
+        assert!(again.is_err(), "a change is reported once");
+    }
 
     #[test]
     fn rejects_unknown_cipher_suite() {

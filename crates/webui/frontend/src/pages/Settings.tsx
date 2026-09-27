@@ -23,7 +23,7 @@ function describe(value: unknown): string {
   return String(value);
 }
 
-function SettingControl({ setting, value, onChange }: { setting: Setting; value: unknown; onChange: (value: unknown) => void }) {
+export function SettingControl({ setting, value, onChange, labels }: { setting: Setting; value: unknown; onChange: (value: unknown) => void; labels?: Record<string, string> }) {
   const kind = setting.kind;
   const effective = value ?? setting.default;
   switch (kind.type) {
@@ -44,7 +44,7 @@ function SettingControl({ setting, value, onChange }: { setting: Setting; value:
       return (
         <select value={String(effective ?? '')} onChange={(event) => onChange(event.target.value)}>
           {effective === undefined || effective === null ? <option value="">Select…</option> : null}
-          {kind.options.map((option) => <option key={option} value={option}>{option}</option>)}
+          {kind.options.map((option) => <option key={option} value={option}>{labels?.[option] ?? option}</option>)}
         </select>
       );
     case 'multi_choice': {
@@ -111,7 +111,8 @@ export function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const view = resource.data;
 
-  const settings = view && view.managed ? view.settings : [];
+  // Certificate settings have their own page.
+  const settings = view && view.managed ? view.settings.filter((setting) => setting.group !== 'acme') : [];
   const dirtyKeys = Object.keys(drafts);
 
   const visible = useMemo(() => {
@@ -243,7 +244,7 @@ export function SettingsPage() {
                           <div className="settingInfo">
                             <strong>{setting.label}{custom && <span className="badge">custom</span>}{draft && <span className="badge dirty">unsaved</span>}</strong>
                             {setting.help && <p>{setting.help}</p>}
-                            <small><code>{setting.key}</code> · applies to {setting.services.join(', ')} on restart{setting.kind.type !== 'secret' && setting.default !== null && setting.default !== undefined ? ` · default ${describe(setting.default)}` : ''}</small>
+                            <small><code>{setting.key}</code> · {setting.services.length ? `applies to ${setting.services.join(', ')} on restart` : 'applies immediately'}{setting.kind.type !== 'secret' && setting.default !== null && setting.default !== undefined ? ` · default ${describe(setting.default)}` : ''}</small>
                           </div>
                           <div className="settingControl">
                             <SettingControl setting={setting} value={current === null ? undefined : current} onChange={(value) => change(setting, value)} />
