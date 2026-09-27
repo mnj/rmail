@@ -75,6 +75,8 @@ struct Session {
     selected: Option<SelectedMailbox>,
     /// The active `NOTIFY SET`, if any (RFC 5465).
     notify: Option<commands::notify::Notifier>,
+    /// CONTEXT=SEARCH/SORT updating contexts (RFC 5267).
+    contexts: commands::context::UpdateContexts,
     command_times: VecDeque<Instant>,
 }
 
@@ -210,6 +212,7 @@ async fn run_session(
         state: state::SessionState::default(),
         selected: None,
         notify: None,
+        contexts: Default::default(),
         command_times: VecDeque::new(),
     };
     imap_log!("info", "session_started", { "peer": session.peer_label(), "encrypted": session_encrypted, "tls_configured": session.tls_ctx.is_some() });
@@ -328,6 +331,7 @@ async fn run_session(
                 &mut reader,
                 &session.mail_root,
                 &mut session.selected,
+                &mut session.contexts,
                 options,
             )
             .await?;
@@ -365,7 +369,7 @@ async fn run_session(
         }
 
         match session.dispatch(&mut reader, &call).await? {
-            Flow::Continue => {}
+            Flow::Continue => session.report_context_updates(&mut reader).await?,
             Flow::Close => break,
         }
     }
@@ -431,6 +435,24 @@ impl Session {
     fn clear_selection(&mut self) {
         self.selected = None;
         self.state.selected_mailbox = None;
+        self.contexts.clear();
+    }
+
+    /// ADDTO/REMOVEFROM for changes the last command made to the selected
+    /// mailbox view (STORE, implicit \Seen, ...). Changes by others are
+    /// reported with the synchronization that discovers them.
+    async fn report_context_updates(&mut self, reader: &mut ImapReader) -> Result<()> {
+        if self.contexts.is_empty() {
+            return Ok(());
+        }
+        let output = self
+            .contexts
+            .refresh(self.selected.as_ref(), self.state.imap4rev2_enabled())
+            .await?;
+        if !output.is_empty() {
+            write(reader, output.as_bytes()).await?;
+        }
+        Ok(())
     }
 
     /// Read the next command line. With NOTIFY active, changes are reported
@@ -550,6 +572,12 @@ impl Session {
             }
             Command::GetMetadata | Command::SetMetadata => self.metadata(reader, call).await,
             Command::Notify => self.notify(reader, call).await,
+            Command::CancelUpdate => {
+                let response =
+                    commands::context::cancel_update(call.tag, call.args, &mut self.contexts);
+                self.respond(reader, call.tag, &call.name, response.encode())
+                    .await
+            }
             Command::Unselect => self.unselect(reader, call).await,
             Command::Unauthenticate => {
                 // RFC 8437: back to the not-authenticated state as if the
@@ -672,11 +700,14 @@ fn log_unsupported_imap(
 }
 
 /// Send untagged updates (EXISTS, EXPUNGE, FETCH FLAGS) for changes made by
-/// other sessions or deliveries.
+/// other sessions or deliveries, with the ESEARCH ADDTO/REMOVEFROM they
+/// cause in updating contexts (REMOVEFROM ahead of EXPUNGE, ADDTO after
+/// EXISTS, as RFC 5267 §4.3.3-4 require).
 pub(crate) async fn sync_selected_mailbox(
     reader: &mut ImapReader,
     mail_root: &str,
     selected: &mut Option<SelectedMailbox>,
+    contexts: &mut commands::context::UpdateContexts,
     options: mailbox::SyncOptions,
 ) -> Result<()> {
     let Some(current) = selected.as_ref() else {
@@ -684,16 +715,19 @@ pub(crate) async fn sync_selected_mailbox(
     };
     let (refreshed, events) =
         mailbox::refresh_selected_mailbox(mail_root, current, options).await?;
-    if !events.is_empty() {
-        let writer = reader.get_mut();
-        for event in &events {
-            writer
-                .write_all(event.response_line(options).as_bytes())
-                .await?;
-        }
-        writer.flush().await?;
+    let mut output = contexts.before_events(current, &events);
+    for event in &events {
+        output.push_str(&event.response_line(options));
     }
     *selected = Some(refreshed);
+    output.push_str(
+        &contexts
+            .refresh(selected.as_ref(), options.imap4rev2)
+            .await?,
+    );
+    if !output.is_empty() {
+        write(reader, output.as_bytes()).await?;
+    }
     Ok(())
 }
 

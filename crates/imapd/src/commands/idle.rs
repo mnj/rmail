@@ -11,6 +11,8 @@ use crate::{
     sync_selected_mailbox,
 };
 
+use super::context::UpdateContexts;
+
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The session's active NOTIFY (RFC 5465), which reports during IDLE too.
@@ -32,6 +34,7 @@ pub(crate) async fn handle(
     tag: &str,
     mail_root: &str,
     selected: &mut Option<SelectedMailbox>,
+    contexts: &mut UpdateContexts,
     options: SyncOptions,
     max_duration: Duration,
     mut notify: Option<Notify<'_>>,
@@ -41,7 +44,7 @@ pub(crate) async fn handle(
 
     // Synchronize after entering IDLE so changes racing with the continuation
     // cannot be missed before the periodic notification loop starts.
-    report_changes(reader, mail_root, selected, options, &mut notify).await?;
+    report_changes(reader, mail_root, selected, contexts, options, &mut notify).await?;
 
     let mut keepalive_elapsed = Duration::ZERO;
     let mut line = Vec::new();
@@ -71,7 +74,7 @@ pub(crate) async fn handle(
                 return Ok(Outcome::Completed);
             }
             ReadEvent::Tick => {
-                report_changes(reader, mail_root, selected, options, &mut notify).await?;
+                report_changes(reader, mail_root, selected, contexts, options, &mut notify).await?;
                 if Instant::now() >= deadline {
                     // A client still idling after the autologout period is
                     // gone or broken (RFC 2177: re-issue IDLE every 29 min).
@@ -97,6 +100,7 @@ async fn report_changes(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     mail_root: &str,
     selected: &mut Option<SelectedMailbox>,
+    contexts: &mut UpdateContexts,
     options: SyncOptions,
     notify: &mut Option<Notify<'_>>,
 ) -> Result<()> {
@@ -108,13 +112,14 @@ async fn report_changes(
                     reader,
                     notify.account,
                     selected,
+                    contexts,
                     options,
                     notify.format,
                     true,
                 )
                 .await
         }
-        None => sync_selected_mailbox(reader, mail_root, selected, options).await,
+        None => sync_selected_mailbox(reader, mail_root, selected, contexts, options).await,
     }
 }
 

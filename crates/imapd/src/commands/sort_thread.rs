@@ -5,44 +5,130 @@ use crate::{
     sort, thread,
 };
 
+use super::context::{self, Order, UpdateContext, UpdateContexts};
+use super::search;
+
+/// Result of SORT / UID SORT.
+pub(crate) struct SortOutcome {
+    pub(crate) response: Response,
+    /// New SEARCHRES result for `RETURN (SAVE)` (RFC 5182 covers SORT).
+    pub(crate) saved_uids: Option<Vec<u64>>,
+    /// A new CONTEXT=SORT updating context (`RETURN (UPDATE)`).
+    pub(crate) context: Option<UpdateContext>,
+}
+
+impl SortOutcome {
+    fn only(response: Response) -> Self {
+        Self {
+            response,
+            saved_uids: None,
+            context: None,
+        }
+    }
+}
+
+/// SORT, with the ESORT and CONTEXT=SORT return options (RFC 5267).
 pub(crate) async fn sort(
     tag: &str,
     raw_args: &str,
     selected: &SelectedMailbox,
     saved_uids: &[u64],
     uid_mode: bool,
-) -> Response {
+    imap4rev2: bool,
+    contexts: &UpdateContexts,
+) -> SortOutcome {
     let command = if uid_mode { "UID SORT" } else { "SORT" };
     let request = match parser::parse_sort_request(raw_args) {
         Ok(request) => request,
-        Err(parser::SortParseError::UnsupportedCharset(_)) => return bad_charset(tag),
+        Err(parser::SortParseError::UnsupportedCharset(_)) => {
+            return SortOutcome::only(bad_charset(tag));
+        }
         Err(parser::SortParseError::Syntax) => {
-            return bad(tag, format!("Invalid {command} arguments"));
+            return SortOutcome::only(bad(tag, format!("Invalid {command} arguments")));
         }
     };
-    let selected = selected.clone();
-    let saved_uids = saved_uids.to_vec();
-    let records =
-        match tokio::task::spawn_blocking(move || execute_sort(&selected, &request, &saved_uids))
-            .await
-        {
-            Ok(Ok(records)) => records,
-            Ok(Err(error)) => return unavailable(tag, command, error),
-            Err(error) => return unavailable(tag, command, error),
-        };
+    let options = request.return_options.clone();
+    let save = options.as_ref().is_some_and(|options| options.save);
+    let update = options.as_ref().is_some_and(|options| options.update);
+    // RFC 5267 §4.3: a tag names at most one updating context.
+    if update && contexts.has_tag(tag) {
+        return SortOutcome::only(bad(tag, "Tag reuse".to_string()));
+    }
+    let view = selected.clone();
+    let saved = saved_uids.to_vec();
+    let (request, records) = match tokio::task::spawn_blocking(move || {
+        let records = execute_sort(&view, &request, &saved, imap4rev2);
+        (request, records)
+    })
+    .await
+    {
+        Ok((request, Ok(records))) => (request, records),
+        Ok((_, Err(error))) => return failed(tag, command, error, save),
+        Err(error) => return failed(tag, command, error, save),
+    };
     let ids = records
         .iter()
         .map(|record| if uid_mode { record.uid } else { record.seq })
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    Response::new()
-        .data(format!("SORT {ids}"))
-        .status(StatusLine::tagged(
+        .collect::<Vec<_>>();
+    let mut response = Response::new();
+    match &options {
+        Some(options) => {
+            if let Some(data) = search::esearch_data(tag, uid_mode, &ids, options) {
+                response = response.data(data);
+            }
+        }
+        None => {
+            let ids = ids.iter().map(u64::to_string).collect::<Vec<_>>();
+            response = response.data(format!("SORT {}", ids.join(" ")));
+        }
+    }
+    let new_saved = options
+        .as_ref()
+        .filter(|options| options.save)
+        .map(|options| {
+            let matches = records
+                .iter()
+                .map(|record| (record.seq, record.uid))
+                .collect::<Vec<_>>();
+            search::saved_result(&matches, options)
+        });
+    let mut update_context = None;
+    if update {
+        if contexts.is_full() {
+            response = response.status(context::refused(tag));
+        } else {
+            update_context = Some(UpdateContext::new(
+                tag,
+                uid_mode,
+                context::freeze(&request.search, selected, saved_uids),
+                Order::Sort(request.criteria.clone()),
+                selected,
+                records
+                    .into_iter()
+                    .map(|record| (record.uid, Some(record)))
+                    .collect(),
+            ));
+        }
+    }
+    SortOutcome {
+        response: response.status(StatusLine::tagged(
             tag,
             Status::Ok,
             format!("{command} completed"),
-        ))
+        )),
+        saved_uids: new_saved,
+        context: update_context,
+    }
+}
+
+/// A SORT that could not run; RFC 5182 §2.1 empties the saved result when
+/// SAVE was requested.
+fn failed(tag: &str, command: &str, error: impl std::fmt::Display, save: bool) -> SortOutcome {
+    SortOutcome {
+        response: unavailable(tag, command, error),
+        saved_uids: save.then(Vec::new),
+        context: None,
+    }
 }
 
 pub(crate) async fn thread(
@@ -89,6 +175,7 @@ fn execute_sort(
     selected: &SelectedMailbox,
     request: &parser::SortRequest,
     saved_uids: &[u64],
+    imap4rev2: bool,
 ) -> anyhow::Result<Vec<sort::SortRecord>> {
     let mut records = Vec::new();
     let now = chrono::Utc::now().timestamp();
@@ -103,10 +190,15 @@ fn execute_sort(
             .get(uid)
             .map(|date| date.0)
             .unwrap_or(0);
+        // As in SEARCH, \Recent exists only before IMAP4rev2.
+        let mut effective_flags = flags.clone();
+        if !imap4rev2 && selected.recent_uids.contains(uid) {
+            effective_flags.push("\\Recent".to_string());
+        }
         let message = parser::SearchMessage {
             seq: index + 1,
             uid: *uid,
-            flags,
+            flags: &effective_flags,
             internal_date,
             in_saved_result: saved_uids.binary_search(uid).is_ok(),
             now,
@@ -223,9 +315,18 @@ mod tests {
     async fn empty_sort_and_thread_have_complete_typed_responses() {
         let selected = empty_selected();
         assert_eq!(
-            sort("A1", "(DATE) UTF-8 ALL", &selected, &[], false)
-                .await
-                .encode(),
+            sort(
+                "A1",
+                "(DATE) UTF-8 ALL",
+                &selected,
+                &[],
+                false,
+                false,
+                &Default::default()
+            )
+            .await
+            .response
+            .encode(),
             "* SORT \r\nA1 OK SORT completed\r\n"
         );
         assert_eq!(

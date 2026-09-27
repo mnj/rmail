@@ -168,7 +168,10 @@ async fn replace_under_uidonly_needs_uid_and_reports_vanished() {
     session.command("E1 ENABLE UIDONLY", "E1 OK").await;
     session.command("S1 SELECT INBOX", "S1 OK").await;
     let refused = session
-        .command(&format!("A1 REPLACE 2 Drafts {{{}}}", NEW_MESSAGE.len()), "A1 ")
+        .command(
+            &format!("A1 REPLACE 2 Drafts {{{}}}", NEW_MESSAGE.len()),
+            "A1 ",
+        )
         .await;
     assert!(
         refused.last().unwrap().starts_with("A1 BAD [UIDREQUIRED]"),

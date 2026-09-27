@@ -5,6 +5,7 @@ mod append;
 mod auth;
 mod autologout;
 mod compat;
+mod context;
 mod extensions;
 mod fetch;
 mod mailboxes;
