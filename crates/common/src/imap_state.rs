@@ -1976,7 +1976,6 @@ pub struct ReplaceOutcome {
 /// `source_uid` from `source_mailbox` in one index transaction. The old
 /// message is expunged first so that the quota check counts its space as
 /// freed; if publishing fails, the expunge is rolled back.
-#[allow(clippy::too_many_arguments)]
 pub fn replace_message(
     maildir_root: &Path,
     domain: &str,
@@ -3572,6 +3571,76 @@ mod tests {
         );
         let (_, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
         assert!(messages.is_empty());
+    }
+
+    fn staged_message(root: &Path, body: &[u8]) -> StagedAppend {
+        let path = append_staging_path(root, "example.test", "user").unwrap();
+        fs::write(&path, body).unwrap();
+        StagedAppend {
+            path,
+            flags: vec!["\\Seen".to_string()],
+            internal_date: None,
+        }
+    }
+
+    #[test]
+    fn replace_message_expunges_and_publishes_together() {
+        let td = tempfile::tempdir().unwrap();
+        let (root, domain, user) = (td.path(), "example.test", "user");
+        let (_, old_uid) =
+            append_message(root, domain, user, "INBOX", b"Subject: old\r\n\r\n", vec![]).unwrap();
+
+        // A failed publish rolls the expunge back.
+        let failed = staged_message(root, b"Subject: new\r\n\r\n");
+        let failed_path = failed.path.clone();
+        assert!(replace_message(root, domain, user, "INBOX", old_uid, "Missing", failed).is_err());
+        let _ = fs::remove_file(failed_path);
+        let (_, inbox) = load_folder(root, domain, user, "INBOX").unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].uid, old_uid);
+        assert_eq!(fs::read(&inbox[0].path).unwrap(), b"Subject: old\r\n\r\n");
+
+        // The old message's space counts as freed for the quota check.
+        set_storage_quota(root, domain, user, Some(20)).unwrap();
+        let outcome = replace_message(
+            root,
+            domain,
+            user,
+            "INBOX",
+            old_uid,
+            "Drafts",
+            staged_message(root, b"Subject: new\r\n\r\n"),
+        )
+        .unwrap();
+        assert!(outcome.expunged);
+        assert!(
+            load_folder(root, domain, user, "INBOX")
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        let (drafts_folder, drafts) = load_folder(root, domain, user, "Drafts").unwrap();
+        assert_eq!(outcome.uidvalidity, drafts_folder.uidvalidity);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].uid, outcome.uid);
+        assert_eq!(drafts[0].flags, vec!["\\Seen"]);
+        assert_eq!(fs::read(&drafts[0].path).unwrap(), b"Subject: new\r\n\r\n");
+
+        // A message that is already gone is not an error; only the append
+        // happens.
+        set_storage_quota(root, domain, user, None).unwrap();
+        let outcome = replace_message(
+            root,
+            domain,
+            user,
+            "INBOX",
+            old_uid,
+            "INBOX",
+            staged_message(root, b"Subject: newer\r\n\r\n"),
+        )
+        .unwrap();
+        assert!(!outcome.expunged);
+        assert_eq!(load_folder(root, domain, user, "INBOX").unwrap().1.len(), 1);
     }
 
     fn set_entries(

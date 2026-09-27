@@ -16,7 +16,7 @@ screenshots of every page, and a quick start.
 - **SMTP, submission and LMTP**: phase-aware ESMTP with STARTTLS, PIPELINING, 8BITMIME, SMTPUTF8,
   CHUNKING/BINARYMIME, DSN and REQUIRETLS; AUTH PLAIN, SCRAM-SHA-256 and optional OAUTHBEARER/XOAUTH2.
 - **IMAP4rev1 and IMAP4rev2** over Maildir: IDLE, CONDSTORE/QRESYNC, MOVE, SORT/THREAD, PREVIEW,
-  QUOTA, METADATA, NOTIFY, UIDONLY, COMPRESS and SCRAM-SHA-256-PLUS.
+  QUOTA, METADATA, NOTIFY, UIDONLY, REPLACE, COMPRESS and SCRAM-SHA-256-PLUS.
 - **Mail authentication**: inbound SPF, DKIM, DMARC (with aggregate reports) and ARC; outbound DKIM
   and ARC signing; optional ClamAV and rspamd filtering.
 - **Outbound relay queue** with retries, per-destination limits, connection reuse and
@@ -177,6 +177,7 @@ or conformance-validation gaps.
 | RFC 5465 | `NOTIFY` | 85% | `NOTIFY SET [STATUS]` and `NOTIFY NONE` with the `SELECTED`, `SELECTED-DELAYED`, `INBOXES`, `PERSONAL`, `SUBSCRIBED`, `SUBTREE` and `MAILBOXES` filters. Events: `MessageNew` (with fetch attributes for the selected mailbox), `MessageExpunge`, `FlagChange`, `MailboxName`, `SubscriptionChange`, `MailboxMetadataChange` and `ServerMetadataChange`; `AnnotationChange` is refused with `BADEVENT`. Changes are found by polling storage between commands and during IDLE (every second for the selected mailbox, every two seconds for the others), so they arrive with that delay; the session's own changes are reported too. More than 1000 changes in one scan end notifications with `NOTIFICATIONOVERFLOW`. |
 | RFC 9586 | `UIDONLY` | 100% | After `ENABLE UIDONLY`, FETCH, STORE, SEARCH, SORT, THREAD, COPY and MOVE, a sequence-set search key in the UID forms, and the QRESYNC message sequence match data are refused with `BAD [UIDREQUIRED]`. Message data goes out as `UIDFETCH` and expunges as `VANISHED` in command responses, unsolicited updates, IDLE and NOTIFY; SELECT leaves out the sequence-numbered `UNSEEN` code. |
 | RFC 8437 | `UNAUTHENTICATE` | 100% | Returns the session to the not-authenticated state while keeping TLS and compression. |
+| RFC 8508 | `REPLACE` | 95% | `REPLACE` and `UID REPLACE` store the new message and expunge the old one in one index transaction, so a failed append leaves the old message in place. The message takes the same forms as APPEND (flags, date-time, synchronizing and non-synchronizing literals, `literal8`/UTF8, `CATENATE`, `APPENDLIMIT`/`TOOBIG`). Replies follow MOVE: `OK [APPENDUID]`, `EXISTS` when the target is the selected mailbox, then `EXPUNGE` or `VANISHED` (QRESYNC). A missing target gets `TRYCREATE`, a read-only mailbox `READ-ONLY`. The UTF8 data item uses the same framing as APPEND (closing parenthesis on the command line). |
 
 IMAP4rev2 is dual-advertised with IMAP4rev1 for compatibility; clients enable
 rev2 UTF-8 behavior with `ENABLE IMAP4rev2`. OAuth mechanisms can be enabled

@@ -13,6 +13,7 @@ mod notify;
 mod objectid;
 mod partial;
 mod protocol;
+mod replace;
 mod rev2;
 mod scram;
 mod search;
