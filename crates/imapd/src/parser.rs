@@ -867,6 +867,11 @@ pub(crate) enum SearchCriterion {
     SentOn(chrono::NaiveDate),
     Larger(usize),
     Smaller(usize),
+    /// RFC 8474 §6 SEARCH EMAILID.
+    EmailId(String),
+    /// RFC 8474 §6 SEARCH THREADID; rMail assigns no thread IDs, so nothing
+    /// matches.
+    ThreadId,
     Header(String, String),
     Body(String),
     Text(String),
@@ -884,6 +889,7 @@ pub(crate) struct SearchMessage<'a> {
     pub(crate) in_saved_result: bool,
     pub(crate) now: i64,
     pub(crate) size: usize,
+    pub(crate) email_id: &'a str,
     pub(crate) data: &'a [u8],
 }
 
@@ -957,6 +963,14 @@ pub(crate) fn tokenize_search(input: &str) -> Result<Vec<String>, ()> {
         }
     }
     Ok(tokens)
+}
+
+/// RFC 8474 §3: `objectid = 1*255(ALPHA / DIGIT / "_" / "-")`.
+pub(crate) fn valid_object_id(id: &str) -> bool {
+    (1..=255).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn parse_imap_date(token: &str) -> Option<chrono::NaiveDate> {
@@ -1059,6 +1073,16 @@ fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCr
             let size = tokens.get(*pos)?.parse::<usize>().ok()?;
             *pos += 1;
             Some(SearchCriterion::Smaller(size))
+        }
+        "EMAILID" => {
+            let id = tokens.get(*pos)?.clone();
+            *pos += 1;
+            valid_object_id(&id).then_some(SearchCriterion::EmailId(id))
+        }
+        "THREADID" => {
+            let id = tokens.get(*pos)?.clone();
+            *pos += 1;
+            valid_object_id(&id).then_some(SearchCriterion::ThreadId)
         }
         "FROM" | "TO" | "CC" | "BCC" | "SUBJECT" => {
             let value = tokens.get(*pos)?.clone();
@@ -1416,6 +1440,8 @@ pub(crate) fn search_matches(
             .unwrap_or(false),
         SearchCriterion::Larger(size) => msg.size > *size,
         SearchCriterion::Smaller(size) => msg.size < *size,
+        SearchCriterion::EmailId(id) => msg.email_id == id,
+        SearchCriterion::ThreadId => false,
         SearchCriterion::Header(name, value) => crate::mailbox::header_value(msg.data, name)
             .map(|header| normalized_casefold(&header).contains(&normalized_casefold(value)))
             .unwrap_or(false),
@@ -1623,7 +1649,7 @@ pub(crate) fn parse_fetch_request(spec: &str) -> Result<FetchRequest, ParseError
             ),
             "FLAGS" | "INTERNALDATE" | "RFC822" | "RFC822.HEADER" | "RFC822.SIZE"
             | "RFC822.TEXT" | "ENVELOPE" | "BODY" | "BODYSTRUCTURE" | "UID" | "MODSEQ"
-            | "SAVEDATE" | "PREVIEW" | "PREVIEW (LAZY)" => out.push(item),
+            | "SAVEDATE" | "PREVIEW" | "PREVIEW (LAZY)" | "EMAILID" | "THREADID" => out.push(item),
             _ if validate_snippet_fetch_item(&item) => out.push(item),
             _ if validate_body_fetch_item(&item) => out.push(item),
             _ => return Err(ParseError::InvalidAtom),
@@ -1982,6 +2008,8 @@ pub(crate) enum StatusItem {
     Size,
     /// RFC 9051 STATUS DELETED: messages with the \Deleted flag.
     Deleted,
+    /// RFC 8474 §4.2 STATUS MAILBOXID.
+    MailboxId,
 }
 
 impl StatusItem {
@@ -1998,6 +2026,7 @@ impl StatusItem {
             "HIGHESTMODSEQ" => Ok(Self::HighestModSeq),
             "SIZE" => Ok(Self::Size),
             "DELETED" => Ok(Self::Deleted),
+            "MAILBOXID" => Ok(Self::MailboxId),
             _ => Err(ParseError::InvalidAtom),
         }
     }
@@ -2218,6 +2247,7 @@ mod tests {
             in_saved_result: false,
             now: 0,
             size: data.len(),
+            email_id: "",
             data,
         };
 

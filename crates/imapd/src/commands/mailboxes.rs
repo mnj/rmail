@@ -74,6 +74,7 @@ pub(crate) fn handle(
     mail_root: &Path,
     address: &str,
     utf8_accept: bool,
+    imap4rev2: bool,
 ) -> Outcome {
     let command = operation.command();
     let mut special_uses = Vec::new();
@@ -148,7 +149,18 @@ pub(crate) fn handle(
 
     match result {
         Ok(()) => Outcome {
-            response: completed(tag, command),
+            response: match operation {
+                Operation::Create => created(tag, mail_root, &domain, &local, &names[0]),
+                Operation::Rename if imap4rev2 => renamed(
+                    tag,
+                    mail_root,
+                    &domain,
+                    &local,
+                    (&names[0], &names[1]),
+                    utf8_accept,
+                ),
+                _ => completed(tag, command),
+            },
             selection_effect: match operation {
                 Operation::Delete => SelectionEffect::Deleted(names[0].clone()),
                 Operation::Rename => SelectionEffect::Renamed {
@@ -176,6 +188,72 @@ fn completed(tag: &str, command: &str) -> Response {
         Status::Ok,
         format!("{command} completed"),
     ))
+}
+
+/// RFC 8474 §4.1: a successful CREATE reports the new MAILBOXID.
+fn created(tag: &str, mail_root: &Path, domain: &str, local: &str, name: &str) -> Response {
+    let line = StatusLine::tagged(tag, Status::Ok, "CREATE completed");
+    let mailbox_id = rmail_common::maildir::normalize_mailbox_name(name)
+        .ok()
+        .and_then(|name| {
+            rmail_common::imap_state::list_folders(mail_root, domain, local)
+                .ok()?
+                .into_iter()
+                .find(|folder| folder.name == name)
+        })
+        .map(|folder| folder.mailbox_id);
+    Response::new().status(match mailbox_id {
+        Some(id) => line.with_code(format!("MAILBOXID ({id})")),
+        None => line,
+    })
+}
+
+/// RFC 9051 §7.3.1: after RENAME, an IMAP4rev2 session gets a LIST response
+/// with the `OLDNAME` extended data item for the renamed mailbox and each
+/// renamed inferior, so it can move cached state without a full LIST.
+fn renamed(
+    tag: &str,
+    mail_root: &Path,
+    domain: &str,
+    local: &str,
+    (source, destination): (&str, &str),
+    utf8_accept: bool,
+) -> Response {
+    let mut response = Response::new();
+    let normalized = rmail_common::maildir::normalize_mailbox_name(source).and_then(|source| {
+        Ok((
+            source,
+            rmail_common::maildir::normalize_mailbox_name(destination)?,
+        ))
+    });
+    let folders = rmail_common::imap_state::list_folders(mail_root, domain, local);
+    if let (Ok((source, destination)), Ok(folders)) = (normalized, folders) {
+        let prefix = format!("{destination}/");
+        for folder in &folders {
+            let old_name = if folder.name == destination {
+                source.clone()
+            } else if let Some(suffix) = folder.name.strip_prefix(&prefix) {
+                format!("{source}/{suffix}")
+            } else {
+                continue;
+            };
+            let child_prefix = format!("{}/", folder.name);
+            let children = if folders
+                .iter()
+                .any(|candidate| candidate.name.starts_with(&child_prefix))
+            {
+                "\\HasChildren"
+            } else {
+                "\\HasNoChildren"
+            };
+            response = response.data(format!(
+                "LIST ({children}) \"/\" {} (\"OLDNAME\" ({}))",
+                mailbox::quote_wire_mailbox_name(&folder.name, utf8_accept),
+                mailbox::quote_wire_mailbox_name(&old_name, utf8_accept)
+            ));
+        }
+    }
+    response.status(StatusLine::tagged(tag, Status::Ok, "RENAME completed"))
 }
 
 fn bad(tag: &str, text: impl Into<String>) -> Response {
@@ -210,8 +288,19 @@ mod tests {
             temp.path(),
             address,
             false,
+            false,
         );
-        assert_eq!(create.response.encode(), "A1 OK CREATE completed\r\n");
+        let mailbox_id =
+            rmail_common::imap_state::list_folders(temp.path(), "example.test", "user")
+                .unwrap()
+                .into_iter()
+                .find(|folder| folder.name == "Projects")
+                .unwrap()
+                .mailbox_id;
+        assert_eq!(
+            create.response.encode(),
+            format!("A1 OK [MAILBOXID ({mailbox_id})] CREATE completed\r\n")
+        );
         assert_eq!(create.selection_effect, SelectionEffect::None);
 
         let duplicate = handle(
@@ -220,6 +309,7 @@ mod tests {
             "Projects",
             temp.path(),
             address,
+            false,
             false,
         )
         .response
@@ -232,6 +322,7 @@ mod tests {
             "Projects Renamed",
             temp.path(),
             address,
+            false,
             false,
         );
         assert_eq!(
@@ -250,6 +341,7 @@ mod tests {
             temp.path(),
             address,
             false,
+            false,
         );
         assert_eq!(
             delete.selection_effect,
@@ -267,6 +359,7 @@ mod tests {
             "OnlyOneName",
             temp.path(),
             "user@example.test",
+            false,
             false,
         );
         assert_eq!(

@@ -115,6 +115,7 @@ fn execute_sort(
                 .get(uid)
                 .copied()
                 .unwrap_or(data.len() as u64) as usize,
+            email_id: selected.email_ids.get(uid).map_or("", String::as_str),
             data: &data,
         };
         if parser::search_matches(&request.search, &message, selected.msgs.len()) {
@@ -161,6 +162,7 @@ fn execute_thread(
                 .get(uid)
                 .copied()
                 .unwrap_or(data.len() as u64) as usize,
+            email_id: selected.email_ids.get(uid).map_or("", String::as_str),
             data: &data,
         };
         if parser::search_matches(&request.search, &search_message, selected.msgs.len()) {
@@ -205,11 +207,13 @@ mod tests {
             uidvalidity: 1,
             uidnext: 1,
             highest_modseq: 1,
+            mailbox_id: "Ftest".to_string(),
             read_only: false,
             msgs: Vec::new(),
             internal_dates: Default::default(),
             save_dates: Default::default(),
             sizes: Default::default(),
+            email_ids: Default::default(),
             recent_uids: Default::default(),
             expunged: Default::default(),
         }

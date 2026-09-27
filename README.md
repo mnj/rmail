@@ -140,7 +140,7 @@ or conformance-validation gaps.
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
 | RFC 3501 | IMAP4rev1 core | 95% | Includes sequence-number stability: EXPUNGE is never sent during FETCH, STORE or SEARCH, and messages expunged by other sessions keep their slot (`EXPUNGEISSUED`) until the next allowed point; an inactivity autologout (3 minutes before login, 30 minutes after, including IDLE) is enforced. No formal protocol test-suite certification or exhaustive live-client matrix yet. |
-| RFC 9051 | IMAP4rev2 core | 90% | Dual-advertised; after `ENABLE IMAP4rev2` the session uses UTF-8, omits `RECENT`/`\Recent`, answers SEARCH with ESEARCH, and includes the mailbox LIST line in SELECT. `STATUS DELETED` is supported. LIST `OLDNAME` is not implemented; no external rev2 conformance certification yet. |
+| RFC 9051 | IMAP4rev2 core | 90% | Dual-advertised; after `ENABLE IMAP4rev2` the session uses UTF-8, omits `RECENT`/`\Recent`, answers SEARCH with ESEARCH, and includes the mailbox LIST line in SELECT. `STATUS DELETED` is supported, and RENAME returns LIST responses with `OLDNAME` for the renamed mailbox and its children. No external rev2 conformance certification yet. |
 | RFC 2595 | IMAP `STARTTLS` and `LOGINDISABLED` | 95% | A real TLS upgrade and resumed IMAP session are integration-tested, but not yet against an external conformance harness. |
 | RFC 2177 | `IDLE` | 100% | Implemented with mailbox synchronization, keepalives, fragmented `DONE`, and bounded input. |
 | RFC 2342 | `NAMESPACE` | 100% | Complete for rMail's single personal Maildir namespace. |
@@ -171,6 +171,7 @@ or conformance-validation gaps.
 | RFC 5929 / RFC 9266 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Supports `tls-server-end-point`, and `tls-exporter` on TLS 1.3. |
 | RFC 4013 | SASLprep | 100% | Usernames and SCRAM passwords are prepared with full SASLprep (mapping, NFKC, prohibited characters, bidi checks). |
 | RFC 7889 | `APPENDLIMIT` | 100% | The server-wide APPEND size limit is advertised. |
+| RFC 8474 | `OBJECTID` | 90% | Permanent `MAILBOXID` (kept across RENAME) and `EMAILID` (kept across COPY and MOVE) come from random IDs stored in the index, never reused. They are reported by CREATE, SELECT/EXAMINE, STATUS, LIST-STATUS and FETCH, and `SEARCH EMAILID` works. `THREADID` is always `NIL`, as the RFC allows when a server has no permanent thread IDs. |
 | RFC 8437 | `UNAUTHENTICATE` | 100% | Returns the session to the not-authenticated state while keeping TLS and compression. |
 
 IMAP4rev2 is dual-advertised with IMAP4rev1 for compatibility; clients enable

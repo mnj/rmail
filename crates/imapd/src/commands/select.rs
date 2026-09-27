@@ -153,6 +153,10 @@ pub(crate) async fn handle(
                 .with_code(format!("UIDNEXT {}", selected.uidnext)),
         )
         .status(
+            StatusLine::untagged(Status::Ok, "Mailbox ID")
+                .with_code(format!("MAILBOXID ({})", selected.mailbox_id)),
+        )
+        .status(
             StatusLine::untagged(Status::Ok, "First unseen")
                 .with_code(format!("UNSEEN {}", mailbox::first_unseen(&selected))),
         );

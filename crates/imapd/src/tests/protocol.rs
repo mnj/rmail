@@ -98,6 +98,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "UNSELECT",
             "UNAUTHENTICATE",
             "CREATE-SPECIAL-USE",
+            "OBJECTID",
             "APPENDLIMIT=104857600",
         ])
     );
