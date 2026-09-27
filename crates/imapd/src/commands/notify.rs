@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 
+use super::context::UpdateContexts;
 use crate::mailbox::{self, MailboxSyncEvent, SelectedMailbox, SyncOptions};
 use crate::parser;
 use crate::response::{Response, Status, StatusLine};
@@ -807,6 +808,7 @@ impl Notifier {
         reader: &mut ImapReader,
         account: Account<'_>,
         selected: &mut Option<SelectedMailbox>,
+        contexts: &mut UpdateContexts,
         options: SyncOptions,
         format: Format,
         in_idle: bool,
@@ -814,8 +816,15 @@ impl Notifier {
         if self.overflowed {
             return Ok(());
         }
-        self.poll_selected(reader, account.mail_root, selected, options, in_idle)
-            .await?;
+        self.poll_selected(
+            reader,
+            account.mail_root,
+            selected,
+            contexts,
+            options,
+            in_idle,
+        )
+        .await?;
         if self.last_scan.elapsed() < ACCOUNT_SCAN_INTERVAL {
             return Ok(());
         }
@@ -861,6 +870,7 @@ impl Notifier {
         reader: &mut ImapReader,
         mail_root: &str,
         selected: &mut Option<SelectedMailbox>,
+        contexts: &mut UpdateContexts,
         options: SyncOptions,
         in_idle: bool,
     ) -> Result<()> {
@@ -875,7 +885,8 @@ impl Notifier {
             // Without message events for the selected mailbox, updates wait
             // for a command; IDLE still reports them as always.
             if in_idle {
-                crate::sync_selected_mailbox(reader, mail_root, selected, options).await?;
+                crate::sync_selected_mailbox(reader, mail_root, selected, contexts, options)
+                    .await?;
             }
             return Ok(());
         };
@@ -892,7 +903,8 @@ impl Notifier {
             .collect::<HashSet<_>>();
         let (refreshed, events) =
             mailbox::refresh_selected_mailbox(mail_root, current, options).await?;
-        let mut output = String::new();
+        // RFC 5267: REMOVEFROM ahead of EXPUNGE, ADDTO after EXISTS.
+        let mut output = contexts.before_events(current, &events);
         for event in &events {
             if matches!(event, MailboxSyncEvent::FetchFlags { .. }) && !group.events.flag_change {
                 continue;
@@ -905,6 +917,10 @@ impl Notifier {
         if let Some(fetch) = &group.events.fetch {
             write_new_messages(reader, &refreshed, &known, fetch, options).await?;
         }
+        let updates = contexts
+            .refresh(Some(&refreshed), options.imap4rev2)
+            .await?;
+        reader.get_mut().write_all(updates.as_bytes()).await?;
         reader.get_mut().flush().await?;
         *selected = Some(refreshed);
         Ok(())

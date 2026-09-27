@@ -170,7 +170,15 @@ impl Session {
             address,
         };
         notifier
-            .poll(reader, account, &mut self.selected, options, format, false)
+            .poll(
+                reader,
+                account,
+                &mut self.selected,
+                &mut self.contexts,
+                options,
+                format,
+                false,
+            )
             .await?;
         if !notifier.is_active() {
             self.notify = None;
@@ -340,6 +348,8 @@ impl Session {
         if outcome.condstore_activated {
             self.state.activate_condstore();
         }
+        // Updating contexts belong to the previous selection.
+        self.contexts.clear();
         self.selected = outcome.selected;
         self.state.selected_mailbox = self
             .selected

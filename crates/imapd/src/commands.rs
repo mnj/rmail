@@ -198,7 +198,7 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
             requires_sync: true,
             ..SELECTED
         }),
-        Command::Unselect => Some(SELECTED),
+        Command::Unselect | Command::CancelUpdate => Some(SELECTED),
         Command::Uid { command } => match command {
             UidCommand::Fetch
             | UidCommand::Search
@@ -275,6 +275,8 @@ mod tests {
             "GETMETADATA \"\" /shared/comment",
             "SETMETADATA INBOX (/private/comment NIL)",
             "NOTIFY NONE",
+            "CANCELUPDATE \"A1\"",
+            "SORT RETURN (MIN COUNT) (DATE) UTF-8 ALL",
             "SELECT INBOX",
             "EXAMINE INBOX",
         ];
@@ -426,6 +428,7 @@ use crate::response::{Status, StatusLine};
 pub(crate) mod append;
 pub(crate) mod authenticate;
 pub(crate) mod basic;
+pub(crate) mod context;
 pub(crate) mod enable;
 pub(crate) mod expunge;
 pub(crate) mod fetch;

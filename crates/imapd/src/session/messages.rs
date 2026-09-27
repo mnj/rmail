@@ -45,6 +45,8 @@ impl Session {
                     self.state.vanished_enabled(),
                 )
                 .await;
+                self.report_context_removals(reader, &outcome.selection_effect)
+                    .await?;
                 self.apply_selection_effect(outcome.selection_effect)
                     .await?;
                 self.respond(reader, tag, "UID EXPUNGE", outcome.response.encode())
@@ -137,10 +139,14 @@ impl Session {
             uid,
             self.state.utf8_enabled(),
             self.state.imap4rev2_enabled(),
+            &self.contexts,
         )
         .await;
         if let Some(saved) = outcome.saved_uids {
             self.state.save_search_uids(saved);
+        }
+        if let Some(context) = outcome.context {
+            self.contexts.insert(context);
         }
         let name = if uid { "UID SEARCH" } else { "SEARCH" };
         self.respond(reader, tag, name, outcome.response.encode())
@@ -148,23 +154,31 @@ impl Session {
     }
 
     pub(super) async fn sort(
-        &self,
+        &mut self,
         reader: &mut ImapReader,
         tag: &str,
         args: &str,
         uid: bool,
     ) -> Result<Flow> {
-        let response = commands::sort_thread::sort(
+        let outcome = commands::sort_thread::sort(
             tag,
             args,
             self.selected(),
             self.state.saved_search_uids(),
             uid,
+            self.state.imap4rev2_enabled(),
+            &self.contexts,
         )
-        .await
-        .encode();
+        .await;
+        if let Some(saved) = outcome.saved_uids {
+            self.state.save_search_uids(saved);
+        }
+        if let Some(context) = outcome.context {
+            self.contexts.insert(context);
+        }
         let name = if uid { "UID SORT" } else { "SORT" };
-        self.respond(reader, tag, name, response).await
+        self.respond(reader, tag, name, outcome.response.encode())
+            .await
     }
 
     pub(super) async fn thread(
@@ -210,6 +224,8 @@ impl Session {
             self.state.vanished_enabled(),
         )
         .await;
+        self.report_removed_from_contexts(reader, &outcome.removed_uids)
+            .await?;
         if let Some(selected) = self.selected.as_mut() {
             selected.remove_reported(&outcome.removed_uids);
         }
@@ -267,12 +283,20 @@ impl Session {
             // old message's sequence number must stay valid until its own
             // EXPUNGE below.
             let options = self.sync_options(false);
-            super::sync_selected_mailbox(reader, &self.mail_root, &mut self.selected, options)
-                .await?;
+            super::sync_selected_mailbox(
+                reader,
+                &self.mail_root,
+                &mut self.selected,
+                &mut self.contexts,
+                options,
+            )
+            .await?;
         }
         let vanished = self.state.vanished_enabled();
         let mut response = String::new();
         if let (Some(old_uid), Some(selected)) = (replaced.expunged_uid, self.selected.as_mut()) {
+            // RFC 5267 §4.3.3: REMOVEFROM goes out ahead of the EXPUNGE.
+            response.push_str(&self.contexts.before_expunge(selected, &[old_uid]));
             if vanished {
                 response.push_str(&format!("* VANISHED {old_uid}\r\n"));
             } else if let Some(index) = selected
@@ -305,6 +329,8 @@ impl Session {
             )
             .await
         };
+        self.report_context_removals(reader, &outcome.selection_effect)
+            .await?;
         self.apply_selection_effect(outcome.selection_effect)
             .await?;
         self.respond(reader, call.tag, &call.name, outcome.response.encode())
@@ -337,6 +363,7 @@ impl Session {
             call.tag,
             &self.mail_root,
             &mut self.selected,
+            &mut self.contexts,
             options,
             self.auth_policy.timeouts().idle,
             notify,
@@ -354,6 +381,34 @@ impl Session {
         } else {
             Flow::Continue
         })
+    }
+
+    /// REMOVEFROM for messages this command expunges, sent before the
+    /// command's EXPUNGE/VANISHED responses (RFC 5267 §4.3.4).
+    async fn report_context_removals(
+        &mut self,
+        reader: &mut ImapReader,
+        effect: &SelectionEffect,
+    ) -> Result<()> {
+        if let SelectionEffect::Remove(uids) = effect {
+            self.report_removed_from_contexts(reader, uids).await?;
+        }
+        Ok(())
+    }
+
+    async fn report_removed_from_contexts(
+        &mut self,
+        reader: &mut ImapReader,
+        uids: &[u64],
+    ) -> Result<()> {
+        let Some(selected) = self.selected.as_ref() else {
+            return Ok(());
+        };
+        let output = self.contexts.before_expunge(selected, uids);
+        if output.is_empty() {
+            return Ok(());
+        }
+        self.send(reader, output).await.map(|_| ())
     }
 
     async fn apply_selection_effect(&mut self, effect: SelectionEffect) -> Result<()> {

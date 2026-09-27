@@ -388,6 +388,7 @@ pub(crate) enum Command {
     GetMetadata,
     SetMetadata,
     Notify,
+    CancelUpdate,
     Unselect,
     Unauthenticate,
     Append,
@@ -441,6 +442,7 @@ impl<'a> RequestLine<'a> {
             Command::GetMetadata => "GETMETADATA",
             Command::SetMetadata => "SETMETADATA",
             Command::Notify => "NOTIFY",
+            Command::CancelUpdate => "CANCELUPDATE",
             Command::Unselect => "UNSELECT",
             Command::Unauthenticate => "UNAUTHENTICATE",
             Command::Append => "APPEND",
@@ -557,6 +559,7 @@ pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseEr
         "GETMETADATA" => Command::GetMetadata,
         "SETMETADATA" => Command::SetMetadata,
         "NOTIFY" => Command::Notify,
+        "CANCELUPDATE" => Command::CancelUpdate,
         "UNSELECT" => Command::Unselect,
         "UNAUTHENTICATE" => Command::Unauthenticate,
         "APPEND" => Command::Append,
@@ -1253,14 +1256,19 @@ pub(crate) struct SearchReturnOptions {
     pub(crate) count: bool,
     pub(crate) save: bool,
     pub(crate) partial: Option<PartialRange>,
+    /// RFC 5267 §4.3 UPDATE: keep the result current with ADDTO/REMOVEFROM.
+    pub(crate) update: bool,
+    /// RFC 5267 §4.2 CONTEXT: a hint only.
+    pub(crate) context: bool,
 }
 
 impl SearchReturnOptions {
     /// Parses an optional `RETURN (...)` clause starting at `tokens[*pos]`
     /// (tokens from [`tokenize_search`]), advancing `pos` past it. Shared by
     /// SEARCH and SORT (RFC 5267 ESORT), which take the same options.
-    /// `RETURN ()` means `RETURN (ALL)`; ALL and PARTIAL are exclusive
-    /// (RFC 9394 §3.1).
+    /// `RETURN ()` means `RETURN (ALL)`, as do CONTEXT and UPDATE alone, so an
+    /// updating context starts from the full result; ALL and PARTIAL are
+    /// exclusive (RFC 9394 §3.1).
     pub(crate) fn parse_clause(tokens: &[String], pos: &mut usize) -> Result<Option<Self>, ()> {
         if !tokens
             .get(*pos)
@@ -1281,6 +1289,8 @@ impl SearchReturnOptions {
                 "ALL" => options.all = true,
                 "COUNT" => options.count = true,
                 "SAVE" => options.save = true,
+                "UPDATE" => options.update = true,
+                "CONTEXT" => options.context = true,
                 "PARTIAL" if options.partial.is_none() => {
                     index += 1;
                     let range = tokens.get(index).ok_or(())?;
@@ -1364,6 +1374,8 @@ pub(crate) struct SortCriterion {
 
 #[derive(Debug)]
 pub(crate) struct SortRequest {
+    /// RFC 5267 ESORT `RETURN (...)`; `None` for a plain SORT.
+    pub(crate) return_options: Option<SearchReturnOptions>,
     pub(crate) criteria: Vec<SortCriterion>,
     pub(crate) charset: String,
     pub(crate) search: SearchCriterion,
@@ -1387,10 +1399,12 @@ fn parse_sort_request_inner(input: &str) -> Option<SortRequest> {
     use std::collections::HashSet;
 
     let tokens = tokenize_search(input).ok()?;
-    if tokens.first().map(String::as_str) != Some("(") {
+    let mut pos = 0;
+    let return_options = SearchReturnOptions::parse_clause(&tokens, &mut pos).ok()?;
+    if tokens.get(pos).map(String::as_str) != Some("(") {
         return None;
     }
-    let mut pos = 1;
+    pos += 1;
     let mut reverse = false;
     let mut criteria = Vec::new();
     let mut seen = HashSet::new();
@@ -1423,6 +1437,7 @@ fn parse_sort_request_inner(input: &str) -> Option<SortRequest> {
     let charset = tokens.get(pos)?.to_ascii_uppercase();
     pos += 1;
     Some(SortRequest {
+        return_options,
         criteria,
         charset,
         search: parse_search_tokens(&tokens[pos..])?,
@@ -2824,8 +2839,7 @@ mod tests {
                 max: true,
                 all: true,
                 count: true,
-                save: false,
-                partial: None,
+                ..Default::default()
             })
         );
         assert!(matches!(request.criterion, SearchCriterion::Unseen));
@@ -2877,6 +2891,7 @@ mod tests {
         assert!(parse_thread_request("REFERENCES UTF-8 SUBJECT \"unterminated").is_err());
         assert_eq!(request.charset, "UTF-8");
         assert!(matches!(request.search, SearchCriterion::Unseen));
+        assert_eq!(request.return_options, None);
         assert!(parse_sort_request("() UTF-8 ALL").is_err());
         assert!(parse_sort_request("(DATE REVERSE) UTF-8 ALL").is_err());
         assert!(parse_sort_request("(UNKNOWN) UTF-8 ALL").is_err());
@@ -2884,6 +2899,43 @@ mod tests {
             parse_sort_request("(DATE) ISO-8859-1 ALL").unwrap_err(),
             SortParseError::UnsupportedCharset("ISO-8859-1".to_string())
         );
+    }
+
+    #[test]
+    fn parses_esort_and_context_return_options() {
+        let request = parse_sort_request("RETURN (MIN UPDATE) (DATE) UTF-8 ALL").unwrap();
+        assert_eq!(
+            request.return_options,
+            Some(SearchReturnOptions {
+                min: true,
+                update: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(request.criteria.len(), 1);
+        // UPDATE and CONTEXT alone still return ALL.
+        let hint = parse_search_request("RETURN (UPDATE CONTEXT) ALL")
+            .unwrap()
+            .return_options
+            .unwrap();
+        assert!(hint.all && hint.update && hint.context);
+        let partial = parse_search_request("RETURN (PARTIAL 500:400) ALL")
+            .unwrap()
+            .return_options
+            .unwrap();
+        assert_eq!(partial.partial, PartialRange::parse("500:400"));
+        assert!(!partial.all);
+        for invalid in [
+            "RETURN (ALL PARTIAL 1:5) ALL",
+            "RETURN (PARTIAL 1:5 PARTIAL 6:9) ALL",
+            "RETURN (PARTIAL 0:5) ALL",
+            "RETURN (PARTIAL 5) ALL",
+            "RETURN (PARTIAL 1:*) ALL",
+        ] {
+            assert!(parse_search_request(invalid).is_err(), "accepted {invalid}");
+        }
+        assert!(parse_sort_request("RETURN (MIN) UTF-8 ALL").is_err());
+        assert!(parse_sort_request("RETURN MIN (DATE) UTF-8 ALL").is_err());
     }
 
     #[test]

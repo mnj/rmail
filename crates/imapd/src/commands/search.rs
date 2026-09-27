@@ -4,9 +4,13 @@ use crate::{
     response::{Response, Status, StatusLine},
 };
 
+use super::context::{self, Order, UpdateContext, UpdateContexts};
+
 pub(crate) struct Outcome {
     pub(crate) response: Response,
     pub(crate) saved_uids: Option<Vec<u64>>,
+    /// A new CONTEXT=SEARCH updating context (RETURN (UPDATE)).
+    pub(crate) context: Option<UpdateContext>,
 }
 
 pub(crate) async fn handle(
@@ -17,6 +21,7 @@ pub(crate) async fn handle(
     uid_mode: bool,
     utf8_accept: bool,
     imap4rev2: bool,
+    contexts: &UpdateContexts,
 ) -> Outcome {
     let request = match parser::parse_search_request(raw_args) {
         Ok(request) => request,
@@ -44,7 +49,16 @@ pub(crate) async fn handle(
             "Cannot set SEARCH charset when UTF8=ACCEPT is enabled",
         ));
     }
+    let update = request
+        .return_options
+        .as_ref()
+        .is_some_and(|options| options.update);
+    // RFC 5267 §4.3: a tag names at most one updating context.
+    if update && contexts.has_tag(tag) {
+        return response(StatusLine::tagged(tag, Status::Bad, "Tag reuse"));
+    }
 
+    let view = selected;
     let selected = selected.clone();
     let criterion = request.criterion.clone();
     let saved = previous_saved_uids.to_vec();
@@ -86,6 +100,21 @@ pub(crate) async fn handle(
     ) {
         result = result.data(data);
     }
+    let mut update_context = None;
+    if update {
+        if contexts.is_full() {
+            result = result.status(context::refused(tag));
+        } else {
+            update_context = Some(UpdateContext::new(
+                tag,
+                uid_mode,
+                context::freeze(&request.criterion, view, previous_saved_uids),
+                Order::Mailbox,
+                view,
+                matches.iter().map(|(_, uid)| (*uid, None)).collect(),
+            ));
+        }
+    }
     result = result.status(StatusLine::tagged(
         tag,
         Status::Ok,
@@ -94,6 +123,7 @@ pub(crate) async fn handle(
     Outcome {
         response: result,
         saved_uids: save,
+        context: update_context,
     }
 }
 
@@ -142,10 +172,14 @@ fn execute(
     Ok(matches)
 }
 
-/// The UIDs SEARCH RETURN (SAVE ...) stores as `$`: everything found, unless
-/// only MIN, MAX and/or PARTIAL were requested, in which case just the
-/// messages those report (RFC 5182 §2.4, RFC 9394 §3.2 Table 1).
-fn saved_result(matches: &[(u64, u64)], options: &parser::SearchReturnOptions) -> Vec<u64> {
+/// The UIDs SEARCH or SORT RETURN (SAVE ...) stores as `$`: everything found,
+/// unless only MIN, MAX and/or PARTIAL were requested, in which case just the
+/// messages those report (RFC 5182 §2.4, RFC 9394 §3.2 Table 1). `matches`
+/// are `(sequence, uid)` pairs in result order.
+pub(crate) fn saved_result(
+    matches: &[(u64, u64)],
+    options: &parser::SearchReturnOptions,
+) -> Vec<u64> {
     let everything =
         options.all || options.count || (!options.min && !options.max && options.partial.is_none());
     if everything {
@@ -172,6 +206,7 @@ fn response(line: StatusLine) -> Outcome {
     Outcome {
         response: Response::new().status(line),
         saved_uids: None,
+        context: None,
     }
 }
 
@@ -198,6 +233,19 @@ fn result_data(
             ));
         }
     };
+    esearch_data(tag, uid_mode, ids, options)
+}
+
+/// ESEARCH data for `ids` in result order: mailbox order for SEARCH, sort
+/// order for ESORT (RFC 5267 §3.1: MIN and MAX are the first and last sorted
+/// results). PARTIAL selects by position in `ids`. `None` when only SAVE was
+/// requested.
+pub(crate) fn esearch_data(
+    tag: &str,
+    uid_mode: bool,
+    ids: &[u64],
+    options: &parser::SearchReturnOptions,
+) -> Option<String> {
     if options.save
         && !options.min
         && !options.max
@@ -207,30 +255,18 @@ fn result_data(
     {
         return None;
     }
-    Some(esearch_data(tag, uid_mode, ids, options))
-}
-
-/// An ESEARCH response line for `ids`, which are in result order (mailbox
-/// order for SEARCH; sort order for SORT RETURN). MIN and MAX are the lowest
-/// and highest ids, and PARTIAL selects by position in `ids`.
-pub(crate) fn esearch_data(
-    tag: &str,
-    uid_mode: bool,
-    ids: &[u64],
-    options: &parser::SearchReturnOptions,
-) -> String {
     let escaped_tag = tag.replace('\\', "\\\\").replace('"', "\\\"");
     let mut data = format!("ESEARCH (TAG \"{escaped_tag}\")");
     if uid_mode {
         data.push_str(" UID");
     }
     if options.min
-        && let Some(minimum) = ids.iter().min()
+        && let Some(minimum) = ids.first()
     {
         data.push_str(&format!(" MIN {minimum}"));
     }
     if options.max
-        && let Some(maximum) = ids.iter().max()
+        && let Some(maximum) = ids.last()
     {
         data.push_str(&format!(" MAX {maximum}"));
     }
@@ -251,9 +287,11 @@ pub(crate) fn esearch_data(
     if options.count {
         data.push_str(&format!(" COUNT {}", ids.len()));
     }
-    data
+    Some(data)
 }
 
+/// A sequence-set for `ids` that keeps their order: only ascending runs
+/// become ranges (RFC 5267 §3.2), so sorted results expand in sort order.
 pub(crate) fn compress_ids(ids: &[u64]) -> String {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -283,8 +321,7 @@ mod tests {
             max: true,
             all: true,
             count: true,
-            save: false,
-            partial: None,
+            ..Default::default()
         };
         assert_eq!(
             result_data("A1", true, &[2, 3, 4, 8], Some(&options), false),
@@ -351,6 +388,37 @@ mod tests {
         assert_eq!(saved("SAVE MIN"), vec![10]);
     }
 
+    #[test]
+    fn esearch_partial_windows_and_sorted_order() {
+        let partial = parser::SearchReturnOptions {
+            partial: parser::PartialRange::parse("2:4"),
+            ..Default::default()
+        };
+        assert_eq!(
+            esearch_data("P1", true, &[9, 3, 4, 5, 1], &partial),
+            Some("ESEARCH (TAG \"P1\") UID PARTIAL (2:4 3:5)".to_string())
+        );
+        let beyond = parser::SearchReturnOptions {
+            partial: parser::PartialRange::parse("10:20"),
+            ..Default::default()
+        };
+        assert_eq!(
+            esearch_data("P2", false, &[1, 2], &beyond),
+            Some("ESEARCH (TAG \"P2\") PARTIAL (10:20 NIL)".to_string())
+        );
+        // Sorted results keep their order; descending runs are not ranges.
+        let all = parser::SearchReturnOptions {
+            min: true,
+            max: true,
+            all: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            esearch_data("S1", false, &[7, 6, 5, 1, 2, 3], &all),
+            Some("ESEARCH (TAG \"S1\") MIN 7 MAX 3 ALL 7,6,5,1:3".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn charset_errors_are_typed_and_do_not_replace_saved_results() {
         let selected = SelectedMailbox {
@@ -378,6 +446,7 @@ mod tests {
             false,
             false,
             false,
+            &Default::default(),
         )
         .await;
         assert_eq!(outcome.saved_uids, None);
