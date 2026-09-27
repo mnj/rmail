@@ -99,6 +99,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "UNAUTHENTICATE",
             "CREATE-SPECIAL-USE",
             "OBJECTID",
+            "METADATA",
             "APPENDLIMIT=104857600",
         ])
     );

@@ -1,5 +1,6 @@
 //! Account- and mailbox-level commands: SELECT/EXAMINE, STATUS, LIST/LSUB,
-//! CREATE/DELETE/RENAME/(UN)SUBSCRIBE, APPEND, quota, ENABLE, ID, NAMESPACE.
+//! CREATE/DELETE/RENAME/(UN)SUBSCRIBE, APPEND, quota, metadata, ENABLE, ID,
+//! NAMESPACE.
 
 use std::path::Path;
 
@@ -68,6 +69,23 @@ impl Session {
         )
         .encode();
         self.send(reader, response).await
+    }
+
+    pub(super) async fn metadata(
+        &self,
+        reader: &mut ImapReader,
+        call: &Invocation<'_>,
+    ) -> Result<Flow> {
+        let response = commands::metadata::handle(
+            call.tag,
+            call.command,
+            call.args,
+            &self.mail_root,
+            self.address(),
+            self.state.utf8_enabled(),
+        )
+        .encode();
+        self.respond(reader, call.tag, &call.name, response).await
     }
 
     pub(super) async fn unselect(

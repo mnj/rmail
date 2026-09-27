@@ -157,6 +157,17 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             quota_bytes INTEGER
         );
         INSERT OR IGNORE INTO account_settings(singleton, quota_bytes) VALUES(1, NULL);
+        CREATE TABLE IF NOT EXISTS server_metadata(
+            entry TEXT PRIMARY KEY COLLATE NOCASE,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS mailbox_metadata(
+            folder_id INTEGER NOT NULL,
+            entry TEXT NOT NULL COLLATE NOCASE,
+            value TEXT NOT NULL,
+            PRIMARY KEY(folder_id, entry),
+            FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
+        );
         INSERT OR IGNORE INTO subscriptions(name)
             SELECT name FROM folders WHERE subscribed != 0;
         ",
@@ -710,6 +721,119 @@ pub fn folder_exists(
     let conn = open_account(maildir_root, domain, localpart)?;
     Ok(folder_id(&conn, &name)?.is_some()
         && mailbox_dir(maildir_root, domain, localpart, &name)?.is_dir())
+}
+
+/// A SETMETADATA request that would take the account past its entry limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataTooMany {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for MetadataTooMany {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "too many metadata entries (limit {})",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for MetadataTooMany {}
+
+/// RFC 5464 annotations of one mailbox, or of the server when `mailbox` is
+/// `None`, as `(entry, value)` pairs sorted by entry. Returns `None` when the
+/// mailbox does not exist.
+pub fn get_metadata(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: Option<&str>,
+) -> Result<Option<Vec<(String, String)>>> {
+    let conn = open_account(maildir_root, domain, localpart)?;
+    let entries = match mailbox {
+        None => {
+            let mut statement =
+                conn.prepare("SELECT entry, value FROM server_metadata ORDER BY entry")?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        Some(mailbox) => {
+            let name = normalize_mailbox_name(mailbox)?;
+            let Some(id) = folder_id(&conn, &name)? else {
+                return Ok(None);
+            };
+            let mut statement = conn.prepare(
+                "SELECT entry, value FROM mailbox_metadata WHERE folder_id = ?1 ORDER BY entry",
+            )?;
+            statement
+                .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        }
+    };
+    Ok(Some(entries))
+}
+
+/// Apply one SETMETADATA request atomically: `Some(value)` sets an entry and
+/// `None` removes it. Entry names compare case-insensitively. Fails with
+/// [`MetadataTooMany`] when the account would hold more than `max_entries`
+/// entries. Returns `false` when the mailbox does not exist.
+pub fn set_metadata(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: Option<&str>,
+    changes: &[(String, Option<String>)],
+    max_entries: usize,
+) -> Result<bool> {
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let folder = match mailbox {
+        None => None,
+        Some(mailbox) => {
+            let name = normalize_mailbox_name(mailbox)?;
+            let Some(id) = folder_id(&tx, &name)? else {
+                return Ok(false);
+            };
+            Some(id)
+        }
+    };
+    for (entry, value) in changes {
+        match (folder, value) {
+            (None, Some(value)) => tx.execute(
+                "INSERT INTO server_metadata(entry, value) VALUES(?1, ?2)
+                 ON CONFLICT(entry) DO UPDATE SET entry = excluded.entry, value = excluded.value",
+                params![entry, value],
+            )?,
+            (None, None) => tx.execute(
+                "DELETE FROM server_metadata WHERE entry = ?1",
+                params![entry],
+            )?,
+            (Some(id), Some(value)) => tx.execute(
+                "INSERT INTO mailbox_metadata(folder_id, entry, value) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(folder_id, entry)
+                 DO UPDATE SET entry = excluded.entry, value = excluded.value",
+                params![id, entry, value],
+            )?,
+            (Some(id), None) => tx.execute(
+                "DELETE FROM mailbox_metadata WHERE folder_id = ?1 AND entry = ?2",
+                params![id, entry],
+            )?,
+        };
+    }
+    let total: i64 = tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM server_metadata) + (SELECT COUNT(*) FROM mailbox_metadata)",
+        [],
+        |row| row.get(0),
+    )?;
+    let adds_entries = changes.iter().any(|(_, value)| value.is_some());
+    if adds_entries && usize::try_from(total).unwrap_or(usize::MAX) > max_entries {
+        // Dropping the transaction rolls every change back.
+        return Err(MetadataTooMany { limit: max_entries }.into());
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 pub fn claim_recent_uids(
@@ -3339,5 +3463,96 @@ mod tests {
         );
         let (_, messages) = load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
         assert!(messages.is_empty());
+    }
+
+    fn set_entries(
+        root: &Path,
+        mailbox: Option<&str>,
+        changes: &[(&str, Option<&str>)],
+        limit: usize,
+    ) -> Result<bool> {
+        let changes = changes
+            .iter()
+            .map(|(entry, value)| (entry.to_string(), value.map(str::to_string)))
+            .collect::<Vec<_>>();
+        set_metadata(root, "example.test", "user", mailbox, &changes, limit)
+    }
+
+    fn entries(root: &Path, mailbox: Option<&str>) -> Option<Vec<(String, String)>> {
+        get_metadata(root, "example.test", "user", mailbox).unwrap()
+    }
+
+    #[test]
+    fn metadata_follows_rename_and_is_dropped_with_the_mailbox() {
+        let td = tempfile::tempdir().unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects").unwrap();
+        create_folder(td.path(), "example.test", "user", "Projects/Child").unwrap();
+        assert!(
+            set_entries(
+                td.path(),
+                Some("Projects/Child"),
+                &[("/private/comment", Some("child"))],
+                10
+            )
+            .unwrap()
+        );
+        rename_folder(td.path(), "example.test", "user", "Projects", "Work").unwrap();
+        assert_eq!(
+            entries(td.path(), Some("Work/Child")).unwrap(),
+            vec![("/private/comment".to_string(), "child".to_string())]
+        );
+        assert_eq!(entries(td.path(), Some("Projects/Child")), None);
+
+        delete_folder(td.path(), "example.test", "user", "Work/Child").unwrap();
+        create_folder(td.path(), "example.test", "user", "Work/Child").unwrap();
+        assert_eq!(entries(td.path(), Some("Work/Child")).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn metadata_entries_are_case_insensitive_and_server_entries_are_separate() {
+        let td = tempfile::tempdir().unwrap();
+        set_entries(td.path(), None, &[("/shared/comment", Some("server"))], 10).unwrap();
+        set_entries(
+            td.path(),
+            Some("inbox"),
+            &[("/Private/Comment", Some("first"))],
+            10,
+        )
+        .unwrap();
+        set_entries(
+            td.path(),
+            Some("INBOX"),
+            &[("/private/comment", Some("second"))],
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            entries(td.path(), Some("INBOX")).unwrap(),
+            vec![("/private/comment".to_string(), "second".to_string())]
+        );
+        assert_eq!(
+            entries(td.path(), None).unwrap(),
+            vec![("/shared/comment".to_string(), "server".to_string())]
+        );
+        set_entries(td.path(), Some("INBOX"), &[("/PRIVATE/COMMENT", None)], 10).unwrap();
+        assert_eq!(entries(td.path(), Some("INBOX")).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn metadata_entry_limit_rolls_back_the_whole_request() {
+        let td = tempfile::tempdir().unwrap();
+        set_entries(td.path(), None, &[("/shared/a", Some("1"))], 2).unwrap();
+        let error = set_entries(
+            td.path(),
+            Some("INBOX"),
+            &[("/private/b", Some("2")), ("/private/c", Some("3"))],
+            2,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<MetadataTooMany>().is_some());
+        assert_eq!(entries(td.path(), Some("INBOX")).unwrap(), Vec::new());
+        // Removing entries is always allowed, even at the limit.
+        set_entries(td.path(), None, &[("/shared/a", None)], 0).unwrap();
+        assert!(!set_entries(td.path(), Some("Missing"), &[("/private/x", Some("1"))], 2).unwrap());
     }
 }

@@ -16,7 +16,7 @@ screenshots of every page, and a quick start.
 - **SMTP, submission and LMTP**: phase-aware ESMTP with STARTTLS, PIPELINING, 8BITMIME, SMTPUTF8,
   CHUNKING/BINARYMIME, DSN and REQUIRETLS; AUTH PLAIN, SCRAM-SHA-256 and optional OAUTHBEARER/XOAUTH2.
 - **IMAP4rev1 and IMAP4rev2** over Maildir: IDLE, CONDSTORE/QRESYNC, MOVE, SORT/THREAD, PREVIEW,
-  QUOTA, COMPRESS and SCRAM-SHA-256-PLUS.
+  QUOTA, METADATA, COMPRESS and SCRAM-SHA-256-PLUS.
 - **Mail authentication**: inbound SPF, DKIM, DMARC (with aggregate reports) and ARC; outbound DKIM
   and ARC signing; optional ClamAV and rspamd filtering.
 - **Outbound relay queue** with retries, per-destination limits, connection reuse and
@@ -172,6 +172,7 @@ or conformance-validation gaps.
 | RFC 4013 | SASLprep | 100% | Usernames and SCRAM passwords are prepared with full SASLprep (mapping, NFKC, prohibited characters, bidi checks). |
 | RFC 7889 | `APPENDLIMIT` | 100% | The server-wide APPEND size limit is advertised. |
 | RFC 8474 | `OBJECTID` | 90% | Permanent `MAILBOXID` (kept across RENAME) and `EMAILID` (kept across COPY and MOVE) come from random IDs stored in the index, never reused. They are reported by CREATE, SELECT/EXAMINE, STATUS, LIST-STATUS and FETCH, and `SEARCH EMAILID` works. `THREADID` is always `NIL`, as the RFC allows when a server has no permanent thread IDs. |
+| RFC 5464 | `METADATA` | 90% | `GETMETADATA` (with `MAXSIZE`/`LONGENTRIES` and `DEPTH`) and atomic `SETMETADATA` for server (`""`) and mailbox entries under `/private` and `/shared`. Entries are stored in the account index, follow a mailbox across RENAME and are removed with it. Limits: 64 KiB per value (`MAXSIZE`) and 512 entries per account (`TOOMANY`); `/shared/admin` is read-only. Values must be UTF-8 text (no `literal8`), and unsolicited METADATA change notifications are not sent. |
 | RFC 8437 | `UNAUTHENTICATE` | 100% | Returns the session to the not-authenticated state while keeping TLS and compression. |
 
 IMAP4rev2 is dual-advertised with IMAP4rev1 for compatibility; clients enable
