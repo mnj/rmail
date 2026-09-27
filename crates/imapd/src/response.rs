@@ -241,6 +241,7 @@ pub(crate) fn capability_tokens_with_policy(
             "QRESYNC",
             "ESEARCH",
             "SEARCHRES",
+            "PARTIAL",
             "SORT",
             "THREAD=ORDEREDSUBJECT",
             "THREAD=REFERENCES",

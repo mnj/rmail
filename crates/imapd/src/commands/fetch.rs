@@ -70,6 +70,15 @@ pub(crate) async fn handle(
         .await?;
         return Ok(Outcome::default());
     }
+    // RFC 9394 §3.3: PARTIAL extends UID FETCH only.
+    if request.partial.is_some() && !uid_mode {
+        write_status(
+            reader,
+            StatusLine::tagged(tag, Status::Bad, "PARTIAL requires UID FETCH"),
+        )
+        .await?;
+        return Ok(Outcome::default());
+    }
     if request.vanished && !context.qresync {
         write_status(
             reader,
@@ -271,7 +280,7 @@ fn collect_targets(
     };
     let set = parser::SequenceSet::parse(&request.message_set, star);
     let mut expunged_requested = false;
-    let targets = selected
+    let addressed = selected
         .msgs
         .iter()
         .enumerate()
@@ -282,6 +291,16 @@ fn collect_targets(
             set.as_ref()
                 .is_some_and(|set| set.contains(if uid_mode { *uid } else { *index as u64 + 1 }))
         })
+        .collect::<Vec<_>>();
+    // RFC 9394 §3.3/§3.4: PARTIAL picks positions among the addressed
+    // messages first; CHANGEDSINCE then filters that page.
+    let addressed = match request.partial {
+        Some(range) => range.select(&addressed),
+        None => &addressed[..],
+    };
+    let targets = addressed
+        .iter()
+        .copied()
         .filter(|(_, (uid, _, _, _))| {
             if selected.is_expunged(*uid) {
                 expunged_requested = true;

@@ -11,6 +11,7 @@ mod mailboxes;
 mod metadata;
 mod notify;
 mod objectid;
+mod partial;
 mod protocol;
 mod rev2;
 mod scram;

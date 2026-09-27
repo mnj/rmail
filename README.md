@@ -151,6 +151,7 @@ or conformance-validation gaps.
 | RFC 5256 | `SORT` and `THREAD` | 90% | Advertised algorithms are implemented; international collation coverage is not exhaustive. |
 | RFC 4731 | `ESEARCH` | 95% | Core and UID result forms are implemented; no external conformance certification. |
 | RFC 5182 | `SEARCHRES` | 100% | Saved search results and `$` sequence-set use are implemented. |
+| RFC 9394 | `PARTIAL` | 100% | `SEARCH`/`UID SEARCH RETURN (PARTIAL first:last)` pages ESEARCH results, counting from the end for negative ranges and answering `NIL` for a page past the results; it combines with `MIN`/`MAX`/`COUNT` and saves `$` as RFC 9394 Table 1 specifies. The `UID FETCH` `PARTIAL` modifier picks the page before `CHANGEDSINCE` filters it. |
 | RFC 5032 | `WITHIN` | 100% | `OLDER` and `YOUNGER` search keys are implemented. |
 | RFC 5258 | `LIST-EXTENDED` | 95% | Selection/return options and hierarchy attributes are implemented; exotic namespace combinations are not applicable. |
 | RFC 5819 | `LIST-STATUS` | 100% | STATUS return data is supported in extended LIST responses. |

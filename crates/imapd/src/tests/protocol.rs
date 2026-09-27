@@ -82,6 +82,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "QRESYNC",
             "ESEARCH",
             "SEARCHRES",
+            "PARTIAL",
             "SORT",
             "THREAD=ORDEREDSUBJECT",
             "THREAD=REFERENCES",
