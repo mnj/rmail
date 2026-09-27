@@ -96,6 +96,10 @@ fn execute(
     let now = chrono::Utc::now().timestamp();
     let needs_data = parser::search_requires_message_data(criterion);
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
+        // Expunged by another session; the file may already be gone.
+        if selected.is_expunged(*uid) {
+            continue;
+        }
         let data = if needs_data {
             std::fs::read(path)?
         } else {
@@ -228,6 +232,7 @@ mod tests {
             save_dates: Default::default(),
             sizes: Default::default(),
             recent_uids: Default::default(),
+            expunged: Default::default(),
         };
         let outcome = handle(
             "A1",
@@ -261,6 +266,7 @@ mod tests {
             save_dates: Default::default(),
             sizes: [(7, 12_345)].into(),
             recent_uids: Default::default(),
+            expunged: Default::default(),
         };
 
         let criterion = parser::SearchCriterion::And(vec![

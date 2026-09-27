@@ -24,6 +24,24 @@ pub(crate) struct SelectedMailbox {
     pub(crate) save_dates: HashMap<u64, i64>,
     pub(crate) sizes: HashMap<u64, u64>,
     pub(crate) recent_uids: HashSet<u64>,
+    /// Messages expunged elsewhere whose EXPUNGE is still pending.
+    pub(crate) expunged: HashSet<u64>,
+}
+
+/// How pending changes are reported to the client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SyncOptions {
+    /// Report messages expunged by other sessions (EXPUNGE or VANISHED).
+    /// RFC 3501 §7.4.1 / RFC 9051 §7.5.1 forbid this while a FETCH, STORE
+    /// or SEARCH that uses sequence numbers is in progress; the expunged
+    /// messages then keep their sequence slots until a later command.
+    pub(crate) allow_expunge: bool,
+    pub(crate) qresync: bool,
+    /// Every untagged FETCH carries MODSEQ once CONDSTORE is enabled
+    /// (RFC 7162 §3.2).
+    pub(crate) condstore: bool,
+    /// IMAP4rev2 has no RECENT response and no \Recent flag.
+    pub(crate) imap4rev2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,30 +55,79 @@ pub(crate) enum MailboxSyncEvent {
         seq: usize,
         uid: u64,
         flags: Vec<String>,
+        modseq: u64,
     },
     Recent(usize),
 }
 
 impl MailboxSyncEvent {
-    pub(crate) fn response_line(&self, qresync_enabled: bool) -> String {
+    pub(crate) fn response_line(&self, options: SyncOptions) -> String {
         match self {
             MailboxSyncEvent::Exists(count) => format!("* {} EXISTS\r\n", count),
             MailboxSyncEvent::Expunge { seq, uid } => {
-                if qresync_enabled {
+                if options.qresync {
                     format!("* VANISHED {}\r\n", uid)
                 } else {
                     format!("* {} EXPUNGE\r\n", seq)
                 }
             }
-            MailboxSyncEvent::FetchFlags { seq, uid, flags } => {
-                format!(
-                    "* {} FETCH (FLAGS ({}) UID {})\r\n",
-                    seq,
-                    flags.join(" "),
-                    uid
-                )
+            MailboxSyncEvent::FetchFlags {
+                seq,
+                uid,
+                flags,
+                modseq,
+            } => {
+                if options.condstore {
+                    format!(
+                        "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
+                        seq,
+                        flags.join(" "),
+                        uid,
+                        modseq
+                    )
+                } else {
+                    format!(
+                        "* {} FETCH (FLAGS ({}) UID {})\r\n",
+                        seq,
+                        flags.join(" "),
+                        uid
+                    )
+                }
             }
             MailboxSyncEvent::Recent(count) => format!("* {count} RECENT\r\n"),
+        }
+    }
+}
+
+impl SelectedMailbox {
+    /// The message was expunged by another session but its expunge has not
+    /// been reported yet, so it still occupies a sequence number.
+    pub(crate) fn is_expunged(&self, uid: u64) -> bool {
+        self.expunged.contains(&uid)
+    }
+
+    /// Record flag changes this session made itself (STORE, implicit \Seen);
+    /// the client already saw them in the command's own responses.
+    pub(crate) fn apply_flag_updates(&mut self, updates: &[(u64, Vec<String>, u64)]) {
+        for (uid, flags, modseq) in updates {
+            if let Some(message) = self.msgs.iter_mut().find(|message| message.0 == *uid) {
+                message.2 = flags.clone();
+                message.3 = *modseq;
+            }
+        }
+    }
+
+    /// Drop messages whose removal this session already reported (EXPUNGE,
+    /// MOVE).
+    pub(crate) fn remove_reported(&mut self, uids: &[u64]) {
+        let removed = uids.iter().copied().collect::<HashSet<_>>();
+        self.msgs.retain(|message| !removed.contains(&message.0));
+        for uid in &removed {
+            self.internal_dates.remove(uid);
+            self.save_dates.remove(uid);
+            self.sizes.remove(uid);
+            self.recent_uids.remove(uid);
+            self.expunged.remove(uid);
         }
     }
 }
@@ -115,6 +182,7 @@ pub(crate) async fn load_selected_mailbox(
             save_dates,
             sizes,
             recent_uids: HashSet::new(),
+            expunged: HashSet::new(),
         })
     })
     .await
@@ -128,6 +196,7 @@ pub(crate) async fn load_selected_mailbox(
 pub(crate) async fn refresh_selected_mailbox(
     mail_root: &str,
     selected: &SelectedMailbox,
+    options: SyncOptions,
 ) -> Result<(SelectedMailbox, Vec<MailboxSyncEvent>)> {
     let address = format!("{}@{}", selected.local, selected.domain);
     let mut refreshed = load_selected_mailbox(mail_root, &address, &selected.mailbox).await?;
@@ -142,72 +211,108 @@ pub(crate) async fn refresh_selected_mailbox(
         )
         .await?,
     );
-    refreshed.recent_uids.retain(|uid| {
-        refreshed
+    Ok(reconcile(selected, refreshed, options))
+}
+
+/// Compare the client's view (`selected`) with the current storage state
+/// (`fresh`) and produce the untagged responses that bring the client up to
+/// date, together with the new view.
+pub(crate) fn reconcile(
+    selected: &SelectedMailbox,
+    mut fresh: SelectedMailbox,
+    options: SyncOptions,
+) -> (SelectedMailbox, Vec<MailboxSyncEvent>) {
+    let fresh_uids = fresh
+        .msgs
+        .iter()
+        .map(|message| message.0)
+        .collect::<HashSet<_>>();
+    let vanished = selected
+        .msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| !fresh_uids.contains(&message.0))
+        .map(|(index, message)| (index + 1, message.0))
+        .collect::<Vec<_>>();
+
+    let mut events = Vec::new();
+    let reported_expunges = if options.allow_expunge {
+        // Highest sequence first so earlier numbers stay valid.
+        for (seq, uid) in vanished.iter().rev() {
+            events.push(MailboxSyncEvent::Expunge {
+                seq: *seq,
+                uid: *uid,
+            });
+        }
+        vanished.len()
+    } else {
+        // Keep the vanished messages in their slots until an expunge may be
+        // reported. New arrivals always have higher UIDs, so ordering by UID
+        // preserves the client's numbering.
+        for (_, uid) in &vanished {
+            if let Some(message) = selected.msgs.iter().find(|message| message.0 == *uid) {
+                fresh.msgs.push(message.clone());
+            }
+            if let Some(date) = selected.internal_dates.get(uid) {
+                fresh.internal_dates.insert(*uid, *date);
+            }
+            if let Some(date) = selected.save_dates.get(uid) {
+                fresh.save_dates.insert(*uid, *date);
+            }
+            if let Some(size) = selected.sizes.get(uid) {
+                fresh.sizes.insert(*uid, *size);
+            }
+            fresh.expunged.insert(*uid);
+        }
+        fresh.msgs.sort_by_key(|message| message.0);
+        0
+    };
+    fresh.recent_uids.retain(|uid| {
+        fresh
             .msgs
             .iter()
             .any(|(message_uid, _, _, _)| message_uid == uid)
     });
-    let old_by_uid = selected
-        .msgs
-        .iter()
-        .enumerate()
-        .map(|(idx, (uid, _, flags, _))| (*uid, (idx + 1, flags.clone())))
-        .collect::<HashMap<_, _>>();
-    let new_by_uid = refreshed
-        .msgs
-        .iter()
-        .enumerate()
-        .map(|(idx, (uid, _, flags, _))| (*uid, (idx + 1, flags.clone())))
-        .collect::<HashMap<_, _>>();
 
-    let mut events = selected
-        .msgs
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, (uid, _, _, _))| {
-            (!new_by_uid.contains_key(uid)).then_some(MailboxSyncEvent::Expunge {
-                seq: idx + 1,
-                uid: *uid,
-            })
-        })
-        .collect::<Vec<_>>();
-    events.sort_by(|a, b| match (a, b) {
-        (
-            MailboxSyncEvent::Expunge { seq: left, .. },
-            MailboxSyncEvent::Expunge { seq: right, .. },
-        ) => right.cmp(left),
-        _ => std::cmp::Ordering::Equal,
-    });
-
-    if refreshed.msgs.len() != selected.msgs.len() {
-        events.push(MailboxSyncEvent::Exists(refreshed.msgs.len()));
+    // EXISTS follows the EXPUNGEs, and compares against the count the client
+    // holds after applying them (arrivals may cancel out expunges).
+    if fresh.msgs.len() != selected.msgs.len() - reported_expunges {
+        events.push(MailboxSyncEvent::Exists(fresh.msgs.len()));
     }
-    if refreshed.recent_uids.len() != selected.recent_uids.len() {
-        events.push(MailboxSyncEvent::Recent(refreshed.recent_uids.len()));
+    if !options.imap4rev2 && fresh.recent_uids.len() != selected.recent_uids.len() {
+        events.push(MailboxSyncEvent::Recent(fresh.recent_uids.len()));
     }
 
-    for (uid, (new_seq, new_flags)) in &new_by_uid {
-        if let Some((_old_seq, old_flags)) = old_by_uid.get(uid)
-            && old_flags != new_flags
-        {
-            events.push(MailboxSyncEvent::FetchFlags {
-                seq: *new_seq,
-                uid: *uid,
-                flags: {
-                    let mut flags = new_flags.clone();
-                    if refreshed.recent_uids.contains(uid) {
-                        flags.push("\\Recent".to_string());
-                        flags.sort();
-                        flags.dedup();
-                    }
-                    flags
-                },
-            });
+    let old_flags = selected
+        .msgs
+        .iter()
+        .map(|(uid, _, flags, _)| (*uid, flags))
+        .collect::<HashMap<_, _>>();
+    for (index, (uid, _, flags, modseq)) in fresh.msgs.iter().enumerate() {
+        if fresh.expunged.contains(uid) {
+            continue;
         }
+        let Some(previous) = old_flags.get(uid) else {
+            continue;
+        };
+        if *previous == flags {
+            continue;
+        }
+        let mut flags = flags.clone();
+        if !options.imap4rev2 && fresh.recent_uids.contains(uid) {
+            flags.push("\\Recent".to_string());
+            flags.sort();
+            flags.dedup();
+        }
+        events.push(MailboxSyncEvent::FetchFlags {
+            seq: index + 1,
+            uid: *uid,
+            flags,
+            modseq: *modseq,
+        });
     }
 
-    Ok((refreshed, events))
+    (fresh, events)
 }
 
 pub(crate) async fn claim_recent_uids(
@@ -252,13 +357,6 @@ pub(crate) fn quote_wire_mailbox_name(name: &str, utf8_accept: bool) -> String {
         "\"{}\"",
         wire_name.replace('\\', "\\\\").replace('"', "\\\"")
     )
-}
-
-pub(crate) fn selected_mailbox_name(selected: &Option<SelectedMailbox>) -> &str {
-    selected
-        .as_ref()
-        .map(|s| s.mailbox.as_str())
-        .unwrap_or("INBOX")
 }
 
 pub(crate) fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &str {

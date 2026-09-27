@@ -103,15 +103,9 @@ impl Session {
         if outcome.close_connection {
             return Ok(Flow::Close);
         }
-        if let Some(mailbox_name) = outcome.appended_mailbox
-            && self
-                .selected
-                .as_ref()
-                .is_some_and(|selected| selected.mailbox.eq_ignore_ascii_case(&mailbox_name))
-        {
-            // The client sees the new message as EXISTS on its next command.
-            self.refresh_selected_named(&mailbox_name).await?;
-        }
+        // A message appended to the selected mailbox is reported as EXISTS
+        // by the next command that synchronizes the mailbox; the selected
+        // view is left alone so that EXISTS is not lost.
         Ok(Flow::Continue)
     }
 

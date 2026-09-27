@@ -68,12 +68,17 @@ impl Session {
             self.selected(),
             self.state.saved_search_uids(),
             uid,
-            self.state.feature_enabled("QRESYNC"),
+            commands::fetch::FetchContext {
+                qresync: self.state.feature_enabled("QRESYNC"),
+                condstore: self.state.condstore_enabled(),
+                imap4rev2: self.state.imap4rev2_enabled(),
+            },
         )
         .await?;
-        if outcome.refresh_selected {
-            self.refresh_selected().await?;
+        if outcome.condstore_activated {
+            self.state.activate_condstore();
         }
+        self.apply_flag_updates(&outcome.flag_updates);
         Ok(Flow::Continue)
     }
 
@@ -91,11 +96,16 @@ impl Session {
             self.selected(),
             self.state.saved_search_uids(),
             uid,
+            commands::store::StoreContext {
+                condstore: self.state.condstore_enabled(),
+                imap4rev2: self.state.imap4rev2_enabled(),
+            },
         )
         .await;
-        if outcome.refresh_selected {
-            self.refresh_selected().await?;
+        if outcome.condstore_activated {
+            self.state.activate_condstore();
         }
+        self.apply_flag_updates(&outcome.flag_updates);
         let name = if uid { "UID STORE" } else { "STORE" };
         self.respond(reader, tag, name, outcome.response.encode())
             .await
@@ -185,10 +195,11 @@ impl Session {
             self.state.saved_search_uids(),
             uid,
             self.state.utf8_enabled(),
+            self.state.feature_enabled("QRESYNC"),
         )
         .await;
-        if outcome.refresh_selected {
-            self.refresh_selected().await?;
+        if let Some(selected) = self.selected.as_mut() {
+            selected.remove_reported(&outcome.removed_uids);
         }
         self.respond(reader, tag, name, outcome.response.encode())
             .await
@@ -222,13 +233,13 @@ impl Session {
         reader: &mut ImapReader,
         call: &Invocation<'_>,
     ) -> Result<Flow> {
-        let qresync = self.state.feature_enabled("QRESYNC");
+        let options = self.sync_options(true);
         let outcome = commands::idle::handle(
             reader,
             call.tag,
             &self.mail_root,
             &mut self.selected,
-            qresync,
+            options,
         )
         .await?;
         Ok(if outcome == commands::idle::Outcome::Disconnected {
@@ -240,10 +251,22 @@ impl Session {
 
     async fn apply_selection_effect(&mut self, effect: SelectionEffect) -> Result<()> {
         match effect {
-            SelectionEffect::Refresh => self.refresh_selected().await?,
+            SelectionEffect::Remove(uids) => {
+                if let Some(selected) = self.selected.as_mut() {
+                    selected.remove_reported(&uids);
+                }
+            }
             SelectionEffect::Clear => self.clear_selection(),
             SelectionEffect::Keep => {}
         }
         Ok(())
+    }
+
+    /// Record flag changes the client already saw in this command's own
+    /// responses, so the next synchronization does not repeat them.
+    fn apply_flag_updates(&mut self, updates: &[(u64, Vec<String>, u64)]) {
+        if let Some(selected) = self.selected.as_mut() {
+            selected.apply_flag_updates(updates);
+        }
     }
 }

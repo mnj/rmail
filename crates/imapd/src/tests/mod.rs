@@ -8,6 +8,7 @@ mod fetch;
 mod mailboxes;
 mod protocol;
 mod search;
+mod sync;
 
 use crate::response::{CapabilityPhase, capability_tokens};
 use crate::{process_stream, process_stream_inner, process_stream_with_policy};

@@ -697,7 +697,8 @@ async fn noop_sync_reports_external_expunge_before_flag_changes() {
         })
         .expect("flag fetch response");
     assert!(expunge_pos < fetch_pos);
-    assert!(noop.iter().any(|line| line.trim_end() == "* 1 EXISTS"));
+    // The EXPUNGE already brought the client's count to 1.
+    assert!(!noop.iter().any(|line| line.contains("EXISTS")));
     let _logout = read_until_contains(&mut reader, "A004 OK").await;
     server_task.await.expect("join").expect("server");
 }

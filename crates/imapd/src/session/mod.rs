@@ -222,13 +222,16 @@ pub(crate) async fn process_stream_inner(
             .await?;
             continue;
         }
-        if spec.is_some_and(commands::CommandSpec::needs_mailbox_sync) && session.selected.is_some()
+        if let Some(spec) = spec
+            && spec.needs_mailbox_sync()
+            && session.selected.is_some()
         {
+            let options = session.sync_options(spec.allows_expunge());
             sync_selected_mailbox(
                 &mut reader,
                 &session.mail_root,
                 &mut session.selected,
-                session.state.feature_enabled("QRESYNC"),
+                options,
             )
             .await?;
         }
@@ -470,24 +473,14 @@ impl Session {
         self.send(reader, response).await
     }
 
-    /// Reload the selected mailbox after a change, keeping EXAMINE's
-    /// read-only mode.
-    async fn refresh_selected(&mut self) -> Result<()> {
-        let name = mailbox::selected_mailbox_name(&self.selected).to_string();
-        self.refresh_selected_named(&name).await
-    }
-
-    async fn refresh_selected_named(&mut self, name: &str) -> Result<()> {
-        self.selected = Some(
-            reload_selected_mailbox_preserving_mode(
-                &self.mail_root,
-                self.address(),
-                name,
-                &self.selected,
-            )
-            .await?,
-        );
-        Ok(())
+    /// How untagged updates are reported in this session.
+    fn sync_options(&self, allow_expunge: bool) -> mailbox::SyncOptions {
+        mailbox::SyncOptions {
+            allow_expunge,
+            qresync: self.state.feature_enabled("QRESYNC"),
+            condstore: self.state.condstore_enabled(),
+            imap4rev2: self.state.imap4rev2_enabled(),
+        }
     }
 
     /// Mirror the account quota from the database before commands that add
@@ -524,38 +517,24 @@ pub(crate) async fn sync_selected_mailbox(
     reader: &mut ImapReader,
     mail_root: &str,
     selected: &mut Option<SelectedMailbox>,
-    qresync_enabled: bool,
+    options: mailbox::SyncOptions,
 ) -> Result<()> {
-    let Some(current) = selected.as_ref().cloned() else {
+    let Some(current) = selected.as_ref() else {
         return Ok(());
     };
-    let (refreshed, events) = mailbox::refresh_selected_mailbox(mail_root, &current).await?;
+    let (refreshed, events) =
+        mailbox::refresh_selected_mailbox(mail_root, current, options).await?;
     if !events.is_empty() {
         let writer = reader.get_mut();
         for event in &events {
             writer
-                .write_all(event.response_line(qresync_enabled).as_bytes())
+                .write_all(event.response_line(options).as_bytes())
                 .await?;
         }
         writer.flush().await?;
     }
     *selected = Some(refreshed);
     Ok(())
-}
-
-async fn reload_selected_mailbox_preserving_mode(
-    mail_root: &str,
-    address: &str,
-    mailbox_name: &str,
-    previous: &Option<SelectedMailbox>,
-) -> Result<SelectedMailbox> {
-    let read_only = previous
-        .as_ref()
-        .map(|selected| selected.read_only)
-        .unwrap_or(false);
-    let mut refreshed = mailbox::load_selected_mailbox(mail_root, address, mailbox_name).await?;
-    refreshed.read_only = read_only;
-    Ok(refreshed)
 }
 
 async fn sync_account_storage_quota(

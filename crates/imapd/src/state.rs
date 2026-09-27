@@ -27,6 +27,23 @@ impl SessionState {
             .contains(&feature.to_ascii_uppercase())
     }
 
+    /// CONDSTORE is active after ENABLE CONDSTORE/QRESYNC or any
+    /// CONDSTORE-enabling command (RFC 7162 §3.1).
+    pub(crate) fn condstore_enabled(&self) -> bool {
+        self.feature_enabled("CONDSTORE")
+    }
+
+    /// Record use of a CONDSTORE-enabling command (SELECT/EXAMINE
+    /// (CONDSTORE), FETCH MODSEQ or CHANGEDSINCE, STORE UNCHANGEDSINCE,
+    /// SEARCH MODSEQ).
+    pub(crate) fn activate_condstore(&mut self) {
+        self.enabled_features.insert("CONDSTORE".to_string());
+    }
+
+    pub(crate) fn imap4rev2_enabled(&self) -> bool {
+        self.feature_enabled("IMAP4REV2")
+    }
+
     pub(crate) fn utf8_enabled(&self) -> bool {
         self.feature_enabled("UTF8=ACCEPT") || self.feature_enabled("IMAP4REV2")
     }

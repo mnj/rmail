@@ -19,6 +19,16 @@ impl CommandSpec {
     pub(crate) fn needs_mailbox_sync(self) -> bool {
         self.requires_sync || self.uses_sequences || self.breaks_sequences
     }
+
+    /// Whether the pre-command synchronization may report expunges.
+    /// RFC 3501 §7.4.1 and RFC 9051 §7.5.1 forbid EXPUNGE (and VANISHED)
+    /// while a command that uses message sequence numbers is in progress:
+    /// the client's sequence numbers refer to the numbering before the
+    /// command, so renumbering first could, for example, STORE the wrong
+    /// message.
+    pub(crate) fn allows_expunge(self) -> bool {
+        !self.uses_sequences
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +333,38 @@ mod tests {
             let request = parse_request_line(&line).unwrap();
             assert!(
                 command_spec(&request.command).unwrap().needs_mailbox_sync(),
+                "{command}"
+            );
+        }
+        for command in [
+            "FETCH 1 FLAGS",
+            "STORE 1 +FLAGS (\\Seen)",
+            "SEARCH ALL",
+            "SORT (DATE) UTF-8 ALL",
+            "THREAD REFERENCES UTF-8 ALL",
+            "COPY 1 Archive",
+            "MOVE 1 Archive",
+        ] {
+            let line = format!("A1 {command}");
+            let request = parse_request_line(&line).unwrap();
+            let spec = command_spec(&request.command).unwrap();
+            assert!(spec.needs_mailbox_sync(), "{command}");
+            assert!(!spec.allows_expunge(), "{command} must not report expunges");
+        }
+        for command in [
+            "NOOP",
+            "CHECK",
+            "IDLE",
+            "EXPUNGE",
+            "UID FETCH 1 FLAGS",
+            "UID STORE 1 +FLAGS (\\Seen)",
+            "UID SEARCH ALL",
+            "UID EXPUNGE 1",
+        ] {
+            let line = format!("A1 {command}");
+            let request = parse_request_line(&line).unwrap();
+            assert!(
+                command_spec(&request.command).unwrap().allows_expunge(),
                 "{command}"
             );
         }

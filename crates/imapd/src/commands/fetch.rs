@@ -11,8 +11,20 @@ use crate::{
     response::{Response, Status, StatusLine},
 };
 
+/// Session state that shapes FETCH responses.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FetchContext {
+    pub(crate) qresync: bool,
+    pub(crate) condstore: bool,
+    pub(crate) imap4rev2: bool,
+}
+
+#[derive(Default)]
 pub(crate) struct Outcome {
-    pub(crate) refresh_selected: bool,
+    /// Flags this FETCH changed (implicit \Seen) as (uid, flags, modseq).
+    pub(crate) flag_updates: Vec<(u64, Vec<String>, u64)>,
+    /// The command used MODSEQ or CHANGEDSINCE, which enables CONDSTORE.
+    pub(crate) condstore_activated: bool,
 }
 
 struct Target {
@@ -33,7 +45,7 @@ pub(crate) async fn handle(
     selected: &SelectedMailbox,
     saved_uids: &[u64],
     uid_mode: bool,
-    qresync_enabled: bool,
+    context: FetchContext,
 ) -> Result<Outcome> {
     let command = if uid_mode { "UID FETCH" } else { "FETCH" };
     let request = match parser::parse_fetch_command_request(raw_args) {
@@ -44,9 +56,7 @@ pub(crate) async fn handle(
                 StatusLine::tagged(tag, Status::Bad, format!("Invalid {command} arguments")),
             )
             .await?;
-            return Ok(Outcome {
-                refresh_selected: false,
-            });
+            return Ok(Outcome::default());
         }
     };
     if request.vanished && !uid_mode {
@@ -55,20 +65,20 @@ pub(crate) async fn handle(
             StatusLine::tagged(tag, Status::Bad, "VANISHED requires UID FETCH"),
         )
         .await?;
-        return Ok(Outcome {
-            refresh_selected: false,
-        });
+        return Ok(Outcome::default());
     }
-    if request.vanished && !qresync_enabled {
+    if request.vanished && !context.qresync {
         write_status(
             reader,
             StatusLine::tagged(tag, Status::Bad, "QRESYNC is not enabled"),
         )
         .await?;
-        return Ok(Outcome {
-            refresh_selected: false,
-        });
+        return Ok(Outcome::default());
     }
+    // RFC 7162 §3.1: FETCH MODSEQ and CHANGEDSINCE are CONDSTORE-enabling.
+    let condstore_activated =
+        request.changed_since.is_some() || request.items.iter().any(|item| item == "MODSEQ");
+    let condstore = context.condstore || condstore_activated;
 
     if request.vanished {
         let root = mail_root.to_string();
@@ -101,7 +111,8 @@ pub(crate) async fn handle(
         }
     }
 
-    let mut targets = collect_targets(&request, selected, saved_uids, uid_mode);
+    let (mut targets, expunged_requested) =
+        collect_targets(&request, selected, saved_uids, uid_mode);
     let mark_seen = fetch_marks_seen(&request.items) && !selected.read_only;
     let seen_updates = if mark_seen {
         targets
@@ -123,6 +134,7 @@ pub(crate) async fn handle(
     } else {
         Vec::new()
     };
+    let mut flag_updates = Vec::new();
     if !seen_updates.is_empty() {
         let root = mail_root.to_string();
         let domain = selected.domain.clone();
@@ -149,24 +161,55 @@ pub(crate) async fn handle(
                 )
                 .await?;
                 return Ok(Outcome {
-                    refresh_selected: false,
+                    condstore_activated,
+                    ..Outcome::default()
                 });
             }
         };
         for target in &mut targets {
             if let Some(modseq) = modseqs.get(&target.uid) {
                 target.modseq = *modseq;
+                flag_updates.push((target.uid, target.flags.clone(), *modseq));
             }
         }
     }
+    let outcome = Outcome {
+        flag_updates,
+        condstore_activated,
+    };
 
+    let flags_requested = request.items.iter().any(|item| item == "FLAGS");
+    let modseq_requested = request.items.iter().any(|item| item == "MODSEQ");
     for target in targets {
         let mut response_flags = target.flags.clone();
-        if selected.recent_uids.contains(&target.uid) {
+        if !context.imap4rev2 && selected.recent_uids.contains(&target.uid) {
             response_flags.push("\\Recent".to_string());
             response_flags.sort();
             response_flags.dedup();
         }
+        // RFC 3501 §6.4.5: flags changed by an implicit \Seen SHOULD be
+        // returned; RFC 7162 §3.1: with CONDSTORE every untagged FETCH
+        // carries MODSEQ.
+        let seen_changed = outcome
+            .flag_updates
+            .iter()
+            .any(|(uid, _, _)| *uid == target.uid);
+        let add_flags = seen_changed && !flags_requested;
+        let add_modseq = condstore && !modseq_requested;
+        let extended_items;
+        let items = if add_flags || add_modseq {
+            let mut items = request.items.clone();
+            if add_flags {
+                items.push("FLAGS".to_string());
+            }
+            if add_modseq {
+                items.push("MODSEQ".to_string());
+            }
+            extended_items = items;
+            &extended_items
+        } else {
+            &request.items
+        };
         if let Err(error) = mailbox::write_fetch_response(
             reader,
             target.sequence,
@@ -176,9 +219,9 @@ pub(crate) async fn handle(
             target.internal_date,
             target.save_date,
             target.path,
-            &request.items,
+            items,
             &request.raw_items,
-            uid_mode,
+            uid_mode || condstore,
         )
         .await
         {
@@ -188,28 +231,42 @@ pub(crate) async fn handle(
                     .with_code("UNAVAILABLE"),
             )
             .await?;
-            return Ok(Outcome {
-                refresh_selected: !seen_updates.is_empty(),
-            });
+            return Ok(outcome);
         }
     }
-    write_status(
-        reader,
-        StatusLine::tagged(tag, Status::Ok, format!("{command} completed")),
-    )
-    .await?;
-    Ok(Outcome {
-        refresh_selected: !seen_updates.is_empty(),
-    })
+    let completion = if expunged_requested {
+        // RFC 2180 §4.1.2 / RFC 9051 EXPUNGEISSUED: the data of messages
+        // expunged by another session is omitted until the expunge can be
+        // reported.
+        StatusLine::tagged(
+            tag,
+            Status::No,
+            "Some of the requested messages no longer exist",
+        )
+        .with_code("EXPUNGEISSUED")
+    } else {
+        StatusLine::tagged(tag, Status::Ok, format!("{command} completed"))
+    };
+    write_status(reader, completion).await?;
+    Ok(outcome)
 }
 
+/// The messages addressed by the request, and whether any addressed message
+/// was expunged by another session and is only kept for its sequence number.
 fn collect_targets(
     request: &parser::FetchCommandRequest,
     selected: &SelectedMailbox,
     saved_uids: &[u64],
     uid_mode: bool,
-) -> Vec<Target> {
-    selected
+) -> (Vec<Target>, bool) {
+    let star = if uid_mode {
+        selected.uidnext.saturating_sub(1)
+    } else {
+        selected.msgs.len() as u64
+    };
+    let set = parser::SequenceSet::parse(&request.message_set, star);
+    let mut expunged_requested = false;
+    let targets = selected
         .msgs
         .iter()
         .enumerate()
@@ -217,13 +274,15 @@ fn collect_targets(
             if request.message_set == "$" {
                 return saved_uids.binary_search(uid).is_ok();
             }
-            let star = if uid_mode {
-                selected.uidnext.saturating_sub(1)
-            } else {
-                selected.msgs.len() as u64
-            };
-            parser::SequenceSet::parse(&request.message_set, star)
+            set.as_ref()
                 .is_some_and(|set| set.contains(if uid_mode { *uid } else { *index as u64 + 1 }))
+        })
+        .filter(|(_, (uid, _, _, _))| {
+            if selected.is_expunged(*uid) {
+                expunged_requested = true;
+                return false;
+            }
+            true
         })
         .filter(|(_, (_, _, _, modseq))| {
             request
@@ -239,7 +298,8 @@ fn collect_targets(
             internal_date: selected.internal_dates.get(uid).copied().unwrap_or((0, 0)),
             save_date: selected.save_dates.get(uid).copied().unwrap_or(0),
         })
-        .collect()
+        .collect();
+    (targets, expunged_requested)
 }
 
 fn filter_vanished(
