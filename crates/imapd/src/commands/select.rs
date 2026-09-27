@@ -8,6 +8,8 @@ use crate::{
 pub(crate) struct Outcome {
     pub(crate) response: Response,
     pub(crate) selected: Option<SelectedMailbox>,
+    /// SELECT/EXAMINE (CONDSTORE) enables CONDSTORE (RFC 7162 §3.1).
+    pub(crate) condstore_activated: bool,
 }
 
 pub(crate) async fn handle(
@@ -20,6 +22,7 @@ pub(crate) async fn handle(
     condstore_enabled: bool,
     qresync_enabled: bool,
     had_selected_mailbox: bool,
+    imap4rev2: bool,
 ) -> Outcome {
     let request = match parser::parse_select_request(raw_args) {
         Ok(request) => request,
@@ -107,9 +110,40 @@ pub(crate) async fn handle(
                 .with_code("PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)"),
         )
     };
+    response = response.data(format!("{} EXISTS", selected.msgs.len()));
+    if imap4rev2 {
+        // RFC 9051 §6.3.2: a LIST response for the mailbox is required;
+        // RECENT no longer exists.
+        let root = mail_root.to_string();
+        let address = address.to_string();
+        let list_args = format!(
+            "\"\" {}",
+            mailbox::quote_wire_mailbox_name(&selected.mailbox, true)
+        );
+        let listed = tokio::task::spawn_blocking(move || {
+            crate::commands::list::handle(
+                "*",
+                "LIST",
+                &list_args,
+                std::path::Path::new(&root),
+                &address,
+                true,
+            )
+            .encode()
+        })
+        .await
+        .unwrap_or_default();
+        for line in listed.lines() {
+            if let Some(data) = line.strip_prefix("* ")
+                && data.starts_with("LIST ")
+            {
+                response = response.data(data.to_string());
+            }
+        }
+    } else {
+        response = response.data(format!("{} RECENT", selected.recent_uids.len()));
+    }
     response = response
-        .data(format!("{} EXISTS", selected.msgs.len()))
-        .data(format!("{} RECENT", selected.recent_uids.len()))
         .status(
             StatusLine::untagged(Status::Ok, "UIDs valid")
                 .with_code(format!("UIDVALIDITY {}", selected.uidvalidity)),
@@ -158,6 +192,7 @@ pub(crate) async fn handle(
     Outcome {
         response,
         selected: Some(selected),
+        condstore_activated: request.condstore,
     }
 }
 
@@ -227,6 +262,7 @@ fn failure(response: Response) -> Outcome {
     Outcome {
         response,
         selected: None,
+        condstore_activated: false,
     }
 }
 
@@ -247,6 +283,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         )
         .await;
         assert!(outcome.selected.is_none());
@@ -265,6 +302,7 @@ mod tests {
             "INBOX",
             temp.path().to_str().unwrap(),
             "user@example.test",
+            false,
             false,
             false,
             false,

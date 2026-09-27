@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use rmail_common::auth::ChannelBindings;
 use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::input::{
@@ -32,6 +33,9 @@ use crate::{
 };
 
 pub(crate) type ImapReader = BufReader<Box<dyn AsyncStream + Send + 'static>>;
+
+/// Sent before closing an inactive session (RFC 3501 §5.4).
+pub(crate) const AUTOLOGOUT_BYE: &[u8] = b"* BYE Autologout; idle for too long\r\n";
 
 /// Result of reading one command line.
 enum Line {
@@ -64,6 +68,8 @@ struct Session {
     peer: Option<SocketAddr>,
     /// The stream is TLS-protected (IMAPS or after STARTTLS).
     encrypted: bool,
+    /// Channel-binding data of the TLS connection (SCRAM-SHA-256-PLUS).
+    channel_bindings: ChannelBindings,
     auth_policy: Arc<sasl::AuthPolicy>,
     state: state::SessionState,
     selected: Option<SelectedMailbox>,
@@ -113,6 +119,31 @@ pub(crate) async fn process_stream_with_policy(
     .await
 }
 
+/// Run a session on a stream whose TLS handshake (IMAPS) already completed;
+/// `channel_bindings` come from that TLS connection.
+pub(crate) async fn process_tls_stream(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    channel_bindings: ChannelBindings,
+    auth_policy: Arc<sasl::AuthPolicy>,
+) -> Result<()> {
+    run_session(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        true,
+        true,
+        auth_policy,
+        Some(channel_bindings),
+    )
+    .await
+}
+
 // `session_encrypted` is true for IMAPS and after STARTTLS; password
 // mechanisms are refused on plaintext sessions. `peer` keys the per-address
 // authentication lockout.
@@ -126,6 +157,44 @@ pub(crate) async fn process_stream_inner(
     send_greeting: bool,
     auth_policy: Arc<sasl::AuthPolicy>,
 ) -> Result<()> {
+    run_session(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        send_greeting,
+        auth_policy,
+        None,
+    )
+    .await
+}
+
+/// `channel_bindings` is `None` when the caller has no TLS connection at
+/// hand; an encrypted session then only offers tls-server-end-point from
+/// the configured certificate.
+async fn run_session(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    send_greeting: bool,
+    auth_policy: Arc<sasl::AuthPolicy>,
+    channel_bindings: Option<ChannelBindings>,
+) -> Result<()> {
+    let channel_bindings = match channel_bindings {
+        Some(bindings) => bindings,
+        None if session_encrypted => ChannelBindings {
+            tls_server_end_point: tls_ctx
+                .as_ref()
+                .map(|context| context.server_end_point.clone()),
+            tls_exporter: None,
+        },
+        None => ChannelBindings::default(),
+    };
     let stream: Box<dyn AsyncStream + Send + 'static> = Box::new(SwitchableStream::new(stream));
     let mut reader = BufReader::new(stream);
     let mut session = Session {
@@ -134,6 +203,7 @@ pub(crate) async fn process_stream_inner(
         db_path,
         peer,
         encrypted: session_encrypted,
+        channel_bindings,
         auth_policy,
         state: state::SessionState::default(),
         selected: None,
@@ -157,10 +227,25 @@ pub(crate) async fn process_stream_inner(
         } else {
             MAX_PREAUTH_LINE_BYTES
         };
-        let line = match session.read_command(&mut reader, line_limit).await? {
-            Line::Command(line) => line,
-            Line::Skip => continue,
-            Line::End => break,
+        let timeouts = session.auth_policy.timeouts();
+        let autologout = if session.state.authenticated_mailbox.is_some() {
+            timeouts.authenticated
+        } else {
+            timeouts.unauthenticated
+        };
+        let read =
+            tokio::time::timeout(autologout, session.read_command(&mut reader, line_limit)).await;
+        let line = match read {
+            Ok(result) => match result? {
+                Line::Command(line) => line,
+                Line::Skip => continue,
+                Line::End => break,
+            },
+            Err(_) => {
+                imap_log!("info", "session_closed", { "peer": session.peer_label(), "encrypted": session.encrypted, "reason": "autologout" });
+                let _ = write(&mut reader, AUTOLOGOUT_BYE).await;
+                break;
+            }
         };
         let Ok(input) = std::str::from_utf8(&line) else {
             write(&mut reader, b"* BAD Command line is not valid UTF-8\r\n").await?;
@@ -222,13 +307,16 @@ pub(crate) async fn process_stream_inner(
             .await?;
             continue;
         }
-        if spec.is_some_and(commands::CommandSpec::needs_mailbox_sync) && session.selected.is_some()
+        if let Some(spec) = spec
+            && spec.needs_mailbox_sync()
+            && session.selected.is_some()
         {
+            let options = session.sync_options(spec.allows_expunge());
             sync_selected_mailbox(
                 &mut reader,
                 &session.mail_root,
                 &mut session.selected,
-                session.state.feature_enabled("QRESYNC"),
+                options,
             )
             .await?;
         }
@@ -241,10 +329,10 @@ pub(crate) async fn process_stream_inner(
                     reader = returned;
                     continue;
                 }
-                Ok(transport::StartTlsOutcome::Upgraded(tls_stream)) => {
+                Ok(transport::StartTlsOutcome::Upgraded(tls_stream, bindings)) => {
                     imap_log!("info", "starttls_succeeded", { "peer": session.peer_label() });
                     // RFC 3501: no greeting after STARTTLS; state starts over.
-                    return Box::pin(process_stream_inner(
+                    return Box::pin(run_session(
                         tls_stream,
                         session.mail_root,
                         session.tls_ctx,
@@ -253,6 +341,7 @@ pub(crate) async fn process_stream_inner(
                         true,
                         false,
                         session.auth_policy,
+                        Some(bindings),
                     ))
                     .await;
                 }
@@ -285,11 +374,25 @@ impl Session {
     }
 
     fn capabilities(&self, phase: response::CapabilityPhase) -> String {
-        response::capability_tokens_with_policy(
-            phase,
-            self.tls_ctx.is_some(),
-            self.auth_policy.as_ref(),
-        )
+        // Before TLS the flag means "STARTTLS can be offered"; on a TLS
+        // session it means "channel binding (SCRAM-*-PLUS) can be offered".
+        let transport_feature = if phase == response::CapabilityPhase::NotAuthenticatedTls {
+            self.channel_bindings.is_available()
+        } else {
+            self.tls_ctx.is_some()
+        };
+        response::capability_tokens_with_policy(phase, transport_feature, self.auth_policy.as_ref())
+    }
+
+    /// Whether this session advertises SCRAM-SHA-256-PLUS; a plain
+    /// SCRAM-SHA-256 client that says it supports channel binding (`y`) is
+    /// then being downgraded (RFC 5802 §6).
+    fn scram_plus_advertised(&self) -> bool {
+        self.encrypted
+            && self
+                .auth_policy
+                .advertised_mechanisms(true, self.channel_bindings.is_available())
+                .any(|mechanism| mechanism.channel_binding_required)
     }
 
     /// The authenticated account. Preflight guarantees it for commands that
@@ -424,6 +527,19 @@ impl Session {
                 self.quota(reader, call).await
             }
             Command::Unselect => self.unselect(reader, call).await,
+            Command::Unauthenticate => {
+                // RFC 8437: back to the not-authenticated state as if the
+                // connection were new; TLS and compression stay active.
+                let account = self.state.authenticated_mailbox.clone();
+                self.clear_selection();
+                self.state = state::SessionState::default();
+                imap_log!("info", "unauthenticated", { "peer": self.peer_label(), "mailbox": account });
+                self.send(
+                    reader,
+                    commands::basic::completed(call.tag, "UNAUTHENTICATE").encode(),
+                )
+                .await
+            }
             Command::Append => self.append(reader, call).await,
             Command::List { .. } | Command::Lsub => self.list(reader, call).await,
             Command::Create | Command::Delete | Command::Rename | Command::Subscribe { .. } => {
@@ -470,24 +586,14 @@ impl Session {
         self.send(reader, response).await
     }
 
-    /// Reload the selected mailbox after a change, keeping EXAMINE's
-    /// read-only mode.
-    async fn refresh_selected(&mut self) -> Result<()> {
-        let name = mailbox::selected_mailbox_name(&self.selected).to_string();
-        self.refresh_selected_named(&name).await
-    }
-
-    async fn refresh_selected_named(&mut self, name: &str) -> Result<()> {
-        self.selected = Some(
-            reload_selected_mailbox_preserving_mode(
-                &self.mail_root,
-                self.address(),
-                name,
-                &self.selected,
-            )
-            .await?,
-        );
-        Ok(())
+    /// How untagged updates are reported in this session.
+    fn sync_options(&self, allow_expunge: bool) -> mailbox::SyncOptions {
+        mailbox::SyncOptions {
+            allow_expunge,
+            qresync: self.state.feature_enabled("QRESYNC"),
+            condstore: self.state.condstore_enabled(),
+            imap4rev2: self.state.imap4rev2_enabled(),
+        }
     }
 
     /// Mirror the account quota from the database before commands that add
@@ -524,38 +630,24 @@ pub(crate) async fn sync_selected_mailbox(
     reader: &mut ImapReader,
     mail_root: &str,
     selected: &mut Option<SelectedMailbox>,
-    qresync_enabled: bool,
+    options: mailbox::SyncOptions,
 ) -> Result<()> {
-    let Some(current) = selected.as_ref().cloned() else {
+    let Some(current) = selected.as_ref() else {
         return Ok(());
     };
-    let (refreshed, events) = mailbox::refresh_selected_mailbox(mail_root, &current).await?;
+    let (refreshed, events) =
+        mailbox::refresh_selected_mailbox(mail_root, current, options).await?;
     if !events.is_empty() {
         let writer = reader.get_mut();
         for event in &events {
             writer
-                .write_all(event.response_line(qresync_enabled).as_bytes())
+                .write_all(event.response_line(options).as_bytes())
                 .await?;
         }
         writer.flush().await?;
     }
     *selected = Some(refreshed);
     Ok(())
-}
-
-async fn reload_selected_mailbox_preserving_mode(
-    mail_root: &str,
-    address: &str,
-    mailbox_name: &str,
-    previous: &Option<SelectedMailbox>,
-) -> Result<SelectedMailbox> {
-    let read_only = previous
-        .as_ref()
-        .map(|selected| selected.read_only)
-        .unwrap_or(false);
-    let mut refreshed = mailbox::load_selected_mailbox(mail_root, address, mailbox_name).await?;
-    refreshed.read_only = read_only;
-    Ok(refreshed)
 }
 
 async fn sync_account_storage_quota(

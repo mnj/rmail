@@ -16,6 +16,7 @@ pub(crate) async fn handle(
     previous_saved_uids: &[u64],
     uid_mode: bool,
     utf8_accept: bool,
+    imap4rev2: bool,
 ) -> Outcome {
     let request = match parser::parse_search_request(raw_args) {
         Ok(request) => request,
@@ -47,22 +48,25 @@ pub(crate) async fn handle(
     let selected = selected.clone();
     let criterion = request.criterion.clone();
     let saved = previous_saved_uids.to_vec();
-    let matches =
-        match tokio::task::spawn_blocking(move || execute(&selected, &criterion, &saved)).await {
-            Ok(Ok(matches)) => matches,
-            Ok(Err(error)) => {
-                return response(
-                    StatusLine::tagged(tag, Status::No, format!("SEARCH failed: {error}"))
-                        .with_code("UNAVAILABLE"),
-                );
-            }
-            Err(error) => {
-                return response(
-                    StatusLine::tagged(tag, Status::No, format!("SEARCH task failed: {error}"))
-                        .with_code("UNAVAILABLE"),
-                );
-            }
-        };
+    let matches = match tokio::task::spawn_blocking(move || {
+        execute(&selected, &criterion, &saved, imap4rev2)
+    })
+    .await
+    {
+        Ok(Ok(matches)) => matches,
+        Ok(Err(error)) => {
+            return response(
+                StatusLine::tagged(tag, Status::No, format!("SEARCH failed: {error}"))
+                    .with_code("UNAVAILABLE"),
+            );
+        }
+        Err(error) => {
+            return response(
+                StatusLine::tagged(tag, Status::No, format!("SEARCH task failed: {error}"))
+                    .with_code("UNAVAILABLE"),
+            );
+        }
+    };
     let ids = matches
         .iter()
         .map(|(sequence, uid)| if uid_mode { *uid } else { *sequence })
@@ -73,7 +77,13 @@ pub(crate) async fn handle(
         .is_some_and(|options| options.save)
         .then(|| matches.iter().map(|(_, uid)| *uid).collect());
     let mut result = Response::new();
-    if let Some(data) = result_data(tag, uid_mode, &ids, request.return_options.as_ref()) {
+    if let Some(data) = result_data(
+        tag,
+        uid_mode,
+        &ids,
+        request.return_options.as_ref(),
+        imap4rev2,
+    ) {
         result = result.data(data);
     }
     result = result.status(StatusLine::tagged(
@@ -91,18 +101,23 @@ fn execute(
     selected: &SelectedMailbox,
     criterion: &parser::SearchCriterion,
     saved_search_uids: &[u64],
+    imap4rev2: bool,
 ) -> anyhow::Result<Vec<(u64, u64)>> {
     let mut matches = Vec::new();
     let now = chrono::Utc::now().timestamp();
     let needs_data = parser::search_requires_message_data(criterion);
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
+        // Expunged by another session; the file may already be gone.
+        if selected.is_expunged(*uid) {
+            continue;
+        }
         let data = if needs_data {
             std::fs::read(path)?
         } else {
             Vec::new()
         };
         let mut effective_flags = flags.clone();
-        if selected.recent_uids.contains(uid) {
+        if !imap4rev2 && selected.recent_uids.contains(uid) {
             effective_flags.push("\\Recent".to_string());
         }
         let message = parser::SearchMessage {
@@ -138,12 +153,23 @@ fn result_data(
     uid_mode: bool,
     ids: &[u64],
     return_options: Option<&parser::SearchReturnOptions>,
+    imap4rev2: bool,
 ) -> Option<String> {
-    let Some(options) = return_options else {
-        return Some(format!(
-            "SEARCH {}",
-            ids.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
-        ));
+    // RFC 9051 §6.4.4: IMAP4rev2 answers every SEARCH with ESEARCH; without
+    // RETURN options that is RETURN (ALL).
+    let rev2_default = parser::SearchReturnOptions {
+        all: true,
+        ..Default::default()
+    };
+    let options = match return_options {
+        Some(options) => options,
+        None if imap4rev2 => &rev2_default,
+        None => {
+            return Some(format!(
+                "SEARCH {}",
+                ids.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
+            ));
+        }
     };
     if options.save && !options.min && !options.max && !options.all && !options.count {
         return None;
@@ -204,11 +230,11 @@ mod tests {
             save: false,
         };
         assert_eq!(
-            result_data("A1", true, &[2, 3, 4, 8], Some(&options)),
+            result_data("A1", true, &[2, 3, 4, 8], Some(&options), false),
             Some("ESEARCH (TAG \"A1\") UID MIN 2 MAX 8 ALL 2:4,8 COUNT 4".to_string())
         );
         assert_eq!(
-            result_data("A1", false, &[], Some(&options)),
+            result_data("A1", false, &[], Some(&options), false),
             Some("ESEARCH (TAG \"A1\") COUNT 0".to_string())
         );
     }
@@ -228,12 +254,14 @@ mod tests {
             save_dates: Default::default(),
             sizes: Default::default(),
             recent_uids: Default::default(),
+            expunged: Default::default(),
         };
         let outcome = handle(
             "A1",
             "CHARSET ISO-8859-1 ALL",
             &selected,
             &[9],
+            false,
             false,
             false,
         )
@@ -261,18 +289,23 @@ mod tests {
             save_dates: Default::default(),
             sizes: [(7, 12_345)].into(),
             recent_uids: Default::default(),
+            expunged: Default::default(),
         };
 
         let criterion = parser::SearchCriterion::And(vec![
             parser::SearchCriterion::Seen,
             parser::SearchCriterion::Larger(10_000),
         ]);
-        assert_eq!(execute(&selected, &criterion, &[]).unwrap(), vec![(1, 7)]);
+        assert_eq!(
+            execute(&selected, &criterion, &[], false).unwrap(),
+            vec![(1, 7)]
+        );
         assert!(
             execute(
                 &selected,
                 &parser::SearchCriterion::Text("body".to_string()),
-                &[]
+                &[],
+                false
             )
             .is_err()
         );

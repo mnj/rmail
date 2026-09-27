@@ -93,6 +93,10 @@ fn execute_sort(
     let mut records = Vec::new();
     let now = chrono::Utc::now().timestamp();
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
+        // Expunged by another session; the file may already be gone.
+        if selected.is_expunged(*uid) {
+            continue;
+        }
         let data = std::fs::read(path)?;
         let internal_date = selected
             .internal_dates
@@ -135,6 +139,10 @@ fn execute_thread(
     let mut messages = Vec::new();
     let now = chrono::Utc::now().timestamp();
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
+        // Expunged by another session; the file may already be gone.
+        if selected.is_expunged(*uid) {
+            continue;
+        }
         let data = std::fs::read(path)?;
         let internal_date = selected
             .internal_dates
@@ -203,6 +211,7 @@ mod tests {
             save_dates: Default::default(),
             sizes: Default::default(),
             recent_uids: Default::default(),
+            expunged: Default::default(),
         }
     }
 

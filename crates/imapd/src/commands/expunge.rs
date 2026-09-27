@@ -7,10 +7,11 @@ use crate::{
     response::{Response, Status, StatusLine},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectionEffect {
     Keep,
-    Refresh,
+    /// The listed UIDs were expunged and reported to the client.
+    Remove(Vec<u64>),
     Clear,
 }
 
@@ -149,7 +150,7 @@ async fn run(
         selection_effect: if silent {
             SelectionEffect::Clear
         } else {
-            SelectionEffect::Refresh
+            SelectionEffect::Remove(deleted.iter().map(|(_, uid)| *uid).collect())
         },
     }
 }

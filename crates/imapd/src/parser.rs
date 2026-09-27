@@ -220,6 +220,40 @@ pub(crate) fn parse_mailbox_argument(input: &str) -> Result<String, ParseError> 
         .ok_or(ParseError::InvalidAtom)
 }
 
+/// CREATE mailbox [(USE (attr ...))] (RFC 4466 create parameters, RFC 6154
+/// §3 USE). Returns the mailbox and the requested special-use attributes.
+pub(crate) fn parse_create_arguments(input: &str) -> Result<(String, Vec<String>), ParseError> {
+    let arguments = parse_imap_args(input)?;
+    let (mailbox, parameters) = match arguments.as_slice() {
+        [mailbox] => (mailbox, None),
+        [mailbox, ImapArg::List(parameters)] => (mailbox, Some(parameters)),
+        _ => return Err(ParseError::TrailingData),
+    };
+    let mailbox = mailbox
+        .as_text()
+        .map(str::to_string)
+        .ok_or(ParseError::InvalidAtom)?;
+    let mut uses = Vec::new();
+    if let Some(parameters) = parameters {
+        let [ImapArg::Atom(name), ImapArg::List(attributes)] = parameters.as_slice() else {
+            return Err(ParseError::InvalidAtom);
+        };
+        if !name.eq_ignore_ascii_case("USE") {
+            return Err(ParseError::InvalidAtom);
+        }
+        for attribute in attributes {
+            let ImapArg::Atom(attribute) = attribute else {
+                return Err(ParseError::InvalidAtom);
+            };
+            if !attribute.starts_with('\\') {
+                return Err(ParseError::InvalidAtom);
+            }
+            uses.push(attribute.clone());
+        }
+    }
+    Ok((mailbox, uses))
+}
+
 pub(crate) fn parse_rename_arguments(input: &str) -> Result<(String, String), ParseError> {
     let arguments = parse_imap_args(input)?;
     let [source, destination] = arguments.as_slice() else {
@@ -350,6 +384,7 @@ pub(crate) enum Command {
     GetQuotaRoot,
     SetQuota,
     Unselect,
+    Unauthenticate,
     Append,
     List { kind: &'static str },
     Lsub,
@@ -398,6 +433,7 @@ impl<'a> RequestLine<'a> {
             Command::GetQuotaRoot => "GETQUOTAROOT",
             Command::SetQuota => "SETQUOTA",
             Command::Unselect => "UNSELECT",
+            Command::Unauthenticate => "UNAUTHENTICATE",
             Command::Append => "APPEND",
             Command::List { kind } => kind,
             Command::Lsub => "LSUB",
@@ -445,6 +481,7 @@ impl Command {
                 | Self::Namespace
                 | Self::StartTls
                 | Self::Unselect
+                | Self::Unauthenticate
         )
     }
 }
@@ -508,6 +545,7 @@ pub(crate) fn parse_request_line(input: &str) -> Result<RequestLine<'_>, ParseEr
         "GETQUOTAROOT" => Command::GetQuotaRoot,
         "SETQUOTA" => Command::SetQuota,
         "UNSELECT" => Command::Unselect,
+        "UNAUTHENTICATE" => Command::Unauthenticate,
         "APPEND" => Command::Append,
         "LIST" | "XLIST" => Command::List {
             kind: if name == "XLIST" { "XLIST" } else { "LIST" },
@@ -1942,6 +1980,8 @@ pub(crate) enum StatusItem {
     Unseen,
     HighestModSeq,
     Size,
+    /// RFC 9051 STATUS DELETED: messages with the \Deleted flag.
+    Deleted,
 }
 
 impl StatusItem {
@@ -1957,6 +1997,7 @@ impl StatusItem {
             "UNSEEN" => Ok(Self::Unseen),
             "HIGHESTMODSEQ" => Ok(Self::HighestModSeq),
             "SIZE" => Ok(Self::Size),
+            "DELETED" => Ok(Self::Deleted),
             _ => Err(ParseError::InvalidAtom),
         }
     }

@@ -158,7 +158,10 @@ pub(crate) async fn enable_deflate(
 
 pub(crate) enum StartTlsOutcome {
     Rejected(BufReader<Box<dyn AsyncStream + Send + 'static>>),
-    Upgraded(Box<dyn RawStream + Send + 'static>),
+    Upgraded(
+        Box<dyn RawStream + Send + 'static>,
+        rmail_common::auth::ChannelBindings,
+    ),
 }
 
 pub(crate) async fn start_tls(
@@ -197,5 +200,6 @@ pub(crate) async fn start_tls(
     let handshake = tls_context.acceptor.accept(reader.into_inner()).await;
     rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
     let stream = handshake.map_err(|error| anyhow!("TLS accept failed: {error}"))?;
-    Ok(StartTlsOutcome::Upgraded(Box::new(stream)))
+    let bindings = tls_context.channel_bindings(stream.get_ref().1);
+    Ok(StartTlsOutcome::Upgraded(Box::new(stream), bindings))
 }

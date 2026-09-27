@@ -294,8 +294,10 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?
                     .to_string();
                 // create SCRAM verifier JSON with a reasonable iteration count
-                let scram = rmail_common::auth::create_scram_verifier(&p, 4096)?;
-                (phs, Some(scram))
+                // SASLprep rejects some passwords (e.g. control characters);
+                // those get no SCRAM verifier but can still use PLAIN/LOGIN.
+                let scram = rmail_common::auth::create_scram_verifier(&p, 4096).ok();
+                (phs, scram)
             } else {
                 (String::new(), None)
             };
