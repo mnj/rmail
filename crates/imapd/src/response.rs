@@ -80,6 +80,8 @@ impl StatusLine {
 pub(crate) enum Line {
     Status(StatusLine),
     UntaggedData(String),
+    /// Untagged data that may carry literals, written verbatim.
+    UntaggedLiteralData(String),
     Continuation(String),
 }
 
@@ -103,6 +105,14 @@ impl Response {
         self
     }
 
+    /// Untagged data containing `{n}\r\n` literals. Unlike [`Self::data`] it
+    /// is not sanitized, so the caller must frame every CR and LF inside a
+    /// literal.
+    pub(crate) fn literal_data(mut self, data: impl Into<String>) -> Self {
+        self.lines.push(Line::UntaggedLiteralData(data.into()));
+        self
+    }
+
     pub(crate) fn continuation(mut self, text: impl Into<String>) -> Self {
         self.lines.push(Line::Continuation(text.into()));
         self
@@ -116,6 +126,11 @@ impl Response {
                 Line::UntaggedData(data) => {
                     output.push_str("* ");
                     output.push_str(&sanitize_component(data));
+                    output.push_str("\r\n");
+                }
+                Line::UntaggedLiteralData(data) => {
+                    output.push_str("* ");
+                    output.push_str(data);
                     output.push_str("\r\n");
                 }
                 Line::Continuation(text) => {
@@ -243,6 +258,7 @@ pub(crate) fn capability_tokens_with_policy(
             "UNAUTHENTICATE",
             "CREATE-SPECIAL-USE",
             "OBJECTID",
+            "METADATA",
         ]),
     }
     let mut caps = caps.join(" ");

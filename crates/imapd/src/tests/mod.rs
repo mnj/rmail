@@ -8,6 +8,7 @@ mod compat;
 mod extensions;
 mod fetch;
 mod mailboxes;
+mod metadata;
 mod objectid;
 mod protocol;
 mod rev2;

@@ -526,6 +526,7 @@ impl Session {
             Command::GetQuota | Command::GetQuotaRoot | Command::SetQuota => {
                 self.quota(reader, call).await
             }
+            Command::GetMetadata | Command::SetMetadata => self.metadata(reader, call).await,
             Command::Unselect => self.unselect(reader, call).await,
             Command::Unauthenticate => {
                 // RFC 8437: back to the not-authenticated state as if the

@@ -147,8 +147,10 @@ pub(crate) async fn read_textual_command_literals(
         let literal_is_utf8 = std::str::from_utf8(&literal).is_ok();
         command.truncate(marker.start);
         command.push(b'"');
+        // CR and LF are escaped too, so a multi-line literal survives as one
+        // quoted string instead of being rejected by the argument parser.
         for byte in literal {
-            if matches!(byte, b'"' | b'\\') {
+            if matches!(byte, b'"' | b'\\' | b'\r' | b'\n') {
                 command.push(b'\\');
             }
             command.push(byte);
