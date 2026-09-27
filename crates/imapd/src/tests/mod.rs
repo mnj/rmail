@@ -3,6 +3,7 @@
 
 mod append;
 mod auth;
+mod autologout;
 mod compat;
 mod fetch;
 mod mailboxes;

@@ -34,6 +34,9 @@ use crate::{
 
 pub(crate) type ImapReader = BufReader<Box<dyn AsyncStream + Send + 'static>>;
 
+/// Sent before closing an inactive session (RFC 3501 §5.4).
+pub(crate) const AUTOLOGOUT_BYE: &[u8] = b"* BYE Autologout; idle for too long\r\n";
+
 /// Result of reading one command line.
 enum Line {
     Command(Vec<u8>),
@@ -224,10 +227,25 @@ async fn run_session(
         } else {
             MAX_PREAUTH_LINE_BYTES
         };
-        let line = match session.read_command(&mut reader, line_limit).await? {
-            Line::Command(line) => line,
-            Line::Skip => continue,
-            Line::End => break,
+        let timeouts = session.auth_policy.timeouts();
+        let autologout = if session.state.authenticated_mailbox.is_some() {
+            timeouts.authenticated
+        } else {
+            timeouts.unauthenticated
+        };
+        let read =
+            tokio::time::timeout(autologout, session.read_command(&mut reader, line_limit)).await;
+        let line = match read {
+            Ok(result) => match result? {
+                Line::Command(line) => line,
+                Line::Skip => continue,
+                Line::End => break,
+            },
+            Err(_) => {
+                imap_log!("info", "session_closed", { "peer": session.peer_label(), "encrypted": session.encrypted, "reason": "autologout" });
+                let _ = write(&mut reader, AUTOLOGOUT_BYE).await;
+                break;
+            }
         };
         let Ok(input) = std::str::from_utf8(&line) else {
             write(&mut reader, b"* BAD Command line is not valid UTF-8\r\n").await?;

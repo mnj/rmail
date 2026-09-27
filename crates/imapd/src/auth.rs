@@ -58,11 +58,34 @@ const SASL_MECHANISMS: &[SaslMechanism] = &[
     },
 ];
 
+/// Inactivity autologout (RFC 3501 §5.4, RFC 9051 §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionTimeouts {
+    /// Before authentication; may be shorter than 30 minutes.
+    pub(crate) unauthenticated: Duration,
+    /// After authentication; RFC 3501 requires at least 30 minutes.
+    pub(crate) authenticated: Duration,
+    /// Longest IDLE without DONE; clients re-issue IDLE every 29 minutes
+    /// (RFC 2177), so a stuck IDLE ends after 30.
+    pub(crate) idle: Duration,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            unauthenticated: Duration::from_secs(3 * 60),
+            authenticated: Duration::from_secs(30 * 60),
+            idle: Duration::from_secs(30 * 60),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthPolicy {
     mechanisms: Vec<SaslMechanism>,
     oauth: Option<rmail_common::oauth::OAuthValidator>,
     max_commands_per_minute: usize,
+    timeouts: SessionTimeouts,
 }
 
 impl Default for AuthPolicy {
@@ -75,6 +98,7 @@ impl Default for AuthPolicy {
                 .collect(),
             oauth: None,
             max_commands_per_minute: 300,
+            timeouts: SessionTimeouts::default(),
         }
     }
 }
@@ -107,6 +131,7 @@ impl AuthPolicy {
             mechanisms,
             oauth: None,
             max_commands_per_minute: 300,
+            timeouts: SessionTimeouts::default(),
         })
     }
 
@@ -152,6 +177,7 @@ impl AuthPolicy {
             mechanisms,
             oauth: None,
             max_commands_per_minute: 300,
+            timeouts: SessionTimeouts::default(),
         })
     }
 
@@ -177,6 +203,16 @@ impl AuthPolicy {
 
     pub(crate) fn oauth(&self) -> Option<&rmail_common::oauth::OAuthValidator> {
         self.oauth.as_ref()
+    }
+
+    pub(crate) fn timeouts(&self) -> SessionTimeouts {
+        self.timeouts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeouts(mut self, timeouts: SessionTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     pub(crate) fn max_commands_per_minute(&self) -> usize {

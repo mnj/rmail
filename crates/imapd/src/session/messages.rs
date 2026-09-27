@@ -241,6 +241,7 @@ impl Session {
             &self.mail_root,
             &mut self.selected,
             options,
+            self.auth_policy.timeouts().idle,
         )
         .await?;
         Ok(if outcome == commands::idle::Outcome::Disconnected {
