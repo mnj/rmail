@@ -163,6 +163,41 @@ async fn replace_reports_vanished_with_qresync() {
 }
 
 #[tokio::test]
+async fn replace_under_uidonly_needs_uid_and_reports_vanished() {
+    let mut session = authenticated_session(2).await;
+    session.command("E1 ENABLE UIDONLY", "E1 OK").await;
+    session.command("S1 SELECT INBOX", "S1 OK").await;
+    let refused = session
+        .command(&format!("A1 REPLACE 2 Drafts {{{}}}", NEW_MESSAGE.len()), "A1 ")
+        .await;
+    assert!(
+        refused.last().unwrap().starts_with("A1 BAD [UIDREQUIRED]"),
+        "{refused:?}"
+    );
+    let old_uid = session.uids[1];
+    send_with_literal(
+        &mut session,
+        &format!("A2 UID REPLACE {old_uid} Drafts"),
+        NEW_MESSAGE,
+        true,
+    )
+    .await;
+    let lines = session.expect("A2 ").await;
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.trim_end() == format!("* VANISHED {old_uid}")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("EXPUNGE")),
+        "{lines:?}"
+    );
+    assert!(lines.last().unwrap().starts_with("A2 OK"), "{lines:?}");
+    session.finish().await;
+}
+
+#[tokio::test]
 async fn replace_supports_literal8_utf8_and_catenate() {
     let mut session = authenticated_session(2).await;
     session.command("E1 ENABLE UTF8=ACCEPT", "E1 OK").await;

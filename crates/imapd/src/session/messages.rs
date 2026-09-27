@@ -270,10 +270,10 @@ impl Session {
             super::sync_selected_mailbox(reader, &self.mail_root, &mut self.selected, options)
                 .await?;
         }
-        let qresync = self.state.feature_enabled("QRESYNC");
+        let vanished = self.state.vanished_enabled();
         let mut response = String::new();
         if let (Some(old_uid), Some(selected)) = (replaced.expunged_uid, self.selected.as_mut()) {
-            if qresync {
+            if vanished {
                 response.push_str(&format!("* VANISHED {old_uid}\r\n"));
             } else if let Some(index) = selected
                 .msgs
