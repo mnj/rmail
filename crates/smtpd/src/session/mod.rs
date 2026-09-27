@@ -294,8 +294,7 @@ impl Session {
             send(reader, b"421 4.7.0 Command rate limit exceeded\r\n").await?;
             return Ok(Flow::Close);
         }
-        if line.len() > protocol::MAX_COMMAND_LINE_BYTES && !matches!(command, SmtpCommand::Auth(_))
-        {
+        if line.len() > protocol::command_line_limit(&command) {
             return reply(reader, b"500 5.5.2 Line too long\r\n").await;
         }
         self.record_command(&command, cmd);

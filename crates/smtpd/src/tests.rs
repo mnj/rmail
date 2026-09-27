@@ -1227,6 +1227,44 @@ async fn nested_mail_is_rejected_and_a_rejected_mail_leaves_no_transaction() {
 }
 
 #[tokio::test]
+async fn dsn_parameters_may_extend_mail_and_rcpt_beyond_512_octets() {
+    let envid = "e".repeat(100);
+    let orcpt = format!("rfc822;{}+40example.test", "o".repeat(60));
+    let mail = format!(
+        "MAIL FROM:<{}@example.test> SIZE=100 BODY=8BITMIME ENVID={envid} RET=HDRS",
+        "s".repeat(60)
+    );
+    let rcpt = format!("RCPT TO:<user@example.test> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT={orcpt}");
+    let padded_rcpt = format!("{rcpt}{}", " ".repeat(600 - rcpt.len()));
+    let padded_mail = format!("{mail}{}", " ".repeat(600 - mail.len()));
+    let noop = format!("NOOP {}", "x".repeat(600));
+    let (responses, _td) = run_session(
+        format!("EHLO localhost\r\n{padded_mail}\r\n{padded_rcpt}\r\n{noop}\r\nQUIT\r\n")
+            .into_bytes(),
+        16 * 1024,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "250 2.1.0 Sender OK\r\n"),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "250 2.1.5 Recipient OK\r\n"),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "500 5.5.2 Line too long\r\n"),
+        "{responses:?}"
+    );
+}
+
+#[tokio::test]
 async fn strict_commands_and_mail_parameters() {
     let (responses, _td) = run_session(
             b"EHLO localhost\r\nDATA junk\r\nQUITzzz\r\nMAIL FROM:<user@example.test> SIZE=42 BODY=8BITMIME SMTPUTF8\r\nQUIT\r\n".to_vec(),

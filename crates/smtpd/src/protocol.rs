@@ -294,7 +294,7 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
         return None;
     }
     let mut rest = trimmed[prefix_len..].trim_start();
-    if !rest.starts_with('<') || rest.len() > 256 {
+    if !rest.starts_with('<') {
         return None;
     }
     let mut quoted = false;
@@ -314,6 +314,10 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
     }
     let end = end?;
     let path = &rest[..=end];
+    // The limit applies to the path alone, not to the ESMTP parameters.
+    if path.len() > MAX_PATH_BYTES {
+        return None;
+    }
     rest = &rest[end + 1..];
     if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
         return None;
@@ -689,6 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn path_limit_excludes_parameters_and_mail_rcpt_lines_are_extended() {
+        let local = "l".repeat(64);
+        let label = "d".repeat(60);
+        let domain = format!("{label}.{label}.example.test");
+        let address = format!("{local}@{domain}");
+        assert!(address.len() + 2 <= 256);
+        let envid = "e".repeat(100);
+        let long_mail = format!("FROM:<{address}> SIZE=1000 ENVID={envid} RET=HDRS");
+        assert!(long_mail.len() > 256);
+        assert!(parse_mail_from_args(&long_mail).is_ok());
+        let orcpt = format!("rfc822;{address}");
+        let long_rcpt = format!("TO:<{address}> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT={orcpt}");
+        assert!(parse_rcpt_to_args(&long_rcpt, false).is_ok());
+
+        // A syntactically valid mailbox whose path exceeds 256 octets.
+        let long_domain = [label.as_str(); 4].join(".");
+        assert!(rmail_common::domain::canonicalize_domain(&long_domain).is_ok());
+        let overlong_path = format!("FROM:<{local}@{long_domain}>");
+        assert!(parse_mail_from_args(&overlong_path).is_err());
+
+        assert_eq!(command_line_limit(&Command::Mail("")), MAX_MAIL_LINE_BYTES);
+        assert!(command_line_limit(&Command::Mail("")) >= 512 + 26 + 100 + 500);
+        assert!(command_line_limit(&Command::Rcpt("")) >= 1012);
+        assert_eq!(command_line_limit(&Command::Noop), 512);
+    }
+
+    #[test]
     fn command_and_helo_grammar_reject_leading_space_missing_args_and_bad_domains() {
         assert_eq!(parse_command(" DATA"), Command::BadSyntax);
         assert_eq!(parse_command("VRFY"), Command::BadSyntax);
@@ -730,7 +761,26 @@ mod tests {
 }
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
+/// RFC 5321 section 4.5.3.1.4: command line including CRLF.
 pub(crate) const MAX_COMMAND_LINE_BYTES: usize = 512;
+/// MAIL grows by the advertised extensions' allowances: SIZE (RFC 1870,
+/// +26), ENVID/RET (RFC 3461, +100), AUTH= (RFC 4954, +500) and a margin
+/// for the keyword-only parameters (BODY=, SMTPUTF8, REQUIRETLS).
+pub(crate) const MAX_MAIL_LINE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 26 + 100 + 500 + 50;
+/// RCPT grows by 500 for NOTIFY and ORCPT (RFC 3461 section 4).
+pub(crate) const MAX_RCPT_LINE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 500;
+/// Largest RFC 5321 path, including the angle brackets (section 4.5.3.1.3).
+const MAX_PATH_BYTES: usize = 256;
+
+/// Line length limit for a command; AUTH lines are bounded separately.
+pub(crate) fn command_line_limit(command: &Command<'_>) -> usize {
+    match command {
+        Command::Mail(_) => MAX_MAIL_LINE_BYTES,
+        Command::Rcpt(_) => MAX_RCPT_LINE_BYTES,
+        Command::Auth(_) => MAX_AUTH_LINE_BYTES,
+        _ => MAX_COMMAND_LINE_BYTES,
+    }
+}
 pub(crate) const MAX_AUTH_LINE_BYTES: usize = 12 * 1024;
 pub(crate) const SMTP_SASL_MECHANISMS: &[&str] =
     &["PLAIN", "LOGIN", "SCRAM-SHA-256", "OAUTHBEARER", "XOAUTH2"];
