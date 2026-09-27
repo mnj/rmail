@@ -221,6 +221,10 @@ pub(crate) async fn verify_password(
     rmail_common::auth::authenticate_password(db_path, user, password).await
 }
 
+pub(crate) use rmail_common::auth::{
+    ScramChannelBindingPolicy, ScramClientFinal, ScramClientFirst, ScramClientFirstError,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SaslProgress {
     Challenge(&'static str),
@@ -233,6 +237,8 @@ pub(crate) enum SaslProgress {
 pub(crate) enum SaslExchangeError {
     InvalidResponse,
     UnexpectedResponse,
+    /// RFC 5802 §6: gs2 flag `y` while SCRAM-SHA-256-PLUS was advertised.
+    ChannelBindingDowngrade,
 }
 
 pub(crate) trait SaslExchange: Send {
@@ -249,14 +255,14 @@ enum ScramState {
 }
 
 pub(crate) struct ScramExchange {
-    channel_binding_required: bool,
+    policy: ScramChannelBindingPolicy,
     state: ScramState,
 }
 
 impl ScramExchange {
-    pub(crate) fn new(channel_binding_required: bool) -> Self {
+    pub(crate) fn new(policy: ScramChannelBindingPolicy) -> Self {
         Self {
-            channel_binding_required,
+            policy,
             state: ScramState::New,
         }
     }
@@ -268,6 +274,22 @@ impl ScramExchange {
         self.state = ScramState::FinalAcknowledgment;
         Ok(())
     }
+
+    fn client_first(&mut self, wire: &str) -> Result<SaslProgress, SaslExchangeError> {
+        let message = decode_sasl_message(wire).ok_or(SaslExchangeError::InvalidResponse)?;
+        let first = rmail_common::auth::parse_scram_client_first_with_policy(&message, self.policy)
+            .map_err(|error| match error {
+                ScramClientFirstError::ChannelBindingDowngrade => {
+                    SaslExchangeError::ChannelBindingDowngrade
+                }
+                ScramClientFirstError::Malformed
+                | ScramClientFirstError::UnsupportedChannelBinding => {
+                    SaslExchangeError::InvalidResponse
+                }
+            })?;
+        self.state = ScramState::ClientFinal;
+        Ok(SaslProgress::ScramClientFirst(first))
+    }
 }
 
 impl SaslExchange for ScramExchange {
@@ -275,31 +297,20 @@ impl SaslExchange for ScramExchange {
         if !matches!(self.state, ScramState::New) {
             return Err(SaslExchangeError::UnexpectedResponse);
         }
-        let Some(initial) = initial else {
-            return Ok(SaslProgress::Challenge(""));
-        };
-        let message = decode_sasl_message(initial).ok_or(SaslExchangeError::InvalidResponse)?;
-        let first = parse_scram_client_first(&message, self.channel_binding_required)
-            .ok_or(SaslExchangeError::InvalidResponse)?;
-        self.state = ScramState::ClientFinal;
-        Ok(SaslProgress::ScramClientFirst(first))
+        match initial {
+            Some(initial) => self.client_first(initial),
+            None => Ok(SaslProgress::Challenge("")),
+        }
     }
 
     fn receive(&mut self, response: &str) -> Result<SaslProgress, SaslExchangeError> {
         match self.state {
-            ScramState::New => {
-                let message =
-                    decode_sasl_message(response).ok_or(SaslExchangeError::InvalidResponse)?;
-                let first = parse_scram_client_first(&message, self.channel_binding_required)
-                    .ok_or(SaslExchangeError::InvalidResponse)?;
-                self.state = ScramState::ClientFinal;
-                Ok(SaslProgress::ScramClientFirst(first))
-            }
+            ScramState::New => self.client_first(response),
             ScramState::ClientFinal => {
                 let message =
                     decode_sasl_message(response).ok_or(SaslExchangeError::InvalidResponse)?;
-                let final_message =
-                    parse_scram_client_final(&message).ok_or(SaslExchangeError::InvalidResponse)?;
+                let final_message = rmail_common::auth::parse_scram_client_final(&message)
+                    .ok_or(SaslExchangeError::InvalidResponse)?;
                 self.state = ScramState::ClientFinalReceived;
                 Ok(SaslProgress::ScramClientFinal(final_message))
             }
@@ -328,118 +339,6 @@ pub(crate) fn parse_scram_attr<'a>(message: &'a str, key: &str) -> Option<&'a st
     message.split(',').find_map(|part| part.strip_prefix(key))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScramClientFirst {
-    pub(crate) username: String,
-    pub(crate) authzid: Option<String>,
-    pub(crate) nonce: String,
-    pub(crate) bare: String,
-    pub(crate) gs2_header: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScramClientFinal {
-    pub(crate) without_proof: String,
-    pub(crate) proof: String,
-    pub(crate) channel_binding: String,
-    pub(crate) nonce: String,
-}
-
-fn decode_scram_name(value: &str) -> Option<String> {
-    let mut decoded = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '=' {
-            decoded.push(ch);
-            continue;
-        }
-        match (chars.next(), chars.next()) {
-            (Some('2'), Some('C')) => decoded.push(','),
-            (Some('3'), Some('D')) => decoded.push('='),
-            _ => return None,
-        }
-    }
-    Some(decoded)
-}
-
-fn parse_scram_attributes(message: &str) -> Option<Vec<(&str, &str)>> {
-    let mut attributes = Vec::new();
-    for part in message.split(',') {
-        let (name, value) = part.split_once('=')?;
-        if name.len() != 1 || name == "m" || attributes.iter().any(|(seen, _)| *seen == name) {
-            return None;
-        }
-        attributes.push((name, value));
-    }
-    Some(attributes)
-}
-
-pub(crate) fn parse_scram_client_first(
-    message: &str,
-    channel_binding_required: bool,
-) -> Option<ScramClientFirst> {
-    let first_comma = message.find(',')?;
-    let second_comma = message[first_comma + 1..].find(',')? + first_comma + 1;
-    let channel_binding_flag = &message[..first_comma];
-    if channel_binding_required {
-        if channel_binding_flag != "p=tls-server-end-point" {
-            return None;
-        }
-    } else if channel_binding_flag != "n" && channel_binding_flag != "y" {
-        return None;
-    }
-    let authzid_field = &message[first_comma + 1..second_comma];
-    let authzid = if authzid_field.is_empty() {
-        None
-    } else {
-        Some(decode_scram_name(authzid_field.strip_prefix("a=")?)?)
-    };
-    let gs2_header = message[..=second_comma].to_string();
-    let bare = message[second_comma + 1..].to_string();
-    let attributes = parse_scram_attributes(&bare)?;
-    let username = decode_scram_name(attributes.iter().find(|(name, _)| *name == "n")?.1)?;
-    let nonce = attributes
-        .iter()
-        .find(|(name, _)| *name == "r")?
-        .1
-        .to_string();
-    if username.is_empty()
-        || nonce.is_empty()
-        || !nonce
-            .bytes()
-            .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b',')
-    {
-        return None;
-    }
-    Some(ScramClientFirst {
-        username,
-        authzid,
-        nonce,
-        bare,
-        gs2_header,
-    })
-}
-
-pub(crate) fn parse_scram_client_final(message: &str) -> Option<ScramClientFinal> {
-    let attributes = parse_scram_attributes(message)?;
-    if attributes.last().map(|(name, _)| *name) != Some("p") {
-        return None;
-    }
-    let proof = attributes.iter().find(|(name, _)| *name == "p")?.1;
-    let channel_binding = attributes.iter().find(|(name, _)| *name == "c")?.1;
-    let nonce = attributes.iter().find(|(name, _)| *name == "r")?.1;
-    if proof.is_empty() || channel_binding.is_empty() || nonce.is_empty() {
-        return None;
-    }
-    let proof_marker = message.rfind(",p=")?;
-    Some(ScramClientFinal {
-        without_proof: message[..proof_marker].to_string(),
-        proof: proof.to_string(),
-        channel_binding: channel_binding.to_string(),
-        nonce: nonce.to_string(),
-    })
-}
-
 pub(crate) fn generate_scram_nonce() -> String {
     let mut bytes = [0u8; 18];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -450,30 +349,61 @@ pub(crate) fn generate_scram_nonce() -> String {
 mod tests {
     use super::*;
 
+    fn parse(message: &str, policy: ScramChannelBindingPolicy) -> Option<ScramClientFirst> {
+        rmail_common::auth::parse_scram_client_first_with_policy(message, policy).ok()
+    }
+
     #[test]
     fn scram_client_first_validates_gs2_names_nonce_and_attributes() {
-        let first = parse_scram_client_first("y,,n=user=2Cname=3Dtest,r=nonce-123", false).unwrap();
+        use ScramChannelBindingPolicy::{NotOffered, Required};
+        let first = parse("y,,n=user=2Cname=3Dtest,r=nonce-123", NotOffered).unwrap();
         assert_eq!(first.username, "user,name=test");
         assert_eq!(first.nonce, "nonce-123");
         assert_eq!(first.gs2_header, "y,,");
         assert_eq!(first.bare, "n=user=2Cname=3Dtest,r=nonce-123");
 
         let authorized =
-            parse_scram_client_first("n,a=user@example.test,n=user@example.test,r=n", false)
-                .unwrap();
+            parse("n,a=user@example.test,n=user@example.test,r=n", NotOffered).unwrap();
         assert_eq!(authorized.authzid.as_deref(), Some("user@example.test"));
-        let plus = parse_scram_client_first("p=tls-server-end-point,,n=user,r=n", true).unwrap();
+        let plus = parse("p=tls-server-end-point,,n=user,r=n", Required).unwrap();
         assert_eq!(plus.gs2_header, "p=tls-server-end-point,,");
-        assert!(parse_scram_client_first("p=tls-server-end-point,,n=user,r=n", false).is_none());
-        assert!(parse_scram_client_first("n,,n=user,r=n", true).is_none());
-        assert!(parse_scram_client_first("n,,n=user,n=duplicate,r=n", false).is_none());
-        assert!(parse_scram_client_first("n,,m=reserved,n=user,r=n", false).is_none());
-        assert!(parse_scram_client_first("n,,n=bad=escape,r=n", false).is_none());
-        assert!(parse_scram_client_first("n,,n=user,r=bad,nonce", false).is_none());
+        let exporter = parse("p=tls-exporter,,n=user,r=n", Required).unwrap();
+        assert_eq!(
+            exporter.channel_binding,
+            Some(rmail_common::auth::ChannelBindingType::TlsExporter)
+        );
+        assert!(parse("p=tls-unique,,n=user,r=n", Required).is_none());
+        assert!(parse("p=tls-server-end-point,,n=user,r=n", NotOffered).is_none());
+        assert!(parse("n,,n=user,r=n", Required).is_none());
+        assert!(parse("n,,n=user,n=duplicate,r=n", NotOffered).is_none());
+        assert!(parse("n,,m=reserved,n=user,r=n", NotOffered).is_none());
+        assert!(parse("n,,n=bad=escape,r=n", NotOffered).is_none());
+        assert!(parse("n,,n=user,r=bad,nonce", NotOffered).is_none());
+    }
+
+    #[test]
+    fn scram_exchange_rejects_y_flag_when_plus_was_advertised() {
+        let first = BASE64_ENGINE.encode("y,,n=user,r=nonce");
+        let mut exchange = ScramExchange::new(ScramChannelBindingPolicy::OfferedButNotSelected);
+        assert_eq!(
+            exchange.start(Some(&first)),
+            Err(SaslExchangeError::ChannelBindingDowngrade)
+        );
+        let mut exchange = ScramExchange::new(ScramChannelBindingPolicy::OfferedButNotSelected);
+        assert!(matches!(
+            exchange.start(Some(&BASE64_ENGINE.encode("n,,n=user,r=nonce"))),
+            Ok(SaslProgress::ScramClientFirst(_))
+        ));
+        let mut exchange = ScramExchange::new(ScramChannelBindingPolicy::NotOffered);
+        assert!(matches!(
+            exchange.start(Some(&first)),
+            Ok(SaslProgress::ScramClientFirst(_))
+        ));
     }
 
     #[test]
     fn scram_client_final_requires_unique_c_r_and_last_proof() {
+        use rmail_common::auth::parse_scram_client_final;
         let final_message = parse_scram_client_final("c=biws,r=nonce,p=cHJvb2Y=").unwrap();
         assert_eq!(final_message.channel_binding, "biws");
         assert_eq!(final_message.nonce, "nonce");
@@ -494,7 +424,7 @@ mod tests {
 
     #[test]
     fn scram_exchange_enforces_first_final_and_acknowledgment_order() {
-        let mut exchange = ScramExchange::new(false);
+        let mut exchange = ScramExchange::new(ScramChannelBindingPolicy::NotOffered);
         assert_eq!(exchange.start(None), Ok(SaslProgress::Challenge("")));
         let first = BASE64_ENGINE.encode("n,,n=user,r=nonce");
         assert!(matches!(
@@ -513,7 +443,7 @@ mod tests {
             Err(SaslExchangeError::UnexpectedResponse)
         );
 
-        let mut plus = ScramExchange::new(true);
+        let mut plus = ScramExchange::new(ScramChannelBindingPolicy::Required);
         assert!(
             plus.start(Some(&BASE64_ENGINE.encode("n,,n=user,r=nonce")))
                 .is_err()

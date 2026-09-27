@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::time::timeout;
 
-use crate::session::process_stream_with_policy;
+use crate::session::{process_stream_with_policy, process_tls_stream};
 use crate::{auth, tls};
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -82,14 +82,19 @@ pub(crate) async fn run_listener(
         tokio::spawn(async move {
             let _session = session;
             let _permit = permit;
-            let stream: Box<dyn crate::RawStream + Send> = match tls_context.clone() {
+            let (stream, bindings): (Box<dyn crate::RawStream + Send>, _) = match tls_context
+                .clone()
+            {
                 Some(tls) if ctx.implicit_tls => {
                     let started = Instant::now();
                     let handshake =
                         timeout(TLS_HANDSHAKE_TIMEOUT, tls.acceptor.accept(stream)).await;
                     rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
                     match handshake {
-                        Ok(Ok(tls_stream)) => Box::new(tls_stream),
+                        Ok(Ok(tls_stream)) => {
+                            let bindings = tls.channel_bindings(tls_stream.get_ref().1);
+                            (Box::new(tls_stream), Some(bindings))
+                        }
                         Ok(Err(error)) => {
                             imap_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() });
                             return;
@@ -100,19 +105,35 @@ pub(crate) async fn run_listener(
                         }
                     }
                 }
-                _ => Box::new(stream),
+                _ => (Box::new(stream), None),
             };
-            if let Err(error) = process_stream_with_policy(
-                stream,
-                ctx.mail_root,
-                tls_context,
-                ctx.db_path,
-                Some(peer),
-                ctx.implicit_tls,
-                ctx.auth_policy,
-            )
-            .await
-            {
+            let result = match bindings {
+                Some(bindings) => {
+                    process_tls_stream(
+                        stream,
+                        ctx.mail_root,
+                        tls_context,
+                        ctx.db_path,
+                        Some(peer),
+                        bindings,
+                        ctx.auth_policy,
+                    )
+                    .await
+                }
+                None => {
+                    process_stream_with_policy(
+                        stream,
+                        ctx.mail_root,
+                        tls_context,
+                        ctx.db_path,
+                        Some(peer),
+                        ctx.implicit_tls,
+                        ctx.auth_policy,
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = result {
                 imap_log!("error", "session_failed", { "peer": peer.to_string(), "tls": ctx.implicit_tls, "error": error.to_string() });
             }
         });

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use rmail_common::auth::ChannelBindings;
 use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::input::{
@@ -64,6 +65,8 @@ struct Session {
     peer: Option<SocketAddr>,
     /// The stream is TLS-protected (IMAPS or after STARTTLS).
     encrypted: bool,
+    /// Channel-binding data of the TLS connection (SCRAM-SHA-256-PLUS).
+    channel_bindings: ChannelBindings,
     auth_policy: Arc<sasl::AuthPolicy>,
     state: state::SessionState,
     selected: Option<SelectedMailbox>,
@@ -113,6 +116,31 @@ pub(crate) async fn process_stream_with_policy(
     .await
 }
 
+/// Run a session on a stream whose TLS handshake (IMAPS) already completed;
+/// `channel_bindings` come from that TLS connection.
+pub(crate) async fn process_tls_stream(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    channel_bindings: ChannelBindings,
+    auth_policy: Arc<sasl::AuthPolicy>,
+) -> Result<()> {
+    run_session(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        true,
+        true,
+        auth_policy,
+        Some(channel_bindings),
+    )
+    .await
+}
+
 // `session_encrypted` is true for IMAPS and after STARTTLS; password
 // mechanisms are refused on plaintext sessions. `peer` keys the per-address
 // authentication lockout.
@@ -126,6 +154,44 @@ pub(crate) async fn process_stream_inner(
     send_greeting: bool,
     auth_policy: Arc<sasl::AuthPolicy>,
 ) -> Result<()> {
+    run_session(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        send_greeting,
+        auth_policy,
+        None,
+    )
+    .await
+}
+
+/// `channel_bindings` is `None` when the caller has no TLS connection at
+/// hand; an encrypted session then only offers tls-server-end-point from
+/// the configured certificate.
+async fn run_session(
+    stream: Box<dyn RawStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    send_greeting: bool,
+    auth_policy: Arc<sasl::AuthPolicy>,
+    channel_bindings: Option<ChannelBindings>,
+) -> Result<()> {
+    let channel_bindings = match channel_bindings {
+        Some(bindings) => bindings,
+        None if session_encrypted => ChannelBindings {
+            tls_server_end_point: tls_ctx
+                .as_ref()
+                .map(|context| context.server_end_point.clone()),
+            tls_exporter: None,
+        },
+        None => ChannelBindings::default(),
+    };
     let stream: Box<dyn AsyncStream + Send + 'static> = Box::new(SwitchableStream::new(stream));
     let mut reader = BufReader::new(stream);
     let mut session = Session {
@@ -134,6 +200,7 @@ pub(crate) async fn process_stream_inner(
         db_path,
         peer,
         encrypted: session_encrypted,
+        channel_bindings,
         auth_policy,
         state: state::SessionState::default(),
         selected: None,
@@ -244,10 +311,10 @@ pub(crate) async fn process_stream_inner(
                     reader = returned;
                     continue;
                 }
-                Ok(transport::StartTlsOutcome::Upgraded(tls_stream)) => {
+                Ok(transport::StartTlsOutcome::Upgraded(tls_stream, bindings)) => {
                     imap_log!("info", "starttls_succeeded", { "peer": session.peer_label() });
                     // RFC 3501: no greeting after STARTTLS; state starts over.
-                    return Box::pin(process_stream_inner(
+                    return Box::pin(run_session(
                         tls_stream,
                         session.mail_root,
                         session.tls_ctx,
@@ -256,6 +323,7 @@ pub(crate) async fn process_stream_inner(
                         true,
                         false,
                         session.auth_policy,
+                        Some(bindings),
                     ))
                     .await;
                 }
@@ -288,11 +356,25 @@ impl Session {
     }
 
     fn capabilities(&self, phase: response::CapabilityPhase) -> String {
-        response::capability_tokens_with_policy(
-            phase,
-            self.tls_ctx.is_some(),
-            self.auth_policy.as_ref(),
-        )
+        // Before TLS the flag means "STARTTLS can be offered"; on a TLS
+        // session it means "channel binding (SCRAM-*-PLUS) can be offered".
+        let transport_feature = if phase == response::CapabilityPhase::NotAuthenticatedTls {
+            self.channel_bindings.is_available()
+        } else {
+            self.tls_ctx.is_some()
+        };
+        response::capability_tokens_with_policy(phase, transport_feature, self.auth_policy.as_ref())
+    }
+
+    /// Whether this session advertises SCRAM-SHA-256-PLUS; a plain
+    /// SCRAM-SHA-256 client that says it supports channel binding (`y`) is
+    /// then being downgraded (RFC 5802 §6).
+    fn scram_plus_advertised(&self) -> bool {
+        self.encrypted
+            && self
+                .auth_policy
+                .advertised_mechanisms(true, self.channel_bindings.is_available())
+                .any(|mechanism| mechanism.channel_binding_required)
     }
 
     /// The authenticated account. Preflight guarantees it for commands that

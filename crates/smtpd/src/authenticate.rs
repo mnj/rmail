@@ -55,10 +55,11 @@ pub(crate) async fn handle_password<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
+    // A name SASLprep rejects is empty here and matches no account.
     let normalized_authcid =
-        rmail_common::auth::saslprep(&credentials.authcid).to_ascii_lowercase();
+        rmail_common::auth::normalize_login_name(&credentials.authcid).unwrap_or_default();
     if credentials.authzid.as_ref().is_some_and(|authzid| {
-        rmail_common::auth::saslprep(authzid).to_ascii_lowercase() != normalized_authcid
+        rmail_common::auth::normalize_login_name(authzid).ok() != Some(normalized_authcid.clone())
     }) {
         record_failure(peer);
         return failure(
@@ -234,12 +235,11 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         Some(first) => first,
         None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-first message\r\n").await,
     };
-    let user = rmail_common::auth::saslprep(&client_first.username).to_ascii_lowercase();
-    if client_first
-        .authzid
-        .as_ref()
-        .is_some_and(|authzid| rmail_common::auth::saslprep(authzid).to_ascii_lowercase() != user)
-    {
+    // A name SASLprep rejects is empty here and matches no account.
+    let user = rmail_common::auth::normalize_login_name(&client_first.username).unwrap_or_default();
+    if client_first.authzid.as_ref().is_some_and(|authzid| {
+        rmail_common::auth::normalize_login_name(authzid).ok() != Some(user.clone())
+    }) {
         record_failure(peer);
         return failure(
             reader,

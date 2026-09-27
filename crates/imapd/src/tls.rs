@@ -35,6 +35,20 @@ pub fn load_tls_context_with_policy(
     Ok(Arc::new(ctx))
 }
 
+impl TlsContext {
+    /// Channel-binding data for a connection accepted with this context:
+    /// tls-server-end-point always, tls-exporter (RFC 9266) on TLS 1.3.
+    pub fn channel_bindings(
+        &self,
+        connection: &tokio_rustls::rustls::ServerConnection,
+    ) -> rmail_common::auth::ChannelBindings {
+        rmail_common::auth::ChannelBindings::for_connection(
+            Some(&self.server_end_point),
+            connection,
+        )
+    }
+}
+
 pub fn reload_tls_context(
     sender: &tokio::sync::watch::Sender<Option<Arc<TlsContext>>>,
     cert_path: &str,
