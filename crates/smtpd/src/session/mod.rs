@@ -65,6 +65,9 @@ struct Transaction {
     body: protocol::MailBody,
     smtp_utf8: bool,
     require_tls: bool,
+    /// RFC 4954 AUTH= submitter, kept only when the session's authenticated
+    /// identity vouches for it; otherwise it is treated as `AUTH=<>`.
+    auth_submitter: Option<String>,
     dsn: DsnOptions,
     rcpts: Vec<String>,
     bdat_buffer: Vec<u8>,
@@ -79,6 +82,7 @@ impl Default for Transaction {
             body: protocol::MailBody::SevenBit,
             smtp_utf8: false,
             require_tls: false,
+            auth_submitter: None,
             dsn: DsnOptions::default(),
             rcpts: Vec::new(),
             bdat_buffer: Vec::new(),
@@ -461,6 +465,12 @@ impl Session {
         self.tx.bdat_started = false;
     }
 
+    /// The AUTH extension is offered on this session (EHLO lists it until
+    /// the client authenticates).
+    fn auth_supported(&self) -> bool {
+        self.service != SmtpService::Lmtp && self.encrypted && self.db_path.is_some()
+    }
+
     async fn greet(&mut self, reader: &mut SmtpReader, name: &str, verb: &str) -> Result<Flow> {
         if !protocol::valid_helo_domain(name) {
             return reply(reader, b"501 5.5.2 Invalid HELO/EHLO domain\r\n").await;
@@ -474,11 +484,7 @@ impl Session {
             if self.service != SmtpService::Lmtp && !self.encrypted && self.tls_ctx.is_some() {
                 response.push_str("250-STARTTLS\r\n");
             }
-            if self.service != SmtpService::Lmtp
-                && self.encrypted
-                && self.db_path.is_some()
-                && self.authenticated_user.is_none()
-            {
+            if self.auth_supported() && self.authenticated_user.is_none() {
                 response.push_str(&format!(
                     "250-AUTH {}\r\n",
                     protocol::advertised_sasl_mechanisms(&self.security.smtp_sasl_mechanisms)
@@ -589,6 +595,13 @@ impl Session {
         if !self.extended_smtp && parsed.has_esmtp_parameters {
             return reply(reader, b"555 5.5.4 ESMTP parameters require EHLO\r\n").await;
         }
+        if parsed.auth_mailbox.is_some() && !self.auth_supported() {
+            return reply(
+                reader,
+                b"555 5.5.4 AUTH parameter requires the AUTH extension\r\n",
+            )
+            .await;
+        }
         if parsed
             .declared_size
             .is_some_and(|size| size > MAX_MESSAGE_BYTES)
@@ -598,6 +611,15 @@ impl Session {
         self.tx.body = parsed.body;
         self.tx.smtp_utf8 = parsed.smtp_utf8;
         self.tx.require_tls = parsed.require_tls;
+        // RFC 4954 section 5: an AUTH= mailbox from a client that is not
+        // authenticated (or that names someone else) is not trusted and is
+        // handled as AUTH=<>, so it is never propagated.
+        self.tx.auth_submitter = match (parsed.auth_mailbox, self.authenticated_user.as_deref()) {
+            (Some(Some(mailbox)), Some(user)) if mailbox.eq_ignore_ascii_case(user) => {
+                Some(mailbox)
+            }
+            _ => None,
+        };
         self.tx.dsn = DsnOptions {
             envelope_id: parsed.dsn_envelope_id,
             return_content: parsed.dsn_return,
@@ -636,7 +658,7 @@ impl Session {
         self.tx.bdat_buffer.clear();
         self.tx.bdat_started = false;
         self.tx.rcpts.clear();
-        session_log!(self, "debug", "mail_from_accepted", { "mail_from": self.tx.mail_from });
+        session_log!(self, "debug", "mail_from_accepted", { "mail_from": self.tx.mail_from, "auth_submitter": self.tx.auth_submitter });
         reply(reader, b"250 2.1.0 Sender OK\r\n").await
     }
 

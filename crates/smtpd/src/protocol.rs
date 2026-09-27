@@ -9,6 +9,9 @@ pub(crate) struct MailFromArgs {
     pub(crate) require_tls: bool,
     pub(crate) dsn_envelope_id: Option<String>,
     pub(crate) dsn_return: Option<DsnReturn>,
+    /// RFC 4954 AUTH= parameter: `Some(None)` for `AUTH=<>`, `Some(Some(_))`
+    /// for a decoded mailbox.
+    pub(crate) auth_mailbox: Option<Option<String>>,
     pub(crate) has_esmtp_parameters: bool,
 }
 
@@ -334,6 +337,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut require_tls = false;
     let mut dsn_envelope_id = None;
     let mut dsn_return = None;
+    let mut auth_value: Option<String> = None;
     for parameter in params.split_whitespace() {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
@@ -368,6 +372,11 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
                 return Err(EnvelopeError::Syntax);
             }
             dsn_envelope_id = Some(decode_xtext(value).map_err(|_| EnvelopeError::Syntax)?);
+        } else if name.eq_ignore_ascii_case("AUTH") {
+            if auth_value.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            auth_value = Some(decode_xtext(value).map_err(|_| EnvelopeError::Syntax)?);
         } else if name.eq_ignore_ascii_case("RET") {
             if dsn_return.is_some() {
                 return Err(EnvelopeError::Syntax);
@@ -392,6 +401,14 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     } else {
         Some(parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)?)
     };
+    // RFC 4954 section 5: AUTH=<> or an xtext-encoded addr-spec.
+    let auth_mailbox = match auth_value {
+        None => None,
+        Some(value) if value == "<>" => Some(None),
+        Some(value) => Some(Some(
+            parse_mailbox(&value, smtp_utf8).ok_or(EnvelopeError::Syntax)?,
+        )),
+    };
     Ok(MailFromArgs {
         sender,
         declared_size,
@@ -400,6 +417,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
         require_tls,
         dsn_envelope_id,
         dsn_return,
+        auth_mailbox,
         has_esmtp_parameters: !params.is_empty(),
     })
 }
@@ -608,6 +626,7 @@ mod tests {
                 require_tls: false,
                 dsn_envelope_id: None,
                 dsn_return: None,
+                auth_mailbox: None,
                 has_esmtp_parameters: true,
             })
         );
@@ -663,6 +682,7 @@ mod tests {
                 require_tls: false,
                 dsn_envelope_id: None,
                 dsn_return: None,
+                auth_mailbox: None,
                 has_esmtp_parameters: true,
             })
         );
@@ -717,6 +737,41 @@ mod tests {
         assert!(command_line_limit(&Command::Mail("")) >= 512 + 26 + 100 + 500);
         assert!(command_line_limit(&Command::Rcpt("")) >= 1012);
         assert_eq!(command_line_limit(&Command::Noop), 512);
+    }
+
+    #[test]
+    fn mail_auth_parameter_is_decoded_strictly() {
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> AUTH=<>")
+                .unwrap()
+                .auth_mailbox,
+            Some(None)
+        );
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> AUTH=e+3Dmc2@Example.TEST")
+                .unwrap()
+                .auth_mailbox,
+            Some(Some("e=mc2@example.test".to_string()))
+        );
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test>")
+                .unwrap()
+                .auth_mailbox,
+            None
+        );
+        for invalid in [
+            "FROM:<a@example.test> AUTH=<> AUTH=<>",
+            "FROM:<a@example.test> AUTH=",
+            "FROM:<a@example.test> AUTH=bad+ZZ@example.test",
+            "FROM:<a@example.test> AUTH=not-a-mailbox",
+            "FROM:<a@example.test> AUTH=a=b@example.test",
+        ] {
+            assert_eq!(
+                parse_mail_from_args(invalid),
+                Err(EnvelopeError::Syntax),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

@@ -1265,6 +1265,45 @@ async fn dsn_parameters_may_extend_mail_and_rcpt_beyond_512_octets() {
 }
 
 #[tokio::test]
+async fn mail_auth_parameter_is_accepted_when_auth_is_supported() {
+    let responses = run_encrypted_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> AUTH=<>\r\nRSET\r\nMAIL FROM:<a@example.test> AUTH=someone+2Belse@example.test\r\nRSET\r\nMAIL FROM:<a@example.test> AUTH=<> AUTH=<>\r\nMAIL FROM:<a@example.test> AUTH=bad+ZZ\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.as_str() == "250 2.1.0 Sender OK\r\n")
+            .count(),
+        2,
+        "{responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.starts_with("501 5.5.2"))
+            .count(),
+        2,
+        "{responses:?}"
+    );
+
+    // Without TLS the AUTH extension is not offered, so neither is AUTH=.
+    let (plaintext, _td) = run_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> AUTH=<>\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert!(
+        plaintext
+            .iter()
+            .any(|response| response.starts_with("555 5.5.4 AUTH parameter")),
+        "{plaintext:?}"
+    );
+}
+
+#[tokio::test]
 async fn strict_commands_and_mail_parameters() {
     let (responses, _td) = run_session(
             b"EHLO localhost\r\nDATA junk\r\nQUITzzz\r\nMAIL FROM:<user@example.test> SIZE=42 BODY=8BITMIME SMTPUTF8\r\nQUIT\r\n".to_vec(),
