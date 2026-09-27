@@ -208,11 +208,23 @@ async fn oauth_failure_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// Channel binding for a SCRAM exchange (RFC 5802 section 6).
+#[derive(Clone, Copy)]
+pub(crate) enum ScramBinding<'a> {
+    /// SCRAM-SHA-256. `plus_advertised` records whether the server offered
+    /// SCRAM-SHA-256-PLUS, in which case a client that claims the server
+    /// lacks channel binding (gs2 flag "y") is the victim of a downgrade.
+    Unsupported { plus_advertised: bool },
+    /// SCRAM-SHA-256-PLUS bound to this RFC 5929 tls-server-end-point value.
+    TlsServerEndPoint(&'a [u8]),
+}
+
 pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     initial_response: Option<&str>,
     db_path: Option<&String>,
     peer: Option<SocketAddr>,
+    binding: ScramBinding<'_>,
 ) -> Outcome {
     let first_wire = match initial_response {
         Some(response) => response.to_string(),
@@ -230,10 +242,27 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         Some(message) => message,
         None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-first message\r\n").await,
     };
-    let client_first = match rmail_common::auth::parse_scram_client_first(&first_message, false) {
+    let channel_binding_required = matches!(binding, ScramBinding::TlsServerEndPoint(_));
+    let client_first = match rmail_common::auth::parse_scram_client_first(
+        &first_message,
+        channel_binding_required,
+    ) {
         Some(first) => first,
         None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-first message\r\n").await,
     };
+    // RFC 5802 section 6: "y" means the client supports channel binding but
+    // believes the server does not. Having advertised -PLUS, that can only
+    // be a downgrade of the mechanism list, so the exchange must fail.
+    if matches!(
+        binding,
+        ScramBinding::Unsupported {
+            plus_advertised: true
+        }
+    ) && client_first.gs2_header.starts_with("y,")
+    {
+        record_failure(peer);
+        return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
+    }
     let user = rmail_common::auth::saslprep(&client_first.username).to_ascii_lowercase();
     if client_first
         .authzid
@@ -294,8 +323,20 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         Some(final_message) => final_message,
         None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-final message\r\n").await,
     };
-    let expected_binding = BASE64_ENGINE.encode(client_first.gs2_header.as_bytes());
-    if client_final.nonce != nonce || client_final.channel_binding != expected_binding {
+    let binding_valid = match binding {
+        ScramBinding::TlsServerEndPoint(server_end_point) => {
+            rmail_common::auth::verify_tls_server_end_point_binding(
+                &client_first.gs2_header,
+                server_end_point,
+                &client_final.channel_binding,
+            )
+            .is_ok()
+        }
+        ScramBinding::Unsupported { .. } => {
+            client_final.channel_binding == BASE64_ENGINE.encode(client_first.gs2_header.as_bytes())
+        }
+    };
+    if client_final.nonce != nonce || !binding_valid {
         record_failure(peer);
         return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
     }

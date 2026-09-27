@@ -819,8 +819,21 @@ mod tests {
         let configured = vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()];
         validate_sasl_mechanisms(&configured, false).unwrap();
         assert_eq!(
-            advertised_sasl_mechanisms(&configured),
+            advertised_sasl_mechanisms(&configured, false),
             "SCRAM-SHA-256 PLAIN"
+        );
+        let with_plus = vec![
+            "SCRAM-SHA-256-PLUS".to_string(),
+            "scram-sha-256".to_string(),
+        ];
+        validate_sasl_mechanisms(&with_plus, false).unwrap();
+        assert_eq!(
+            advertised_sasl_mechanisms(&with_plus, true),
+            "SCRAM-SHA-256-PLUS SCRAM-SHA-256"
+        );
+        assert_eq!(
+            advertised_sasl_mechanisms(&with_plus, false),
+            "SCRAM-SHA-256"
         );
         assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()], false).is_err());
         assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()], true).is_ok());
@@ -852,8 +865,16 @@ pub(crate) fn command_line_limit(command: &Command<'_>) -> usize {
     }
 }
 pub(crate) const MAX_AUTH_LINE_BYTES: usize = 12 * 1024;
-pub(crate) const SMTP_SASL_MECHANISMS: &[&str] =
-    &["PLAIN", "LOGIN", "SCRAM-SHA-256", "OAUTHBEARER", "XOAUTH2"];
+pub(crate) const SMTP_SASL_MECHANISMS: &[&str] = &[
+    "PLAIN",
+    "LOGIN",
+    "SCRAM-SHA-256",
+    "SCRAM-SHA-256-PLUS",
+    "OAUTHBEARER",
+    "XOAUTH2",
+];
+/// Mechanisms that need TLS channel-binding data (RFC 5802 section 6).
+pub(crate) const CHANNEL_BINDING_MECHANISMS: &[&str] = &["SCRAM-SHA-256-PLUS"];
 
 pub(crate) fn validate_sasl_mechanisms(
     configured: &[String],
@@ -884,7 +905,12 @@ pub(crate) fn validate_sasl_mechanisms(
     Ok(())
 }
 
-pub(crate) fn advertised_sasl_mechanisms(configured: &[String]) -> String {
+/// Configured mechanisms in configuration order. Channel-binding
+/// mechanisms are left out unless the session has TLS binding data.
+pub(crate) fn advertised_sasl_mechanisms(
+    configured: &[String],
+    channel_binding_available: bool,
+) -> String {
     configured
         .iter()
         .filter_map(|configured| {
@@ -892,6 +918,9 @@ pub(crate) fn advertised_sasl_mechanisms(configured: &[String]) -> String {
                 .iter()
                 .copied()
                 .find(|supported| supported.eq_ignore_ascii_case(configured))
+        })
+        .filter(|mechanism| {
+            channel_binding_available || !CHANNEL_BINDING_MECHANISMS.contains(mechanism)
         })
         .collect::<Vec<_>>()
         .join(" ")

@@ -122,6 +122,15 @@ async fn reply_tracking_counts_wire_bytes_and_stops_below_starttls() {
 }
 
 fn scram_client_final(password: &str, client_first_bare: &str, server_first: &str) -> String {
+    scram_client_final_with_binding(password, client_first_bare, server_first, "biws")
+}
+
+fn scram_client_final_with_binding(
+    password: &str,
+    client_first_bare: &str,
+    server_first: &str,
+    channel_binding: &str,
+) -> String {
     use hmac::Mac;
     use hmac::digest::KeyInit;
     use pbkdf2::pbkdf2;
@@ -137,7 +146,7 @@ fn scram_client_final(password: &str, client_first_bare: &str, server_first: &st
     let salt = BASE64_ENGINE.decode(attribute("s=")).expect("salt");
     let iterations = attribute("i=").parse::<u32>().expect("iterations");
     let nonce = attribute("r=");
-    let without_proof = format!("c=biws,r={nonce}");
+    let without_proof = format!("c={channel_binding},r={nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
     let mut salted_password = [0u8; 32];
     pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted_password)
@@ -1508,6 +1517,7 @@ async fn starttls_rejects_pipelined_plaintext_without_losing_commands() {
         ));
     let tls_context = Arc::new(super::tls::TlsContext {
         acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+        server_end_point: Vec::new(),
     });
     let (client, server) = duplex(16 * 1024);
     let server_task = tokio::spawn(process_stream(
@@ -1552,48 +1562,13 @@ async fn starttls_rejects_pipelined_plaintext_without_losing_commands() {
 
 #[tokio::test]
 async fn starttls_completes_real_handshake_and_requires_fresh_ehlo() {
-    use std::io::Cursor;
-    use std::time::SystemTime;
     use tokio_rustls::TlsConnector;
-    use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
-    use tokio_rustls::rustls::{
-        Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
-    };
-
-    struct PinnedCertificate(Vec<u8>);
-    impl ServerCertVerifier for PinnedCertificate {
-        fn verify_server_cert(
-            &self,
-            end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: SystemTime,
-        ) -> Result<ServerCertVerified, TlsError> {
-            if end_entity.0 == self.0 {
-                Ok(ServerCertVerified::assertion())
-            } else {
-                Err(TlsError::General(
-                    "STARTTLS test received unexpected certificate".to_string(),
-                ))
-            }
-        }
-    }
+    use tokio_rustls::rustls::ServerName;
 
     let (_td, mail_root, db_path) = setup_mailbox();
     let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
     let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
-    let certificate_pem = std::fs::read(cert_path).expect("certificate");
-    let certificates =
-        rustls_pemfile::certs(&mut Cursor::new(certificate_pem)).expect("parse certificate");
-    let mut client_config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(RootCertStore::empty())
-        .with_no_client_auth();
-    client_config
-        .dangerous()
-        .set_certificate_verifier(Arc::new(PinnedCertificate(certificates[0].clone())));
+    let (client_config, _) = pinned_tls_client_config();
 
     let (client, server) = duplex(32 * 1024);
     let server_task = tokio::spawn(process_stream(
@@ -1785,6 +1760,191 @@ async fn auth_scram_sha256_verifies_a_real_client_proof() {
             .contains("221 2.0.0 Bye")
     );
     server_task.await.expect("join").expect("server");
+}
+
+/// Client configuration that trusts exactly the test certificate, and that
+/// certificate's DER bytes.
+fn pinned_tls_client_config() -> (tokio_rustls::rustls::ClientConfig, Vec<u8>) {
+    use std::io::Cursor;
+    use std::time::SystemTime;
+    use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
+    use tokio_rustls::rustls::{
+        Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
+    };
+
+    struct PinnedCertificate(Vec<u8>);
+    impl ServerCertVerifier for PinnedCertificate {
+        fn verify_server_cert(
+            &self,
+            end_entity: &Certificate,
+            _intermediates: &[Certificate],
+            _server_name: &ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: SystemTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            if end_entity.0 == self.0 {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(TlsError::General(
+                    "TLS test received unexpected certificate".to_string(),
+                ))
+            }
+        }
+    }
+
+    let (cert_path, _) = rmail_common::test_support::localhost_cert();
+    let certificate_pem = std::fs::read(cert_path).expect("certificate");
+    let certificates =
+        rustls_pemfile::certs(&mut Cursor::new(certificate_pem)).expect("parse certificate");
+    let mut client_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    client_config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(PinnedCertificate(certificates[0].clone())));
+    (client_config, certificates[0].clone())
+}
+
+#[tokio::test]
+async fn auth_scram_sha256_plus_binds_to_the_tls_certificate_and_detects_downgrade() {
+    use sha2::{Digest, Sha256};
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::ServerName;
+
+    let (_td, mail_root, db_path) = setup_mailbox();
+    let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
+    let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
+    let (client_config, certificate) = pinned_tls_client_config();
+    let server_end_point = Sha256::digest(&certificate).to_vec();
+    assert_eq!(tls_context.server_end_point, server_end_point);
+
+    let (client, server) = duplex(32 * 1024);
+    let server_task = tokio::spawn(async move {
+        let tls_stream = tls_context
+            .acceptor
+            .accept(server)
+            .await
+            .expect("server TLS handshake");
+        process_stream(
+            Box::new(tls_stream),
+            mail_root.to_string_lossy().to_string(),
+            Some(tls_context),
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+            SmtpService::Submission,
+            None,
+        )
+        .await
+    });
+    let tls_stream = TlsConnector::from(Arc::new(client_config))
+        .connect(ServerName::try_from("localhost").unwrap(), client)
+        .await
+        .expect("client TLS handshake");
+    let mut reader = BufReader::new(tls_stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.expect("greeting");
+
+    async fn send<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        reader: &mut BufReader<S>,
+        line: &str,
+    ) -> String {
+        reader
+            .get_mut()
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
+            .unwrap();
+        reader.get_mut().flush().await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        response
+    }
+    fn server_first(challenge: &str) -> String {
+        String::from_utf8(
+            BASE64_ENGINE
+                .decode(challenge.trim().strip_prefix("334 ").expect("challenge"))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    reader
+        .get_mut()
+        .write_all(b"EHLO client.example\r\n")
+        .await
+        .unwrap();
+    let capabilities = read_until(&mut reader, "250 ENHANCEDSTATUSCODES").await;
+    assert!(
+        capabilities.contains("250-AUTH PLAIN LOGIN SCRAM-SHA-256 SCRAM-SHA-256-PLUS\r\n"),
+        "{capabilities}"
+    );
+
+    // Downgrade: the client supports binding ("y") but the server offered -PLUS.
+    let bare = "n=user@example.test,r=downgrade";
+    let first = BASE64_ENGINE.encode(format!("y,,{bare}"));
+    let response = send(&mut reader, &format!("AUTH SCRAM-SHA-256 {first}")).await;
+    assert!(response.starts_with("535 5.7.8"), "{response:?}");
+
+    // -PLUS with channel-binding data for a different certificate fails.
+    let gs2 = "p=tls-server-end-point,,";
+    let bare = "n=user@example.test,r=wrongbinding";
+    let first = BASE64_ENGINE.encode(format!("{gs2}{bare}"));
+    let challenge = send(&mut reader, &format!("AUTH SCRAM-SHA-256-PLUS {first}")).await;
+    let wrong = BASE64_ENGINE.encode([gs2.as_bytes(), &[0u8; 32]].concat());
+    let final_message =
+        scram_client_final_with_binding("password", bare, &server_first(&challenge), &wrong);
+    let response = send(&mut reader, &BASE64_ENGINE.encode(final_message)).await;
+    assert!(response.starts_with("535 5.7.8"), "{response:?}");
+
+    // A client that does not send channel binding cannot use -PLUS.
+    let first = BASE64_ENGINE.encode("n,,n=user@example.test,r=nobinding");
+    let response = send(&mut reader, &format!("AUTH SCRAM-SHA-256-PLUS {first}")).await;
+    assert!(response.starts_with("501 5.5.2"), "{response:?}");
+
+    // Correct tls-server-end-point binding authenticates.
+    let bare = "n=user@example.test,r=plusnonce";
+    let first = BASE64_ENGINE.encode(format!("{gs2}{bare}"));
+    let challenge = send(&mut reader, &format!("AUTH SCRAM-SHA-256-PLUS {first}")).await;
+    let binding = BASE64_ENGINE.encode([gs2.as_bytes(), &server_end_point].concat());
+    let final_message =
+        scram_client_final_with_binding("password", bare, &server_first(&challenge), &binding);
+    let response = send(&mut reader, &BASE64_ENGINE.encode(final_message)).await;
+    assert!(response.starts_with("235 2.7.0 "), "{response:?}");
+
+    let response = send(&mut reader, "QUIT").await;
+    assert!(response.starts_with("221 "), "{response:?}");
+    server_task.await.expect("join").expect("server");
+}
+
+#[tokio::test]
+async fn scram_plus_is_not_offered_without_tls_binding_data() {
+    let responses = run_encrypted_session(
+        b"EHLO localhost\r\nAUTH SCRAM-SHA-256-PLUS cD10bHMtc2VydmVyLWVuZC1wb2ludCwsbj11LHI9eA==\r\nAUTH SCRAM-SHA-256 eSwsbj11c2VyQGV4YW1wbGUudGVzdCxyPWFiYw==\r\n*\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    let auth = responses
+        .iter()
+        .find(|line| line.starts_with("250-AUTH "))
+        .expect("AUTH capability");
+    assert!(!auth.contains("SCRAM-SHA-256-PLUS"), "{auth:?}");
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("504 5.5.4 SCRAM-SHA-256-PLUS requires TLS")),
+        "{responses:?}"
+    );
+    // Without -PLUS on offer, gs2 flag "y" is legitimate.
+    assert!(
+        responses.iter().any(|line| line.starts_with("334 ")),
+        "{responses:?}"
+    );
 }
 
 #[tokio::test]

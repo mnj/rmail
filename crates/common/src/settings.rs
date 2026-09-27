@@ -152,7 +152,14 @@ const IMAP_SASL: &[&str] = &[
     "OAUTHBEARER",
     "XOAUTH2",
 ];
-const SMTP_SASL: &[&str] = &["PLAIN", "LOGIN", "SCRAM-SHA-256", "OAUTHBEARER", "XOAUTH2"];
+const SMTP_SASL: &[&str] = &[
+    "PLAIN",
+    "LOGIN",
+    "SCRAM-SHA-256",
+    "SCRAM-SHA-256-PLUS",
+    "OAUTHBEARER",
+    "XOAUTH2",
+];
 const OAUTH_MECHANISMS: &[&str] = &["OAUTHBEARER", "XOAUTH2"];
 
 const fn int(min: i64, max: i64) -> SettingKind {

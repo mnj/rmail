@@ -476,6 +476,27 @@ impl Session {
         self.tx.bdat_started = false;
     }
 
+    /// tls-server-end-point binding data of this TLS session, if any.
+    fn channel_binding(&self) -> Option<&[u8]> {
+        if !self.encrypted {
+            return None;
+        }
+        self.tls_ctx
+            .as_deref()
+            .map(|context| context.server_end_point.as_slice())
+            .filter(|binding| !binding.is_empty())
+    }
+
+    /// SCRAM-SHA-256-PLUS is configured and listed in the EHLO reply.
+    fn scram_plus_advertised(&self) -> bool {
+        self.channel_binding().is_some()
+            && self
+                .security
+                .smtp_sasl_mechanisms
+                .iter()
+                .any(|mechanism| mechanism.eq_ignore_ascii_case("SCRAM-SHA-256-PLUS"))
+    }
+
     /// The AUTH extension is offered on this session (EHLO lists it until
     /// the client authenticates).
     fn auth_supported(&self) -> bool {
@@ -498,7 +519,10 @@ impl Session {
             if self.auth_supported() && self.authenticated_user.is_none() {
                 response.push_str(&format!(
                     "250-AUTH {}\r\n",
-                    protocol::advertised_sasl_mechanisms(&self.security.smtp_sasl_mechanisms)
+                    protocol::advertised_sasl_mechanisms(
+                        &self.security.smtp_sasl_mechanisms,
+                        self.channel_binding().is_some()
+                    )
                 ));
             }
             response.push_str(&format!("250-SIZE {MAX_MESSAGE_BYTES}\r\n"));
@@ -567,7 +591,21 @@ impl Session {
                 authenticate::handle_password(reader, &mechanism, initial, db_path, self.peer).await
             }
             "SCRAM-SHA-256" => {
-                authenticate::handle_scram(reader, initial, db_path, self.peer).await
+                let binding = authenticate::ScramBinding::Unsupported {
+                    plus_advertised: self.scram_plus_advertised(),
+                };
+                authenticate::handle_scram(reader, initial, db_path, self.peer, binding).await
+            }
+            "SCRAM-SHA-256-PLUS" => {
+                let Some(server_end_point) = self.channel_binding() else {
+                    return reply(
+                        reader,
+                        b"504 5.5.4 SCRAM-SHA-256-PLUS requires TLS channel binding\r\n",
+                    )
+                    .await;
+                };
+                let binding = authenticate::ScramBinding::TlsServerEndPoint(server_end_point);
+                authenticate::handle_scram(reader, initial, db_path, self.peer, binding).await
             }
             "OAUTHBEARER" | "XOAUTH2" => {
                 let Some(validator) = self.oauth.as_ref() else {

@@ -441,6 +441,7 @@ fn default_smtp_sasl_mechanisms() -> Vec<String> {
         "PLAIN".to_string(),
         "LOGIN".to_string(),
         "SCRAM-SHA-256".to_string(),
+        "SCRAM-SHA-256-PLUS".to_string(),
     ]
 }
 
@@ -533,7 +534,7 @@ mod tests {
         );
         assert_eq!(
             cfg.security.smtp_sasl_mechanisms,
-            ["PLAIN", "LOGIN", "SCRAM-SHA-256"]
+            ["PLAIN", "LOGIN", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
         );
         assert!(cfg.security.oauth.is_none());
         assert!(!cfg.security.rspamd_enabled);
