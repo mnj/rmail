@@ -58,6 +58,7 @@ pub(crate) enum Command<'a> {
     Auth(&'a str),
     Vrfy,
     Expn,
+    Help,
     Unknown,
     BadSyntax,
 }
@@ -144,6 +145,7 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "AUTH" if !args.is_empty() => Command::Auth(args),
         "VRFY" if !args.is_empty() => Command::Vrfy,
         "EXPN" if !args.is_empty() => Command::Expn,
+        "HELP" => Command::Help,
         "HELO" | "EHLO" | "LHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT"
         | "STARTTLS" | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
         _ => Command::Unknown,
@@ -435,6 +437,9 @@ pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<RcptToAr
             let mut notify = DsnNotify::default();
             for item in value.split(',') {
                 if item.eq_ignore_ascii_case("NEVER") {
+                    if notify.never {
+                        return Err(EnvelopeError::Syntax);
+                    }
                     notify.never = true;
                 } else if item.eq_ignore_ascii_case("SUCCESS") {
                     if notify.success {
@@ -709,6 +714,14 @@ mod tests {
         assert!(
             parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER,FAILURE", false).is_err()
         );
+        assert!(parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER,NEVER", false).is_err());
+        assert!(
+            parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER", false)
+                .unwrap()
+                .dsn_notify
+                .unwrap()
+                .never
+        );
         assert!(parse_mail_from_args("FROM:<sender@example.test> ENVID=bad+0Avalue").is_err());
     }
 
@@ -779,6 +792,8 @@ mod tests {
         assert_eq!(parse_command(" DATA"), Command::BadSyntax);
         assert_eq!(parse_command("VRFY"), Command::BadSyntax);
         assert_eq!(parse_command("QUITzzz"), Command::Unknown);
+        assert_eq!(parse_command("HELP"), Command::Help);
+        assert_eq!(parse_command("help MAIL"), Command::Help);
         assert!(valid_helo_domain("mail.example.test"));
         assert!(valid_helo_domain("[IPv6:2001:db8::1]"));
         assert!(!valid_helo_domain("-bad.example"));

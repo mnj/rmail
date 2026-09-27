@@ -327,6 +327,13 @@ impl Session {
                 )
                 .await
             }
+            SmtpCommand::Help => {
+                reply(
+                    reader,
+                    b"214 2.0.0 Commands: HELO EHLO MAIL RCPT DATA BDAT RSET NOOP QUIT STARTTLS AUTH VRFY HELP\r\n",
+                )
+                .await
+            }
             SmtpCommand::Quit => {
                 send(reader, b"221 2.0.0 Bye\r\n").await?;
                 Ok(Flow::Close)
@@ -422,6 +429,8 @@ impl Session {
                         | SmtpCommand::Helo(_)
                         | SmtpCommand::StartTls
                         | SmtpCommand::Noop
+                        | SmtpCommand::Rset
+                        | SmtpCommand::Help
                         | SmtpCommand::Quit
                 )
             {
@@ -497,15 +506,19 @@ impl Session {
                 "BINARYMIME",
                 "PIPELINING",
                 "SMTPUTF8",
-                "REQUIRETLS",
                 "DSN",
             ] {
                 response.push_str(&format!("250-{extension}\r\n"));
             }
+            // RFC 8689: REQUIRETLS is only offered on TLS-protected sessions.
+            if self.encrypted {
+                response.push_str("250-REQUIRETLS\r\n");
+            }
             response.push_str("250 ENHANCEDSTATUSCODES\r\n");
             response
         } else {
-            format!("250 2.0.0 rMail Hello {name}\r\n")
+            // RFC 2034: HELO/EHLO replies carry no enhanced status code.
+            format!("250 rMail Hello {name}\r\n")
         };
         send(reader, response.as_bytes()).await?;
         self.reset_transaction();
@@ -594,6 +607,13 @@ impl Session {
         };
         if !self.extended_smtp && parsed.has_esmtp_parameters {
             return reply(reader, b"555 5.5.4 ESMTP parameters require EHLO\r\n").await;
+        }
+        if parsed.require_tls && !self.encrypted {
+            return reply(
+                reader,
+                b"530 5.7.10 REQUIRETLS requires a TLS-protected session\r\n",
+            )
+            .await;
         }
         if parsed.auth_mailbox.is_some() && !self.auth_supported() {
             return reply(

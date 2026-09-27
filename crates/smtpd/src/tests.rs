@@ -1304,6 +1304,74 @@ async fn mail_auth_parameter_is_accepted_when_auth_is_supported() {
 }
 
 #[tokio::test]
+async fn requiretls_is_only_offered_and_accepted_over_tls() {
+    let (plaintext, _td) = run_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> REQUIRETLS\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert!(!plaintext.iter().any(|line| line == "250-REQUIRETLS\r\n"));
+    assert!(
+        plaintext
+            .iter()
+            .any(|line| line.starts_with("530 5.7.10 REQUIRETLS")),
+        "{plaintext:?}"
+    );
+
+    let encrypted = run_encrypted_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> REQUIRETLS\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert!(encrypted.iter().any(|line| line == "250-REQUIRETLS\r\n"));
+    assert!(
+        encrypted
+            .iter()
+            .any(|line| line == "250 2.1.0 Sender OK\r\n"),
+        "{encrypted:?}"
+    );
+}
+
+#[tokio::test]
+async fn helo_reply_help_and_plaintext_submission_rset() {
+    let (responses, _td) = run_session(
+        b"HELO client.example\r\nHELP\r\nHELP MAIL\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    let helo = &responses[0];
+    assert!(helo.starts_with("250 "), "{helo:?}");
+    assert!(!helo.starts_with("250 2."), "{helo:?}");
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|line| line.starts_with("214 "))
+            .count(),
+        2
+    );
+
+    let (submission, _td) = run_session_with_policy(
+        b"EHLO localhost\r\nRSET\r\nHELP\r\nMAIL FROM:<user@example.test>\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Submission,
+    )
+    .await;
+    assert!(
+        submission
+            .iter()
+            .any(|line| line == "250 2.0.0 Reset state\r\n")
+    );
+    assert!(submission.iter().any(|line| line.starts_with("214 ")));
+    assert!(
+        submission
+            .iter()
+            .any(|line| line.starts_with("530 5.7.0 Must issue STARTTLS"))
+    );
+}
+
+#[tokio::test]
 async fn strict_commands_and_mail_parameters() {
     let (responses, _td) = run_session(
             b"EHLO localhost\r\nDATA junk\r\nQUITzzz\r\nMAIL FROM:<user@example.test> SIZE=42 BODY=8BITMIME SMTPUTF8\r\nQUIT\r\n".to_vec(),
@@ -1340,7 +1408,7 @@ async fn advertised_enhanced_status_codes_are_used_for_command_replies() {
             .any(|response| response == "250 ENHANCEDSTATUSCODES\r\n")
     );
     assert!(
-        responses
+        !responses
             .iter()
             .any(|response| response == "250-REQUIRETLS\r\n")
     );
