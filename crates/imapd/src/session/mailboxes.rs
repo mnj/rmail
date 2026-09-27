@@ -88,6 +88,103 @@ impl Session {
         self.respond(reader, call.tag, &call.name, response).await
     }
 
+    /// NOTIFY SET and NOTIFY NONE (RFC 5465).
+    pub(super) async fn notify(
+        &mut self,
+        reader: &mut ImapReader,
+        call: &Invocation<'_>,
+    ) -> Result<Flow> {
+        use commands::notify;
+
+        let request = match notify::parse(call.args, self.state.utf8_enabled()) {
+            Ok(request) => request,
+            Err(rejection) => {
+                let response = rejection.response(call.tag).encode();
+                return self.respond(reader, call.tag, &call.name, response).await;
+            }
+        };
+        let (status, spec) = match request {
+            notify::Request::None => {
+                self.notify = None;
+                let response = commands::basic::completed(call.tag, "NOTIFY").encode();
+                return self.respond(reader, call.tag, &call.name, response).await;
+            }
+            notify::Request::Set { status, spec } => (status, spec),
+        };
+        let (local, domain) = mailbox::address_parts(self.address())?;
+        let root = self.mail_root.clone();
+        let scan_spec = spec.clone();
+        let scanned = tokio::task::spawn_blocking(move || {
+            notify::scan(Path::new(&root), &domain, &local, &scan_spec)
+        })
+        .await?;
+        let snapshot = match scanned {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let response = response::Response::new()
+                    .status(
+                        response::StatusLine::tagged(
+                            call.tag,
+                            response::Status::No,
+                            format!("NOTIFY failed: {error}"),
+                        )
+                        .with_code("UNAVAILABLE"),
+                    )
+                    .encode();
+                return self.respond(reader, call.tag, &call.name, response).await;
+            }
+        };
+        let mut response = response::Response::new();
+        if status {
+            let selected = self
+                .selected
+                .as_ref()
+                .map(|mailbox| mailbox.mailbox.as_str());
+            for line in notify::initial_status(&snapshot, selected, self.notify_format()) {
+                response = response.data(line);
+            }
+        }
+        self.notify = Some(notify::Notifier::new(spec, snapshot));
+        let response = response
+            .status(response::StatusLine::tagged(
+                call.tag,
+                response::Status::Ok,
+                "NOTIFY completed",
+            ))
+            .encode();
+        self.respond(reader, call.tag, &call.name, response).await
+    }
+
+    /// Report changes for the active NOTIFY between commands.
+    pub(super) async fn poll_notifications(&mut self, reader: &mut ImapReader) -> Result<()> {
+        let options = self.sync_options(true);
+        let format = self.notify_format();
+        let Some(notifier) = self.notify.as_mut() else {
+            return Ok(());
+        };
+        let Some(address) = self.state.authenticated_mailbox.as_deref() else {
+            return Ok(());
+        };
+        let account = commands::notify::Account {
+            mail_root: &self.mail_root,
+            address,
+        };
+        notifier
+            .poll(reader, account, &mut self.selected, options, format, false)
+            .await?;
+        if !notifier.is_active() {
+            self.notify = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn notify_format(&self) -> commands::notify::Format {
+        commands::notify::Format {
+            utf8_accept: self.state.utf8_enabled(),
+            condstore: self.state.condstore_enabled(),
+        }
+    }
+
     pub(super) async fn unselect(
         &mut self,
         reader: &mut ImapReader,

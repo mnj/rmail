@@ -235,6 +235,21 @@ impl Session {
         call: &Invocation<'_>,
     ) -> Result<Flow> {
         let options = self.sync_options(true);
+        let format = self.notify_format();
+        let notify = match (
+            self.notify.as_mut(),
+            self.state.authenticated_mailbox.as_deref(),
+        ) {
+            (Some(notifier), Some(address)) => Some(commands::idle::Notify {
+                notifier,
+                account: commands::notify::Account {
+                    mail_root: &self.mail_root,
+                    address,
+                },
+                format,
+            }),
+            _ => None,
+        };
         let outcome = commands::idle::handle(
             reader,
             call.tag,
@@ -242,8 +257,16 @@ impl Session {
             &mut self.selected,
             options,
             self.auth_policy.timeouts().idle,
+            notify,
         )
         .await?;
+        if self
+            .notify
+            .as_ref()
+            .is_some_and(|notifier| !notifier.is_active())
+        {
+            self.notify = None;
+        }
         Ok(if outcome == commands::idle::Outcome::Disconnected {
             Flow::Close
         } else {

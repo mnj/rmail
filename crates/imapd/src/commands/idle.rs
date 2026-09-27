@@ -12,6 +12,13 @@ use crate::{
 };
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The session's active NOTIFY (RFC 5465), which reports during IDLE too.
+pub(crate) struct Notify<'a> {
+    pub(crate) notifier: &'a mut super::notify::Notifier,
+    pub(crate) account: super::notify::Account<'a>,
+    pub(crate) format: super::notify::Format,
+}
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +34,14 @@ pub(crate) async fn handle(
     selected: &mut Option<SelectedMailbox>,
     options: SyncOptions,
     max_duration: Duration,
+    mut notify: Option<Notify<'_>>,
 ) -> Result<Outcome> {
     let deadline = Instant::now() + max_duration;
     write(reader, Response::new().continuation("idling")).await?;
 
     // Synchronize after entering IDLE so changes racing with the continuation
     // cannot be missed before the periodic notification loop starts.
-    sync_selected_mailbox(reader, mail_root, selected, options).await?;
+    report_changes(reader, mail_root, selected, options, &mut notify).await?;
 
     let mut keepalive_elapsed = Duration::ZERO;
     let mut line = Vec::new();
@@ -63,7 +71,7 @@ pub(crate) async fn handle(
                 return Ok(Outcome::Completed);
             }
             ReadEvent::Tick => {
-                sync_selected_mailbox(reader, mail_root, selected, options).await?;
+                report_changes(reader, mail_root, selected, options, &mut notify).await?;
                 if Instant::now() >= deadline {
                     // A client still idling after the autologout period is
                     // gone or broken (RFC 2177: re-issue IDLE every 29 min).
@@ -82,6 +90,31 @@ pub(crate) async fn handle(
                 }
             }
         }
+    }
+}
+
+async fn report_changes(
+    reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
+    mail_root: &str,
+    selected: &mut Option<SelectedMailbox>,
+    options: SyncOptions,
+    notify: &mut Option<Notify<'_>>,
+) -> Result<()> {
+    match notify {
+        Some(notify) => {
+            notify
+                .notifier
+                .poll(
+                    reader,
+                    notify.account,
+                    selected,
+                    options,
+                    notify.format,
+                    true,
+                )
+                .await
+        }
+        None => sync_selected_mailbox(reader, mail_root, selected, options).await,
     }
 }
 

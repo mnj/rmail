@@ -144,6 +144,7 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
         | Command::SetQuota
         | Command::GetMetadata
         | Command::SetMetadata
+        | Command::Notify
         | Command::Subscribe { .. }
         | Command::Enable
         | Command::Compress
@@ -240,6 +241,7 @@ mod tests {
             "ID NIL",
             "GETMETADATA \"\" /shared/comment",
             "SETMETADATA INBOX (/private/comment NIL)",
+            "NOTIFY NONE",
             "SELECT INBOX",
             "EXAMINE INBOX",
         ];
@@ -397,6 +399,7 @@ pub(crate) mod list;
 pub(crate) mod login;
 pub(crate) mod mailboxes;
 pub(crate) mod metadata;
+pub(crate) mod notify;
 pub(crate) mod quota;
 pub(crate) mod search;
 pub(crate) mod select;

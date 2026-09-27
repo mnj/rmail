@@ -100,6 +100,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "CREATE-SPECIAL-USE",
             "OBJECTID",
             "METADATA",
+            "NOTIFY",
             "APPENDLIMIT=104857600",
         ])
     );

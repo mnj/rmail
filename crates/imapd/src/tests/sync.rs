@@ -13,7 +13,7 @@ pub(super) struct Fixture {
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
-async fn selected_session(messages: usize) -> Fixture {
+pub(super) async fn selected_session(messages: usize) -> Fixture {
     let mut fixture = authenticated_session(messages).await;
     fixture.command("S1 SELECT INBOX", "S1 OK").await;
     fixture
@@ -87,6 +87,11 @@ impl Fixture {
             .expect("write command");
         self.reader.get_mut().flush().await.expect("flush");
         read_until_contains_bounded(&mut self.reader, done).await
+    }
+
+    /// Read unsolicited responses until one contains `needle`.
+    pub(super) async fn expect(&mut self, needle: &str) -> Vec<String> {
+        read_until_contains_bounded(&mut self.reader, needle).await
     }
 
     /// Deliver a message as the MTA does, so it is \Recent.
