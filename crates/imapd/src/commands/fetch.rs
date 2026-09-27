@@ -331,7 +331,7 @@ fn filter_vanished(
     })
 }
 
-fn fetch_marks_seen(items: &[String]) -> bool {
+pub(crate) fn fetch_marks_seen(items: &[String]) -> bool {
     items.iter().any(|item| {
         item == "RFC822"
             || item == "RFC822.TEXT"

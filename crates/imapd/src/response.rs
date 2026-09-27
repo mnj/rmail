@@ -259,6 +259,7 @@ pub(crate) fn capability_tokens_with_policy(
             "CREATE-SPECIAL-USE",
             "OBJECTID",
             "METADATA",
+            "NOTIFY",
         ]),
     }
     let mut caps = caps.join(" ");

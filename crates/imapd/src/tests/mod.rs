@@ -9,6 +9,7 @@ mod extensions;
 mod fetch;
 mod mailboxes;
 mod metadata;
+mod notify;
 mod objectid;
 mod protocol;
 mod rev2;

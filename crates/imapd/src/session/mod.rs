@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use rmail_common::auth::ChannelBindings;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::input::{
     BoundedLine, CommandLiteralError, read_bounded_line, read_textual_command_literals,
@@ -73,6 +73,8 @@ struct Session {
     auth_policy: Arc<sasl::AuthPolicy>,
     state: state::SessionState,
     selected: Option<SelectedMailbox>,
+    /// The active `NOTIFY SET`, if any (RFC 5465).
+    notify: Option<commands::notify::Notifier>,
     command_times: VecDeque<Instant>,
 }
 
@@ -207,6 +209,7 @@ async fn run_session(
         auth_policy,
         state: state::SessionState::default(),
         selected: None,
+        notify: None,
         command_times: VecDeque::new(),
     };
     imap_log!("info", "session_started", { "peer": session.peer_label(), "encrypted": session_encrypted, "tls_configured": session.tls_ctx.is_some() });
@@ -234,7 +237,7 @@ async fn run_session(
             timeouts.unauthenticated
         };
         let read =
-            tokio::time::timeout(autologout, session.read_command(&mut reader, line_limit)).await;
+            tokio::time::timeout(autologout, session.next_command(&mut reader, line_limit)).await;
         let line = match read {
             Ok(result) => match result? {
                 Line::Command(line) => line,
@@ -421,6 +424,19 @@ impl Session {
         self.state.selected_mailbox = None;
     }
 
+    /// Read the next command line. With NOTIFY active, changes are reported
+    /// while the client is quiet.
+    async fn next_command(&mut self, reader: &mut ImapReader, line_limit: usize) -> Result<Line> {
+        while self.notify.is_some() {
+            match tokio::time::timeout(commands::notify::POLL_INTERVAL, reader.fill_buf()).await {
+                // Input, end of stream or an error: read_command handles it.
+                Ok(_) => break,
+                Err(_) => self.poll_notifications(reader).await?,
+            }
+        }
+        self.read_command(reader, line_limit).await
+    }
+
     /// Read one command line and any textual literals it announces.
     async fn read_command(&self, reader: &mut ImapReader, line_limit: usize) -> Result<Line> {
         let line = match read_bounded_line(reader, line_limit).await {
@@ -527,6 +543,7 @@ impl Session {
                 self.quota(reader, call).await
             }
             Command::GetMetadata | Command::SetMetadata => self.metadata(reader, call).await,
+            Command::Notify => self.notify(reader, call).await,
             Command::Unselect => self.unselect(reader, call).await,
             Command::Unauthenticate => {
                 // RFC 8437: back to the not-authenticated state as if the
@@ -534,6 +551,7 @@ impl Session {
                 let account = self.state.authenticated_mailbox.clone();
                 self.clear_selection();
                 self.state = state::SessionState::default();
+                self.notify = None;
                 imap_log!("info", "unauthenticated", { "peer": self.peer_label(), "mailbox": account });
                 self.send(
                     reader,
