@@ -141,11 +141,16 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if acme.ca == AcmeCa::ZeroSsl && !has_kid {
         bail!("ZeroSSL needs external account binding: set acme.eab_kid and acme.eab_hmac_key");
     }
-    if let Some(key) = &acme.eab_hmac_key {
-        decode_eab_key(key.expose())?;
+    // Validation only checks secrets are well formed; it never keeps them.
+    if acme
+        .eab_hmac_key
+        .as_ref()
+        .is_some_and(|key| decode_eab_key(key.expose()).is_err())
+    {
+        bail!("acme.eab_hmac_key must be base64url, as issued by the CA");
     }
     if acme.challenge == AcmeChallenge::Dns01 {
-        dns::Provider::from_config(&acme.dns)?;
+        dns::check_config(&acme.dns)?;
     }
     if config.global.tls.ocsp_response.is_some() {
         bail!(

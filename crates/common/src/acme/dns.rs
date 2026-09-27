@@ -73,6 +73,60 @@ fn required_secret<'a>(
         .ok_or_else(|| anyhow!("{what} is required for this DNS provider"))
 }
 
+/// Check that the provider's required settings are present and well formed,
+/// without copying or decoding any secret value (used when settings are
+/// saved; [`Provider::from_config`] builds the real client at issuance).
+pub(super) fn check_config(config: &AcmeDnsConfig) -> Result<()> {
+    let present = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let secret_present = |value: &Option<crate::config::SecretString>| {
+        value
+            .as_ref()
+            .is_some_and(|v| !v.expose().trim().is_empty())
+    };
+    let missing = |what: &str| anyhow!("{what} is required for this DNS provider");
+    let kind = config
+        .provider
+        .ok_or_else(|| anyhow!("acme.dns.provider is required for the dns-01 challenge"))?;
+    match kind {
+        DnsProviderKind::Cloudflare
+        | DnsProviderKind::DigitalOcean
+        | DnsProviderKind::Desec
+        | DnsProviderKind::Gandi => {
+            if !secret_present(&config.api_token) {
+                return Err(missing("acme.dns.api_token"));
+            }
+        }
+        DnsProviderKind::Route53 => {
+            if !present(&config.aws_access_key_id) {
+                return Err(missing("acme.dns.aws_access_key_id"));
+            }
+            if !secret_present(&config.aws_secret_access_key) {
+                return Err(missing("acme.dns.aws_secret_access_key"));
+            }
+        }
+        DnsProviderKind::Rfc2136 => {
+            if !present(&config.rfc2136_server) {
+                return Err(missing("acme.dns.rfc2136_server"));
+            }
+            if !present(&config.tsig_key_name) {
+                return Err(missing("acme.dns.tsig_key_name"));
+            }
+            if !secret_present(&config.tsig_secret) {
+                return Err(missing("acme.dns.tsig_secret"));
+            }
+            let decodes = config.tsig_secret.as_ref().is_some_and(|secret| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(secret.expose().trim())
+                    .is_ok()
+            });
+            if !decodes {
+                bail!("acme.dns.tsig_secret must be base64 (as in a BIND key file)");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn decode_tsig_secret(secret: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(secret.trim())
