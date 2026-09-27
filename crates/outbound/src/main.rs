@@ -34,6 +34,13 @@ const DNS_NEGATIVE_MIN_TTL: Duration = Duration::from_secs(5);
 const DNS_NEGATIVE_MAX_TTL: Duration = Duration::from_secs(5 * 60);
 
 static OUTBOUND_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
+/// Name sent in EHLO/HELO: `global.hostname` or the system hostname
+/// (RFC 5321 section 4.1.1.1 requires the client's FQDN).
+static HELO_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn helo_name() -> &'static str {
+    HELO_NAME.get_or_init(rmail_common::config::system_hostname)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MtaStsMode {
@@ -226,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
             let cfg = rmail_common::config::Config::load(&path)
                 .with_context(|| format!("loading configuration from {path}"))?;
             rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
+            let _ = HELO_NAME.set(cfg.global.server_hostname());
             if let Err(error) = rmail_common::settings::record_service_start(&cfg, "outbound") {
                 rmail_common::structured_log!("warn", "outbound", "service_state_failed", { "error": format!("{error:#}") });
             }
@@ -2549,14 +2557,16 @@ async fn establish_smtp_connection(
         return Err(rejected("connection greeting", code, banner));
     }
 
-    reader.get_mut().write_all(b"EHLO rmail\r\n").await?;
-    trace.command("ehlo", "EHLO rmail", 12);
+    let ehlo = format!("EHLO {}\r\n", helo_name());
+    reader.get_mut().write_all(ehlo.as_bytes()).await?;
+    trace.command("ehlo", ehlo.trim_end(), ehlo.len());
     reader.get_mut().flush().await?;
     let (code, ehlo_response) = read_response(&mut reader).await?;
     trace.reply("ehlo", code, &ehlo_response);
     let mut capabilities = if code != 250 {
-        reader.get_mut().write_all(b"HELO rmail\r\n").await?;
-        trace.command("helo", "HELO rmail", 12);
+        let helo = format!("HELO {}\r\n", helo_name());
+        reader.get_mut().write_all(helo.as_bytes()).await?;
+        trace.command("helo", helo.trim_end(), helo.len());
         reader.get_mut().flush().await?;
         let (code, response) = read_response(&mut reader).await?;
         trace.reply("helo", code, &response);
@@ -2589,14 +2599,15 @@ async fn establish_smtp_connection(
         encrypted = true;
         trace.emit("tls", "encrypted", Some(host.to_string()), None);
 
-        reader.get_mut().write_all(b"EHLO rmail\r\n").await?;
-        trace.command("ehlo", "EHLO rmail", 12);
+        reader.get_mut().write_all(ehlo.as_bytes()).await?;
+        trace.command("ehlo", ehlo.trim_end(), ehlo.len());
         reader.get_mut().flush().await?;
         let (code, ehlo_response) = read_response(&mut reader).await?;
         trace.reply("ehlo", code, &ehlo_response);
         if code != 250 {
-            reader.get_mut().write_all(b"HELO rmail\r\n").await?;
-            trace.command("helo", "HELO rmail", 12);
+            let helo = format!("HELO {}\r\n", helo_name());
+            reader.get_mut().write_all(helo.as_bytes()).await?;
+            trace.command("helo", helo.trim_end(), helo.len());
             reader.get_mut().flush().await?;
             let (code, response) = read_response(&mut reader).await?;
             trace.reply("helo", code, &response);
@@ -2673,6 +2684,13 @@ async fn connect_host_with_fallback(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn helo_name_defaults_to_the_system_hostname() {
+        let name = helo_name();
+        assert_eq!(name, rmail_common::config::system_hostname());
+        assert!(rmail_common::domain::canonicalize_domain(name).is_ok());
+    }
 
     #[test]
     fn outbound_dns_cache_is_bounded_and_clamps_ttls() {

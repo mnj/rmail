@@ -7,7 +7,9 @@ use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::time::timeout;
 
-use crate::{DATA_READ_TIMEOUT, MAX_DATA_LINE_BYTES, MAX_MESSAGE_BYTES, SmtpService};
+use crate::{
+    DATA_READ_TIMEOUT, MAX_DATA_LINE_BYTES, MAX_MESSAGE_BYTES, SmtpService, server_hostname,
+};
 
 async fn timed_read_until<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
@@ -174,12 +176,16 @@ pub(crate) fn received_header(
         "SMTP"
     };
     let timestamp = chrono_like_utc_timestamp();
+    // RFC 5321 section 4.4: "by" names the receiving host.
+    let host = server_hostname();
     match peer {
         Some(peer) => format!(
-            "Received: from {helo} ([{}]) by rMail SMTPD with {protocol}; {timestamp}\r\n",
+            "Received: from {helo} ([{}]) by {host} (rMail) with {protocol}; {timestamp}\r\n",
             peer.ip()
         ),
-        None => format!("Received: from {helo} by rMail SMTPD with {protocol}; {timestamp}\r\n"),
+        None => {
+            format!("Received: from {helo} by {host} (rMail) with {protocol}; {timestamp}\r\n")
+        }
     }
     .into_bytes()
 }

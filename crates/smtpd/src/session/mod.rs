@@ -29,7 +29,7 @@ use crate::protocol::{self, Command as SmtpCommand, parse_command, parse_mail_fr
 use crate::trace::{ConnectionTrace, ReplyTrackingStream, emit_tracking};
 use crate::{
     AsyncStream, COMMAND_IDLE_TIMEOUT, MAX_MESSAGE_BYTES, STARTTLS_HANDSHAKE_TIMEOUT, SmtpService,
-    authenticate, tls,
+    authenticate, server_hostname, tls,
 };
 
 #[cfg(test)]
@@ -179,12 +179,14 @@ pub(crate) async fn process_stream(
     };
     session_log!(session, "info", "session_started", { "service": service.as_str(), "encrypted": session_encrypted, "tls_configured": session.tls_ctx.is_some(), "dmarc_enforced": enforce_dmarc });
     if send_greeting {
-        let greeting: &[u8] = if service == SmtpService::Lmtp {
-            b"220 rMail LMTP ready\r\n"
+        // RFC 5321 section 4.2: the greeting starts with the server's domain.
+        let host = server_hostname();
+        let greeting = if service == SmtpService::Lmtp {
+            format!("220 {host} LMTP rMail ready\r\n")
         } else {
-            b"220 rMail SMTPD ready\r\n"
+            format!("220 {host} ESMTP rMail ready\r\n")
         };
-        send(&mut reader, greeting).await?;
+        send(&mut reader, greeting.as_bytes()).await?;
     }
 
     loop {
@@ -489,7 +491,7 @@ impl Session {
         self.helo_name = Some(name.to_string());
         self.extended_smtp = extended;
         let response = if extended {
-            let mut response = format!("250-rMail Hello {name}\r\n");
+            let mut response = format!("250-{} Hello {name}\r\n", server_hostname());
             if self.service != SmtpService::Lmtp && !self.encrypted && self.tls_ctx.is_some() {
                 response.push_str("250-STARTTLS\r\n");
             }
@@ -518,7 +520,7 @@ impl Session {
             response
         } else {
             // RFC 2034: HELO/EHLO replies carry no enhanced status code.
-            format!("250 rMail Hello {name}\r\n")
+            format!("250 {} Hello {name}\r\n", server_hostname())
         };
         send(reader, response.as_bytes()).await?;
         self.reset_transaction();

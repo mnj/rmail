@@ -60,6 +60,14 @@ pub(crate) const AUTH_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const DATA_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const STARTTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// This server's SMTP identity (`global.hostname` or the system hostname).
+static SERVER_HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Domain announced in greetings, EHLO/HELO replies and Received headers.
+pub(crate) fn server_hostname() -> &'static str {
+    SERVER_HOSTNAME.get_or_init(rmail_common::config::system_hostname)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SmtpService {
     Mta,
@@ -83,6 +91,7 @@ async fn main() -> Result<()> {
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
     rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
+    let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
         smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
     }

@@ -7,6 +7,9 @@
 # warning lists any that differ from the database).
 [global]
 mail_root = "mail"
+# Fully qualified name announced in the SMTP/LMTP greeting, EHLO/HELO and
+# Received headers. Defaults to the system hostname.
+# hostname = "mail.example.com"
 # Optional: when unset, a random webmail session key is generated and kept in
 # the settings database.
 # webmail_session_secret = "replace-with-at-least-32-random-bytes"

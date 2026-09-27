@@ -52,11 +52,16 @@ pub fn deliver_blocking(
     }
 
     // EHLO
-    reader.get_mut().write_all(b"EHLO rmail\r\n")?;
+    let helo_name = crate::helo_name();
+    reader
+        .get_mut()
+        .write_all(format!("EHLO {helo_name}\r\n").as_bytes())?;
     reader.get_mut().flush()?;
     let (code, _resp) = read_response_blocking(&mut reader)?;
     if code >= 400 {
-        reader.get_mut().write_all(b"HELO rmail\r\n")?;
+        reader
+            .get_mut()
+            .write_all(format!("HELO {helo_name}\r\n").as_bytes())?;
         reader.get_mut().flush()?;
         let (code2, _r2) = read_response_blocking(&mut reader)?;
         if code2 >= 400 {

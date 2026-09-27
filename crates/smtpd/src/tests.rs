@@ -263,7 +263,17 @@ async fn run_prepared_session(
     let mut reader = BufReader::new(client);
     let mut line = String::new();
     reader.read_line(&mut line).await.expect("greeting");
-    assert!(line.starts_with("220 "));
+    // RFC 5321 section 4.2: the server's domain comes first.
+    let expected_greeting = format!(
+        "220 {} {} rMail ready\r\n",
+        super::server_hostname(),
+        if service == SmtpService::Lmtp {
+            "LMTP"
+        } else {
+            "ESMTP"
+        }
+    );
+    assert_eq!(line, expected_greeting);
     reader.get_mut().write_all(&input).await.expect("write");
     reader.get_mut().flush().await.expect("flush");
 
@@ -620,7 +630,11 @@ async fn smtp_data_preserves_non_utf8_bytes() {
         .collect();
     assert_eq!(entries.len(), 1);
     let body = std::fs::read(&entries[0]).expect("read message");
-    assert!(body.starts_with(b"Received: from localhost by rMail SMTPD with ESMTP;"));
+    let expected = format!(
+        "Received: from localhost by {} (rMail) with ESMTP;",
+        super::server_hostname()
+    );
+    assert!(body.starts_with(expected.as_bytes()));
     assert!(body.windows(8).any(|w| w == b"binary:\xff"));
     assert!(Path::new(&entries[0]).exists());
 }
@@ -957,11 +971,8 @@ async fn lmtp_requires_lhlo_and_reports_each_recipient_delivery() {
             .iter()
             .any(|line| line == "500 5.5.1 LMTP requires LHLO\r\n")
     );
-    assert!(
-        responses
-            .iter()
-            .any(|line| line.starts_with("250-rMail Hello"))
-    );
+    let hello = format!("250-{} Hello localhost\r\n", super::server_hostname());
+    assert!(responses.contains(&hello));
     assert!(
         responses
             .iter()
@@ -1339,9 +1350,10 @@ async fn helo_reply_help_and_plaintext_submission_rset() {
         16 * 1024,
     )
     .await;
-    let helo = &responses[0];
-    assert!(helo.starts_with("250 "), "{helo:?}");
-    assert!(!helo.starts_with("250 2."), "{helo:?}");
+    assert_eq!(
+        responses[0],
+        format!("250 {} Hello client.example\r\n", super::server_hostname())
+    );
     assert_eq!(
         responses
             .iter()
@@ -1438,11 +1450,8 @@ async fn bare_lf_command_is_rejected_without_losing_following_crlf_commands() {
             .iter()
             .any(|response| response.starts_with("500 5.5.2 Command line must end with CRLF"))
     );
-    assert!(
-        responses
-            .iter()
-            .any(|response| response.starts_with("250-rMail Hello"))
-    );
+    let hello = format!("250-{} Hello localhost\r\n", super::server_hostname());
+    assert!(responses.contains(&hello));
     assert!(
         responses
             .iter()
