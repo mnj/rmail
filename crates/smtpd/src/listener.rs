@@ -138,14 +138,15 @@ pub(crate) fn spawn_tls_reloader(
     key_path: String,
     policy: rmail_common::config::TlsPolicy,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .context("installing SMTP SIGHUP handler")?;
+    let mut trigger = rmail_common::tls::ReloadTrigger::new(&cert_path, &key_path, &policy)
+        .context("installing SMTP TLS reload handler")?;
     Ok(tokio::spawn(async move {
-        while signal.recv().await.is_some() {
+        loop {
+            let reason = trigger.next().await;
             match tls::reload_tls_context(&sender, &cert_path, &key_path, &policy) {
-                Ok(()) => smtp_log!("info", "tls_reloaded", {}),
+                Ok(()) => smtp_log!("info", "tls_reloaded", { "reason": reason }),
                 Err(error) => {
-                    smtp_log!("error", "tls_reload_failed", { "error": error.to_string() })
+                    smtp_log!("error", "tls_reload_failed", { "reason": reason, "error": error.to_string() })
                 }
             }
         }

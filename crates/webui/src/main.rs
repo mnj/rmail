@@ -1020,18 +1020,11 @@ async fn handle_connection<S>(
     admin_user: Option<String>,
     admin_hash: Option<String>,
     db_path: Option<String>,
-    acme_challenge_dir: Option<String>,
     readiness: ReadinessConfig,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let state = api::AdminState::new(
-        mail_root,
-        db_path,
-        admin_user.zip(admin_hash),
-        acme_challenge_dir,
-        readiness,
-    );
+    let state = api::AdminState::new(mail_root, db_path, admin_user.zip(admin_hash), readiness);
     api::serve(stream, peer, Arc::new(state)).await;
 }
 
@@ -1120,6 +1113,62 @@ fn settings_view_sync(db_path: &str) -> Result<serde_json::Value> {
     Ok(view)
 }
 
+/// Accept connections on `listener` until shutdown, terminating TLS when a
+/// context is available.
+fn spawn_listener(
+    listeners: &mut JoinSet<()>,
+    addr: String,
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    tls: rmail_common::tls::ServerTlsReceiver,
+    listener_shutdown: GracefulShutdown,
+) {
+    listeners.spawn(async move {
+        let mut shutdown_signal = listener_shutdown.subscribe();
+        loop {
+            if *shutdown_signal.borrow() {
+                break;
+            }
+            let (stream, peer) = tokio::select! {
+                _ = shutdown_signal.changed() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(value) => value,
+                    Err(e) => {
+                        web_log!("error", "listener_accept_failed", { "address": addr, "error": e.to_string() });
+                        break;
+                    }
+                },
+            };
+            let session = listener_shutdown.start_session();
+            let tls_context = tls.borrow().clone();
+            let app = app.clone();
+            let stop = listener_shutdown.subscribe();
+            tokio::spawn(async move {
+                let _session = session;
+                let served = match tls_context {
+                    Some(context) => {
+                        match timeout(Duration::from_secs(15), context.acceptor.accept(stream)).await {
+                            Ok(Ok(stream)) => serve_connection(stream, Some(peer), app, Some(stop)).await,
+                            Ok(Err(error)) => {
+                                web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() });
+                                return;
+                            }
+                            Err(_) => {
+                                web_log!("warn", "tls_handshake_timeout", { "peer": peer.to_string() });
+                                return;
+                            }
+                        }
+                    }
+                    None => serve_connection(stream, Some(peer), app, Some(stop)).await,
+                };
+                if let Err(error) = served {
+                    web_log!("debug", "connection_error", { "peer": peer.to_string(), "error": error.to_string() });
+                }
+            });
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg_path =
@@ -1143,10 +1192,14 @@ async fn main() -> Result<()> {
             .web_admin_user
             .clone()
             .zip(cfg.global.web_admin_password_hash.clone()),
-        cfg.global.acme_challenge_dir.clone(),
         readiness_from_config(&cfg),
     );
     state.config_path = Some(cfg_path.clone());
+    state.http_redirect_url = cfg
+        .global
+        .http_redirect_url
+        .clone()
+        .filter(|url| !url.trim().is_empty());
     state.secure_cookies = tls_active || cfg.global.tls.web_http_only;
     if let Some(db_path) = cfg.global.db_path.as_deref() {
         // A persistent key keeps admins signed in across restarts.
@@ -1173,7 +1226,12 @@ async fn main() -> Result<()> {
         }
         web_log!("warn", "admin_setup_mode", { "reason": "no admin credentials configured; the first visitor on a loopback listener sets them" });
     }
-    let app = api::router(Arc::new(state));
+    let state = Arc::new(state);
+    let app = api::router(state.clone());
+    let http_app = api::certificates::http_router(state);
+    if cfg.global.db_path.is_some() {
+        api::certificates::spawn_renewal_task(cfg_path.clone());
+    }
 
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
@@ -1188,53 +1246,29 @@ async fn main() -> Result<()> {
     for addr in bind_addrs {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
         web_log!("info", "listener_started", { "address": addr, "tls_configured": tls_active });
-        let listener_shutdown = shutdown.clone();
-        let tls = tls.1.clone();
-        let app = app.clone();
-        listeners.spawn(async move {
-            let mut shutdown_signal = listener_shutdown.subscribe();
-            loop {
-                if *shutdown_signal.borrow() {
-                    break;
-                }
-                let (stream, peer) = tokio::select! {
-                    _ = shutdown_signal.changed() => break,
-                    accepted = listener.accept() => match accepted {
-                        Ok(value) => value,
-                        Err(e) => {
-                            web_log!("error", "listener_accept_failed", { "address": addr, "error": e.to_string() });
-                            break;
-                        }
-                    },
-                };
-                let session = listener_shutdown.start_session();
-                let tls_context = tls.borrow().clone();
-                let app = app.clone();
-                let stop = listener_shutdown.subscribe();
-                tokio::spawn(async move {
-                    let _session = session;
-                    let served = match tls_context {
-                        Some(context) => {
-                            match timeout(Duration::from_secs(15), context.acceptor.accept(stream)).await {
-                                Ok(Ok(stream)) => serve_connection(stream, Some(peer), app, Some(stop)).await,
-                                Ok(Err(error)) => {
-                                    web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() });
-                                    return;
-                                }
-                                Err(_) => {
-                                    web_log!("warn", "tls_handshake_timeout", { "peer": peer.to_string() });
-                                    return;
-                                }
-                            }
-                        }
-                        None => serve_connection(stream, Some(peer), app, Some(stop)).await,
-                    };
-                    if let Err(error) = served {
-                        web_log!("debug", "connection_error", { "peer": peer.to_string(), "error": error.to_string() });
-                    }
-                });
-            }
-        });
+        spawn_listener(
+            &mut listeners,
+            addr,
+            listener,
+            app.clone(),
+            tls.1.clone(),
+            shutdown.clone(),
+        );
+    }
+    // Plain HTTP (port 80): ACME challenges and a redirect to HTTPS.
+    let (_, no_tls) = tokio::sync::watch::channel(None);
+    for addr in cfg.global.http_listeners() {
+        let listener = bind_tcp_listener_with_config(&addr, &listener_config)
+            .with_context(|| format!("binding the plain HTTP listener {addr}"))?;
+        web_log!("info", "http_listener_started", { "address": addr });
+        spawn_listener(
+            &mut listeners,
+            addr,
+            listener,
+            http_app.clone(),
+            no_tls.clone(),
+            shutdown.clone(),
+        );
     }
     rmail_common::runtime::wait_for_shutdown_signal().await?;
     web_log!("info", "shutdown_requested", { "active_requests": shutdown.active_sessions() });
@@ -1288,7 +1322,6 @@ mod tests {
                 None,
                 None,
                 db_path,
-                None,
                 readiness,
             )
             .await;
@@ -1752,15 +1785,13 @@ mod tests {
     #[tokio::test]
     async fn acme_challenge_rejects_path_traversal() {
         let td = tempdir().unwrap();
-        let acme = td.path().join("acme");
-        fs::create_dir_all(&acme).unwrap();
-        fs::write(acme.join("good-token_1"), "challenge").unwrap();
+        let db = td.path().join("rmail.db").display().to_string();
+        rmail_common::acme::put_challenge(&db, "good-token_1", "good-token_1.thumb").unwrap();
         fs::write(td.path().join("secret.txt"), "TOPSECRET").unwrap();
         let state = Arc::new(api::AdminState::new(
             td.path().to_path_buf(),
-            None,
+            Some(db),
             Some(("admin".into(), hash("correct horse battery"))),
-            Some(acme.to_string_lossy().into_owned()),
             ReadinessConfig::default(),
         ));
         let ok = send_to_state(
@@ -1770,9 +1801,16 @@ mod tests {
         )
         .await;
         assert!(
-            ok.starts_with("HTTP/1.1 200 OK") && ok.ends_with("challenge"),
+            ok.starts_with("HTTP/1.1 200 OK") && ok.ends_with("good-token_1.thumb"),
             "{ok}"
         );
+        let unknown = send_to_state(
+            state.clone(),
+            "t",
+            "GET /.well-known/acme-challenge/other HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
         for target in [
             "/.well-known/acme-challenge/../secret.txt".to_string(),
             format!(
@@ -1788,12 +1826,152 @@ mod tests {
         }
     }
 
+    async fn send_http(state: Arc<api::AdminState>, request: &str) -> String {
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let app = api::certificates::http_router(state);
+        let task = tokio::spawn(async move {
+            let _ = rmail_common::http::serve_connection(server, None, app, None).await;
+        });
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn plain_http_listener_answers_challenges_and_redirects_to_https() {
+        let td = tempdir().unwrap();
+        let db = td.path().join("rmail.db").display().to_string();
+        rmail_common::acme::put_challenge(&db, "tok", "tok.thumb").unwrap();
+        let state = |redirect: Option<&str>| {
+            let mut state = api::AdminState::new(
+                td.path().to_path_buf(),
+                Some(db.clone()),
+                None,
+                ReadinessConfig::default(),
+            );
+            state.http_redirect_url = redirect.map(str::to_string);
+            Arc::new(state)
+        };
+        let challenge = send_http(
+            state(None),
+            "GET /.well-known/acme-challenge/tok HTTP/1.1\r\nHost: mail.example.com\r\n\r\n",
+        )
+        .await;
+        assert!(
+            challenge.starts_with("HTTP/1.1 200") && challenge.ends_with("tok.thumb"),
+            "{challenge}"
+        );
+
+        let redirect = send_http(
+            state(None),
+            "GET /mail/inbox?x=1 HTTP/1.1\r\nHost: mail.example.com:80\r\n\r\n",
+        )
+        .await;
+        assert!(redirect.starts_with("HTTP/1.1 301"), "{redirect}");
+        assert!(
+            redirect
+                .to_ascii_lowercase()
+                .contains("location: https://mail.example.com/mail/inbox?x=1"),
+            "{redirect}"
+        );
+        // The admin API is not reachable over plain HTTP.
+        let api = send_http(
+            state(None),
+            "GET /api/settings HTTP/1.1\r\nHost: mail.example.com\r\n\r\n",
+        )
+        .await;
+        assert!(api.starts_with("HTTP/1.1 301"), "{api}");
+
+        let fixed = send_http(
+            state(Some("https://webmail.example.com/")),
+            "POST /x HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(fixed.starts_with("HTTP/1.1 308"), "{fixed}");
+        assert!(
+            fixed
+                .to_ascii_lowercase()
+                .contains("location: https://webmail.example.com/x"),
+            "{fixed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn certificates_api_reports_configuration_and_guards_runs() {
+        let td = tempdir().unwrap();
+        let db = td.path().join("rmail.db");
+        let config_path = td.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[global]\nmail_root = {:?}\ndb_path = {:?}\nhostname = \"mail.example.com\"\n",
+                td.path().display().to_string(),
+                db.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut state = api::AdminState::new(
+            td.path().to_path_buf(),
+            Some(db.display().to_string()),
+            None,
+            ReadinessConfig::default(),
+        );
+        state.config_path = Some(config_path.display().to_string());
+        let state = Arc::new(state);
+
+        let overview = send_to_state(
+            state.clone(),
+            "127.0.0.1:1",
+            "GET /api/certificates HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(overview.starts_with("HTTP/1.1 200"), "{overview}");
+        let body: serde_json::Value =
+            serde_json::from_str(overview.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["names"], json!(["mail.example.com"]));
+        assert_eq!(body["challenge"], "http-01");
+        assert_eq!(body["running"], false);
+
+        // A real run requires ACME to be enabled first.
+        let refused = send_to_state(
+            state.clone(),
+            "127.0.0.1:1",
+            post("/api/certificates/issue", "{}", ""),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+
+        // Enabling http-01 without a port-80 listener warns about it.
+        let mut conn = rmail_common::settings::open(&db).unwrap();
+        rmail_common::settings::update(
+            &mut conn,
+            &BTreeMap::from([("acme.enabled".to_string(), json!(true))]),
+        )
+        .unwrap();
+        let overview = send_to_state(
+            state.clone(),
+            "127.0.0.1:1",
+            "GET /api/certificates HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(overview.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["renewal"]["due"], true);
+        let warnings = body["warnings"].to_string();
+        assert!(warnings.contains("port 80"), "{warnings}");
+        assert!(warnings.contains("restart"), "{warnings}");
+    }
+
     #[tokio::test]
     async fn oversized_bodies_are_rejected_before_allocation() {
         let td = tempdir().unwrap();
         let state = Arc::new(api::AdminState::new(
             td.path().to_path_buf(),
-            None,
             None,
             None,
             ReadinessConfig::default(),
@@ -1814,7 +1992,6 @@ mod tests {
             td.path().to_path_buf(),
             None,
             Some(("admin".into(), hash("correct horse battery"))),
-            None,
             ReadinessConfig::default(),
         ));
         let anonymous = send_to_state(
@@ -1867,7 +2044,6 @@ mod tests {
             td.path().to_path_buf(),
             None,
             Some(("admin".into(), hash("correct horse battery"))),
-            None,
             ReadinessConfig::default(),
         ));
         let peer = "192.0.2.10:5555";
@@ -1951,7 +2127,6 @@ mod tests {
         let state = Arc::new(api::AdminState::new(
             td.path().to_path_buf(),
             Some(db.clone()),
-            None,
             None,
             ReadinessConfig::default(),
         ));

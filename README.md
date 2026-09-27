@@ -25,8 +25,9 @@ screenshots of every page, and a quick start.
   settings, logs, Prometheus metrics and readiness checks.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
   layout.
-- **Operations**: structured JSON logs, live `rmail_ctl watch`, per-message tracking, ACME
-  certificates, and `.deb` packages for amd64 and arm64 published on every merge.
+- **Operations**: structured JSON logs, live `rmail_ctl watch`, per-message tracking, built-in
+  ACME certificates (Let's Encrypt over HTTP or DNS, renewed and hot-reloaded), and `.deb`
+  packages for amd64 and arm64 published on every merge.
 
 ## Screenshots
 

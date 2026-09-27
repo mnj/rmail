@@ -8,8 +8,6 @@ log_level = "debug"
 # setup mode. Use `rmail_ctl admin-password --config config/test.toml` to set them.
 # local test DB path for mailboxes/catchalls
 db_path = "config/rmail_test.db"
-# ACME challenge dir for local testing (empty by default)
-acme_challenge_dir = "config/acme-challenges"
 
 [global.tcp_listener]
 reuse_port = false

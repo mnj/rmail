@@ -317,3 +317,22 @@ div.logView pre { margin: 0; padding: 6px 14px; white-space: pre-wrap; word-brea
 .panelNote { margin: 0; padding: 12px 18px; color: #667085; font-size: 13px; }
 .rawAnswer { display: block; margin-top: 6px; font-size: 12px; word-break: break-all; }
 .banner.info { display: block; background: #eff8ff; border-color: #b2ddff; color: #175cd3; }
+
+/* ---- Certificates --------------------------------------------------------- */
+.certificatesPage { display: grid; gap: 18px; padding-bottom: 72px; }
+.certificatesPage .notice p { margin: 0; }
+.statusDot.off { background: #98a2b3; box-shadow: 0 0 0 4px #eaecf0; }
+.pill.error { background: #fee4e2; color: #b42318; }
+.certSummary { padding: 16px 18px; display: grid; gap: 14px; }
+.certNames { display: flex; flex-wrap: wrap; gap: 6px; }
+.certNames code { background: #f4f3ff; color: #5925dc; padding: 4px 8px; border-radius: 6px; font-size: 13px; }
+.certFacts { margin: 0; display: grid; gap: 10px; }
+.certFacts div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; }
+.certFacts dt { color: #667085; font-size: 13px; }
+.certFacts dd { margin: 0; font-size: 13px; word-break: break-word; }
+.runHead { display: flex; align-items: center; gap: 10px; padding: 14px 18px 0; color: #667085; font-size: 13px; }
+.runError { margin: 12px 16px 0; }
+.certificatesPage div.logView { max-height: 320px; }
+.logLine.plain.warn { color: #fdb022; }
+.logLine.plain.error { color: #fda29b; }
+.logLine.plain time { margin-right: 6px; }

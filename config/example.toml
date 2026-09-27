@@ -23,8 +23,6 @@ log_level = "info"
 # web_admin_password_hash = "$argon2id$..."   # from `rmail_ctl hash`
 # optional SQLite DB for mailboxes and catchalls (preferred for production)
 db_path = "config/rmail.db"
-# directory used to serve ACME http-01 challenges (used by automated cert managers)
-acme_challenge_dir = "config/acme-challenges"
 
 [global.tls]
 minimum_version = "1.2"
@@ -60,6 +58,9 @@ imap = ["[::]:143"]
 imaps = ["[::]:993"]
 admin = ["127.0.0.1:8080"]
 webmail = ["127.0.0.1:8081"]
+# Plain HTTP (port 80), served by rmail_web: answers ACME http-01 challenges and
+# redirects everything else to HTTPS (see global.http_redirect_url).
+# http = ["[::]:80"]
 
 [global.tracking]
 # Durable protocol/message history used by `rmail_ctl watch` and `track`.
@@ -106,6 +107,24 @@ rspamd_reject_actions = []
 # audience = "rmail"
 # timeout_ms = 5000
 # allow_insecure_http = false
+
+# Automatic certificates from Let's Encrypt (or another ACME CA). Usually managed
+# on the admin console's Certificates page. The certificate is written to
+# tls_cert/tls_key (or <mail_root>/tls/ when unset); every TLS service reloads it
+# when the files change, and rmail_web renews it before it expires.
+# [acme]
+# enabled = true
+# domains = ["mail.example.com"]    # empty uses global.hostname
+# email = "postmaster@example.com"
+# ca = "letsencrypt"                # letsencrypt | letsencrypt-staging | zerossl | custom
+# challenge = "http-01"             # http-01 needs listeners.http on port 80; or dns-01
+# [acme.dns]                        # for challenge = "dns-01"
+# provider = "cloudflare"           # cloudflare | digitalocean | desec | gandi | route53 | rfc2136
+# api_token = "..."                 # Cloudflare token with Zone:Read + DNS:Edit
+# rfc2136_server = "ns1.example.com"
+# tsig_key_name = "acme-key."
+# tsig_secret = "base64..."
+# tsig_algorithm = "hmac-sha256"
 
 # Folder suggestions from local models (rmail_classifier). Usually managed on the
 # admin console's Organization page; model files live in <mail_root>/models.

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, ChevronRight, FolderTree, Gauge, LogOut, Menu, Network, Send, Server, SlidersHorizontal, Users, X } from 'lucide-react';
+import { Activity, ChevronRight, FolderTree, Gauge, LockKeyhole, LogOut, Menu, Network, Send, Server, SlidersHorizontal, Users, X } from 'lucide-react';
 import { api, errorMessage, onUnauthorized, Session } from './api';
 import { FeedbackProvider, Field } from './ui';
 import { OverviewPage } from './pages/Overview';
@@ -8,12 +8,13 @@ import { AccountsPage } from './pages/Accounts';
 import { RoutingPage } from './pages/Routing';
 import { DeliveryPage } from './pages/Delivery';
 import { SettingsPage } from './pages/Settings';
+import { CertificatesPage } from './pages/Certificates';
 import { OrganizationPage } from './pages/Organization';
 import { ObservabilityPage } from './pages/Observability';
 import { AdminCredentialsForm, SystemPage } from './pages/System';
 import './style.css';
 
-export type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'organization' | 'settings' | 'observability' | 'system';
+export type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'organization' | 'settings' | 'certificates' | 'observability' | 'system';
 
 const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; description: string; icon: React.ElementType }> = {
   overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'Health, storage and delivery at a glance.', icon: Gauge },
@@ -22,6 +23,7 @@ const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; des
   delivery: { path: '/delivery', label: 'Delivery', eyebrow: 'Outbound operations', description: 'Inspect and recover the outbound queue.', icon: Send },
   organization: { path: '/organization', label: 'Organization', eyebrow: 'Local AI', description: 'Download, choose and test the local models that suggest folders for new mail.', icon: FolderTree },
   settings: { path: '/settings', label: 'Settings', eyebrow: 'Configuration', description: 'Listeners, TLS, authentication, limits and filtering. Stored in the database.', icon: SlidersHorizontal },
+  certificates: { path: '/certificates', label: 'Certificates', eyebrow: 'TLS', description: 'Automatic certificates from Let\'s Encrypt or another ACME CA, renewed and reloaded without restarts.', icon: LockKeyhole },
   observability: { path: '/observability', label: 'Logs & metrics', eyebrow: 'Diagnostics', description: 'Daemon logs and Prometheus telemetry.', icon: Activity },
   system: { path: '/system', label: 'System', eyebrow: 'Services & access', description: 'Dependency readiness, running services and the admin account.', icon: Server },
 };
@@ -29,7 +31,7 @@ const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; des
 const navGroups: { label: string; pages: Page[] }[] = [
   { label: 'Workspace', pages: ['overview'] },
   { label: 'Mail', pages: ['accounts', 'routing', 'delivery', 'organization'] },
-  { label: 'Server', pages: ['settings', 'observability', 'system'] },
+  { label: 'Server', pages: ['settings', 'certificates', 'observability', 'system'] },
 ];
 
 function pageFromPath(path: string): Page {
@@ -159,6 +161,7 @@ function Console({ session, setSession }: { session: Session; setSession: (sessi
         {page === 'delivery' && <DeliveryPage />}
         {page === 'organization' && <OrganizationPage />}
         {page === 'settings' && <SettingsPage />}
+        {page === 'certificates' && <CertificatesPage />}
         {page === 'observability' && <ObservabilityPage />}
         {page === 'system' && <SystemPage session={session} onSessionChange={setSession} />}
       </section>
