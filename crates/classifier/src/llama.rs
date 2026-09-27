@@ -225,9 +225,8 @@ impl Chooser for LlamaChooser {
         ]);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut answer = String::new();
-        let mut pos = tokens.len() as i32;
         let mut index = batch.n_tokens() - 1;
-        for _ in 0..MAX_ANSWER_TOKENS {
+        for pos in (tokens.len() as i32..).take(MAX_ANSWER_TOKENS) {
             let token: LlamaToken = sampler.sample(&ctx, index);
             if self.model.is_eog_token(token) {
                 break;
@@ -243,7 +242,6 @@ impl Chooser for LlamaChooser {
             }
             batch.clear();
             batch.add(token, pos, &[0], true)?;
-            pos += 1;
             index = 0;
             ctx.decode(&mut batch).context("generating")?;
         }

@@ -239,8 +239,10 @@ pub fn imap_utf7_to_utf8(input: &str) -> anyhow::Result<String> {
             anyhow::bail!("mailbox name is not valid modified UTF-7");
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect::<Vec<_>>();
         let decoded = String::from_utf16(&units)
             .map_err(|_| anyhow::anyhow!("mailbox name is not valid modified UTF-7"))?;
