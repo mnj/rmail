@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Mail, MailOpen, Menu, RefreshCw, Search, Trash2 } from 'lucide-react';
+import { Archive, Image, LogOut, Mail, MailOpen, Menu, RefreshCw, Search, Trash2 } from 'lucide-react';
 import './style.css';
 
 type Folder = { name: string; special_use: string | null; messages: number; unread: number };
 type Message = { uid: number; flags: string[]; size: number; internal_date: number; from: string; to: string; subject: string; snippet: string };
-type MessageDetail = Message & { date: string; text_body: string; html_body: string | null };
+type MessageDetail = Message & { date: string; text_body: string; html_body: string | null; has_remote_content: boolean };
 
 function App() {
   const [address, setAddress] = useState<string | null>(null);
@@ -21,8 +21,9 @@ function App() {
   const [error, setError] = useState('');
 
   async function api<T>(url: string, options?: RequestInit): Promise<T> {
-    const res = await fetch(url, { credentials: 'same-origin', headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) }, ...options });
-    if (!res.ok) throw new Error(await res.text() || res.statusText);
+    // X-Rmail-Webmail marks the request as same-origin (CSRF protection).
+    const res = await fetch(url, { ...options, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Rmail-Webmail': '1', ...(options?.headers || {}) } });
+    if (!res.ok) throw Object.assign(new Error(await res.text() || res.statusText), { status: res.status });
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
   }
@@ -53,9 +54,23 @@ function App() {
       setAddress(session.address);
       setPassword('');
       await refresh();
-    } catch {
-      setError('Invalid mailbox or password');
+    } catch (err) {
+      setError((err as { status?: number }).status === 429 ? (err as Error).message : 'Invalid mailbox or password');
     }
+  }
+
+  async function logout() {
+    await api('/api/logout', { method: 'POST' }).catch(() => undefined);
+    setAddress(null);
+    setSelected(null);
+    setMessages([]);
+    setFolders([]);
+  }
+
+  async function loadRemoteContent() {
+    if (!selected) return;
+    const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${selected.uid}?remote_content=1`);
+    setSelected({ ...detail, has_remote_content: false });
   }
 
   async function openMessage(message: Message) {
@@ -94,11 +109,11 @@ function App() {
     <main className={`app mobile-${mobileView}`}>
       <aside className="folders"><div className="account">{address}</div>{folders.map((f) => <button key={f.name} className={f.name === folder ? 'active' : ''} onClick={() => chooseFolder(f.name)}><span>{f.name}</span><small>{f.unread ? f.unread : f.messages}</small></button>)}</aside>
       <section className="mailbox">
-        <header className="topbar"><button className="icon mobile-only" onClick={() => setMobileView('folders')} title="Folders"><Menu size={18} /></button><div className="search"><Search size={18} /><input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && refresh()} placeholder="Search mail" /></div><button className="icon" onClick={() => refresh()} title="Refresh"><RefreshCw size={18} /></button></header>
+        <header className="topbar"><button className="icon mobile-only" onClick={() => setMobileView('folders')} title="Folders"><Menu size={18} /></button><div className="search"><Search size={18} /><input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && refresh()} placeholder="Search mail" /></div><button className="icon" onClick={() => refresh()} title="Refresh"><RefreshCw size={18} /></button><button className="icon" onClick={logout} title="Sign out"><LogOut size={18} /></button></header>
         <div className="toolbar"><strong>{title}</strong><span>{messages.length}</span></div>
         <div className="message-list">{messages.map((m) => <div key={m.uid} className={`row ${m.flags.some((f) => f.toLowerCase() === '\\seen') ? '' : 'unread'}`}><input type="checkbox" checked={checked.includes(m.uid)} onChange={(e) => setChecked(e.target.checked ? [...checked, m.uid] : checked.filter((id) => id !== m.uid))} /><button onClick={() => openMessage(m)}><span className="from">{m.from || '(unknown)'}</span><span className="subject">{m.subject || '(no subject)'}</span><span className="snippet">{m.snippet}</span></button></div>)}</div>
       </section>
-      <article className="reader">{selected ? <><div className="reader-actions"><button className="back mobile-only" onClick={() => setMobileView('list')}>Back</button><button className="icon" onClick={() => actOnSelected('archive')} title="Archive"><Archive size={18} /></button><button className="icon" onClick={() => actOnSelected('delete')} title="Delete"><Trash2 size={18} /></button><button className="icon" onClick={() => actOnSelected('mark_read')} title="Mark read"><MailOpen size={18} /></button><button className="icon" onClick={() => actOnSelected('mark_unread')} title="Mark unread"><Mail size={18} /></button></div><h2>{selected.subject || '(no subject)'}</h2><div className="meta">From {selected.from || '(unknown)'} to {selected.to || address}</div>{selected.html_body ? <iframe className="html-message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} /> : <pre>{selected.text_body}</pre>}</> : <div className="empty">Select a message</div>}</article>
+      <article className="reader">{selected ? <><div className="reader-actions"><button className="back mobile-only" onClick={() => setMobileView('list')}>Back</button><button className="icon" onClick={() => actOnSelected('archive')} title="Archive"><Archive size={18} /></button><button className="icon" onClick={() => actOnSelected('delete')} title="Delete"><Trash2 size={18} /></button><button className="icon" onClick={() => actOnSelected('mark_read')} title="Mark read"><MailOpen size={18} /></button><button className="icon" onClick={() => actOnSelected('mark_unread')} title="Mark unread"><Mail size={18} /></button></div><h2>{selected.subject || '(no subject)'}</h2><div className="meta">From {selected.from || '(unknown)'} to {selected.to || address}</div>{selected.html_body && selected.has_remote_content && <div className="remote-banner"><Image size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}{selected.html_body ? <iframe className="html-message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} /> : <pre>{selected.text_body}</pre>}</> : <div className="empty">Select a message</div>}</article>
     </main>
   );
 }

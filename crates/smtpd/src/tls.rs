@@ -57,14 +57,7 @@ mod tests {
             cipher_suites: vec!["TLS_FAKE_SUITE".into()],
             ..TlsPolicy::default()
         };
-        let cert_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.crt"
-        );
-        let key_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.key"
-        );
+        let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
         assert!(load_tls_context_with_policy(cert_path, key_path, &unknown).is_err());
 
         let tls12_only = TlsPolicy {
@@ -80,14 +73,7 @@ mod tests {
 
     #[test]
     fn reload_swaps_only_after_replacement_validates() {
-        let cert_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.crt"
-        );
-        let key_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.key"
-        );
+        let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
         let initial = load_tls_context(cert_path, key_path).unwrap();
         let (sender, receiver) = tokio::sync::watch::channel(Some(initial.clone()));
         assert!(

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TcpListenerConfig {
     #[serde(default = "default_backlog")]
     pub backlog: u32,
@@ -92,6 +92,15 @@ pub fn bind_tcp_listener_with_config(
 mod tests {
     use super::{TcpListenerConfig, bind_tcp_listener, bind_tcp_listener_with_config};
 
+    /// True when the host has no usable IPv6 (common in containers). The OS
+    /// error sits below our context, so inspect the whole error chain.
+    fn ipv6_unavailable(error: &anyhow::Error) -> bool {
+        let text = format!("{error:#}");
+        text.contains("Cannot assign requested address")
+            || text.contains("Address family not supported")
+            || text.contains("Network is unreachable")
+    }
+
     #[tokio::test]
     async fn ipv4_and_ipv6_loopback_can_share_port() {
         let v4 = bind_tcp_listener("127.0.0.1:0").expect("bind ipv4");
@@ -100,16 +109,8 @@ mod tests {
 
         match bind_tcp_listener(&v6_addr) {
             Ok(_v6) => {}
-            Err(err) => {
-                let text = err.to_string();
-                if text.contains("Cannot assign requested address")
-                    || text.contains("Address family not supported")
-                    || text.contains("Network is unreachable")
-                {
-                    return;
-                }
-                panic!("failed to bind IPv6 loopback on same port: {err:#}");
-            }
+            Err(err) if ipv6_unavailable(&err) => {}
+            Err(err) => panic!("failed to bind IPv6 loopback on same port: {err:#}"),
         }
     }
 
@@ -134,14 +135,7 @@ mod tests {
         };
         let listener = match bind_tcp_listener_with_config("[::]:0", &config) {
             Ok(listener) => listener,
-            Err(error)
-                if error.to_string().contains("Address family not supported")
-                    || error
-                        .to_string()
-                        .contains("Cannot assign requested address") =>
-            {
-                return;
-            }
+            Err(error) if ipv6_unavailable(&error) => return,
             Err(error) => panic!("dual-stack bind failed: {error:#}"),
         };
         let port = listener.local_addr().unwrap().port();

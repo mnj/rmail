@@ -223,7 +223,7 @@ fn decode_gs2_name(value: &str) -> anyhow::Result<String> {
     Ok(decoded)
 }
 
-fn validate_config(config: &OAuthConfig) -> anyhow::Result<()> {
+pub fn validate_config(config: &OAuthConfig) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(&config.introspection_url)?;
     if url.scheme() != "https" && !(config.allow_insecure_http && url.scheme() == "http") {
         anyhow::bail!("OAuth introspection URL must use HTTPS unless allow_insecure_http is true");

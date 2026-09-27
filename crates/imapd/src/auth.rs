@@ -2,12 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use once_cell::sync::Lazy;
 use rand::RngCore;
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{net::IpAddr, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaslSecurity {
@@ -196,49 +191,24 @@ pub(crate) fn sasl_mechanism(name: &str) -> Option<SaslMechanism> {
         .find(|mechanism| mechanism.name.eq_ignore_ascii_case(name))
 }
 
-#[derive(Clone)]
-struct AuthFailInfo {
-    count: u32,
-    first: Instant,
-    locked_until: Option<Instant>,
-}
+// In-process brute-force protection keyed by client address (IPv6 by /64).
+static AUTH_THROTTLE: Lazy<rmail_common::throttle::AuthThrottle> =
+    Lazy::new(rmail_common::throttle::AuthThrottle::default);
 
-static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
+/// Remaining authentication lockout for the client, if any.
 pub(crate) fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
-    let m = AUTH_FAILS.lock().unwrap();
-    if let Some(info) = m.get(&ip)
-        && let Some(until) = info.locked_until
-    {
-        let now = Instant::now();
-        if until > now {
-            return Some(until - now);
-        }
-    }
-    None
+    AUTH_THROTTLE.blocked_for(ip)
 }
 
+/// Record a failed authentication; repeated failures lock the client out.
 pub(crate) fn record_auth_failure(ip: IpAddr) {
-    let mut m = AUTH_FAILS.lock().unwrap();
-    let now = Instant::now();
-    let entry = m.entry(ip).or_insert(AuthFailInfo {
-        count: 0,
-        first: now,
-        locked_until: None,
-    });
-    entry.count = entry.count.saturating_add(1);
     rmail_common::metrics::inc_auth_failures();
-    if entry.count >= 5 {
-        entry.locked_until = Some(now + Duration::from_secs(30 * 60));
-        entry.count = 0;
-        entry.first = now;
-    }
+    AUTH_THROTTLE.record_failure(ip);
 }
 
+/// Clear recorded failures after a successful authentication.
 pub(crate) fn reset_auth_failures(ip: IpAddr) {
-    let mut m = AUTH_FAILS.lock().unwrap();
-    m.remove(&ip);
+    AUTH_THROTTLE.reset(ip);
 }
 
 pub(crate) use rmail_common::auth::{PasswordAuthResult, lookup_mailbox};

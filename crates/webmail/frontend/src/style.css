@@ -50,3 +50,7 @@ button, input { font: inherit; }
   .row button { grid-template-columns: 1fr; }
   .snippet { grid-column: 1; }
 }
+
+.remote-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; background: #fff7e0; color: #5c4400; font-size: 13px; }
+.remote-banner span { flex: 1; }
+.remote-banner button { border: 1px solid #d9b54a; background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; }

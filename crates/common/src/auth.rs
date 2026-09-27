@@ -4,7 +4,8 @@
 //!
 //! Notes:
 //! - Accepts PHC-style password hashes (e.g. argon2id strings produced by password-hash compatible libraries)
-//! - For testing only: supports a "plain:..." prefix to store plaintext passwords (DO NOT USE IN PRODUCTION)
+//! - Test builds only: the `insecure-plaintext-passwords` feature accepts a
+//!   "plain:..." prefix for plaintext fixtures. Release builds reject it.
 
 use argon2::{Argon2, PasswordVerifier};
 use base64::Engine;
@@ -24,13 +25,21 @@ use unicode_normalization::UnicodeNormalization;
 ///
 /// Supported formats:
 /// - PHC string (e.g. "$argon2id$v=19$m=...,t=...,p=...$...$...") — verified with argon2 crate
-/// - "plain:secret" — direct comparison for testing only
+/// - "plain:secret" — only with the test-only `insecure-plaintext-passwords` feature
 ///
 /// Returns Ok(true) if the password matches, Ok(false) if it does not, or Err on malformed hashes.
+///
+/// Argon2 is deliberately expensive; async callers should use
+/// [`verify_password_async`] so verification does not stall the runtime.
 pub fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> {
-    // Shortcut for test-only plaintext hashes
     if let Some(rest) = password_hash.strip_prefix("plain:") {
-        return Ok(password == rest);
+        if cfg!(any(test, feature = "insecure-plaintext-passwords")) {
+            return Ok(crate::http::constant_time_eq(
+                password.as_bytes(),
+                rest.as_bytes(),
+            ));
+        }
+        anyhow::bail!("plaintext password hashes are not accepted; reset the password");
     }
 
     // Parse PHC-format password hash and verify with Argon2
@@ -40,6 +49,33 @@ pub fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bo
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+/// Verify a password on the blocking thread pool.
+pub async fn verify_password_async(
+    password: String,
+    password_hash: String,
+) -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+        .await
+        .map_err(|error| anyhow::anyhow!("password verification task failed: {error}"))?
+}
+
+/// Spend roughly the same time as a real verification so a missing account
+/// cannot be distinguished from a wrong password by response latency.
+pub async fn burn_password_verification(password: String) {
+    static DUMMY_HASH: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+        use argon2::PasswordHasher;
+        let salt = password_hash::SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"rmail-dummy-password", &salt)
+            .map(|hash| hash.to_string())
+            .unwrap_or_default()
+    });
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = verify_password(&password, &DUMMY_HASH);
+    })
+    .await;
 }
 
 pub enum PasswordAuthResult {
@@ -82,7 +118,10 @@ pub async fn authenticate_password(
 ) -> PasswordAuthResult {
     let mailbox = match lookup_mailbox(db_path, user).await {
         Ok(Some(mailbox)) => mailbox,
-        Ok(None) => return PasswordAuthResult::Rejected,
+        Ok(None) => {
+            burn_password_verification(password.to_string()).await;
+            return PasswordAuthResult::Rejected;
+        }
         Err(message) => {
             return PasswordAuthResult::Unavailable {
                 mailbox: None,
@@ -90,10 +129,11 @@ pub async fn authenticate_password(
             };
         }
     };
-    let Some(hash) = mailbox.password_hash.as_ref() else {
+    let Some(hash) = mailbox.password_hash.clone() else {
+        burn_password_verification(password.to_string()).await;
         return PasswordAuthResult::Rejected;
     };
-    match verify_password(password, hash) {
+    match verify_password_async(password.to_string(), hash).await {
         Ok(true) => PasswordAuthResult::Success(mailbox),
         Ok(false) => PasswordAuthResult::Rejected,
         Err(error) => PasswordAuthResult::Unavailable {

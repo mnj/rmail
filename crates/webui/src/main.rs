@@ -1,4 +1,4 @@
-// rmail_web: minimal tokio-based HTTP UI for stats and logs (no hyper/axum)
+// rmail_web: admin console and JSON API (minimal tokio HTTP server; see api.rs)
 
 #![allow(clippy::ptr_arg, clippy::too_many_arguments, clippy::type_complexity)]
 
@@ -7,22 +7,21 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHasher, SaltString},
 };
-use base64::Engine;
 use rand::rngs::OsRng;
-use rmail_common::auth;
 use rmail_common::config::Config;
 use rmail_common::net::bind_tcp_listener_with_config;
 use rmail_common::outbound::QueueControl;
 use rmail_common::runtime::GracefulShutdown;
-use rmail_common::tracking::new_tracking_id;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(test)]
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -32,6 +31,8 @@ macro_rules! web_log {
         rmail_common::structured_log!($level, "web", $event, $fields)
     };
 }
+
+mod api;
 
 #[derive(Serialize)]
 struct Stats {
@@ -306,8 +307,11 @@ struct AccountRequest {
     address: String,
     password: Option<String>,
     password_hash: Option<String>,
-    /// Storage quota in MiB. Zero or absent preserves the existing setting.
+    /// Storage quota in MiB. Zero removes the limit; absent keeps it.
     quota_mib: Option<u64>,
+    /// Set for updates: fail instead of creating a new mailbox.
+    #[serde(skip)]
+    must_exist: bool,
 }
 
 #[derive(Deserialize)]
@@ -340,218 +344,16 @@ fn admin_app_html() -> &'static str {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>rMail Admin</title>
-  <style>
-    :root {
-      color: #1d252c;
-      background: #eef2f3;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 15px;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: #eef2f3; }
-    button, input, select { font: inherit; }
-    .shell { min-height: 100vh; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
-    .side { background: #1f2d34; color: #edf5f6; padding: 24px 18px; display: flex; flex-direction: column; gap: 24px; }
-    .brand { display: flex; gap: 12px; align-items: center; }
-    .mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 8px; background: #69d2c2; color: #152126; font-weight: 800; }
-    .brand strong { display: block; font-size: 20px; }
-    .brand span { display: block; color: #9eb4ba; font-size: 13px; margin-top: 2px; }
-    nav { display: grid; gap: 6px; }
-    nav a { color: #d8e6e8; text-decoration: none; padding: 10px 12px; border-radius: 7px; display: flex; justify-content: space-between; }
-    nav a:hover, nav a.active { background: #31464f; color: #fff; }
-    .side-foot { margin-top: auto; color: #9eb4ba; font-size: 13px; line-height: 1.5; }
-    .main { min-width: 0; padding: 22px 28px 36px; display: grid; gap: 18px; }
-    .top { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
-    h1 { margin: 0; font-size: 28px; line-height: 1.15; letter-spacing: 0; }
-    .subtitle { color: #64747b; margin-top: 5px; }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .btn { border: 1px solid #c9d4d8; background: #fff; color: #213038; border-radius: 7px; padding: 9px 12px; cursor: pointer; }
-    .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-    .btn.danger { color: #9b1c2b; }
-    .grid { display: grid; gap: 14px; }
-    .kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-    .panel-grid { grid-template-columns: minmax(0, 1.35fr) minmax(360px, .65fr); align-items: start; }
-    .panel, .kpi { background: #fff; border: 1px solid #d8e0e3; border-radius: 8px; box-shadow: 0 10px 28px rgba(31, 45, 52, .06); }
-    .kpi { padding: 16px; min-height: 116px; display: grid; align-content: space-between; }
-    .kpi span { color: #65777f; font-size: 13px; }
-    .kpi strong { font-size: 30px; line-height: 1; }
-    .kpi small { color: #71838a; }
-    .panel { min-width: 0; overflow: hidden; }
-    .panel-head { padding: 15px 16px; border-bottom: 1px solid #e3eaed; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .panel-head h2 { margin: 0; font-size: 16px; }
-    .panel-body { padding: 14px 16px 16px; }
-    .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
-    .tab { border: 1px solid #cbd7db; background: #f7fafb; border-radius: 999px; padding: 7px 10px; cursor: pointer; color: #3b4d55; }
-    .tab.active { background: #253842; border-color: #253842; color: #fff; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 11px 8px; border-bottom: 1px solid #e8eef0; text-align: left; vertical-align: middle; }
-    th { color: #64747b; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
-    td strong { display: block; }
-    .muted { color: #6d7f87; }
-    .pill { display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px; border-radius: 999px; background: #edf5f3; color: #27645b; font-size: 12px; }
-    .queue-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 8px; margin-bottom: 12px; }
-    input, select { border: 1px solid #cbd7db; border-radius: 7px; padding: 9px 10px; min-width: 0; background: #fff; }
-    pre { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; background: #172228; color: #d8f3ef; border-radius: 8px; padding: 14px; line-height: 1.45; }
-    .metric-list { display: grid; gap: 8px; }
-    .metric { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #e8eef0; }
-    .metric:last-child { border-bottom: 0; }
-    .empty { color: #77888f; padding: 18px 0; }
-    .status { color: #64747b; font-size: 13px; }
-    .error { color: #9b1c2b; }
-    @media (max-width: 980px) {
-      .shell { grid-template-columns: 1fr; }
-      .side { position: static; }
-      .kpis, .panel-grid { grid-template-columns: 1fr; }
-      .top { align-items: flex-start; flex-direction: column; }
-      .queue-actions { grid-template-columns: 1fr 1fr; }
-    }
-  </style>
+  <style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#1d252c}code{background:#eef2f3;padding:.1rem .3rem;border-radius:4px}</style>
 </head>
 <body>
-  <div class="shell">
-    <aside class="side">
-      <div class="brand"><div class="mark">rM</div><div><strong>rMail</strong><span>Admin console</span></div></div>
-      <nav>
-        <a class="active" href="#overview">Overview <span>01</span></a>
-        <a href="#accounts">Accounts <span>02</span></a>
-        <a href="#queue">Queue <span>03</span></a>
-        <a href="#metrics">Metrics <span>04</span></a>
-        <a href="#logs">Logs <span>05</span></a>
-      </nav>
-      <div class="side-foot">Live operational view backed by rMail stats, queue, metrics, and log endpoints.</div>
-    </aside>
-    <main class="main">
-      <header class="top">
-        <div><h1>Mail Operations</h1><div class="subtitle">Accounts, delivery health, queue pressure, and daemon diagnostics in one place.</div></div>
-        <div class="actions"><button class="btn" id="refresh">Refresh</button><a class="btn" href="/metrics">Prometheus</a><a class="btn" href="/health">Health</a></div>
-      </header>
-      <section class="grid kpis" id="overview">
-        <div class="kpi"><span>Mailboxes</span><strong id="k-mailboxes">-</strong><small id="k-accounts">configured accounts</small></div>
-        <div class="kpi"><span>Stored messages</span><strong id="k-messages">-</strong><small>new and current maildir files</small></div>
-        <div class="kpi"><span>Delivered</span><strong id="k-delivered">-</strong><small>runtime delivery counter</small></div>
-        <div class="kpi"><span>Outbound pending</span><strong id="k-pending">-</strong><small id="k-queue-detail">queued workload</small></div>
-      </section>
-      <section class="grid panel-grid">
-        <section class="panel" id="accounts">
-          <div class="panel-head"><h2>Account Management</h2><span class="status" id="account-status">Loading</span></div>
-          <div class="panel-body"><table><thead><tr><th>Mailbox</th><th>Auth</th><th>Folders</th><th>Messages</th><th>Unseen</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
-        </section>
-        <section class="panel" id="metrics">
-          <div class="panel-head"><h2>Metrics Snapshot</h2><span class="status" id="metrics-status">Loading</span></div>
-          <div class="panel-body"><div class="metric-list" id="metrics-list"></div></div>
-        </section>
-      </section>
-      <section class="grid panel-grid">
-        <section class="panel" id="queue">
-          <div class="panel-head"><h2>Outbound Queue</h2><span class="status" id="queue-status">Loading</span></div>
-          <div class="panel-body">
-            <div class="queue-actions">
-              <input id="queue-target" placeholder="Message name or pattern">
-              <button class="btn" data-action="requeue">Requeue</button>
-              <button class="btn primary" data-action="promote">Promote</button>
-              <button class="btn danger" data-action="delete">Delete</button>
-            </div>
-            <table><thead><tr><th>Message</th><th>Attempts</th><th>Priority</th><th>Next try</th><th>Error</th></tr></thead><tbody id="queue-body"></tbody></table>
-          </div>
-        </section>
-        <section class="panel">
-          <div class="panel-head"><h2>DMARC</h2><span class="status" id="dmarc-status">Loading</span></div>
-          <div class="panel-body"><div class="metric-list" id="dmarc-list"></div></div>
-        </section>
-      </section>
-      <section class="panel" id="logs">
-        <div class="panel-head"><h2>Daemon Logs</h2><div class="tabs" id="log-tabs"><button class="tab active" data-log="smtpd">SMTP</button><button class="tab" data-log="imapd">IMAP</button><button class="tab" data-log="outbound">Outbound</button><button class="tab" data-log="web">Web</button></div></div>
-        <div class="panel-body"><pre id="log-output">Loading logs...</pre></div>
-      </section>
-    </main>
+  <div id="root">
+    <h1>rMail Admin</h1>
+    <p>The admin console frontend is not installed. Build it with
+    <code>cd crates/webui/frontend &amp;&amp; bun install &amp;&amp; bun run build</code>
+    or set <code>RMAIL_WEB_STATIC_DIR</code> to the built <code>dist</code> directory.</p>
+    <p>The JSON API under <code>/api/</code> and <code>/metrics</code> remain available.</p>
   </div>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const fmt = (n) => Number(n || 0).toLocaleString();
-    async function json(url, options) {
-      const res = await fetch(url, options);
-      if (!res.ok) throw new Error(await res.text() || res.statusText);
-      return res.json();
-    }
-    async function text(url) {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(await res.text() || res.statusText);
-      return res.text();
-    }
-    function metricRow(label, value) {
-      return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`;
-    }
-    async function loadStats() {
-      const [stats, queue] = await Promise.all([json('/stats'), json('/api/queue/summary')]);
-      $('k-mailboxes').textContent = fmt(stats.mailboxes);
-      $('k-messages').textContent = fmt(stats.total_messages);
-      $('k-delivered').textContent = fmt(stats.delivered_count);
-      $('k-pending').textContent = fmt(stats.outbound_pending);
-      $('k-queue-detail').textContent = `${fmt(queue.inflight)} inflight, ${fmt(queue.failed)} failed`;
-    }
-    async function loadAccounts() {
-      const accounts = await json('/api/accounts');
-      $('k-accounts').textContent = `${fmt(accounts.length)} configured accounts`;
-      $('account-status').textContent = `${fmt(accounts.length)} accounts`;
-      $('accounts-body').innerHTML = accounts.length ? accounts.map(a => `<tr><td><strong>${a.address}</strong><span class="muted">${a.unseen ? 'Needs attention' : 'No unread mail'}</span></td><td><span class="pill">${a.auth}</span></td><td>${fmt(a.folders)}</td><td>${fmt(a.messages)}</td><td>${fmt(a.unseen)}</td></tr>`).join('') : `<tr><td colspan="5" class="empty">No DB-backed accounts found.</td></tr>`;
-    }
-    async function loadQueue() {
-      const data = await json('/api/queue');
-      const queued = data.queued || [];
-      $('queue-status').textContent = `${fmt(queued.length)} queued`;
-      $('queue-body').innerHTML = queued.length ? queued.slice(0, 12).map(item => {
-        const c = item.control || {};
-        return `<tr><td><strong>${item.name}</strong></td><td>${fmt(c.attempts)}</td><td>${fmt(c.priority)}</td><td>${c.next_try ?? '-'}</td><td class="muted">${c.last_error || '-'}</td></tr>`;
-      }).join('') : `<tr><td colspan="5" class="empty">No queued outbound messages.</td></tr>`;
-    }
-    async function loadMetrics() {
-      const raw = await text('/metrics');
-      const lines = raw.split('\n').filter(line => line && !line.startsWith('#')).slice(0, 8);
-      $('metrics-status').textContent = `${fmt(lines.length)} displayed`;
-      $('metrics-list').innerHTML = lines.length ? lines.map(line => {
-        const parts = line.trim().split(/\s+/);
-        return metricRow(parts[0], parts.slice(1).join(' '));
-      }).join('') : '<div class="empty">No metrics emitted yet.</div>';
-    }
-    async function loadDmarc() {
-      try {
-        const rows = await json('/dmarc');
-        $('dmarc-status').textContent = `${fmt(rows.length)} domains`;
-        $('dmarc-list').innerHTML = rows.length ? rows.map(r => metricRow(r.domain, `${fmt(r.events)} events`)).join('') : '<div class="empty">No unreported DMARC events.</div>';
-      } catch (err) {
-        $('dmarc-status').textContent = 'Unavailable';
-        $('dmarc-list').innerHTML = `<div class="empty">${err.message}</div>`;
-      }
-    }
-    async function loadLogs(component = document.querySelector('.tab.active')?.dataset.log || 'smtpd') {
-      $('log-output').textContent = await text(`/logs?component=${component}&lines=160`);
-    }
-    async function refreshAll() {
-      const jobs = [loadStats(), loadAccounts(), loadQueue(), loadMetrics(), loadDmarc(), loadLogs()];
-      const results = await Promise.allSettled(jobs);
-      const failed = results.filter(r => r.status === 'rejected');
-      if (failed.length) console.error(failed);
-    }
-    document.getElementById('refresh').onclick = refreshAll;
-    document.getElementById('log-tabs').onclick = (event) => {
-      const btn = event.target.closest('button[data-log]');
-      if (!btn) return;
-      document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab === btn));
-      loadLogs(btn.dataset.log).catch(err => $('log-output').textContent = err.message);
-    };
-    document.querySelectorAll('[data-action]').forEach(btn => btn.addEventListener('click', async () => {
-      const value = $('queue-target').value.trim();
-      if (!value) return;
-      const body = value.includes('*') ? { pattern: value } : { name: value };
-      body.action = btn.dataset.action;
-      if (body.action === 'promote') body.priority = 10;
-      await json('/api/queue/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      $('queue-target').value = '';
-      await Promise.all([loadStats(), loadQueue()]);
-    }));
-    refreshAll();
-    setInterval(refreshAll, 30000);
-  </script>
 </body>
 </html>"##
 }
@@ -581,7 +383,7 @@ fn static_content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
-fn read_admin_static(path: &str) -> Option<(&'static str, String)> {
+fn read_admin_static(path: &str) -> Option<(&'static str, Vec<u8>)> {
     let relative = if path == "/" {
         "index.html"
     } else {
@@ -606,7 +408,7 @@ fn read_admin_static(path: &str) -> Option<(&'static str, String)> {
             continue;
         };
         if file_path.is_file()
-            && let Ok(body) = std::fs::read_to_string(&file_path)
+            && let Ok(body) = std::fs::read(&file_path)
         {
             return Some((static_content_type(&file_path), body));
         }
@@ -770,10 +572,24 @@ fn upsert_account_sync(
 ) -> Result<()> {
     let address = normalize_address(&req.address)?;
     let (local, domain) = split_address(&address).expect("validated address");
+    let existing = rmail_common::db::get_mailbox(db_path, &address)?;
+    if req.must_exist && existing.is_none() {
+        anyhow::bail!("mailbox {address} does not exist");
+    }
+    let password = req
+        .password
+        .as_deref()
+        .filter(|password| !password.is_empty());
+    let (password_hash, scram) = match (
+        password_material(password, req.password_hash.as_deref())?,
+        &existing,
+    ) {
+        // No new password: keep the current credentials instead of clearing them.
+        ((None, None), Some(existing)) => (existing.password_hash.clone(), existing.scram.clone()),
+        (material, _) => material,
+    };
     let maildir_path = mail_root.join(domain).join(local).join("Maildir");
     rmail_common::maildir::ensure_maildir(&maildir_path)?;
-    let (password_hash, scram) =
-        password_material(req.password.as_deref(), req.password_hash.as_deref())?;
     rmail_common::db::add_mailbox(
         db_path,
         &address,
@@ -993,6 +809,9 @@ fn find_message_sync(
     root: &PathBuf,
     name: &str,
 ) -> Result<Option<(String, PathBuf, Option<PathBuf>)>> {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) || name.starts_with('.') {
+        anyhow::bail!("invalid message name");
+    }
     let fname = ensure_ext(name);
     let (queue, inflight, sent, failed) = spool_dirs(root);
     let candidates = vec![
@@ -1189,6 +1008,8 @@ fn delete_single_sync(
     Ok(())
 }
 
+/// Serve one admin connection. Kept as a free function for tests.
+#[cfg(test)]
 async fn handle_connection<S>(
     stream: S,
     peer: String,
@@ -1201,1111 +1022,155 @@ async fn handle_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request_id = new_tracking_id("admin-http");
-    let mut reader = BufReader::new(stream);
-    let mut first_line = String::new();
-    // read request line
-    match reader.read_line(&mut first_line).await {
-        Ok(0) => return,
-        Ok(_) => {}
-        Err(_) => return,
-    }
-    let req_line = first_line
-        .trim_end_matches('\n')
-        .trim_end_matches('\r')
-        .to_string();
-    // read headers until empty line, store them in a map
-    let mut headers: HashMap<String, String> = HashMap::new();
-    loop {
-        let mut h = String::new();
-        match reader.read_line(&mut h).await {
-            Ok(0) => break,
-            Ok(_) => {
-                if h == "\r\n" || h == "\n" {
-                    break;
-                }
-                if let Some(colon) = h.find(':') {
-                    let name = h[..colon].trim().to_ascii_lowercase();
-                    let val = h[colon + 1..].trim().to_string();
-                    headers.insert(name, val);
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    // parse request line: METHOD PATH HTTP/X
-    let mut parts = req_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path_q = parts.next().unwrap_or("/");
-
-    // simple basic auth checker closure: returns true if no admin_user configured or credentials match
-    let is_authorized = |headers: &HashMap<String, String>| -> bool {
-        if admin_user.is_none() {
-            return true;
-        }
-        let expected_user = admin_user.as_ref().unwrap();
-        let expected_hash = match &admin_hash {
-            Some(h) => h,
-            None => return false,
-        };
-        if let Some(authz) = headers.get("authorization")
-            && authz.len() > 6
-            && authz[..6].eq_ignore_ascii_case("Basic ")
-        {
-            let b64 = authz[6..].trim();
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
-                && let Ok(creds) = String::from_utf8(bytes)
-                && let Some(colon) = creds.find(':')
-            {
-                let u = &creds[..colon];
-                let p = &creds[colon + 1..];
-                if u == expected_user
-                    && let Ok(valid) = auth::verify_password(p, expected_hash)
-                {
-                    return valid;
-                }
-            }
-        }
-        false
-    };
-    let mut extra_headers = String::new();
-
-    // prepare response
-    let mut status = 200;
-    let mut content_type = "text/plain".to_string();
-    let body: String;
-
-    // read body for POST requests
-    let mut body_bytes: Vec<u8> = Vec::new();
-    if (method == "POST" || method == "DELETE")
-        && let Some(cl) = headers.get("content-length")
-        && let Ok(n) = cl.parse::<usize>()
-    {
-        body_bytes.resize(n, 0);
-        let _ = reader.read_exact(&mut body_bytes).await;
-    }
-
-    let (path, query) = if let Some(pos) = path_q.find('?') {
-        (&path_q[..pos], &path_q[pos + 1..])
-    } else {
-        (path_q, "")
-    };
-    // Serve ACME http-01 challenge files from configured directory
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        if method != "GET" {
-            status = 405;
-            body = "Method Not Allowed".to_string();
-        } else {
-            if let Some(acme_dir) = acme_challenge_dir.as_ref() {
-                let fpath = std::path::Path::new(acme_dir).join(token);
-                match tokio::fs::read_to_string(fpath).await {
-                    Ok(s) => {
-                        content_type = "text/plain".to_string();
-                        body = s;
-                    }
-                    Err(_) => {
-                        status = 404;
-                        body = "Not Found".to_string();
-                    }
-                }
-            } else {
-                status = 404;
-                body = "Not Found".to_string();
-            }
-        }
-    } else {
-        match path {
-            "/" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    if let Some((ctype, static_body)) = read_admin_static(path) {
-                        content_type = ctype.to_string();
-                        body = static_body;
-                    } else {
-                        content_type = "text/html".to_string();
-                        body = admin_app_html().to_string();
-                    }
-                }
-            }
-            "/health" | "/healthz" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    content_type = "text/plain".to_string();
-                    body = "ok".to_string();
-                }
-            }
-            "/ready" | "/readyz" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    let report =
-                        readiness_report(mail_root.clone(), db_path.clone(), readiness.clone())
-                            .await;
-                    if !report.ready {
-                        status = 503;
-                    }
-                    content_type = "application/json".to_string();
-                    body = serde_json::to_string(&report).unwrap_or_else(|error| {
-                        status = 500;
-                        format!("{{\"ready\":false,\"error\":\"{error}\"}}")
-                    });
-                }
-            }
-            "/stats" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    // run blocking scan in threadpool
-                    let mr_clone = mail_root.clone();
-                    match tokio::task::spawn_blocking(move || scan_maildirs_sync(&mr_clone)).await {
-                        Ok(Ok(mut stats)) => {
-                            // attempt to read delivered count from metrics file (fallback)
-                            let delivered = tokio::fs::read_to_string(
-                                rmail_common::runtime::delivered_count_path(&mail_root),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                            .unwrap_or(0);
-                            stats.delivered_count = delivered;
-                            content_type = "application/json".to_string();
-                            body = match serde_json::to_string(&stats) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    status = 500;
-                                    format!("{{\"error\":\"{}\"}}", e)
-                                }
-                            };
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("scan error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                }
-            }
-            "/metrics" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    // Aggregate process-local snapshots with one bounded component label.
-                    let mut metrics_text = String::new();
-                    let mut have_metadata = false;
-                    for component in ["smtpd", "outbound", "imapd", "web"] {
-                        let Ok(snapshot) = tokio::fs::read_to_string(
-                            rmail_common::runtime::prometheus_snapshot_path(&mail_root, component),
-                        )
-                        .await
-                        else {
-                            continue;
-                        };
-                        let labeled =
-                            rmail_common::metrics::add_component_label(&snapshot, component);
-                        for line in labeled.lines() {
-                            if !line.starts_with('#') || !have_metadata {
-                                metrics_text.push_str(line);
-                                metrics_text.push('\n');
-                            }
-                        }
-                        have_metadata = true;
-                    }
-                    if metrics_text.is_empty() {
-                        metrics_text = rmail_common::metrics::add_component_label(
-                            &rmail_common::metrics::gather_prometheus(),
-                            "web",
-                        );
-                    }
-                    match count_queue_entries_sync(&mail_root) {
-                        Ok(n) => {
-                            metrics_text.push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
-                            metrics_text.push_str("# TYPE rmail_outbound_pending gauge\n");
-                            metrics_text.push_str(&format!("rmail_outbound_pending {}\n", n));
-                        }
-                        Err(e) => {
-                            web_log!("error", "queue_metrics_failed", { "request_id": request_id, "peer": peer, "error": e.to_string() });
-                        }
-                    }
-                    content_type = "text/plain".to_string();
-                    body = metrics_text;
-                }
-            }
-            "/dmarc" => {
-                // DMARC reporting overview: domains with unreported events and counts
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else if let Some(dbp) = db_path.as_ref() {
-                    // fetch unreported domains and counts in blocking thread
-                    match tokio::task::spawn_blocking({
-                        let dbp = dbp.clone();
-                        move || rmail_common::db::get_unreported_dmarc_domains(&dbp)
-                    })
-                    .await
-                    {
-                        Ok(Ok(domains)) => {
-                            let mut out: Vec<serde_json::Value> = Vec::new();
-                            for d in domains {
-                                match rmail_common::db::fetch_unreported_dmarc_events_for_domain(
-                                    dbp.as_str(),
-                                    &d,
-                                ) {
-                                    Ok(evts) => {
-                                        out.push(
-                                            serde_json::json!({"domain": d, "events": evts.len()}),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        web_log!("error", "dmarc_events_fetch_failed", { "request_id": request_id, "peer": peer, "domain": d, "error": e.to_string() });
-                                    }
-                                }
-                            }
-                            content_type = "application/json".to_string();
-                            body = serde_json::to_string(&out).unwrap_or_else(|e| {
-                                status = 500;
-                                format!("{{\"error\":\"{}\"}}", e)
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("db error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                } else {
-                    status = 400;
-                    body = "DB not configured".to_string();
-                }
-            }
-            "/logs" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    // parse query params for component and lines (simple parser, no percent-decoding)
-                    let params: HashMap<_, _> = query
-                        .split('&')
-                        .filter_map(|kv| {
-                            if kv.is_empty() {
-                                return None;
-                            }
-                            let mut s = kv.splitn(2, '=');
-                            let k = s.next().unwrap_or("").to_string();
-                            let v = s.next().unwrap_or("").to_string();
-                            if k.is_empty() { None } else { Some((k, v)) }
-                        })
-                        .collect();
-                    let component = params
-                        .get("component")
-                        .map(|s| s.as_str())
-                        .unwrap_or("smtpd");
-                    let mut lines: usize = params
-                        .get("lines")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(200);
-                    lines = std::cmp::min(lines, 2000);
-                    match component {
-                        "smtpd" | "imapd" | "web" | "outbound" => {
-                            let path = rmail_common::runtime::log_path(&mail_root, component);
-                            match tokio::fs::read_to_string(&path).await {
-                                Ok(s) => {
-                                    content_type = "text/plain".to_string();
-                                    body = tail_lines(&s, lines);
-                                }
-                                Err(e) => {
-                                    status = 500;
-                                    body = format!("read error from {}: {}", path.display(), e);
-                                }
-                            }
-                        }
-                        _ => {
-                            status = 400;
-                            body = "invalid component".to_string();
-                        }
-                    }
-                }
-            }
-            "/api/queue/requeue" => {
-                if method != "POST" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    if !is_authorized(&headers) {
-                        status = 401;
-                        body = "Unauthorized".to_string();
-                        extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                    } else {
-                        let b = String::from_utf8_lossy(&body_bytes).to_string();
-                        match serde_json::from_str::<serde_json::Value>(&b) {
-                            Ok(val) => {
-                                let mr_clone = mail_root.clone();
-                                let res = tokio::task::spawn_blocking(move || {
-                                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-                                        if let Ok(Some((spool, eml, jsonp))) =
-                                            find_message_sync(&mr_clone, &ensure_ext(name))
-                                        {
-                                            return requeue_single_sync(
-                                                &spool, &eml, &jsonp, &mr_clone,
-                                            );
-                                        }
-                                        Err(anyhow::anyhow!("not found"))
-                                    } else if let Some(pattern) =
-                                        val.get("pattern").and_then(|v| v.as_str())
-                                    {
-                                        let matches =
-                                            find_messages_matching_sync(&mr_clone, pattern)?;
-                                        for (spool, eml, jsonp, _fname) in matches {
-                                            requeue_single_sync(&spool, &eml, &jsonp, &mr_clone)?;
-                                        }
-                                        Ok(())
-                                    } else {
-                                        Err(anyhow::anyhow!("missing name or pattern"))
-                                    }
-                                })
-                                .await;
-                                match res {
-                                    Ok(Ok(_)) => {
-                                        content_type = "application/json".to_string();
-                                        body = json!({"result":"ok"}).to_string();
-                                    }
-                                    Ok(Err(e)) => {
-                                        status = 500;
-                                        body = format!("error: {}", e);
-                                    }
-                                    Err(e) => {
-                                        status = 500;
-                                        body = format!("task join error: {}", e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                status = 400;
-                                body = "invalid JSON".to_string();
-                            }
-                        }
-                    }
-                }
-            }
-            "/api/queue/promote" => {
-                if method != "POST" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    if !is_authorized(&headers) {
-                        status = 401;
-                        body = "Unauthorized".to_string();
-                        extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                    } else {
-                        let b = String::from_utf8_lossy(&body_bytes).to_string();
-                        match serde_json::from_str::<serde_json::Value>(&b) {
-                            Ok(val) => {
-                                let priority =
-                                    val.get("priority").and_then(|v| v.as_i64()).unwrap_or(0)
-                                        as i32;
-                                let mr_clone = mail_root.clone();
-                                let res = tokio::task::spawn_blocking(move || {
-                                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-                                        if let Ok(Some((spool, eml, jsonp))) =
-                                            find_message_sync(&mr_clone, &ensure_ext(name))
-                                        {
-                                            return promote_single_sync(
-                                                &spool, &eml, &jsonp, &mr_clone, priority,
-                                            );
-                                        }
-                                        Err(anyhow::anyhow!("not found"))
-                                    } else if let Some(pattern) =
-                                        val.get("pattern").and_then(|v| v.as_str())
-                                    {
-                                        let matches =
-                                            find_messages_matching_sync(&mr_clone, pattern)?;
-                                        for (spool, eml, jsonp, _fname) in matches {
-                                            promote_single_sync(
-                                                &spool, &eml, &jsonp, &mr_clone, priority,
-                                            )?;
-                                        }
-                                        Ok(())
-                                    } else {
-                                        Err(anyhow::anyhow!("missing name or pattern"))
-                                    }
-                                })
-                                .await;
-                                match res {
-                                    Ok(Ok(_)) => {
-                                        content_type = "application/json".to_string();
-                                        body = json!({"result":"ok"}).to_string();
-                                    }
-                                    Ok(Err(e)) => {
-                                        status = 500;
-                                        body = format!("error: {}", e);
-                                    }
-                                    Err(e) => {
-                                        status = 500;
-                                        body = format!("task join error: {}", e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                status = 400;
-                                body = "invalid JSON".to_string();
-                            }
-                        }
-                    }
-                }
-            }
-            "/api/queue/delete" => {
-                if method != "POST" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    if !is_authorized(&headers) {
-                        status = 401;
-                        body = "Unauthorized".to_string();
-                        extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                    } else {
-                        let b = String::from_utf8_lossy(&body_bytes).to_string();
-                        match serde_json::from_str::<serde_json::Value>(&b) {
-                            Ok(val) => {
-                                let mr_clone = mail_root.clone();
-                                let res = tokio::task::spawn_blocking(move || {
-                                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-                                        if let Ok(Some((spool, eml, jsonp))) =
-                                            find_message_sync(&mr_clone, &ensure_ext(name))
-                                        {
-                                            return delete_single_sync(
-                                                &spool, &eml, &jsonp, &mr_clone,
-                                            );
-                                        }
-                                        Err(anyhow::anyhow!("not found"))
-                                    } else if let Some(pattern) =
-                                        val.get("pattern").and_then(|v| v.as_str())
-                                    {
-                                        let matches =
-                                            find_messages_matching_sync(&mr_clone, pattern)?;
-                                        for (spool, eml, jsonp, _fname) in matches {
-                                            delete_single_sync(&spool, &eml, &jsonp, &mr_clone)?;
-                                        }
-                                        Ok(())
-                                    } else {
-                                        Err(anyhow::anyhow!("missing name or pattern"))
-                                    }
-                                })
-                                .await;
-                                match res {
-                                    Ok(Ok(_)) => {
-                                        content_type = "application/json".to_string();
-                                        body = json!({"result":"ok"}).to_string();
-                                    }
-                                    Ok(Err(e)) => {
-                                        status = 500;
-                                        body = format!("error: {}", e);
-                                    }
-                                    Err(e) => {
-                                        status = 500;
-                                        body = format!("task join error: {}", e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                status = 400;
-                                body = "invalid JSON".to_string();
-                            }
-                        }
-                    }
-                }
-            }
-            "/api/queue" => {
-                if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    let mr_clone = mail_root.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        let (queue, _i, _s, _f) = spool_dirs(&mr_clone);
-                        match read_queue_entries(&queue) {
-                            Ok(list) => serde_json::to_string(&serde_json::json!({"queued": list}))
-                                .map_err(|e| anyhow::anyhow!(e)),
-                            Err(e) => Err(anyhow::anyhow!(format!("read error: {}", e))),
-                        }
-                    })
-                    .await
-                    {
-                        Ok(Ok(s)) => {
-                            content_type = "application/json".to_string();
-                            body = s;
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                }
-            }
-            "/api/queue/summary" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    let mr_clone = mail_root.clone();
-                    match tokio::task::spawn_blocking(move || queue_summary_sync(&mr_clone)).await {
-                        Ok(Ok(summary)) => {
-                            content_type = "application/json".to_string();
-                            body = serde_json::to_string(&summary).unwrap_or_else(|e| {
-                                status = 500;
-                                format!("{{\"error\":\"{}\"}}", e)
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                }
-            }
-            "/api/overview" => {
-                if method != "GET" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else {
-                    let mr_clone = mail_root.clone();
-                    let dbp = db_path.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        overview_summary_sync(&mr_clone, dbp.as_deref())
-                    })
-                    .await
-                    {
-                        Ok(Ok(summary)) => {
-                            content_type = "application/json".to_string();
-                            body = serde_json::to_string(&summary).unwrap_or_else(|e| {
-                                status = 500;
-                                format!("{{\"error\":\"{}\"}}", e)
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                }
-            }
-            "/api/accounts" => {
-                if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else if method == "GET" {
-                    let mr_clone = mail_root.clone();
-                    let dbp = db_path.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        account_summaries_sync(&mr_clone, dbp.as_deref())
-                    })
-                    .await
-                    {
-                        Ok(Ok(accounts)) => {
-                            content_type = "application/json".to_string();
-                            body = serde_json::to_string(&accounts).unwrap_or_else(|e| {
-                                status = 500;
-                                format!("{{\"error\":\"{}\"}}", e)
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                } else if method == "POST" {
-                    if let Some(dbp) = db_path.clone() {
-                        match serde_json::from_slice::<AccountRequest>(&body_bytes) {
-                            Ok(req) => {
-                                let mr_clone = mail_root.clone();
-                                match tokio::task::spawn_blocking(move || {
-                                    upsert_account_sync(&mr_clone, &dbp, req)
-                                })
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        content_type = "application/json".to_string();
-                                        body = json!({"result":"ok"}).to_string();
-                                    }
-                                    Ok(Err(e)) => {
-                                        status = 400;
-                                        body = format!("error: {}", e);
-                                    }
-                                    Err(e) => {
-                                        status = 500;
-                                        body = format!("task join error: {}", e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                status = 400;
-                                body = "invalid JSON".to_string();
-                            }
-                        }
-                    } else {
-                        status = 400;
-                        body = "DB not configured".to_string();
-                    }
-                } else if method == "DELETE" {
-                    if let Some(dbp) = db_path.clone() {
-                        match serde_json::from_slice::<AccountDeleteRequest>(&body_bytes) {
-                            Ok(req) => {
-                                match tokio::task::spawn_blocking(move || {
-                                    delete_account_sync(&dbp, req)
-                                })
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        content_type = "application/json".to_string();
-                                        body = json!({"result":"ok"}).to_string();
-                                    }
-                                    Ok(Err(e)) => {
-                                        status = 400;
-                                        body = format!("error: {}", e);
-                                    }
-                                    Err(e) => {
-                                        status = 500;
-                                        body = format!("task join error: {}", e);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                status = 400;
-                                body = "invalid JSON".to_string();
-                            }
-                        }
-                    } else {
-                        status = 400;
-                        body = "DB not configured".to_string();
-                    }
-                } else {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                }
-            }
-            "/api/routing" => {
-                if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else if method == "GET" {
-                    let dbp = db_path.clone();
-                    match tokio::task::spawn_blocking(move || routing_summary_sync(dbp.as_deref()))
-                        .await
-                    {
-                        Ok(Ok(summary)) => {
-                            content_type = "application/json".to_string();
-                            body = serde_json::to_string(&summary).unwrap_or_else(|e| {
-                                status = 500;
-                                format!("{{\"error\":\"{}\"}}", e)
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            status = 500;
-                            body = format!("error: {}", e);
-                        }
-                        Err(e) => {
-                            status = 500;
-                            body = format!("task join error: {}", e);
-                        }
-                    }
-                } else {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                }
-            }
-            "/api/routing/alias" => {
-                if method != "POST" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else if let Some(dbp) = db_path.clone() {
-                    match serde_json::from_slice::<AliasRequest>(&body_bytes) {
-                        Ok(req) => {
-                            match tokio::task::spawn_blocking(move || upsert_alias_sync(&dbp, req))
-                                .await
-                            {
-                                Ok(Ok(())) => {
-                                    content_type = "application/json".to_string();
-                                    body = json!({"result":"ok"}).to_string();
-                                }
-                                Ok(Err(e)) => {
-                                    status = 400;
-                                    body = format!("error: {}", e);
-                                }
-                                Err(e) => {
-                                    status = 500;
-                                    body = format!("task join error: {}", e);
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            status = 400;
-                            body = "invalid JSON".to_string();
-                        }
-                    }
-                } else {
-                    status = 400;
-                    body = "DB not configured".to_string();
-                }
-            }
-            "/api/routing/catchall" => {
-                if method != "POST" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else if !is_authorized(&headers) {
-                    status = 401;
-                    body = "Unauthorized".to_string();
-                    extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                } else if let Some(dbp) = db_path.clone() {
-                    match serde_json::from_slice::<CatchallRequest>(&body_bytes) {
-                        Ok(req) => {
-                            match tokio::task::spawn_blocking(move || {
-                                upsert_catchall_sync(&dbp, req)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    content_type = "application/json".to_string();
-                                    body = json!({"result":"ok"}).to_string();
-                                }
-                                Ok(Err(e)) => {
-                                    status = 400;
-                                    body = format!("error: {}", e);
-                                }
-                                Err(e) => {
-                                    status = 500;
-                                    body = format!("task join error: {}", e);
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            status = 400;
-                            body = "invalid JSON".to_string();
-                        }
-                    }
-                } else {
-                    status = 400;
-                    body = "DB not configured".to_string();
-                }
-            }
-            "/api/queue/action" => {
-                if method != "POST" {
-                    status = 405;
-                    body = "Method Not Allowed".to_string();
-                } else {
-                    if !is_authorized(&headers) {
-                        status = 401;
-                        body = "Unauthorized".to_string();
-                        extra_headers = "WWW-Authenticate: Basic realm=\"rMail\"\r\n".to_string();
-                    } else {
-                        let b = String::from_utf8_lossy(&body_bytes).to_string();
-                        match serde_json::from_str::<serde_json::Value>(&b) {
-                            Ok(val) => {
-                                let action =
-                                    val.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                                let mr_clone = mail_root.clone();
-                                match action {
-                                    "requeue" => {
-                                        let res = tokio::task::spawn_blocking(move || {
-                                            if let Some(name) =
-                                                val.get("name").and_then(|v| v.as_str())
-                                            {
-                                                if let Ok(Some((spool, eml, jsonp))) =
-                                                    find_message_sync(&mr_clone, &ensure_ext(name))
-                                                {
-                                                    return requeue_single_sync(
-                                                        &spool, &eml, &jsonp, &mr_clone,
-                                                    );
-                                                }
-                                                Err(anyhow::anyhow!("not found"))
-                                            } else if let Some(pattern) =
-                                                val.get("pattern").and_then(|v| v.as_str())
-                                            {
-                                                let matches = find_messages_matching_sync(
-                                                    &mr_clone, pattern,
-                                                )?;
-                                                for (spool, eml, jsonp, _fname) in matches {
-                                                    requeue_single_sync(
-                                                        &spool, &eml, &jsonp, &mr_clone,
-                                                    )?;
-                                                }
-                                                Ok(())
-                                            } else {
-                                                Err(anyhow::anyhow!("missing name or pattern"))
-                                            }
-                                        })
-                                        .await;
-                                        match res {
-                                            Ok(Ok(_)) => {
-                                                content_type = "application/json".to_string();
-                                                body = json!({"result":"ok"}).to_string();
-                                            }
-                                            Ok(Err(e)) => {
-                                                status = 500;
-                                                body = format!("error: {}", e);
-                                            }
-                                            Err(e) => {
-                                                status = 500;
-                                                body = format!("task join error: {}", e);
-                                            }
-                                        }
-                                    }
-                                    "promote" => {
-                                        let priority = val
-                                            .get("priority")
-                                            .and_then(|v| v.as_i64())
-                                            .unwrap_or(0)
-                                            as i32;
-                                        let res = tokio::task::spawn_blocking(move || {
-                                            if let Some(name) =
-                                                val.get("name").and_then(|v| v.as_str())
-                                            {
-                                                if let Ok(Some((spool, eml, jsonp))) =
-                                                    find_message_sync(&mr_clone, &ensure_ext(name))
-                                                {
-                                                    return promote_single_sync(
-                                                        &spool, &eml, &jsonp, &mr_clone, priority,
-                                                    );
-                                                }
-                                                Err(anyhow::anyhow!("not found"))
-                                            } else if let Some(pattern) =
-                                                val.get("pattern").and_then(|v| v.as_str())
-                                            {
-                                                let matches = find_messages_matching_sync(
-                                                    &mr_clone, pattern,
-                                                )?;
-                                                for (spool, eml, jsonp, _fname) in matches {
-                                                    promote_single_sync(
-                                                        &spool, &eml, &jsonp, &mr_clone, priority,
-                                                    )?;
-                                                }
-                                                Ok(())
-                                            } else {
-                                                Err(anyhow::anyhow!("missing name or pattern"))
-                                            }
-                                        })
-                                        .await;
-                                        match res {
-                                            Ok(Ok(_)) => {
-                                                content_type = "application/json".to_string();
-                                                body = json!({"result":"ok"}).to_string();
-                                            }
-                                            Ok(Err(e)) => {
-                                                status = 500;
-                                                body = format!("error: {}", e);
-                                            }
-                                            Err(e) => {
-                                                status = 500;
-                                                body = format!("task join error: {}", e);
-                                            }
-                                        }
-                                    }
-                                    "delete" => {
-                                        let res = tokio::task::spawn_blocking(move || {
-                                            if let Some(name) =
-                                                val.get("name").and_then(|v| v.as_str())
-                                            {
-                                                if let Ok(Some((spool, eml, jsonp))) =
-                                                    find_message_sync(&mr_clone, &ensure_ext(name))
-                                                {
-                                                    return delete_single_sync(
-                                                        &spool, &eml, &jsonp, &mr_clone,
-                                                    );
-                                                }
-                                                Err(anyhow::anyhow!("not found"))
-                                            } else if let Some(pattern) =
-                                                val.get("pattern").and_then(|v| v.as_str())
-                                            {
-                                                let matches = find_messages_matching_sync(
-                                                    &mr_clone, pattern,
-                                                )?;
-                                                for (spool, eml, jsonp, _fname) in matches {
-                                                    delete_single_sync(
-                                                        &spool, &eml, &jsonp, &mr_clone,
-                                                    )?;
-                                                }
-                                                Ok(())
-                                            } else {
-                                                Err(anyhow::anyhow!("missing name or pattern"))
-                                            }
-                                        })
-                                        .await;
-                                        match res {
-                                            Ok(Ok(_)) => {
-                                                content_type = "application/json".to_string();
-                                                body = json!({"result":"ok"}).to_string();
-                                            }
-                                            Ok(Err(e)) => {
-                                                status = 500;
-                                                body = format!("error: {}", e);
-                                            }
-                                            Err(e) => {
-                                                status = 500;
-                                                body = format!("task join error: {}", e);
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        status = 400;
-                                        body = "unknown action".to_string();
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                status = 400;
-                                body = "invalid JSON".to_string();
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                if method == "GET" && !path.starts_with("/api/") {
-                    if let Some((ctype, static_body)) = read_admin_static(path) {
-                        content_type = ctype.to_string();
-                        body = static_body;
-                    } else {
-                        status = 404;
-                        body = "Not Found".to_string();
-                    }
-                } else {
-                    status = 404;
-                    body = "Not Found".to_string();
-                }
-            }
-        }
-    }
-
-    // write response (HTTP/1.1)
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n{}\r\n{}",
-        status,
-        if status == 200 { "OK" } else { "ERR" },
-        body.len(),
-        content_type,
-        extra_headers,
-        body
+    let state = api::AdminState::new(
+        mail_root,
+        db_path,
+        admin_user.zip(admin_hash),
+        acme_challenge_dir,
+        readiness,
     );
-    // take ownership of underlying stream and write once
-    let mut stream = reader.into_inner();
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.shutdown().await;
-    web_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method, "path": path_q, "status": status, "response_bytes": body.len() });
+    api::serve(stream, peer, Arc::new(state)).await;
+}
+
+fn readiness_from_config(cfg: &Config) -> ReadinessConfig {
+    ReadinessConfig {
+        tls_cert: cfg.global.tls_cert.clone(),
+        tls_key: cfg.global.tls_key.clone(),
+        tls_policy: cfg.global.tls.clone(),
+        security: cfg.security.clone(),
+        check_dns: true,
+    }
+}
+
+async fn metrics_text(mail_root: &Path) -> String {
+    // Aggregate process-local snapshots with one bounded component label.
+    let mut metrics_text = String::new();
+    let mut have_metadata = false;
+    for component in ["smtpd", "outbound", "imapd", "web"] {
+        let Ok(snapshot) = tokio::fs::read_to_string(
+            rmail_common::runtime::prometheus_snapshot_path(mail_root, component),
+        )
+        .await
+        else {
+            continue;
+        };
+        let labeled = rmail_common::metrics::add_component_label(&snapshot, component);
+        for line in labeled.lines() {
+            if !line.starts_with('#') || !have_metadata {
+                metrics_text.push_str(line);
+                metrics_text.push('\n');
+            }
+        }
+        have_metadata = true;
+    }
+    if metrics_text.is_empty() {
+        metrics_text = rmail_common::metrics::add_component_label(
+            &rmail_common::metrics::gather_prometheus(),
+            "web",
+        );
+    }
+    let root = mail_root.to_path_buf();
+    match tokio::task::spawn_blocking(move || count_queue_entries_sync(&root)).await {
+        Ok(Ok(pending)) => {
+            metrics_text
+                .push_str("# HELP rmail_outbound_pending Number of pending outbound messages\n");
+            metrics_text.push_str("# TYPE rmail_outbound_pending gauge\n");
+            metrics_text.push_str(&format!("rmail_outbound_pending {pending}\n"));
+        }
+        Ok(Err(error)) => {
+            web_log!("error", "queue_metrics_failed", { "error": error.to_string() });
+        }
+        Err(error) => {
+            web_log!("error", "queue_metrics_failed", { "error": error.to_string() });
+        }
+    }
+    metrics_text
+}
+
+fn dmarc_summary_sync(db_path: &str) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for domain in rmail_common::db::get_unreported_dmarc_domains(db_path)? {
+        let events = rmail_common::db::fetch_unreported_dmarc_events_for_domain(db_path, &domain)?;
+        out.push(json!({"domain": domain, "events": events.len()}));
+    }
+    Ok(out)
+}
+
+fn queue_listing_sync(mail_root: &PathBuf, spool: &str) -> Result<serde_json::Value> {
+    let (queue, inflight, sent, failed) = spool_dirs(mail_root);
+    let dir = match spool {
+        "queue" => queue,
+        "inflight" => inflight,
+        "sent" => sent,
+        "failed" => failed,
+        _ => anyhow::bail!("unknown spool {spool:?}"),
+    };
+    let entries = read_queue_entries(&dir)?;
+    // "queued" is kept for older clients of this endpoint.
+    Ok(json!({"spool": spool, "entries": entries, "queued": entries}))
+}
+
+fn settings_view_sync(db_path: &str) -> Result<serde_json::Value> {
+    let conn = rmail_common::settings::open(db_path)?;
+    let mut view = serde_json::to_value(rmail_common::settings::describe(&conn)?)?;
+    view["managed"] = json!(true);
+    Ok(view)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| {
-        // fallback default settings
-        Config {
-            global: rmail_common::config::Global {
-                tracking: rmail_common::config::TrackingConfig::default(),
-                mail_root: "mail".into(),
-                tcp_listener: rmail_common::net::TcpListenerConfig::default(),
-                listeners: rmail_common::config::ListenerEndpoints::default(),
-                listen_addrs: None,
-                smtps_listen_addrs: None,
-                smtps_port: None,
-                submission_port: None,
-                submission_listen_addrs: None,
-                imaps_listen_addrs: None,
-                imaps_port: None,
-                imap_listen_addrs: None,
-                imap_port: None,
-                web_listen_addrs: None,
-                web_port: None,
-                webmail_listen_addrs: None,
-                webmail_port: None,
-                webmail_session_secret: None,
-                tls_cert: None,
-                tls_key: None,
-                tls: rmail_common::config::TlsPolicy::default(),
-                log_level: None,
-                web_admin_user: None,
-                web_admin_password_hash: None,
-                acme_challenge_dir: None,
-                db_path: None,
-                enforce_dmarc: None,
-            },
-            security: rmail_common::config::SecurityConfig::default(),
-        }
-    });
+    let cfg = Config::load(&cfg_path).with_context(|| format!("loading {cfg_path}"))?;
     let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "web").context("redirecting logs")?;
+    if let Err(error) = rmail_common::settings::record_service_start(&cfg, "web") {
+        web_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
+    }
     let _metrics_task = rmail_common::metrics::spawn_prometheus_snapshot_task(&mail_root, "web")?;
-    let admin_user = cfg.global.web_admin_user.clone();
-    let admin_hash = cfg.global.web_admin_password_hash.clone();
-    let db_path = cfg.global.db_path.clone();
-    let acme_dir = cfg.global.acme_challenge_dir.clone();
-    let readiness = ReadinessConfig {
-        tls_cert: cfg.global.tls_cert.clone(),
-        tls_key: cfg.global.tls_key.clone(),
-        tls_policy: cfg.global.tls.clone(),
-        security: cfg.security.clone(),
-        check_dns: true,
-    };
     let bind_addrs = cfg.global.admin_listeners();
     let tls = rmail_common::tls::web_tls_channel(&cfg.global)?;
+    let tls_active = tls.1.borrow().is_some();
+
+    let mut state = api::AdminState::new(
+        mail_root.clone(),
+        cfg.global.db_path.clone(),
+        cfg.global
+            .web_admin_user
+            .clone()
+            .zip(cfg.global.web_admin_password_hash.clone()),
+        cfg.global.acme_challenge_dir.clone(),
+        readiness_from_config(&cfg),
+    );
+    state.config_path = Some(cfg_path.clone());
+    state.secure_cookies = tls_active || cfg.global.tls.web_http_only;
+    if let Some(db_path) = cfg.global.db_path.as_deref() {
+        // A persistent key keeps admins signed in across restarts.
+        let mut conn = rmail_common::settings::open(db_path)?;
+        state.session_key =
+            rmail_common::settings::internal_secret(&mut conn, "admin_session_key")?.into_bytes();
+    }
+    // Without credentials the console runs in first-run setup mode, where the
+    // first visitor chooses the admin password. Never allow that remotely.
+    let has_credentials =
+        cfg.global.web_admin_user.is_some() && cfg.global.web_admin_password_hash.is_some();
+    if !has_credentials {
+        let exposed = bind_addrs
+            .iter()
+            .filter(|address| !rmail_common::http::is_loopback_bind(address))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exposed.is_empty() {
+            anyhow::bail!(
+                "refusing to serve the admin console on {} without admin credentials; \
+                 run `rmail_ctl admin-password` or bind it to 127.0.0.1 and complete setup in the browser",
+                exposed.join(", ")
+            );
+        }
+        web_log!("warn", "admin_setup_mode", { "reason": "no admin credentials configured; the first visitor on a loopback listener sets them" });
+    }
+    let state = Arc::new(state);
+
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
         cfg.global.tls_cert.clone(),
@@ -2318,15 +1183,10 @@ async fn main() -> Result<()> {
     let mut listeners = JoinSet::new();
     for addr in bind_addrs {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
-        web_log!("info", "listener_started", { "address": addr, "tls_configured": tls.1.borrow().is_some() });
-        let mr = mail_root.clone();
-        let admin_user = admin_user.clone();
-        let admin_hash = admin_hash.clone();
-        let db_path = db_path.clone();
-        let acme_dir = acme_dir.clone();
-        let readiness = readiness.clone();
+        web_log!("info", "listener_started", { "address": addr, "tls_configured": tls_active });
         let listener_shutdown = shutdown.clone();
         let tls = tls.1.clone();
+        let state = state.clone();
         listeners.spawn(async move {
             let mut shutdown_signal = listener_shutdown.subscribe();
             loop {
@@ -2338,50 +1198,24 @@ async fn main() -> Result<()> {
                     accepted = listener.accept() => match accepted {
                         Ok(value) => value,
                         Err(e) => {
-                        web_log!("error", "listener_accept_failed", { "address": addr, "error": e.to_string() });
-                        break;
+                            web_log!("error", "listener_accept_failed", { "address": addr, "error": e.to_string() });
+                            break;
                         }
                     },
                 };
-                let mr = mr.clone();
-                let admin_user = admin_user.clone();
-                let admin_hash = admin_hash.clone();
-                let db_path = db_path.clone();
-                let acme_dir = acme_dir.clone();
-                let readiness = readiness.clone();
                 let session = listener_shutdown.start_session();
                 let tls_context = tls.borrow().clone();
+                let state = state.clone();
                 tokio::spawn(async move {
                     let _session = session;
                     if let Some(context) = tls_context {
-                        match context.acceptor.accept(stream).await {
-                            Ok(stream) => {
-                                handle_connection(
-                                    stream,
-                                    peer.to_string(),
-                                    mr,
-                                    admin_user,
-                                    admin_hash,
-                                    db_path,
-                                    acme_dir,
-                                    readiness,
-                                )
-                                .await
-                            }
-                            Err(error) => web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() }),
+                        match timeout(Duration::from_secs(15), context.acceptor.accept(stream)).await {
+                            Ok(Ok(stream)) => api::serve(stream, peer.to_string(), state).await,
+                            Ok(Err(error)) => web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() }),
+                            Err(_) => web_log!("warn", "tls_handshake_timeout", { "peer": peer.to_string() }),
                         }
                     } else {
-                        handle_connection(
-                            stream,
-                            peer.to_string(),
-                            mr,
-                            admin_user,
-                            admin_hash,
-                            db_path,
-                            acme_dir,
-                            readiness,
-                        )
-                        .await;
+                        api::serve(stream, peer.to_string(), state).await;
                     }
                 });
             }
@@ -2505,7 +1339,10 @@ mod tests {
             readiness,
         )
         .await;
-        assert!(response.starts_with("HTTP/1.1 503 ERR"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
         assert!(response.contains("\"ready\":false"), "{response}");
         assert!(
             response.contains("\"certificates\":{\"status\":\"error\""),
@@ -2604,7 +1441,7 @@ mod tests {
 
         let body = r#"{"address":"New@Example.Test","password":"secret","quota_mib":256}"#;
         let request = format!(
-            "POST /api/accounts HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /api/accounts HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -2628,7 +1465,7 @@ mod tests {
 
         let body = r#"{"address":"new@example.test"}"#;
         let request = format!(
-            "DELETE /api/accounts HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            "DELETE /api/accounts HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -2656,7 +1493,7 @@ mod tests {
         let alias =
             r#"{"address":"team@example.test","targets":["a@example.test","b@example.test"]}"#;
         let request = format!(
-            "POST /api/routing/alias HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /api/routing/alias HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{}",
             alias.len(),
             alias
         );
@@ -2670,7 +1507,7 @@ mod tests {
 
         let catchall = r#"{"domain":"example.test","target":"postmaster@example.test"}"#;
         let request = format!(
-            "POST /api/routing/catchall HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /api/routing/catchall HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{}",
             catchall.len(),
             catchall
         );
@@ -2823,7 +1660,7 @@ mod tests {
 
         let body = r#"{"action":"requeue","name":"msg.eml"}"#;
         let request = format!(
-            "POST /api/queue/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /api/queue/action HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -2855,6 +1692,385 @@ mod tests {
         let request = "GET /api/queue/action HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string();
 
         let response = send_request(td.path().to_path_buf(), request).await;
-        assert!(response.starts_with("HTTP/1.1 405 ERR"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{response}"
+        );
+    }
+
+    async fn send_to_state(state: Arc<api::AdminState>, peer: &str, request: String) -> String {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let peer = peer.to_string();
+        let task = tokio::spawn(async move { api::serve(server, peer, state).await });
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn hash(password: &str) -> String {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    fn post(path: &str, body: &str, extra: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn cookie_from(response: &str) -> String {
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .and_then(|cookie| cookie.split(';').next())
+            .expect("session cookie")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn acme_challenge_rejects_path_traversal() {
+        let td = tempdir().unwrap();
+        let acme = td.path().join("acme");
+        fs::create_dir_all(&acme).unwrap();
+        fs::write(acme.join("good-token_1"), "challenge").unwrap();
+        fs::write(td.path().join("secret.txt"), "TOPSECRET").unwrap();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            None,
+            Some(("admin".into(), hash("correct horse battery"))),
+            Some(acme.to_string_lossy().into_owned()),
+            ReadinessConfig::default(),
+        ));
+        let ok = send_to_state(
+            state.clone(),
+            "t",
+            "GET /.well-known/acme-challenge/good-token_1 HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            ok.starts_with("HTTP/1.1 200 OK") && ok.ends_with("challenge"),
+            "{ok}"
+        );
+        for target in [
+            "/.well-known/acme-challenge/../secret.txt".to_string(),
+            format!(
+                "/.well-known/acme-challenge/{}/secret.txt",
+                td.path().display()
+            ),
+            "/.well-known/acme-challenge/%2e%2e%2fsecret.txt".to_string(),
+        ] {
+            let response =
+                send_to_state(state.clone(), "t", format!("GET {target} HTTP/1.1\r\n\r\n")).await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{target}: {response}");
+            assert!(!response.contains("TOPSECRET"), "{target}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_rejected_before_allocation() {
+        let td = tempdir().unwrap();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            None,
+            None,
+            None,
+            ReadinessConfig::default(),
+        ));
+        let response = send_to_state(
+            state,
+            "t",
+            "POST /api/accounts HTTP/1.1\r\nContent-Length: 99999999999\r\n\r\n".into(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn api_requires_credentials_and_csrf_header() {
+        let td = tempdir().unwrap();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            None,
+            Some(("admin".into(), hash("correct horse battery"))),
+            None,
+            ReadinessConfig::default(),
+        ));
+        let anonymous = send_to_state(
+            state.clone(),
+            "t",
+            "GET /api/queue/summary HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+
+        let basic = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "admin:correct horse battery",
+        );
+        let authorized = send_to_state(
+            state.clone(),
+            "t",
+            format!("GET /api/queue/summary HTTP/1.1\r\nAuthorization: Basic {basic}\r\n\r\n"),
+        )
+        .await;
+        assert!(authorized.starts_with("HTTP/1.1 200"), "{authorized}");
+
+        let no_csrf = send_to_state(
+            state.clone(),
+            "t",
+            format!(
+                "POST /api/queue/action HTTP/1.1\r\nAuthorization: Basic {basic}\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(no_csrf.starts_with("HTTP/1.1 403"), "{no_csrf}");
+
+        let cross_origin = send_to_state(
+            state,
+            "t",
+            post(
+                "/api/queue/action",
+                "{}",
+                &format!("Authorization: Basic {basic}\r\nOrigin: https://evil.example\r\n"),
+            ),
+        )
+        .await;
+        assert!(cross_origin.starts_with("HTTP/1.1 403"), "{cross_origin}");
+    }
+
+    #[tokio::test]
+    async fn login_issues_session_and_throttles_guessing() {
+        let td = tempdir().unwrap();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            None,
+            Some(("admin".into(), hash("correct horse battery"))),
+            None,
+            ReadinessConfig::default(),
+        ));
+        let peer = "192.0.2.10:5555";
+        let login = send_to_state(
+            state.clone(),
+            peer,
+            post(
+                "/api/login",
+                r#"{"username":"admin","password":"correct horse battery"}"#,
+                "",
+            ),
+        )
+        .await;
+        assert!(login.starts_with("HTTP/1.1 200"), "{login}");
+        assert!(login.contains("HttpOnly; SameSite=Strict"), "{login}");
+        let cookie = cookie_from(&login);
+
+        let session = send_to_state(
+            state.clone(),
+            peer,
+            format!("GET /api/session HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(session.contains("\"authenticated\":true"), "{session}");
+        let summary = send_to_state(
+            state.clone(),
+            peer,
+            format!("GET /api/queue/summary HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
+
+        let logout = send_to_state(
+            state.clone(),
+            peer,
+            post("/api/logout", "", &format!("Cookie: {cookie}\r\n")),
+        )
+        .await;
+        assert!(logout.starts_with("HTTP/1.1 200"), "{logout}");
+        let after_logout = send_to_state(
+            state.clone(),
+            peer,
+            format!("GET /api/queue/summary HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(after_logout.starts_with("HTTP/1.1 401"), "{after_logout}");
+
+        let attacker = "198.51.100.7:4444";
+        for _ in 0..5 {
+            let response = send_to_state(
+                state.clone(),
+                attacker,
+                post(
+                    "/api/login",
+                    r#"{"username":"admin","password":"wrong"}"#,
+                    "",
+                ),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        }
+        let locked = send_to_state(
+            state,
+            attacker,
+            post(
+                "/api/login",
+                r#"{"username":"admin","password":"correct horse battery"}"#,
+                "",
+            ),
+        )
+        .await;
+        assert!(locked.starts_with("HTTP/1.1 429"), "{locked}");
+    }
+
+    #[tokio::test]
+    async fn setup_mode_sets_credentials_and_settings_are_editable() {
+        let td = tempdir().unwrap();
+        let db_path = td.path().join("rmail.db");
+        rmail_common::db::init_db(&db_path).unwrap();
+        let db = db_path.to_string_lossy().into_owned();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            Some(db.clone()),
+            None,
+            None,
+            ReadinessConfig::default(),
+        ));
+        let session = send_to_state(
+            state.clone(),
+            "t",
+            "GET /api/session HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(session.contains("\"setup_required\":true"), "{session}");
+
+        let short = send_to_state(
+            state.clone(),
+            "t",
+            post(
+                "/api/admin/credentials",
+                r#"{"username":"root","new_password":"short"}"#,
+                "",
+            ),
+        )
+        .await;
+        assert!(short.starts_with("HTTP/1.1 422"), "{short}");
+        let created = send_to_state(
+            state.clone(),
+            "t",
+            post(
+                "/api/admin/credentials",
+                r#"{"username":"root","new_password":"a much longer password"}"#,
+                "",
+            ),
+        )
+        .await;
+        assert!(created.starts_with("HTTP/1.1 200"), "{created}");
+        let cookie = cookie_from(&created);
+
+        // Setup mode is over: anonymous requests are now rejected.
+        let anonymous = send_to_state(
+            state.clone(),
+            "t",
+            "GET /api/settings HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+
+        let settings = send_to_state(
+            state.clone(),
+            "t",
+            format!("GET /api/settings HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(settings.starts_with("HTTP/1.1 200"), "{settings}");
+        assert!(
+            settings.contains("security.smtp_max_recipients"),
+            "{settings}"
+        );
+        assert!(
+            !settings.contains("argon2"),
+            "admin hash leaked: {settings}"
+        );
+
+        let body = r#"{"changes":{"security.smtp_max_recipients":0}}"#;
+        let invalid = send_to_state(
+            state.clone(),
+            "t",
+            format!(
+                "PUT /api/settings HTTP/1.1\r\nX-Rmail-Admin: 1\r\nCookie: {cookie}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(invalid.starts_with("HTTP/1.1 422"), "{invalid}");
+        let body = r#"{"changes":{"security.smtp_max_recipients":42}}"#;
+        let saved = send_to_state(
+            state,
+            "t",
+            format!(
+                "PUT /api/settings HTTP/1.1\r\nX-Rmail-Admin: 1\r\nCookie: {cookie}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+        let conn = rmail_common::settings::open(&db).unwrap();
+        assert_eq!(
+            rmail_common::settings::get(&conn, "security.smtp_max_recipients").unwrap(),
+            Some(json!(42))
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_quota_keeps_existing_password() {
+        let td = tempdir().unwrap();
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).unwrap();
+        let db = Some(db_path.to_string_lossy().into_owned());
+        for body in [
+            r#"{"address":"keep@example.test","password":"secret-password"}"#,
+            r#"{"address":"keep@example.test","quota_mib":10}"#,
+        ] {
+            let response = send_request_with_db(
+                mail_root.clone(),
+                post("/api/accounts", body, ""),
+                db.clone(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        let mailbox = rmail_common::db::get_mailbox(&db_path, "keep@example.test")
+            .unwrap()
+            .unwrap();
+        assert!(mailbox.password_hash.is_some() && mailbox.scram.is_some());
+        assert_eq!(mailbox.quota_bytes, Some(10 * 1024 * 1024));
+
+        let body = r#"{"address":"missing@example.test","quota_mib":1}"#;
+        let patch = format!(
+            "PATCH /api/accounts HTTP/1.1\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = send_request_with_db(mail_root, patch, db).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn queue_actions_reject_path_like_names() {
+        let td = tempdir().unwrap();
+        let response = send_request(
+            td.path().to_path_buf(),
+            post(
+                "/api/queue/action",
+                r#"{"action":"delete","name":"../../x"}"#,
+                "",
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
     }
 }

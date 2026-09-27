@@ -73,8 +73,9 @@ Then edit both files:
 Important:
 
 - `rmail_outbound` reads `RMAIL_MAIL_ROOT` for spool placement and, when `RMAIL_CONFIG` is set,
-  reads the shared tracking-retention policy from the TOML file
-- `rmail_web` currently binds to `127.0.0.1` by default, which is a safer default for admin access
+  reads the shared tracking-retention policy from the configuration
+- `rmail_web` binds to `127.0.0.1` by default and refuses non-loopback addresses until admin
+  credentials exist
 - port 25 listeners use MTA policy; port 587 and implicit-TLS port 465 use submission policy
 - submission requires TLS, authentication, and an envelope sender matching the authenticated mailbox
 - optional `global.listeners.lmtp` endpoints provide RFC 2033 local delivery; bind them only to
@@ -254,11 +255,33 @@ probe paths at the reverse proxy or firewall because readiness details are inten
 operators.
 
 The admin console uses dedicated browser routes for its main operating areas: `/` (overview),
-`/accounts`, `/routing`, `/delivery`, `/observability`, and `/system`. Navigation is grouped into
-mail-management and operations areas; the system page exposes live readiness for the storage, DNS,
-TLS, and filtering dependencies used by all rMail services. These routes are served through the same
-single-page frontend, so a reverse proxy should pass unknown non-API paths to `rmail_web` rather than
-returning its own 404 page.
+`/accounts`, `/routing`, `/delivery`, `/settings`, `/observability`, and `/system`. These routes are
+served through the same single-page frontend, so a reverse proxy should pass unknown non-API paths to
+`rmail_web` rather than returning its own 404 page.
+
+### Settings and admin access
+
+When the configuration file sets `db_path`, the file only bootstraps `mail_root` and `db_path`.
+Every other setting lives in the `settings` table of that database:
+
+- On the first start against a database without settings, all values in the file are imported once.
+- Afterwards settings are edited on the console's **Settings** page or with
+  `rmail_ctl settings list|get|set|unset`. Values still present in the file are ignored; each daemon
+  logs the keys whose file value differs from the database.
+- Daemons read settings at startup and record the revision they loaded. The Settings and System
+  pages show which services must be restarted (for example
+  `rmail_ctl service restart --unit smtpd`) and which changed keys each one is waiting for.
+- Secrets (admin password hash, OAuth client secret, session signing keys) are stored in the same
+  database and are never returned by the API.
+
+Admin access uses a session cookie after signing in on the console; `/metrics` and the JSON API also
+accept HTTP Basic authentication for scripts and Prometheus. State-changing API requests must send an
+`X-Rmail-Admin: 1` header (CSRF protection). Repeated failed sign-ins lock the client out for 30
+minutes.
+
+Set the admin credentials with `rmail_ctl admin-password` (or on the System page). Without
+credentials, `rmail_web` refuses to listen on non-loopback addresses; on loopback it starts in
+first-run setup mode, where the first visitor creates the admin account.
 
 Prometheus metrics are available from authenticated `GET /metrics`. Each daemon publishes an
 atomic snapshot every 15 seconds, and the web service aggregates them with a bounded `component`

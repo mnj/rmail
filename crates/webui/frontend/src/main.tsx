@@ -1,195 +1,104 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronRight, Database, Gauge, HardDrive, Mail, Menu, Network, Plus, RefreshCw, RotateCcw, Route, Send, Server, Settings, Shield, Trash2, Users, X, Zap } from 'lucide-react';
+import { Activity, ChevronRight, Gauge, LogOut, Menu, Network, Send, Server, SlidersHorizontal, Users, X } from 'lucide-react';
+import { api, errorMessage, onUnauthorized, Session } from './api';
+import { FeedbackProvider, Field } from './ui';
+import { OverviewPage } from './pages/Overview';
+import { AccountsPage } from './pages/Accounts';
+import { RoutingPage } from './pages/Routing';
+import { DeliveryPage } from './pages/Delivery';
+import { SettingsPage } from './pages/Settings';
+import { ObservabilityPage } from './pages/Observability';
+import { AdminCredentialsForm, SystemPage } from './pages/System';
 import './style.css';
 
-type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
-type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null };
-type QueueSummary = { queued: number; inflight: number; sent: number; failed: number };
-type Overview = {
-  accounts: number;
-  folders: number;
-  total_messages: number;
-  unseen_messages: number;
-  aliases: number;
-  catchalls: number;
-  domains: { domain: string; accounts: number; messages: number; unseen: number }[];
-  top_mailboxes: { address: string; messages: number; unseen: number; folders: number }[];
-  queue: QueueSummary;
-};
-type QueueItem = { name: string; control?: { attempts?: number; priority?: number; next_try?: number | null; last_error?: string | null } };
-type DmarcRow = { domain: string; events: number };
-type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[] };
-type ReadinessCheck = { status: 'ok' | 'error' | 'skipped'; error?: string };
-type Readiness = { ready: boolean; checks: Record<string, ReadinessCheck> };
+export type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'settings' | 'observability' | 'system';
 
-const numberFmt = new Intl.NumberFormat();
-const formatBytes = (value: number) => value >= 1024 * 1024 * 1024 ? `${(value / (1024 * 1024 * 1024)).toFixed(1)} GiB` : value >= 1024 * 1024 ? `${(value / (1024 * 1024)).toFixed(1)} MiB` : `${Math.ceil(value / 1024)} KiB`;
-type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'observability' | 'system';
 const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; description: string; icon: React.ElementType }> = {
-  overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'System health, storage activity, and delivery pressure at a glance.', icon: Gauge },
-  accounts: { path: '/accounts', label: 'Accounts', eyebrow: 'Identity & storage', description: 'Provision mailboxes and inspect account storage and authentication state.', icon: Users },
-  routing: { path: '/routing', label: 'Routing', eyebrow: 'Mail flow', description: 'Manage aliases, catchalls, and domain-level recipient routing.', icon: Network },
-  delivery: { path: '/delivery', label: 'Delivery', eyebrow: 'Outbound operations', description: 'Inspect queue pressure, recover messages, and review DMARC activity.', icon: Send },
-  observability: { path: '/observability', label: 'Observability', eyebrow: 'Diagnostics', description: 'Review daemon telemetry and live operational logs.', icon: Activity },
-  system: { path: '/system', label: 'System', eyebrow: 'Services & dependencies', description: 'Inspect service readiness, storage, DNS, TLS, and filtering dependencies.', icon: Settings },
+  overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'Health, storage and delivery at a glance.', icon: Gauge },
+  accounts: { path: '/accounts', label: 'Mailboxes', eyebrow: 'Identity & storage', description: 'Create mailboxes, reset passwords and manage quotas.', icon: Users },
+  routing: { path: '/routing', label: 'Routing', eyebrow: 'Mail flow', description: 'Aliases and per-domain catchalls.', icon: Network },
+  delivery: { path: '/delivery', label: 'Delivery', eyebrow: 'Outbound operations', description: 'Inspect and recover the outbound queue.', icon: Send },
+  settings: { path: '/settings', label: 'Settings', eyebrow: 'Configuration', description: 'Listeners, TLS, authentication, limits and filtering. Stored in the database.', icon: SlidersHorizontal },
+  observability: { path: '/observability', label: 'Logs & metrics', eyebrow: 'Diagnostics', description: 'Daemon logs and Prometheus telemetry.', icon: Activity },
+  system: { path: '/system', label: 'System', eyebrow: 'Services & access', description: 'Dependency readiness, running services and the admin account.', icon: Server },
 };
+
 const navGroups: { label: string; pages: Page[] }[] = [
   { label: 'Workspace', pages: ['overview'] },
-  { label: 'Mail management', pages: ['accounts', 'routing', 'delivery'] },
-  { label: 'Operations', pages: ['observability', 'system'] },
+  { label: 'Mail', pages: ['accounts', 'routing', 'delivery'] },
+  { label: 'Server', pages: ['settings', 'observability', 'system'] },
 ];
 
 function pageFromPath(path: string): Page {
   return (Object.entries(pageMeta).find(([, value]) => value.path === path)?.[0] as Page | undefined) || 'overview';
 }
 
-async function api<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(url, options);
-  if (!res.ok) throw new Error(`${url} returned ${res.status}`);
-  return res.json() as Promise<T>;
+function AuthScreen({ children, title, subtitle }: { children: React.ReactNode; title: string; subtitle: string }) {
+  return (
+    <main className="authShell">
+      <div className="authCard">
+        <div className="brand dark"><div className="logo">rM</div><div><strong>rMail</strong><span>Admin console</span></div></div>
+        <h1>{title}</h1>
+        <p>{subtitle}</p>
+        {children}
+      </div>
+    </main>
+  );
 }
 
-async function text(url: string): Promise<string> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} returned ${res.status}`);
-  return res.text();
+function LoginScreen({ onLogin }: { onLogin: (session: Session) => void }) {
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      await api('/api/login', 'POST', { username, password });
+      onLogin(await api<Session>('/api/session'));
+    } catch (err) {
+      setError(errorMessage(err));
+      setPassword('');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AuthScreen title="Sign in" subtitle="Use the admin account for this server.">
+      <form className="formStack" onSubmit={submit}>
+        <Field label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></Field>
+        <Field label="Password"><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" autoFocus required /></Field>
+        {error && <div className="banner">{error}</div>}
+        <button className="button primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+      </form>
+    </AuthScreen>
+  );
 }
 
-async function readinessApi(): Promise<Readiness> {
-  const res = await fetch('/readyz');
-  const report = await res.json() as Readiness;
-  if (!report.checks) throw new Error('/readyz returned an invalid readiness report');
-  return report;
+function SetupScreen({ session, onDone }: { session: Session; onDone: (session: Session) => void }) {
+  if (!session.settings_managed) {
+    return (
+      <AuthScreen title="Finish setting up" subtitle="No admin credentials are configured.">
+        <p>This console is only reachable from this machine until you set <code>web_admin_user</code> and <code>web_admin_password_hash</code> in the configuration file (generate the hash with <code>rmail_ctl hash</code>), or configure a <code>db_path</code> to manage settings here.</p>
+        <button className="button primary" onClick={() => onDone({ ...session, setup_required: false })}>Continue without a password</button>
+      </AuthScreen>
+    );
+  }
+  return (
+    <AuthScreen title="Create the admin account" subtitle="No admin account exists yet. Choose the credentials you will use to sign in.">
+      <AdminCredentialsForm setup session={session} onChanged={(user) => onDone({ ...session, user, authenticated: true, setup_required: false })} />
+    </AuthScreen>
+  );
 }
 
-function Kpi({ label, value, detail, icon: Icon }: { label: string; value: string; detail: string; icon: React.ElementType }) {
-  return <section className="kpi"><div><span>{label}</span><strong>{value}</strong></div><Icon size={22} /><small>{detail}</small></section>;
-}
-
-function BarRow({ label, value, max, detail }: { label: string; value: number; max: number; detail: string }) {
-  const width = max > 0 ? Math.max(4, Math.round((value / max) * 100)) : 0;
-  return <div className="barRow"><div><span>{label}</span><strong>{numberFmt.format(value)}</strong></div><div className="barTrack"><i style={{ width: `${width}%` }} /></div><small>{detail}</small></div>;
-}
-
-function App() {
+function Console({ session, setSession }: { session: Session; setSession: (session: Session | null) => void }) {
   const [page, setPage] = useState<Page>(() => pageFromPath(window.location.pathname));
   const [mobileNav, setMobileNav] = useState(false);
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [queueSummary, setQueueSummary] = useState<QueueSummary | null>(null);
-  const [queue, setQueue] = useState<QueueItem[]>([]);
-  const [metrics, setMetrics] = useState<string[]>([]);
-  const [dmarc, setDmarc] = useState<DmarcRow[]>([]);
-  const [routing, setRouting] = useState<Routing>({ aliases: [], catchalls: [] });
-  const [readiness, setReadiness] = useState<Readiness | null>(null);
-  const [logComponent, setLogComponent] = useState('smtpd');
-  const [logs, setLogs] = useState('');
-  const [target, setTarget] = useState('');
-  const [newAccount, setNewAccount] = useState({ address: '', password: '', quota_mib: '' });
-  const [aliasForm, setAliasForm] = useState({ address: '', targets: '' });
-  const [catchallForm, setCatchallForm] = useState({ domain: '', target: '' });
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-
-  const health = useMemo(() => {
-    if (!stats || !queueSummary) return { label: 'Loading', detail: 'Waiting for daemon data', icon: Activity };
-    if (queueSummary.failed > 0) return { label: 'Attention', detail: `${queueSummary.failed} failed outbound messages`, icon: AlertTriangle };
-    if (stats.outbound_pending > 0) return { label: 'Backlog', detail: `${stats.outbound_pending} messages pending delivery`, icon: Zap };
-    return { label: 'Nominal', detail: 'No visible queue pressure', icon: CheckCircle2 };
-  }, [stats, queueSummary]);
-
-  async function refresh(component = logComponent) {
-    setLoading(true);
-    setError('');
-    const failures: string[] = [];
-    const capture = (err: unknown) => failures.push(err instanceof Error ? err.message : String(err));
-    await Promise.all([
-      api<Stats>('/stats').then(setStats).catch(capture),
-      api<Overview>('/api/overview').then((data) => {
-        setOverview(data);
-        setQueueSummary(data.queue);
-      }).catch(capture),
-      api<Account[]>('/api/accounts').then(setAccounts).catch(capture),
-      api<QueueSummary>('/api/queue/summary').then(setQueueSummary).catch(capture),
-      api<{ queued: QueueItem[] }>('/api/queue').then((data) => setQueue(data.queued || [])).catch(capture),
-      text('/metrics').then((raw) => setMetrics(raw.split('\n').filter((line) => line && !line.startsWith('#')).slice(0, 9))).catch(capture),
-      text(`/logs?component=${component}&lines=180`).then((raw) => setLogs(raw || 'No log lines available.')).catch(capture),
-      api<Routing>('/api/routing').then(setRouting).catch(capture),
-      api<DmarcRow[]>('/dmarc').then(setDmarc).catch(() => setDmarc([])),
-      readinessApi().then(setReadiness).catch(capture),
-    ]);
-    if (failures.length) setError(`Some admin endpoints are unavailable: ${failures.slice(0, 2).join(', ')}`);
-    setLoading(false);
-  }
-
-  async function saveAccount(event: React.FormEvent) {
-    event.preventDefault();
-    if (!newAccount.address.trim()) return;
-    await api('/api/accounts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address: newAccount.address.trim(), password: newAccount.password || undefined, quota_mib: newAccount.quota_mib === '' ? undefined : Number(newAccount.quota_mib) }),
-    });
-    setNewAccount({ address: '', password: '', quota_mib: '' });
-    await refresh();
-  }
-
-  async function deleteAccount(address: string) {
-    await api('/api/accounts', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address }),
-    });
-    await refresh();
-  }
-
-  async function saveAlias(event: React.FormEvent) {
-    event.preventDefault();
-    if (!aliasForm.address.trim()) return;
-    const targets = aliasForm.targets.split(',').map((item) => item.trim()).filter(Boolean);
-    await api('/api/routing/alias', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address: aliasForm.address.trim(), targets }),
-    });
-    setAliasForm({ address: '', targets: '' });
-    await refresh();
-  }
-
-  async function saveCatchall(event: React.FormEvent) {
-    event.preventDefault();
-    if (!catchallForm.domain.trim()) return;
-    await api('/api/routing/catchall', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domain: catchallForm.domain.trim(), target: catchallForm.target.trim() || undefined }),
-    });
-    setCatchallForm({ domain: '', target: '' });
-    await refresh();
-  }
-
-  async function queueAction(action: 'requeue' | 'promote' | 'delete') {
-    const value = target.trim();
-    if (!value) return;
-    const body: Record<string, unknown> = value.includes('*') ? { pattern: value } : { name: value };
-    body.action = action;
-    if (action === 'promote') body.priority = 10;
-    await api('/api/queue/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    setTarget('');
-    await refresh();
-  }
-
-  useEffect(() => {
-    refresh();
-    const id = window.setInterval(() => refresh(), 30000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    text(`/logs?component=${logComponent}&lines=180`).then(setLogs).catch((err) => setLogs(err.message));
-  }, [logComponent]);
 
   useEffect(() => {
     const onPopState = () => setPage(pageFromPath(window.location.pathname));
@@ -197,134 +106,81 @@ function App() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  function navigate(next: Page) {
+  useEffect(() => {
+    document.title = `${pageMeta[page].label} · rMail Admin`;
+  }, [page]);
+
+  const navigate = useCallback((next: Page) => {
     window.history.pushState({}, '', pageMeta[next].path);
     setPage(next);
     setMobileNav(false);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    window.scrollTo({ top: 0 });
+  }, []);
+
+  async function logout() {
+    await api('/api/logout', 'POST').catch(() => undefined);
+    setSession(null);
   }
 
-  const HealthIcon = health.icon;
-  const domainMax = Math.max(0, ...(overview?.domains.map((domain) => domain.messages) || []));
-  const mailboxMax = Math.max(0, ...(overview?.top_mailboxes.map((mailbox) => mailbox.messages) || []));
-  const queueMax = Math.max(1, ...(queueSummary ? [queueSummary.queued, queueSummary.inflight, queueSummary.sent, queueSummary.failed] : [0]));
-
+  const meta = pageMeta[page];
   return (
     <main className="shell">
       {mobileNav && <button className="navScrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
       <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span>Admin console</span></div></div>
         <button className="closeNav" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X size={20} /></button>
-        <nav>{navGroups.map((group) => <div className="navGroup" key={group.label}><div className="navLabel">{group.label}</div>{group.pages.map((key) => { const item = pageMeta[key]; const Icon = item.icon; return <a key={key} href={item.path} className={page === key ? 'active' : ''} onClick={(event) => { event.preventDefault(); navigate(key); }}><Icon size={18} /><span>{item.label}</span><ChevronRight size={15} /></a>; })}</div>)}</nav>
-        <div className="health"><HealthIcon size={18} /><div><strong>{health.label}</strong><span>{health.detail}</span></div></div>
+        <nav>
+          {navGroups.map((group) => (
+            <div className="navGroup" key={group.label}>
+              <div className="navLabel">{group.label}</div>
+              {group.pages.map((key) => {
+                const item = pageMeta[key];
+                const Icon = item.icon;
+                return <a key={key} href={item.path} className={page === key ? 'active' : ''} aria-current={page === key ? 'page' : undefined} onClick={(event) => { event.preventDefault(); navigate(key); }}><Icon size={18} /><span>{item.label}</span><ChevronRight size={15} /></a>;
+              })}
+            </div>
+          ))}
+        </nav>
+        <div className="account">
+          <div><strong>{session.user || 'Local access'}</strong><span>{session.user ? 'Administrator' : 'No admin password set'}</span></div>
+          {session.user && <button className="iconButton ghost" title="Sign out" onClick={logout}><LogOut size={16} /></button>}
+        </div>
       </aside>
       <section className="content">
         <header className="topbar">
           <button className="menuButton" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button>
-          <div className="pageTitle"><span>{pageMeta[page].eyebrow}</span><h1>{pageMeta[page].label}</h1><p>{pageMeta[page].description}</p></div>
-          <div className="topActions"><span className="refreshState"><i className={loading ? 'loading' : ''} />{loading ? 'Refreshing' : 'Auto-refresh · 30s'}</span><button className="button primary" onClick={() => refresh()} disabled={loading}><RefreshCw size={16} />Refresh</button></div>
+          <div className="pageTitle"><span>{meta.eyebrow}</span><h1>{meta.label}</h1><p>{meta.description}</p></div>
         </header>
-        {error && <div className="banner">{error}</div>}
-        <section className="kpis" id="overview" hidden={page !== 'overview'}>
-          <Kpi label="Mailboxes" value={numberFmt.format(overview?.accounts ?? stats?.mailboxes ?? 0)} detail={`${overview?.folders ?? 0} folders tracked`} icon={Users} />
-          <Kpi label="Stored Messages" value={numberFmt.format(overview?.total_messages ?? stats?.total_messages ?? 0)} detail={`${numberFmt.format(overview?.unseen_messages ?? 0)} unseen messages`} icon={Mail} />
-          <Kpi label="Delivered" value={numberFmt.format(stats?.delivered_count || 0)} detail="Runtime delivery counter" icon={Send} />
-          <Kpi label="Pending" value={numberFmt.format(stats?.outbound_pending || queueSummary?.queued || 0)} detail={`${queueSummary?.inflight || 0} inflight, ${queueSummary?.failed || 0} failed`} icon={Server} />
-        </section>
-        <section className="grid analytics" id="analytics" hidden={page !== 'overview'}>
-          <article className="panel">
-            <div className="panelHead"><h2>Domain Distribution</h2><span>{overview ? `${overview.domains.length} domains` : 'Loading'}</span></div>
-            <div className="barList">{overview?.domains.length ? overview.domains.slice(0, 8).map((domain) => <BarRow key={domain.domain} label={domain.domain} value={domain.messages} max={domainMax} detail={`${domain.accounts} accounts, ${domain.unseen} unseen`} />) : <div className="empty">No domain activity yet.</div>}</div>
-          </article>
-          <article className="panel">
-            <div className="panelHead"><h2>Operations Snapshot</h2><BarChart3 size={18} /></div>
-            <div className="snapshotGrid">
-              <div><span>Aliases</span><strong>{numberFmt.format(overview?.aliases || 0)}</strong></div>
-              <div><span>Catchalls</span><strong>{numberFmt.format(overview?.catchalls || 0)}</strong></div>
-              <div><span>Unread</span><strong>{numberFmt.format(overview?.unseen_messages || 0)}</strong></div>
-              <div><span>Folders</span><strong>{numberFmt.format(overview?.folders || 0)}</strong></div>
-            </div>
-            <div className="barList compact">
-              {queueSummary && <>
-                <BarRow label="Queued" value={queueSummary.queued} max={queueMax} detail="waiting delivery" />
-                <BarRow label="Inflight" value={queueSummary.inflight} max={queueMax} detail="worker-owned" />
-                <BarRow label="Sent" value={queueSummary.sent} max={queueMax} detail="retained sent spool" />
-                <BarRow label="Failed" value={queueSummary.failed} max={queueMax} detail="needs action" />
-              </>}
-            </div>
-          </article>
-          <article className="panel wide">
-            <div className="panelHead"><h2>Mailbox Load</h2><span>{overview ? `${overview.top_mailboxes.length} busiest` : 'Loading'}</span></div>
-            <div className="barList twoCol">{overview?.top_mailboxes.length ? overview.top_mailboxes.map((mailbox) => <BarRow key={mailbox.address} label={mailbox.address} value={mailbox.messages} max={mailboxMax} detail={`${mailbox.folders} folders, ${mailbox.unseen} unseen`} />) : <div className="empty">No mailbox messages found.</div>}</div>
-          </article>
-        </section>
-        <section className="grid accountPage" hidden={page !== 'accounts'}>
-          <article className="panel wide" id="accounts">
-            <div className="panelHead"><h2>Account Management</h2><span>{accounts.length} accounts</span></div>
-            <form className="inlineForm" onSubmit={saveAccount}><input value={newAccount.address} onChange={(e) => setNewAccount({ ...newAccount, address: e.target.value })} placeholder="mailbox@example.com" /><input value={newAccount.password} onChange={(e) => setNewAccount({ ...newAccount, password: e.target.value })} placeholder="New password" type="password" /><input value={newAccount.quota_mib} onChange={(e) => setNewAccount({ ...newAccount, quota_mib: e.target.value })} placeholder="Quota MiB (0 = none)" type="number" min="0" /><button className="button primary"><Plus size={16} />Save mailbox</button></form>
-            <table><thead><tr><th>Mailbox</th><th>Auth</th><th>Storage</th><th>Folders</th><th>Messages</th><th>Unseen</th><th></th></tr></thead><tbody>{accounts.length ? accounts.map((a) => <tr key={a.address}><td><strong>{a.address}</strong><small>{a.unseen ? 'Unread activity' : 'No unread mail'}</small></td><td><span className="pill">{a.auth}</span></td><td>{formatBytes(a.used_bytes)} / {a.quota_bytes == null ? 'Unlimited' : formatBytes(a.quota_bytes)}</td><td>{a.folders}</td><td>{a.messages}</td><td>{a.unseen}</td><td><button className="iconButton danger" onClick={() => deleteAccount(a.address)} title="Delete mailbox"><Trash2 size={15} /></button></td></tr>) : <tr><td colSpan={7} className="empty">No DB-backed accounts found.</td></tr>}</tbody></table>
-          </article>
-          <article className="panel accountSummary">
-            <div className="panelHead"><h2>Storage Summary</h2><Database size={18} /></div>
-            <div className="snapshotGrid"><div><span>Accounts</span><strong>{overview?.accounts || 0}</strong></div><div><span>Folders</span><strong>{overview?.folders || 0}</strong></div><div><span>Messages</span><strong>{overview?.total_messages || 0}</strong></div><div><span>Unseen</span><strong>{overview?.unseen_messages || 0}</strong></div></div>
-          </article>
-        </section>
-        <section className="grid" id="routing" hidden={page !== 'routing'}>
-          <article className="panel">
-            <div className="panelHead"><h2>Aliases</h2><Route size={18} /></div>
-            <form className="stackForm" onSubmit={saveAlias}><input value={aliasForm.address} onChange={(e) => setAliasForm({ ...aliasForm, address: e.target.value })} placeholder="alias@example.com" /><input value={aliasForm.targets} onChange={(e) => setAliasForm({ ...aliasForm, targets: e.target.value })} placeholder="target1@example.com, target2@example.com" /><button className="button primary"><Plus size={16} />Save alias</button></form>
-            <div className="metricList">{routing.aliases.length ? routing.aliases.map((alias) => <div className="metric" key={alias.address}><span>{alias.address}</span><strong>{alias.targets.join(', ')}</strong></div>) : <div className="empty">No aliases configured.</div>}</div>
-          </article>
-          <article className="panel">
-            <div className="panelHead"><h2>Catchalls</h2><Shield size={18} /></div>
-            <form className="stackForm" onSubmit={saveCatchall}><input value={catchallForm.domain} onChange={(e) => setCatchallForm({ ...catchallForm, domain: e.target.value })} placeholder="example.com" /><input value={catchallForm.target} onChange={(e) => setCatchallForm({ ...catchallForm, target: e.target.value })} placeholder="target@example.com" /><button className="button primary"><Plus size={16} />Save catchall</button></form>
-            <div className="metricList">{routing.catchalls.length ? routing.catchalls.map((row) => <div className="metric" key={row.domain}><span>@{row.domain}</span><strong>{row.target}</strong></div>) : <div className="empty">No catchalls configured.</div>}</div>
-          </article>
-        </section>
-        <section className="grid" hidden={page !== 'delivery'}>
-          <article className="panel wide" id="queue">
-            <div className="panelHead"><h2>Outbound Queue</h2><span>{queueSummary ? `${queueSummary.queued} queued, ${queueSummary.failed} failed` : 'Loading'}</span></div>
-            <div className="queueTools"><input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="Message name or wildcard pattern" /><button className="button" onClick={() => queueAction('requeue')}><RotateCcw size={16} />Requeue</button><button className="button primary" onClick={() => queueAction('promote')}><Zap size={16} />Promote</button><button className="button danger" onClick={() => queueAction('delete')}><Trash2 size={16} />Delete</button></div>
-            <table><thead><tr><th>Message</th><th>Attempts</th><th>Priority</th><th>Next Try</th><th>Error</th></tr></thead><tbody>{queue.length ? queue.slice(0, 12).map((item) => <tr key={item.name}><td><strong>{item.name}</strong></td><td>{item.control?.attempts ?? 0}</td><td>{item.control?.priority ?? 0}</td><td>{item.control?.next_try ?? '-'}</td><td className="muted">{item.control?.last_error || '-'}</td></tr>) : <tr><td colSpan={5} className="empty">No queued outbound messages.</td></tr>}</tbody></table>
-          </article>
-          <article className="panel">
-            <div className="panelHead"><h2>DMARC</h2><Shield size={18} /></div>
-            <div className="metricList">{dmarc.length ? dmarc.map((row) => <div className="metric" key={row.domain}><span>{row.domain}</span><strong>{row.events} events</strong></div>) : <div className="empty">No unreported DMARC events.</div>}</div>
-          </article>
-        </section>
-        <section className="grid observability" hidden={page !== 'observability'}>
-          <article className="panel" id="metrics">
-            <div className="panelHead"><div><h2>Prometheus Metrics</h2><small>Latest cross-service samples</small></div><BarChart3 size={18} /></div>
-            <div className="metricList">{metrics.length ? metrics.map((line) => <div className="metric" key={line}><span>{line.split(/\s+/)[0]}</span><strong>{line.split(/\s+/).slice(1).join(' ')}</strong></div>) : <div className="empty">No metrics emitted yet.</div>}</div>
-          </article>
-          <article className="panel diagnosticCard"><div className="panelHead"><h2>Service Diagnostics</h2><Shield size={18} /></div><div className="diagnosticBody"><CheckCircle2 size={28} /><strong>{health.label}</strong><p>{health.detail}</p><span>Readiness and dependency checks are available at <code>/readyz</code>.</span></div></article>
-        </section>
-        <article className="panel" id="logs" hidden={page !== 'observability'}>
-          <div className="panelHead"><h2>Daemon Logs</h2><div className="tabs">{['smtpd', 'imapd', 'outbound', 'web'].map((name) => <button key={name} className={name === logComponent ? 'active' : ''} onClick={() => setLogComponent(name)}>{name}</button>)}</div></div>
-          <pre>{logs}</pre>
-        </article>
-        <section className="systemPage" hidden={page !== 'system'}>
-          <div className="systemHero">
-            <div><span className={`statusDot ${readiness?.ready ? 'ok' : 'error'}`} /><strong>{readiness?.ready ? 'All required dependencies ready' : 'System needs attention'}</strong><p>Readiness is evaluated by the admin daemon against the live storage, network, and security configuration.</p></div>
-            <button className="button" onClick={() => refresh()}><RefreshCw size={16} />Run checks</button>
-          </div>
-          <div className="serviceGrid">
-            {Object.entries(readiness?.checks || {}).map(([name, check]) => <article className="serviceCard" key={name}>
-              <div className={`serviceIcon ${check.status}`}><Server size={18} /></div>
-              <div><span>{name.replaceAll('_', ' ')}</span><strong>{check.status === 'ok' ? 'Operational' : check.status === 'skipped' ? 'Not configured' : 'Unavailable'}</strong><p>{check.error || (check.status === 'ok' ? 'Live check completed successfully.' : check.status === 'skipped' ? 'Optional dependency is disabled.' : 'The readiness probe reported a failure.')}</p></div>
-              <span className={`statusBadge ${check.status}`}>{check.status}</span>
-            </article>)}
-            {!readiness && <div className="empty">Waiting for readiness data.</div>}
-          </div>
-          <div className="grid systemDetails">
-            <article className="panel"><div className="panelHead"><h2>Managed services</h2><Settings size={18} /></div><div className="serviceList">{['SMTP ingress', 'IMAP access', 'Outbound delivery', 'Admin web', 'Webmail'].map((name, index) => <div key={name}><span className="serviceGlyph">{index === 0 ? <Mail size={16} /> : index === 1 ? <Database size={16} /> : index === 2 ? <Send size={16} /> : <Server size={16} />}</span><div><strong>{name}</strong><small>Managed through the shared rMail configuration</small></div><span className="pill">Configured</span></div>)}</div></article>
-            <article className="panel"><div className="panelHead"><h2>Operator endpoints</h2><HardDrive size={18} /></div><div className="endpointList"><div><code>/healthz</code><span>Process liveness</span></div><div><code>/readyz</code><span>Dependency readiness</span></div><div><code>/metrics</code><span>Prometheus telemetry</span></div><div><code>/logs</code><span>Daemon diagnostics</span></div></div></article>
-          </div>
-        </section>
-        <footer><Database size={15} /> API-backed admin UI served by rMail web daemon.</footer>
+        {page === 'overview' && <OverviewPage navigate={navigate} />}
+        {page === 'accounts' && <AccountsPage />}
+        {page === 'routing' && <RoutingPage />}
+        {page === 'delivery' && <DeliveryPage />}
+        {page === 'settings' && <SettingsPage />}
+        {page === 'observability' && <ObservabilityPage />}
+        {page === 'system' && <SystemPage session={session} onSessionChange={setSession} />}
       </section>
     </main>
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+function App() {
+  const [session, setSession] = useState<Session | null | undefined>(undefined);
+  const [error, setError] = useState('');
+
+  const loadSession = useCallback(() => {
+    api<Session>('/api/session').then(setSession).catch((err) => setError(errorMessage(err)));
+  }, []);
+
+  useEffect(() => {
+    loadSession();
+    onUnauthorized(() => setSession((current) => (current ? { ...current, authenticated: false, user: null } : current)));
+  }, [loadSession]);
+
+  if (error) return <AuthScreen title="Admin console unavailable" subtitle={error}><button className="button" onClick={() => { setError(''); loadSession(); }}>Retry</button></AuthScreen>;
+  if (session === undefined) return <div className="bootSplash">Loading…</div>;
+  if (session === null || (!session.authenticated && !session.setup_required)) return <LoginScreen onLogin={setSession} />;
+  if (session.setup_required) return <SetupScreen session={session} onDone={setSession} />;
+  return <Console session={session} setSession={(next) => (next ? setSession(next) : setSession({ ...session, authenticated: false, user: null }))} />;
+}
+
+createRoot(document.getElementById('root')!).render(<FeedbackProvider><App /></FeedbackProvider>);

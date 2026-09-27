@@ -98,6 +98,26 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Show or change database-managed settings (the same ones the admin UI edits)
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
+    /// Set the admin console username and password
+    AdminPassword {
+        /// Admin username
+        #[arg(long, default_value = "admin")]
+        user: String,
+        /// Password; read from standard input when omitted
+        #[arg(long)]
+        password: Option<String>,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Control rMail systemd services
     Service {
         #[command(subcommand)]
@@ -124,6 +144,18 @@ enum Commands {
         #[arg(long, default_value_t = 500)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// List every setting with its stored value or default
+    List,
+    /// Print one setting as JSON
+    Get { key: String },
+    /// Store a setting. VALUE is JSON (e.g. 42, true, ["[::]:25"]) or plain text
+    Set { key: String, value: String },
+    /// Remove a stored setting so its default applies
+    Unset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -164,6 +196,64 @@ async fn main() -> Result<()> {
                 .to_string();
             println!("{}", ph);
         }
+        Commands::Settings { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db_path = cfg.global.db_path.clone().ok_or_else(|| {
+                anyhow::anyhow!("{cfg_path} has no db_path; settings are file-only")
+            })?;
+            let mut conn = rmail_common::settings::open(&db_path)?;
+            run_settings(&mut conn, action)?;
+        }
+        Commands::AdminPassword {
+            user,
+            password,
+            config,
+        } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db_path = cfg.global.db_path.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{cfg_path} has no db_path; set web_admin_password_hash in the file"
+                )
+            })?;
+            let password = match password {
+                Some(password) => password,
+                None => {
+                    eprint!("New admin password: ");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            if password.chars().count() < 10 {
+                anyhow::bail!("admin password must be at least 10 characters");
+            }
+            let salt = SaltString::generate(&mut OsRng);
+            let hash = Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .to_string();
+            let mut conn = rmail_common::settings::open(&db_path)?;
+            rmail_common::settings::write_raw(
+                &mut conn,
+                &std::collections::BTreeMap::from([
+                    (
+                        "global.web_admin_user".to_string(),
+                        Some(serde_json::Value::from(user.trim())),
+                    ),
+                    (
+                        "global.web_admin_password_hash".to_string(),
+                        Some(serde_json::Value::from(hash)),
+                    ),
+                ]),
+            )?;
+            println!("Admin credentials updated for {}", user.trim());
+        }
         Commands::InitDb { db_path, config } => {
             let dbp = if let Some(p) = db_path {
                 p
@@ -172,7 +262,7 @@ async fn main() -> Result<()> {
                     std::env::var("RMAIL_CONFIG")
                         .unwrap_or_else(|_| "config/example.toml".to_string())
                 });
-                let cfg = Config::from_file(&cfg_path)?;
+                let cfg = Config::load(&cfg_path)?;
                 cfg.global
                     .db_path
                     .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
@@ -191,7 +281,7 @@ async fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
-            let cfg = Config::from_file(&cfg_path)?;
+            let cfg = Config::load(&cfg_path)?;
             // determine password_hash: either provided precomputed, or hash the plaintext password
             // Also generate a SCRAM verifier if a plaintext password was provided so SCRAM-SHA-256 can be used.
             let (ph, scram_json) = if let Some(h) = password_hash {
@@ -268,7 +358,7 @@ async fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
-            let cfg = Config::from_file(&cfg_path)?;
+            let cfg = Config::load(&cfg_path)?;
             if let Some(dbp) = cfg.global.db_path.as_ref() {
                 // list from DB
                 for m in rmail_common::db::list_mailboxes(dbp)? {
@@ -313,7 +403,7 @@ async fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
-            let cfg = Config::from_file(&cfg_path)?;
+            let cfg = Config::load(&cfg_path)?;
             let dbp = cfg
                 .global
                 .db_path
@@ -445,7 +535,7 @@ async fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
-            let cfg = Config::from_file(&cfg_path)?;
+            let cfg = Config::load(&cfg_path)?;
             let acme_dir = cfg.global.acme_challenge_dir.clone().ok_or_else(|| {
                 anyhow::anyhow!("No acme_challenge_dir configured in global config")
             })?;
@@ -527,7 +617,7 @@ async fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
-            let cfg = Config::from_file(&cfg_path)?;
+            let cfg = Config::load(&cfg_path)?;
             println!("Running certbot renew...");
             let mut cmd = Command::new("certbot");
             cmd.arg("renew").arg("--non-interactive");
@@ -730,6 +820,78 @@ fn run_systemctl(action: &str, unit: &str, dry_run: bool) -> Result<()> {
             "systemctl {action} {unit} exited with {status}"
         ))
     }
+}
+
+fn run_settings(
+    conn: &mut rmail_common::settings::Connection,
+    action: SettingsAction,
+) -> Result<()> {
+    use rmail_common::settings;
+    match action {
+        SettingsAction::List => {
+            let view = settings::describe(conn)?;
+            println!("settings revision {}", view.revision);
+            for group in view.groups {
+                println!("\n[{}]", group.label);
+                for setting in view.settings.iter().filter(|s| s.spec.group == group.id) {
+                    let shown = match (&setting.value, setting.is_set) {
+                        (Some(value), _) => value.to_string(),
+                        (None, true) => "<secret set>".to_string(),
+                        (None, false) => match &setting.default {
+                            Some(default) => format!("{default} (default)"),
+                            None => "(unset)".to_string(),
+                        },
+                    };
+                    println!("  {:<48} {}", setting.spec.key, shown);
+                }
+            }
+            if !view.other.is_empty() {
+                println!("\n[Other stored keys]");
+                for other in &view.other {
+                    println!("  {:<48} {}", other.key, other.value);
+                }
+            }
+            for service in &view.services {
+                if service.restart_required {
+                    println!(
+                        "\nrestart {} to apply: {}",
+                        service.service,
+                        service.pending_changes.join(", ")
+                    );
+                }
+            }
+        }
+        SettingsAction::Get { key } => {
+            if settings::RESERVED_KEYS.contains(&key.as_str())
+                || key.starts_with(settings::INTERNAL_PREFIX)
+                || settings::spec_for(&key)
+                    .is_some_and(|spec| matches!(spec.kind, settings::SettingKind::Secret))
+            {
+                anyhow::bail!("{key} is write-only");
+            }
+            match settings::get(conn, &key)? {
+                Some(value) => println!("{value}"),
+                None => println!("null"),
+            }
+        }
+        SettingsAction::Set { key, value } => {
+            let parsed = serde_json::from_str(&value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
+            let revision = settings::update(
+                conn,
+                &std::collections::BTreeMap::from([(key.clone(), parsed)]),
+            )?;
+            println!("{key} updated (revision {revision}); restart affected services to apply");
+        }
+        SettingsAction::Unset { key } => {
+            let revision = settings::update(
+                conn,
+                &std::collections::BTreeMap::from([(key.clone(), serde_json::Value::Null)]),
+            )?;
+            println!("{key} reset to default (revision {revision})");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

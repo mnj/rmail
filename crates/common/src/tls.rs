@@ -198,14 +198,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let empty = temp.path().join("empty.der");
         File::create(&empty).unwrap();
-        let cert_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.crt"
-        );
-        let key_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.key"
-        );
+        let (cert_path, key_path) = crate::test_support::localhost_cert();
         assert!(load_server_tls_material(cert_path, key_path, empty.to_str()).is_err());
 
         let oversized = temp.path().join("oversized.der");

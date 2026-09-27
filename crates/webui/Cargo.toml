@@ -4,7 +4,7 @@ version = "0.8.11"
 edition = "2024"
 
 [dependencies]
-# Minimal tokio-based HTTP server (no hyper/axum to avoid feature conflicts in this environment)
+# Minimal tokio-based HTTP server; request parsing lives in rmail_common::http
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -15,6 +15,8 @@ argon2 = "0.5"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls-pemfile = "1.0"
+sha2 = "0.10"
 
 [dev-dependencies]
+rmail_common = { path = "../common", features = ["insecure-plaintext-passwords"] }
 tempfile = "3.5"

@@ -1,15 +1,23 @@
 # Example rMail configuration (TOML)
+#
+# With `db_path` set, this file only needs `mail_root` and `db_path`. On the
+# first start every other value below is imported once into the settings
+# database; from then on settings are edited in the admin console (Settings
+# page) or with `rmail_ctl settings`, and values left here are ignored (a
+# warning lists any that differ from the database).
 [global]
 mail_root = "mail"
-# Set this to a long random value in production.
+# Optional: when unset, a random webmail session key is generated and kept in
+# the settings database.
 # webmail_session_secret = "replace-with-at-least-32-random-bytes"
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "info"
-# optional web admin user (for /stats and /logs endpoints)
-web_admin_user = "admin"
-# generate a hash using rmail_ctl hash and paste here
-web_admin_password_hash = "argon2$PLACEHOLDER"
+# Admin console credentials. Prefer `rmail_ctl admin-password`, which stores
+# them in the settings database. Without credentials the console only starts
+# on loopback addresses, where the first visitor creates the admin account.
+# web_admin_user = "admin"
+# web_admin_password_hash = "$argon2id$..."   # from `rmail_ctl hash`
 # optional SQLite DB for mailboxes and catchalls (preferred for production)
 db_path = "config/rmail.db"
 # directory used to serve ACME http-01 challenges (used by automated cert managers)

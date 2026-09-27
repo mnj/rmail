@@ -162,7 +162,7 @@ fn cmd_alias_add(_root: &PathBuf, address: &str, targets: &Vec<String>) -> Resul
     // Use RMAIL_CONFIG or fall back to config/example.toml
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path)?;
+    let cfg = Config::load(&cfg_path)?;
     let dbp = cfg
         .global
         .db_path
@@ -179,7 +179,7 @@ fn cmd_alias_add(_root: &PathBuf, address: &str, targets: &Vec<String>) -> Resul
 fn cmd_alias_remove(_root: &PathBuf, address: &str) -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path)?;
+    let cfg = Config::load(&cfg_path)?;
     let dbp = cfg
         .global
         .db_path
@@ -195,7 +195,7 @@ fn cmd_alias_remove(_root: &PathBuf, address: &str) -> Result<()> {
 fn cmd_alias_list(_root: &PathBuf) -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path)?;
+    let cfg = Config::load(&cfg_path)?;
     let dbp = cfg
         .global
         .db_path

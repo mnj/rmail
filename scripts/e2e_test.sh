@@ -13,8 +13,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ensure a clean maildir
+# ensure a clean maildir and account database
 rm -rf mail_test
+rm -f config/rmail_test.db
+./target/debug/rmail_ctl init-db --config config/test.toml
+./target/debug/rmail_ctl add-mailbox user@example.local --password password --config config/test.toml
 
 # start services using prebuilt binaries to avoid compile delays
 ./target/debug/rmail_smtpd > /tmp/rmail_smtpd.log 2>&1 & echo $! > /tmp/rmail_smtpd.pid

@@ -60,19 +60,6 @@ macro_rules! eprintln {
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized> AsyncStream for T {}
 
-// Simple in-memory rate-limiter for authentication failures keyed by remote IP. This is a
-// best-effort defensive measure against brute-force attacks. It is intentionally lightweight
-// and uses an in-process Mutex-protected HashMap. For multi-process deployments a shared
-// store (Redis, etc.) should be used instead.
-#[derive(Clone)]
-struct AuthFailInfo {
-    count: u32,
-    first: Instant,
-    locked_until: Option<Instant>,
-}
-
-static AUTH_FAILS: Lazy<Mutex<HashMap<IpAddr, AuthFailInfo>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 static SUBMISSION_MESSAGES: Lazy<Mutex<HashMap<String, VecDeque<Instant>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CONNECTION_ATTEMPTS: Lazy<Mutex<HashMap<IpAddr, VecDeque<Instant>>>> =
@@ -330,44 +317,24 @@ async fn increment_delivery_counter(mail_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Check whether the remote IP is currently blocked from authenticating. Returns remaining block Duration if blocked.
+// In-process brute-force protection keyed by client address (IPv6 by /64).
+static AUTH_THROTTLE: Lazy<rmail_common::throttle::AuthThrottle> =
+    Lazy::new(rmail_common::throttle::AuthThrottle::default);
+
+/// Remaining authentication lockout for the client, if any.
 fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
-    let m = AUTH_FAILS.lock().unwrap();
-    if let Some(info) = m.get(&ip)
-        && let Some(until) = info.locked_until
-    {
-        let now = Instant::now();
-        if until > now {
-            return Some(until - now);
-        }
-    }
-    None
+    AUTH_THROTTLE.blocked_for(ip)
 }
 
-/// Record a failed auth attempt for the IP and apply a temporary lockout if threshold exceeded.
+/// Record a failed authentication; repeated failures lock the client out.
 fn record_auth_failure(ip: IpAddr) {
-    let mut m = AUTH_FAILS.lock().unwrap();
-    let now = Instant::now();
-    let entry = m.entry(ip).or_insert(AuthFailInfo {
-        count: 0,
-        first: now,
-        locked_until: None,
-    });
-    entry.count = entry.count.saturating_add(1);
-    // Increment global metric for monitoring
     rmail_common::metrics::inc_auth_failures();
-    // if 5 failures within short window, lock for 30 minutes
-    if entry.count >= 5 {
-        entry.locked_until = Some(now + Duration::from_secs(30 * 60));
-        entry.count = 0;
-        entry.first = now;
-    }
+    AUTH_THROTTLE.record_failure(ip);
 }
 
-/// Reset any recorded failures for this IP (on successful authentication)
+/// Clear recorded failures after a successful authentication.
 fn reset_auth_failures(ip: IpAddr) {
-    let mut m = AUTH_FAILS.lock().unwrap();
-    m.remove(&ip);
+    AUTH_THROTTLE.reset(ip);
 }
 
 fn submission_quota_available(user: &str, limit: usize) -> bool {
@@ -427,7 +394,10 @@ async fn main() -> Result<()> {
     // load config (example path)
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
+    let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
+    if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
+        eprintln!("rmail: could not record smtpd start in the settings database: {error:#}");
+    }
 
     let mail_root = cfg.global.mail_root.clone();
     rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "smtpd")
@@ -3772,9 +3742,11 @@ mod tests {
             "{responses:?}"
         );
         let queue = td.path().join("mail/outbound/maildrop/queue");
+        // The spool also holds a .eml.json control sidecar; directory order is unspecified.
         let queued = std::fs::read_dir(queue)
             .unwrap()
-            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().is_some_and(|ext| ext == "eml"))
             .expect("forwarded queue entry");
         let message = std::fs::read_to_string(queued).unwrap();
         assert_eq!(message.matches("ARC-Seal: i=1;").count(), 1, "{message}");
@@ -4195,14 +4167,7 @@ mod tests {
         }
 
         let (_td, mail_root, db_path) = setup_mailbox();
-        let cert_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.crt"
-        );
-        let key_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.key"
-        );
+        let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
         let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
         let certificate_pem = std::fs::read(cert_path).expect("certificate");
         let certificates =

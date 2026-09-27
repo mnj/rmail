@@ -4,9 +4,8 @@ mail_root = "mail_test"
 tls_cert = "config/certs/localhost.crt"
 tls_key = "config/certs/localhost.key"
 log_level = "debug"
-# optional web admin user for local testing
-web_admin_user = "admin"
-web_admin_password_hash = "plain:password"
+# No admin credentials: the loopback-only admin console starts in first-run
+# setup mode. Use `rmail_ctl admin-password --config config/test.toml` to set them.
 # local test DB path for mailboxes/catchalls
 db_path = "config/rmail_test.db"
 # ACME challenge dir for local testing (empty by default)

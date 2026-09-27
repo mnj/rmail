@@ -20,6 +20,7 @@ rustls-pemfile = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
+rmail_common = { path = "../common", features = ["insecure-plaintext-passwords", "test-support"] }
 tempfile = "3.5"
 hmac = "0.12"
 pbkdf2 = "0.12"

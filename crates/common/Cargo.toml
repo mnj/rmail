@@ -36,8 +36,16 @@ libc = "0.2"
 socket2 = "0.6"
 tokio-rustls = "0.23"
 rustls-pemfile = "1.0"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+
+[features]
+# Accept "plain:<password>" hashes. Test fixtures only; never enable in release builds.
+insecure-plaintext-passwords = []
+# Helpers for other crates' tests, e.g. a generated localhost certificate.
+test-support = ["dep:rcgen"]
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3.5"
 criterion = { version = "0.5", default-features = false }
 

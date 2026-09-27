@@ -8,6 +8,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod http;
 pub mod imap_state;
 pub mod mail_auth;
 pub mod maildir;
@@ -17,10 +18,15 @@ pub mod oauth;
 pub mod outbound;
 pub mod runtime;
 pub mod scanner;
+pub mod settings;
 pub mod sqlite_pool;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub mod throttle;
 pub mod tls;
 pub mod tracking;
 pub mod transport;
+pub mod websession;
 
 #[doc(hidden)]
 pub use serde_json;

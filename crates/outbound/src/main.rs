@@ -223,10 +223,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&failed_dir).await?;
     let tracking_config = match std::env::var("RMAIL_CONFIG") {
         Ok(path) => {
-            rmail_common::config::Config::from_file(&path)
-                .with_context(|| format!("loading tracking configuration from {path}"))?
-                .global
-                .tracking
+            let cfg = rmail_common::config::Config::load(&path)
+                .with_context(|| format!("loading configuration from {path}"))?;
+            if let Err(error) = rmail_common::settings::record_service_start(&cfg, "outbound") {
+                eprintln!(
+                    "rmail: could not record outbound start in the settings database: {error:#}"
+                );
+            }
+            cfg.global.tracking
         }
         Err(_) => rmail_common::config::TrackingConfig::default(),
     };

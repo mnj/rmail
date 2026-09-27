@@ -1,28 +1,25 @@
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use base64::Engine;
 use percent_encoding::percent_decode_str;
 use rmail_common::{
-    auth, config::Config, db, imap_state, net::bind_tcp_listener_with_config,
-    runtime::GracefulShutdown, tracking::new_tracking_id,
+    auth, config::Config, db, http::HttpLimits, imap_state, net::bind_tcp_listener_with_config,
+    runtime::GracefulShutdown, throttle::AuthThrottle, tracking::new_tracking_id, websession,
 };
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::{
-    collections::HashMap,
-    env, fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, env, fs, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinSet,
 };
 
-type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE: &str = "rmail_webmail";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+/// State-changing requests must carry this header; browsers cannot add it to
+/// cross-site form posts.
+const CSRF_HEADER: &str = "x-rmail-webmail";
+/// Policy for the web app itself. Message HTML is rendered in a sandboxed
+/// srcdoc iframe that inherits this policy and adds its own, stricter one.
+const APP_CSP: &str = "default-src 'self'; img-src * data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src 'self' about:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 
 macro_rules! webmail_log {
     ($level:expr, $event:expr, $fields:tt) => {
@@ -30,12 +27,14 @@ macro_rules! webmail_log {
     };
 }
 
-#[derive(Clone)]
 struct AppState {
     mail_root: PathBuf,
     db_path: PathBuf,
     static_dir: PathBuf,
     session_secret: Vec<u8>,
+    secure_cookies: bool,
+    throttle: AuthThrottle,
+    revoked: websession::RevocationList,
 }
 
 #[derive(Debug)]
@@ -45,6 +44,7 @@ struct Request {
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    peer: Option<IpAddr>,
 }
 
 #[derive(Debug)]
@@ -116,43 +116,15 @@ struct MessageDetail {
     date: String,
     text_body: String,
     html_body: Option<String>,
+    /// The HTML references remote images or styles, which are blocked unless
+    /// the reader asks for them (`?remote_content=1`) to prevent tracking.
+    has_remote_content: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg_path = env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path).unwrap_or_else(|_| Config {
-        global: rmail_common::config::Global {
-            tracking: rmail_common::config::TrackingConfig::default(),
-            mail_root: "mail".to_string(),
-            tcp_listener: rmail_common::net::TcpListenerConfig::default(),
-            listeners: rmail_common::config::ListenerEndpoints::default(),
-            listen_addrs: None,
-            smtps_listen_addrs: None,
-            smtps_port: None,
-            submission_port: None,
-            submission_listen_addrs: None,
-            imaps_listen_addrs: None,
-            imaps_port: None,
-            imap_listen_addrs: None,
-            imap_port: None,
-            web_listen_addrs: None,
-            web_port: None,
-            webmail_listen_addrs: None,
-            webmail_port: None,
-            webmail_session_secret: None,
-            tls_cert: None,
-            tls_key: None,
-            tls: rmail_common::config::TlsPolicy::default(),
-            log_level: None,
-            db_path: None,
-            web_admin_user: None,
-            web_admin_password_hash: None,
-            acme_challenge_dir: None,
-            enforce_dmarc: None,
-        },
-        security: rmail_common::config::SecurityConfig::default(),
-    });
+    let cfg = Config::load(&cfg_path).with_context(|| format!("loading {cfg_path}"))?;
     let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "webmail")
         .context("redirecting logs")?;
@@ -162,26 +134,39 @@ async fn main() -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| mail_root.join("rmail.sqlite"));
-    let session_secret = cfg
-        .global
-        .webmail_session_secret
-        .clone()
-        .unwrap_or_else(|| {
-            webmail_log!("warn", "ephemeral_session_secret", { "reason": "webmail_session_secret is not configured" });
-            format!("ephemeral-{}", randish())
-        })
-        .into_bytes();
+    if let Err(error) = rmail_common::settings::record_service_start(&cfg, "webmail") {
+        webmail_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
+    }
+    let session_secret = match (&cfg.global.webmail_session_secret, &cfg.global.db_path) {
+        (Some(secret), _) => secret.clone(),
+        // Persist a generated key so sessions survive restarts.
+        (None, Some(db_path)) => {
+            let mut conn = rmail_common::settings::open(db_path)?;
+            rmail_common::settings::internal_secret(&mut conn, "webmail_session_key")?
+        }
+        (None, None) => {
+            webmail_log!("warn", "ephemeral_session_secret", { "reason": "no database or webmail_session_secret; sessions end on restart" });
+            let mut bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+    }
+    .into_bytes();
     let static_dir = env::var("RMAIL_WEBMAIL_STATIC_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/usr/share/rmail/webmail"));
+    let bind_addrs = cfg.global.webmail_listeners();
+    let tls = rmail_common::tls::web_tls_channel(&cfg.global)?;
+    let secure_cookies = tls.1.borrow().is_some() || cfg.global.tls.web_http_only;
     let state = Arc::new(AppState {
         mail_root,
         db_path,
         static_dir,
         session_secret,
+        secure_cookies,
+        throttle: AuthThrottle::default(),
+        revoked: websession::RevocationList::default(),
     });
-    let bind_addrs = cfg.global.webmail_listeners();
-    let tls = rmail_common::tls::web_tls_channel(&cfg.global)?;
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
         cfg.global.tls_cert.clone(),
@@ -216,9 +201,10 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             let _session = session;
                             let result = if let Some(context) = tls_context {
-                                match context.acceptor.accept(stream).await {
-                                    Ok(stream) => handle_connection(stream, state, Some(peer.to_string())).await,
-                                    Err(error) => Err(error.into()),
+                                match tokio::time::timeout(Duration::from_secs(15), context.acceptor.accept(stream)).await {
+                                    Ok(Ok(stream)) => handle_connection(stream, state, Some(peer.to_string())).await,
+                                    Ok(Err(error)) => Err(error.into()),
+                                    Err(_) => Err(anyhow::anyhow!("TLS handshake timed out")),
                                 }
                             } else {
                                 handle_connection(stream, state, Some(peer.to_string())).await
@@ -259,88 +245,63 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request_id = new_tracking_id("webmail-http");
-    let request = read_request(&mut stream).await?;
-    let method = request.as_ref().map(|request| request.method.clone());
-    let path = request.as_ref().map(|request| request.path.clone());
-    let response = match request {
-        Some(request) => route(request, &state).await,
-        None => Response::empty(400),
+    let response = match rmail_common::http::read_request(&mut stream, HttpLimits::default()).await
+    {
+        Ok(raw) => {
+            let (path, query) = split_target(&raw.target);
+            let request = Request {
+                method: raw.method,
+                path,
+                query,
+                headers: raw.headers,
+                body: raw.body,
+                peer: peer.as_deref().and_then(peer_ip),
+            };
+            let method = request.method.clone();
+            let path = request.path.clone();
+            let response = route(request, &state).await;
+            webmail_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method, "path": path, "status": response.status, "response_bytes": response.body.len() });
+            response
+        }
+        Err(error) => match error.status() {
+            Some(status) => Response::empty(status),
+            None => return Ok(()),
+        },
     };
-    webmail_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method, "path": path, "status": response.status, "response_bytes": response.body.len() });
-    write_response(&mut stream, response).await
+    write_response(&mut stream, response).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
-async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<Request>> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    let header_end;
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
-            header_end = pos + 4;
-            break;
-        }
-        if buf.len() > 1024 * 1024 {
-            return Ok(None);
-        }
-    }
-    let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let mut lines = header_text.lines();
-    let Some(start) = lines.next() else {
-        return Ok(None);
-    };
-    let mut parts = start.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or_default();
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-    let content_length = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let body = buf[header_end..buf.len().min(header_end + content_length)].to_vec();
-    let (raw_path, query) = split_target(target);
-    Ok(Some(Request {
-        method,
-        path: raw_path,
-        query,
-        headers,
-        body,
-    }))
+fn peer_ip(peer: &str) -> Option<IpAddr> {
+    peer.parse::<std::net::SocketAddr>()
+        .map(|address| address.ip())
+        .ok()
 }
 
 async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, response: Response) -> Result<()> {
-    let reason = match response.status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Internal Server Error",
-    };
     let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nX-Content-Type-Options: nosniff\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\
+         X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n",
         response.status,
-        reason,
+        rmail_common::http::reason_phrase(response.status),
         response.body.len(),
         response.content_type
     );
+    if !response
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+    {
+        head.push_str("Cache-Control: no-store\r\n");
+    }
+    if !response
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-security-policy"))
+    {
+        head.push_str(&format!("Content-Security-Policy: {APP_CSP}\r\n"));
+    }
     for (k, v) in response.headers {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -351,12 +312,25 @@ async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, response: Respons
 }
 
 async fn route(request: Request, state: &AppState) -> Response {
+    if request.path.starts_with("/api/")
+        && !matches!(request.method.as_str(), "GET" | "HEAD")
+        && !request.headers.contains_key(CSRF_HEADER)
+    {
+        return Response::text(403, "missing CSRF header");
+    }
     match (request.method.as_str(), request.path.as_str()) {
-        ("POST", "/api/login") => login(request, state),
-        ("POST", "/api/logout") => Response::empty(204).with_header(
-            "Set-Cookie",
-            format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
-        ),
+        ("POST", "/api/login") => login(request, state).await,
+        ("POST", "/api/logout") => {
+            if let Some(token) = session_token(&request)
+                && let Some(session) = websession::verify(&state.session_secret, token)
+            {
+                state.revoked.revoke(token, session.expires_at);
+            }
+            Response::empty(204).with_header(
+                "Set-Cookie",
+                websession::set_cookie(SESSION_COOKIE, "", 0, state.secure_cookies, "Strict"),
+            )
+        }
         ("GET", "/api/session") => match require_session(&request, state) {
             Ok(session) => json(
                 200,
@@ -376,33 +350,68 @@ async fn route(request: Request, state: &AppState) -> Response {
     }
 }
 
-fn login(request: Request, state: &AppState) -> Response {
+async fn login(request: Request, state: &AppState) -> Response {
     let Ok(input) = serde_json::from_slice::<LoginRequest>(&request.body) else {
         return Response::text(400, "invalid json");
     };
-    let address = input.address.trim().to_ascii_lowercase();
+    if let Some(remaining) = request.peer.and_then(|ip| state.throttle.blocked_for(ip)) {
+        return Response::text(
+            429,
+            &format!(
+                "too many failed sign-in attempts; try again in {} minutes",
+                remaining.as_secs().div_ceil(60)
+            ),
+        )
+        .with_header("Retry-After", remaining.as_secs().to_string());
+    }
+    let address = auth::saslprep(input.address.trim()).to_ascii_lowercase();
+    let reject = |state: &AppState| {
+        if let Some(ip) = request.peer {
+            state.throttle.record_failure(ip);
+        }
+        rmail_common::metrics::inc_auth_failures();
+        Response::text(401, "invalid login")
+    };
     let Some((localpart, domain)) = split_address(&address) else {
-        return Response::text(401, "invalid login");
+        auth::burn_password_verification(input.password).await;
+        return reject(state);
     };
-    let mailbox = match db::get_mailbox(&state.db_path, &address) {
-        Ok(Some(mailbox)) => mailbox,
-        _ => return Response::text(401, "invalid login"),
+    let db_path = state.db_path.clone();
+    let lookup = address.clone();
+    let mailbox = tokio::task::spawn_blocking(move || db::get_mailbox(&db_path, &lookup)).await;
+    let Ok(Ok(Some(mailbox))) = mailbox else {
+        auth::burn_password_verification(input.password).await;
+        return reject(state);
     };
-    let Some(hash) = mailbox.password_hash.as_deref() else {
-        return Response::text(401, "invalid login");
+    let Some(hash) = mailbox.password_hash else {
+        auth::burn_password_verification(input.password).await;
+        return reject(state);
     };
-    match auth::verify_password(&input.password, hash) {
+    match auth::verify_password_async(input.password, hash.clone()).await {
         Ok(true) => {
-            let _ = imap_state::init_account(&state.mail_root, &domain, &localpart);
-            let token = sign_session(&state.session_secret, &address);
+            if let Some(ip) = request.peer {
+                state.throttle.reset(ip);
+            }
+            let mail_root = state.mail_root.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                imap_state::init_account(&mail_root, &domain, &localpart)
+            })
+            .await;
+            let binding = websession::credential_binding(&state.session_secret, &hash);
+            let token =
+                websession::sign(&state.session_secret, &address, &binding, SESSION_TTL_SECS);
             json(200, &SessionResponse { address }).with_header(
                 "Set-Cookie",
-                format!(
-                    "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECS}"
+                websession::set_cookie(
+                    SESSION_COOKIE,
+                    &token,
+                    SESSION_TTL_SECS,
+                    state.secure_cookies,
+                    "Strict",
                 ),
             )
         }
-        _ => Response::text(401, "invalid login"),
+        _ => reject(state),
     }
 }
 
@@ -422,7 +431,13 @@ fn mailbox_api(request: Request, state: &AppState) -> Response {
         ("GET", [_, "messages", uid]) => uid
             .parse::<u64>()
             .ok()
-            .map(|uid| message_detail(state, &session, &folder, uid))
+            .map(|uid| {
+                let remote = request
+                    .query
+                    .get("remote_content")
+                    .is_some_and(|v| v == "1");
+                message_detail(state, &session, &folder, uid, remote)
+            })
             .unwrap_or_else(|| Response::empty(404)),
         ("PATCH", [_, "messages", uid]) => uid
             .parse::<u64>()
@@ -508,7 +523,13 @@ fn message_list(
     json(200, &items)
 }
 
-fn message_detail(state: &AppState, session: &Session, folder: &str, uid: u64) -> Response {
+fn message_detail(
+    state: &AppState,
+    session: &Session,
+    folder: &str,
+    uid: u64,
+    allow_remote_content: bool,
+) -> Response {
     let Ok((_folder, messages)) = imap_state::load_folder(
         &state.mail_root,
         &session.domain,
@@ -536,7 +557,10 @@ fn message_detail(state: &AppState, session: &Session, folder: &str, uid: u64) -
             subject: parsed.subject,
             date: parsed.date,
             text_body: parsed.text_body,
-            html_body: parsed.html_body.map(|html| sanitize_email_html(&html)),
+            has_remote_content: parsed.html_body.as_deref().is_some_and(has_remote_content),
+            html_body: parsed
+                .html_body
+                .map(|html| sanitize_email_html(&html, allow_remote_content)),
         },
     )
 }
@@ -640,59 +664,53 @@ fn update_seen(
     Ok(())
 }
 
+fn session_token(request: &Request) -> Option<&str> {
+    request
+        .headers
+        .get("cookie")
+        .and_then(|cookie| websession::cookie_value(cookie, SESSION_COOKIE))
+}
+
 fn require_session(request: &Request, state: &AppState) -> std::result::Result<Session, Response> {
-    let Some(cookie) = request.headers.get("cookie") else {
+    let Some(token) = session_token(request) else {
         return Err(Response::empty(401));
     };
-    let Some(token) = cookie.split(';').find_map(|part| {
-        let (k, v) = part.trim().split_once('=')?;
-        (k == SESSION_COOKIE).then_some(v)
-    }) else {
+    if state.revoked.is_revoked(token) {
+        return Err(Response::empty(401));
+    }
+    let Some(session) = websession::verify(&state.session_secret, token) else {
         return Err(Response::empty(401));
     };
-    let Some(address) = verify_session(&state.session_secret, token) else {
-        return Err(Response::empty(401));
-    };
+    let address = session.subject;
     let Some((localpart, domain)) = split_address(&address) else {
         return Err(Response::empty(401));
     };
+    // The session is bound to the password hash at login time, so a password
+    // change or account removal ends it.
     match db::get_mailbox(&state.db_path, &address) {
-        Ok(Some(_)) => Ok(Session {
-            address,
-            domain,
-            localpart,
-        }),
+        Ok(Some(mailbox))
+            if mailbox.password_hash.as_deref().is_some_and(|hash| {
+                websession::credential_binding(&state.session_secret, hash) == session.binding
+            }) =>
+        {
+            Ok(Session {
+                address,
+                domain,
+                localpart,
+            })
+        }
         _ => Err(Response::empty(401)),
     }
 }
 
-fn sign_session(secret: &[u8], address: &str) -> String {
-    let exp = now_secs() + SESSION_TTL_SECS;
-    let payload = format!("{address}|{exp}");
-    let sig = hmac(secret, payload.as_bytes());
-    format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(payload.as_bytes()),
-        URL_SAFE_NO_PAD.encode(sig)
-    )
-}
-
-fn verify_session(secret: &[u8], token: &str) -> Option<String> {
-    let (payload64, sig64) = token.split_once('.')?;
-    let payload = URL_SAFE_NO_PAD.decode(payload64).ok()?;
-    let sig = URL_SAFE_NO_PAD.decode(sig64).ok()?;
-    if hmac(secret, &payload).as_slice() != sig.as_slice() {
-        return None;
-    }
-    let payload = String::from_utf8(payload).ok()?;
-    let (address, exp) = payload.rsplit_once('|')?;
-    (exp.parse::<u64>().ok()? >= now_secs()).then(|| address.to_string())
-}
-
-fn hmac(secret: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(payload);
-    mac.finalize().into_bytes().to_vec()
+#[cfg(test)]
+fn sign_session(state: &AppState, address: &str) -> String {
+    let hash = db::get_mailbox(&state.db_path, address)
+        .unwrap()
+        .and_then(|mailbox| mailbox.password_hash)
+        .unwrap();
+    let binding = websession::credential_binding(&state.session_secret, &hash);
+    websession::sign(&state.session_secret, address, &binding, SESSION_TTL_SECS)
 }
 
 #[derive(Default)]
@@ -1061,7 +1079,37 @@ fn remove_html_comments(input: &str) -> String {
     out
 }
 
-fn sanitize_email_html(input: &str) -> String {
+fn has_remote_content(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    [
+        "src=\"http",
+        "src='http",
+        "src=http",
+        "src=\"//",
+        "src='//",
+        "url(http",
+        "url('http",
+        "url(\"http",
+        "url(//",
+        "background=\"http",
+        "srcset=\"http",
+        "@import",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Content policy for a rendered message. Remote images, fonts and styles are
+/// blocked by default so opening a message cannot be tracked.
+fn message_csp(allow_remote_content: bool) -> &'static str {
+    if allow_remote_content {
+        "default-src 'none'; img-src data: cid: https: http:; style-src 'unsafe-inline' https: http:; font-src data: https: http:"
+    } else {
+        "default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; font-src data:"
+    }
+}
+
+fn sanitize_email_html(input: &str, allow_remote_content: bool) -> String {
     let input = remove_html_block(input, "script");
     let input = remove_html_block(&input, "iframe");
     let input = remove_html_block(&input, "object");
@@ -1081,7 +1129,8 @@ fn sanitize_email_html(input: &str) -> String {
     }
     out.push_str(rest);
     format!(
-        r#"<!doctype html><html><head><base target="_blank"><style>html,body{{margin:0;padding:0;background:#fff;color:#222831;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}}img{{max-width:100%;height:auto}}table{{max-width:100%;border-collapse:collapse}}a{{color:#276ef1}}</style></head><body>{}</body></html>"#,
+        r#"<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="{}"><base target="_blank"><style>html,body{{margin:0;padding:0;background:#fff;color:#222831;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}}img{{max-width:100%;height:auto}}table{{max-width:100%;border-collapse:collapse}}a{{color:#276ef1}}</style></head><body>{}</body></html>"#,
+        message_csp(allow_remote_content),
         out
     )
 }
@@ -1191,31 +1240,12 @@ fn decode_path(value: &str) -> String {
     percent_decode_str(value).decode_utf8_lossy().to_string()
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 fn html_unescape(input: &str) -> String {
     input
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&amp;", "&")
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn randish() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ u64::from(std::process::id())
 }
 
 fn static_spa(path: &str, state: &AppState) -> Response {
@@ -1273,7 +1303,18 @@ fn embedded_spa() -> Response {
     Response {
         status: 200,
         content_type: "text/html; charset=utf-8",
-        headers: vec![("Cache-Control".to_string(), "no-cache".to_string())],
+        headers: vec![
+            ("Cache-Control".to_string(), "no-cache".to_string()),
+            // The built-in fallback page carries its script inline.
+            (
+                "Content-Security-Policy".to_string(),
+                APP_CSP.replacen(
+                    "default-src 'self'",
+                    "default-src 'self'; script-src 'self' 'unsafe-inline'",
+                    1,
+                ),
+            ),
+        ],
         body: EMBEDDED_SPA.as_bytes().to_vec(),
     }
 }
@@ -1299,7 +1340,7 @@ const EMBEDDED_SPA: &str = r#"<!doctype html>
   </head>
   <body><div id="root" class="login"></div><script>
     const root=document.getElementById('root');let folder='INBOX',q='';
-    async function api(url,options={}){const r=await fetch(url,{credentials:'same-origin',headers:{'Content-Type':'application/json'},...options});if(!r.ok)throw new Error(await r.text()||r.statusText);return r.status===204?null:r.json()}
+    async function api(url,options={}){const r=await fetch(url,{credentials:'same-origin',headers:{'Content-Type':'application/json','X-Rmail-Webmail':'1'},...options});if(!r.ok)throw new Error(await r.text()||r.statusText);return r.status===204?null:r.json()}
     function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
     async function load(){try{const s=await api('/api/session'),folders=await api('/api/folders'),msgs=await api('/api/folders/'+encodeURIComponent(folder)+'/messages?limit=100&q='+encodeURIComponent(q));root.className='app';root.innerHTML='<aside class="folders"><p class="muted">'+esc(s.address)+'</p>'+folders.map(f=>'<button class="'+(f.name===folder?'active':'')+'" data-folder="'+esc(f.name)+'"><span>'+esc(f.name)+'</span><small>'+(f.unread||f.messages)+'</small></button>').join('')+'</aside><main class="list"><div class="bar"><input id="q" placeholder="Search mail" value="'+esc(q)+'"><button id="refresh">Refresh</button></div><div>'+msgs.map(m=>'<button class="msg '+(m.flags.some(f=>f.toLowerCase()==='\\\\seen')?'':'unread')+'" data-uid="'+m.uid+'"><span>'+esc(m.from||'(unknown)')+'</span><span>'+esc(m.subject||'(no subject)')+'</span><small>'+esc(m.snippet)+'</small></button>').join('')+'</div></main><article class="reader" id="reader">Select a message</article>';document.querySelector('.folders').onclick=e=>{const b=e.target.closest('button[data-folder]');if(b){folder=b.dataset.folder;load()}};document.getElementById('refresh').onclick=()=>{q=document.getElementById('q').value;load()};document.getElementById('q').onkeydown=e=>{if(e.key==='Enter'){q=e.target.value;load()}};document.querySelector('.list').onclick=async e=>{const b=e.target.closest('button[data-uid]');if(!b)return;const m=await api('/api/folders/'+encodeURIComponent(folder)+'/messages/'+b.dataset.uid);const body=m.html_body?'<iframe class="html-message" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>':'<pre>'+esc(m.text_body)+'</pre>';document.getElementById('reader').innerHTML='<div class="reader-actions"><button id="archive">Archive</button><button id="delete">Delete</button></div><h2>'+esc(m.subject||'(no subject)')+'</h2><p class="muted">From '+esc(m.from||'(unknown)')+' to '+esc(m.to||s.address)+'</p>'+body;if(m.html_body){document.querySelector('.html-message').srcdoc=m.html_body}window.currentUid=Number(b.dataset.uid);document.getElementById('archive').onclick=()=>bulk('archive');document.getElementById('delete').onclick=()=>bulk('delete')}}catch{login()}}
     async function bulk(action){if(!window.currentUid)return;await api('/api/folders/'+encodeURIComponent(folder)+'/messages/bulk',{method:'POST',body:JSON.stringify({action,uids:[window.currentUid]})});window.currentUid=null;load()}
@@ -1363,6 +1404,9 @@ mod tests {
             db_path,
             static_dir: td.path().join("static"),
             session_secret: b"test secret".to_vec(),
+            secure_cookies: false,
+            throttle: AuthThrottle::default(),
+            revoked: websession::RevocationList::default(),
         }
     }
 
@@ -1371,6 +1415,7 @@ mod tests {
         if let Some(cookie) = cookie {
             headers.insert("cookie".to_string(), cookie);
         }
+        headers.insert(CSRF_HEADER.to_string(), "1".to_string());
         let (path, query) = split_target(path);
         Request {
             method: method.to_string(),
@@ -1378,6 +1423,7 @@ mod tests {
             query,
             headers,
             body: body.to_vec(),
+            peer: Some("192.0.2.1".parse().unwrap()),
         }
     }
 
@@ -1423,7 +1469,7 @@ mod tests {
             b"From: a@example.test\r\nTo: user@example.test\r\nSubject: hello\r\n\r\nbody",
         )
         .unwrap();
-        let token = sign_session(&state.session_secret, "user@example.test");
+        let token = sign_session(&state, "user@example.test");
         let ok = route(
             req(
                 "GET",
@@ -1452,7 +1498,7 @@ mod tests {
             b"From: a@example.test\r\nTo: user@example.test\r\nSubject: hello\r\n\r\nbody text",
         )
         .unwrap();
-        let token = sign_session(&state.session_secret, "user@example.test");
+        let token = sign_session(&state, "user@example.test");
         let cookie = Some(format!("{SESSION_COOKIE}={token}"));
         let list = route(
             req(
@@ -1574,5 +1620,128 @@ mod tests {
         let html = parsed.html_body.unwrap();
         assert!(html.contains("Logo"));
         assert!(html.contains("src=\"data:image/png;base64,aGVsbG8=\""));
+    }
+
+    #[tokio::test]
+    async fn state_changes_require_csrf_header() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let mut request = req(
+            "POST",
+            "/api/login",
+            br#"{"address":"user@example.test","password":"secret"}"#,
+            None,
+        );
+        request.headers.remove(CSRF_HEADER);
+        assert_eq!(route(request, &state).await.status, 403);
+    }
+
+    #[tokio::test]
+    async fn sessions_end_on_logout_and_password_change() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let login = route(
+            req(
+                "POST",
+                "/api/login",
+                br#"{"address":"user@example.test","password":"secret"}"#,
+                None,
+            ),
+            &state,
+        )
+        .await;
+        let cookie = login
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Set-Cookie")
+            .map(|(_, v)| v.split(';').next().unwrap().to_string())
+            .unwrap();
+        assert!(
+            login
+                .headers
+                .iter()
+                .any(|(_, v)| v.contains("SameSite=Strict"))
+        );
+        let ok = route(
+            req("GET", "/api/session", b"", Some(cookie.clone())),
+            &state,
+        )
+        .await;
+        assert_eq!(ok.status, 200);
+
+        route(
+            req("POST", "/api/logout", b"", Some(cookie.clone())),
+            &state,
+        )
+        .await;
+        let after = route(req("GET", "/api/session", b"", Some(cookie)), &state).await;
+        assert_eq!(after.status, 401);
+
+        let token = sign_session(&state, "user@example.test");
+        db::add_mailbox(
+            &state.db_path,
+            "user@example.test",
+            Some("plain:changed"),
+            None,
+            None,
+        )
+        .unwrap();
+        let stale = route(
+            req(
+                "GET",
+                "/api/session",
+                b"",
+                Some(format!("{SESSION_COOKIE}={token}")),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(stale.status, 401);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_logins_are_throttled() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        for _ in 0..5 {
+            let bad = route(
+                req(
+                    "POST",
+                    "/api/login",
+                    br#"{"address":"user@example.test","password":"bad"}"#,
+                    None,
+                ),
+                &state,
+            )
+            .await;
+            assert_eq!(bad.status, 401);
+        }
+        let locked = route(
+            req(
+                "POST",
+                "/api/login",
+                br#"{"address":"user@example.test","password":"secret"}"#,
+                None,
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(locked.status, 429);
+    }
+
+    #[test]
+    fn remote_content_is_blocked_unless_requested() {
+        let html = r#"<p>Hi</p><img src="https://tracker.example/pixel.gif">"#;
+        assert!(has_remote_content(html));
+        assert!(!has_remote_content(
+            "<p>plain</p><img src=\"data:image/png;base64,AA\">"
+        ));
+        let blocked = sanitize_email_html(html, false);
+        assert!(blocked.contains("img-src data: cid:;"), "{blocked}");
+        let allowed = sanitize_email_html(html, true);
+        assert!(
+            allowed.contains("img-src data: cid: https: http:"),
+            "{allowed}"
+        );
     }
 }

@@ -1,9 +1,9 @@
 use crate::net::TcpListenerConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Global {
     pub mail_root: String,
     /// Durable SMTP tracking retention and pruning limits.
@@ -57,7 +57,7 @@ pub struct Global {
     pub enforce_dmarc: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct TlsPolicy {
     #[serde(default)]
     pub minimum_version: TlsMinimumVersion,
@@ -82,7 +82,7 @@ impl Default for TlsPolicy {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMinimumVersion {
     #[default]
     #[serde(rename = "1.2")]
@@ -91,7 +91,7 @@ pub enum TlsMinimumVersion {
     Tls13,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 pub struct TrackingConfig {
     /// Remove events older than this many days; zero disables age pruning.
     #[serde(default = "default_tracking_retention_days")]
@@ -129,7 +129,7 @@ fn default_tracking_prune_batch_size() -> u32 {
     10_000
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct ListenerEndpoints {
     pub smtp: Option<Vec<String>>,
     /// Local Mail Transfer Protocol endpoints. Empty by default.
@@ -213,14 +213,18 @@ impl Global {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub global: Global,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Revision of the database-managed settings this config was built from.
+    /// Zero when the config came from a file only.
+    #[serde(skip)]
+    pub settings_revision: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ScannerFailureAction {
     Tempfail,
@@ -228,7 +232,7 @@ pub enum ScannerFailureAction {
     Reject,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SecurityConfig {
     #[serde(default = "default_imap_max_concurrent_sessions")]
     pub imap_max_concurrent_sessions: usize,
@@ -308,7 +312,7 @@ impl Default for SecurityConfig {
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct OAuthConfig {
     pub introspection_url: String,
     #[serde(default)]
@@ -445,10 +449,27 @@ fn default_rspamd_quarantine_actions() -> Vec<String> {
 }
 
 impl Config {
+    /// Parse a TOML file as-is, without consulting the settings database.
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {
         let s = fs::read_to_string(path)?;
         let cfg: Config = toml::from_str(&s)?;
         Ok(cfg)
+    }
+
+    /// Load the effective configuration for a daemon.
+    ///
+    /// When the file names a `db_path`, the file only bootstraps `mail_root`
+    /// and `db_path`; every other setting lives in the database (see
+    /// [`crate::settings`]). File values are imported into an empty database
+    /// once. Without a `db_path` the file is used as-is.
+    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {
+        let path = path.as_ref();
+        let text = fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
+        let file = serde_json::to_value(root)?;
+        crate::settings::resolve_config(file, &path.display().to_string())
     }
 }
 
@@ -614,6 +635,40 @@ imap_port = 1143
             ["0.0.0.0:2587", "[::]:2587"]
         );
         assert_eq!(cfg.global.imap_listeners(), ["0.0.0.0:1143"]);
+    }
+
+    #[test]
+    fn example_config_imports_into_settings_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rmail.db");
+        let text = include_str!("../../../config/example.toml").replace(
+            "db_path = \"config/rmail.db\"",
+            &format!("db_path = {:?}", db.display().to_string()),
+        );
+        let path = dir.path().join("rmail.toml");
+        std::fs::write(&path, text).unwrap();
+        let first = Config::load(&path).expect("first load imports the file");
+        assert_eq!(first.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(first.settings_revision, 1);
+        // A file trimmed to the bootstrap keys yields the same configuration.
+        std::fs::write(
+            &path,
+            format!(
+                "[global]\nmail_root = \"mail\"\ndb_path = {:?}\n",
+                db.display().to_string()
+            ),
+        )
+        .unwrap();
+        let second = Config::load(&path).expect("bootstrap-only load");
+        assert_eq!(second.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(
+            second.security.smtp_max_recipients,
+            first.security.smtp_max_recipients
+        );
+        assert_eq!(
+            second.global.acme_challenge_dir,
+            first.global.acme_challenge_dir
+        );
     }
 
     #[test]

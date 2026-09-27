@@ -271,7 +271,10 @@ fn spawn_tls_reloader(
 async fn main() -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
-    let cfg = Config::from_file(&cfg_path).context(format!("loading {}", cfg_path))?;
+    let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
+    if let Err(error) = rmail_common::settings::record_service_start(&cfg, "imapd") {
+        eprintln!("rmail: could not record imapd start in the settings database: {error:#}");
+    }
     let auth_policy = Arc::new(
         auth::AuthPolicy::from_security(&cfg.security)
             .context("validating security.imap_sasl_mechanisms")?,
@@ -2525,14 +2528,7 @@ mod tests {
         }
 
         let td = tempfile::tempdir().expect("tempdir");
-        let cert_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.crt"
-        );
-        let key_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../config/certs/localhost.key"
-        );
+        let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
         let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
         let cert_pem = std::fs::read(cert_path).expect("read certificate");
         let certificates = rustls_pemfile::certs(&mut Cursor::new(cert_pem)).expect("parse cert");
