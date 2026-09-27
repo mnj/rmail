@@ -9,6 +9,7 @@ use argon2::{
 };
 use rand::rngs::OsRng;
 use rmail_common::config::Config;
+use rmail_common::http::serve_connection;
 use rmail_common::net::bind_tcp_listener_with_config;
 use rmail_common::outbound::QueueControl;
 use rmail_common::runtime::GracefulShutdown;
@@ -1020,7 +1021,7 @@ async fn handle_connection<S>(
     acme_challenge_dir: Option<String>,
     readiness: ReadinessConfig,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let state = api::AdminState::new(
         mail_root,
@@ -1170,7 +1171,7 @@ async fn main() -> Result<()> {
         }
         web_log!("warn", "admin_setup_mode", { "reason": "no admin credentials configured; the first visitor on a loopback listener sets them" });
     }
-    let state = Arc::new(state);
+    let app = api::router(Arc::new(state));
 
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
@@ -1187,7 +1188,7 @@ async fn main() -> Result<()> {
         web_log!("info", "listener_started", { "address": addr, "tls_configured": tls_active });
         let listener_shutdown = shutdown.clone();
         let tls = tls.1.clone();
-        let state = state.clone();
+        let app = app.clone();
         listeners.spawn(async move {
             let mut shutdown_signal = listener_shutdown.subscribe();
             loop {
@@ -1206,17 +1207,28 @@ async fn main() -> Result<()> {
                 };
                 let session = listener_shutdown.start_session();
                 let tls_context = tls.borrow().clone();
-                let state = state.clone();
+                let app = app.clone();
+                let stop = listener_shutdown.subscribe();
                 tokio::spawn(async move {
                     let _session = session;
-                    if let Some(context) = tls_context {
-                        match timeout(Duration::from_secs(15), context.acceptor.accept(stream)).await {
-                            Ok(Ok(stream)) => api::serve(stream, peer.to_string(), state).await,
-                            Ok(Err(error)) => web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() }),
-                            Err(_) => web_log!("warn", "tls_handshake_timeout", { "peer": peer.to_string() }),
+                    let served = match tls_context {
+                        Some(context) => {
+                            match timeout(Duration::from_secs(15), context.acceptor.accept(stream)).await {
+                                Ok(Ok(stream)) => serve_connection(stream, Some(peer), app, Some(stop)).await,
+                                Ok(Err(error)) => {
+                                    web_log!("error", "tls_handshake_failed", { "peer": peer.to_string(), "error": error.to_string() });
+                                    return;
+                                }
+                                Err(_) => {
+                                    web_log!("warn", "tls_handshake_timeout", { "peer": peer.to_string() });
+                                    return;
+                                }
+                            }
                         }
-                    } else {
-                        api::serve(stream, peer.to_string(), state).await;
+                        None => serve_connection(stream, Some(peer), app, Some(stop)).await,
+                    };
+                    if let Err(error) = served {
+                        web_log!("debug", "connection_error", { "peer": peer.to_string(), "error": error.to_string() });
                     }
                 });
             }
@@ -1704,6 +1716,7 @@ mod tests {
         let peer = peer.to_string();
         let task = tokio::spawn(async move { api::serve(server, peer, state).await });
         client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         task.await.unwrap();

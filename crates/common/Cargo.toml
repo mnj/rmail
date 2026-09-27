@@ -18,6 +18,11 @@ moka = { version = "0.12", features = ["sync"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 bytes = "1"
+# HTTP serving for the admin console and webmail.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower-http = { version = "0.6", features = ["limit", "timeout"] }
 
 # SCRAM helpers
 pbkdf2 = "0.11"

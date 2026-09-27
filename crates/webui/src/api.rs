@@ -1,20 +1,28 @@
-//! HTTP layer of the admin console: request reading, authentication, CSRF
-//! protection and routing. Data access helpers live in `main.rs`.
+//! HTTP API of the admin console: an axum router with authentication, CSRF
+//! and security-header middleware. Data access helpers live in `main.rs`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use rmail_common::http::{HttpLimits, HttpRequest, read_request, reason_phrase};
+use axum::body::Bytes;
+use axum::extract::{Path as UrlPath, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
+use rmail_common::http::Peer;
 use rmail_common::throttle::AuthThrottle;
 use rmail_common::websession;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::*;
 
@@ -26,6 +34,8 @@ const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 pub(crate) const CSRF_HEADER: &str = "x-rmail-admin";
 const BASIC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MIN_ADMIN_PASSWORD_CHARS: usize = 10;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 pub(crate) struct AdminState {
     pub mail_root: PathBuf,
@@ -70,116 +80,200 @@ impl AdminState {
     }
 }
 
-pub(crate) struct Response {
-    status: u16,
-    content_type: &'static str,
-    headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
+type Shared = Arc<AdminState>;
+
+pub(crate) fn router(state: Shared) -> Router {
+    let protected = Router::new()
+        .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
+        .route("/dmarc", get(dmarc))
+        .route("/logs", get(logs))
+        .route("/api/overview", get(overview))
+        .route("/api/queue", get(queue_listing))
+        .route("/api/queue/summary", get(queue_summary))
+        .route("/api/queue/action", post(queue_action))
+        .route("/api/queue/{action}", post(queue_action_path))
+        .route(
+            "/api/accounts",
+            get(accounts)
+                .post(save_account)
+                .patch(update_account)
+                .delete(delete_account),
+        )
+        .route("/api/routing", get(routing))
+        .route("/api/routing/alias", post(save_alias).delete(delete_alias))
+        .route(
+            "/api/routing/catchall",
+            post(save_catchall).delete(delete_catchall),
+        )
+        .route("/api/settings", get(settings).put(update_settings))
+        .route("/api/admin/credentials", post(change_credentials))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+    let app = Router::new()
+        .route("/.well-known/acme-challenge/{*token}", get(acme_challenge))
+        .route("/health", get(health))
+        .route("/healthz", get(health))
+        .route("/ready", get(ready))
+        .route("/readyz", get(ready))
+        .route("/api/session", get(session_info))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .merge(protected)
+        .fallback(fallback)
+        .layer(middleware::from_fn(reject_cross_site))
+        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(log_request))
+        .with_state(state);
+    rmail_common::http::harden(app, MAX_BODY_BYTES)
 }
 
-impl Response {
-    fn new(status: u16, content_type: &'static str, body: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status,
-            content_type,
-            headers: Vec::new(),
-            body: body.into(),
-        }
-    }
-
-    fn json(status: u16, value: &impl serde::Serialize) -> Self {
-        match serde_json::to_vec(value) {
-            Ok(body) => Self::new(status, "application/json", body),
-            Err(error) => Self::error(500, &error.to_string()),
-        }
-    }
-
-    fn ok() -> Self {
-        Self::json(200, &json!({"result": "ok"}))
-    }
-
-    fn text(status: u16, body: impl Into<String>) -> Self {
-        Self::new(status, "text/plain; charset=utf-8", body.into())
-    }
-
-    /// JSON error body the frontend can show verbatim.
-    fn error(status: u16, message: &str) -> Self {
-        Self::json(status, &json!({"error": message}))
-    }
-
-    fn with_header(mut self, name: &'static str, value: String) -> Self {
-        self.headers.push((name, value));
-        self
-    }
-}
-
-fn method_not_allowed() -> Response {
-    Response::error(405, "method not allowed")
-}
-
-/// 401 response. API clients (curl, Prometheus) get a Basic challenge; the
-/// console's own requests do not, so browsers never show their native dialog.
-fn unauthorized(request: &HttpRequest) -> Response {
-    let response = Response::error(401, "authentication required");
-    if request.header(CSRF_HEADER).is_some() {
-        response
-    } else {
-        response.with_header("WWW-Authenticate", "Basic realm=\"rMail\"".to_string())
-    }
-}
-
-pub(crate) async fn serve<S>(mut stream: S, peer: String, state: Arc<AdminState>)
+/// Serve one connection (used by the tests with in-memory streams).
+#[cfg(test)]
+pub(crate) async fn serve<S>(stream: S, peer: String, state: Shared)
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let request_id = rmail_common::tracking::new_tracking_id("admin-http");
-    let limits = HttpLimits {
-        max_body_bytes: 1024 * 1024,
-        ..HttpLimits::default()
-    };
-    let (response, method, target) = match read_request(&mut stream, limits).await {
-        Ok(request) => {
-            let method = request.method.clone();
-            let target = request.path.clone();
-            (route(request, &peer, &state).await, method, target)
-        }
-        Err(error) => match error.status() {
-            Some(status) => (
-                Response::error(status, reason_phrase(status)),
-                String::new(),
-                String::new(),
-            ),
-            None => return,
-        },
-    };
-    let status = response.status;
-    let bytes = response.body.len();
-    let _ = write_response(&mut stream, response).await;
-    let _ = stream.shutdown().await;
-    web_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method, "path": target, "status": status, "response_bytes": bytes });
+    let _ =
+        rmail_common::http::serve_connection(stream, peer.parse().ok(), router(state), None).await;
 }
 
-async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, response: Response) -> Result<()> {
-    let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\
-         X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\
-         Cache-Control: no-store\r\n\
-         Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n",
-        response.status,
-        reason_phrase(response.status),
-        response.body.len(),
-        response.content_type,
-    );
-    for (name, value) in &response.headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
+// ---------------------------------------------------------------------------
+// Responses
+
+/// JSON error body the frontend can show verbatim.
+fn error(status: StatusCode, message: impl AsRef<str>) -> Response {
+    (status, Json(json!({"error": message.as_ref()}))).into_response()
+}
+
+fn ok() -> Response {
+    Json(json!({"result": "ok"})).into_response()
+}
+
+fn outcome<T: serde::Serialize>(result: Result<T>, failure: StatusCode) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error(failure, format!("{err:#}")),
     }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(&response.body).await?;
-    Ok(())
+}
+
+/// An error answered as `{"error": message}` with the given status.
+struct ApiError(StatusCode, String);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        error(self.0, self.1)
+    }
+}
+
+/// Parse a JSON body regardless of Content-Type (scripts often omit it).
+fn parse<T: DeserializeOwned>(body: &Bytes) -> std::result::Result<T, ApiError> {
+    serde_json::from_slice(body)
+        .map_err(|err| ApiError(StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")))
+}
+
+fn require_db(state: &AdminState) -> std::result::Result<String, ApiError> {
+    state.db_path.clone().ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "no database is configured (global.db_path)".to_string(),
+        )
+    })
+}
+
+async fn blocking<T, F>(work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| anyhow!("background task failed: {err}"))?
+}
+
+fn with_cookie(response: impl IntoResponse, cookie: String) -> Response {
+    let mut response = response.into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+
+async fn log_request(request: Request, next: Next) -> Response {
+    let request_id = rmail_common::tracking::new_tracking_id("admin-http");
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let peer = request
+        .extensions()
+        .get::<Peer>()
+        .and_then(|peer| peer.0)
+        .map(|address| address.to_string());
+    let response = next.run(request).await;
+    web_log!("info", "request_completed", { "request_id": request_id, "peer": peer, "method": method.as_str(), "path": path, "status": response.status().as_u16() });
+    response
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::CACHE_CONTROL, "no-store"),
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+    ] {
+        headers
+            .entry(name)
+            .or_insert(HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// Reject cross-site state changes: require the custom header and, when the
+/// browser sends an Origin, require it to match the Host.
+async fn reject_cross_site(request: Request, next: Next) -> Response {
+    if matches!(*request.method(), Method::GET | Method::HEAD) {
+        return next.run(request).await;
+    }
+    let headers = request.headers();
+    if !headers.contains_key(CSRF_HEADER) {
+        return error(
+            StatusCode::FORBIDDEN,
+            format!("missing {CSRF_HEADER} header"),
+        );
+    }
+    if let (Some(origin), Some(host)) = (
+        headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+    ) {
+        let origin_host = origin
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(origin);
+        if !origin_host.eq_ignore_ascii_case(host) {
+            return error(StatusCode::FORBIDDEN, "cross-origin request rejected");
+        }
+    }
+    next.run(request).await
+}
+
+/// Authenticate the request and attach the [`Principal`].
+async fn require_admin(State(state): State<Shared>, mut request: Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<Peer>()
+        .copied()
+        .unwrap_or(Peer(None));
+    match authenticate(request.headers(), peer, &state).await {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(response) => response,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,23 +286,43 @@ enum Principal {
     Admin(String),
 }
 
-fn peer_ip(peer: &str) -> Option<IpAddr> {
-    peer.parse::<std::net::SocketAddr>()
-        .map(|address| address.ip())
-        .ok()
+/// 401 response. API clients (curl, Prometheus) get a Basic challenge; the
+/// console's own requests do not, so browsers never show their native dialog.
+fn unauthorized(headers: &HeaderMap) -> Response {
+    let mut response = error(StatusCode::UNAUTHORIZED, "authentication required");
+    if !headers.contains_key(CSRF_HEADER) {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"rMail\""),
+        );
+    }
+    response
+}
+
+fn too_many_attempts(remaining: Duration) -> Response {
+    let mut response = error(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "too many failed sign-in attempts; try again in {} minutes",
+            remaining.as_secs().div_ceil(60)
+        ),
+    );
+    if let Ok(value) = HeaderValue::from_str(&remaining.as_secs().to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// Current admin credentials: the settings database wins over the file.
 async fn admin_credentials(state: &AdminState) -> Result<Option<(String, String)>> {
     if let Some(db_path) = state.db_path.clone() {
-        let stored = tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
+        let stored = blocking(move || {
             let conn = rmail_common::settings::open(&db_path)?;
             let user = rmail_common::settings::get_string(&conn, "global.web_admin_user")?;
             let hash = rmail_common::settings::get_string(&conn, "global.web_admin_password_hash")?;
             Ok(user.zip(hash))
         })
-        .await
-        .map_err(|error| anyhow!("credential lookup failed: {error}"))??;
+        .await?;
         if stored.is_some() {
             return Ok(stored);
         }
@@ -216,55 +330,56 @@ async fn admin_credentials(state: &AdminState) -> Result<Option<(String, String)
     Ok(state.file_admin.clone())
 }
 
+fn session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| websession::cookie_value(cookie, SESSION_COOKIE))
+}
+
+/// The admin named by a valid session cookie, if any.
+fn cookie_user(headers: &HeaderMap, state: &AdminState, user: &str, hash: &str) -> bool {
+    session_token(headers).is_some_and(|token| {
+        !state.revoked.is_revoked(token)
+            && websession::verify(&state.session_key, token).is_some_and(|session| {
+                session.subject == user
+                    && session.binding == websession::credential_binding(&state.session_key, hash)
+            })
+    })
+}
+
 async fn authenticate(
-    request: &HttpRequest,
-    peer: &str,
+    headers: &HeaderMap,
+    peer: Peer,
     state: &AdminState,
 ) -> std::result::Result<Principal, Response> {
     let credentials = admin_credentials(state)
         .await
-        .map_err(|error| Response::error(503, &error.to_string()))?;
+        .map_err(|err| error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
     let Some((user, hash)) = credentials else {
         return Ok(Principal::Setup);
     };
-    if let Some(token) = request
-        .header("cookie")
-        .and_then(|cookie| websession::cookie_value(cookie, SESSION_COOKIE))
-        && !state.revoked.is_revoked(token)
-        && let Some(session) = websession::verify(&state.session_key, token)
-        && session.subject == user
-        && session.binding == websession::credential_binding(&state.session_key, &hash)
-    {
+    if cookie_user(headers, state, &user, &hash) {
         return Ok(Principal::Admin(user));
     }
-    let Some((basic_user, basic_password)) = request.header("authorization").and_then(parse_basic)
+    let Some((basic_user, basic_password)) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_basic)
     else {
-        return Err(unauthorized(request));
+        return Err(unauthorized(headers));
     };
-    if let Some(ip) = peer_ip(peer)
-        && let Some(remaining) = state.throttle.blocked_for(ip)
-    {
+    if let Some(remaining) = peer.ip().and_then(|ip| state.throttle.blocked_for(ip)) {
         return Err(too_many_attempts(remaining));
     }
     if check_password(state, &user, &hash, &basic_user, &basic_password).await {
         Ok(Principal::Admin(user))
     } else {
-        if let Some(ip) = peer_ip(peer) {
+        if let Some(ip) = peer.ip() {
             state.throttle.record_failure(ip);
         }
-        Err(unauthorized(request))
+        Err(unauthorized(headers))
     }
-}
-
-fn too_many_attempts(remaining: Duration) -> Response {
-    Response::error(
-        429,
-        &format!(
-            "too many failed sign-in attempts; try again in {} minutes",
-            remaining.as_secs().div_ceil(60)
-        ),
-    )
-    .with_header("Retry-After", remaining.as_secs().to_string())
 }
 
 fn parse_basic(header: &str) -> Option<(String, String)> {
@@ -339,32 +454,8 @@ fn clear_cookie(state: &AdminState) -> String {
     websession::set_cookie(SESSION_COOKIE, "", 0, state.secure_cookies, "Strict")
 }
 
-/// Reject cross-site state changes: require the custom header and, when the
-/// browser sends an Origin, require it to match the Host.
-fn check_csrf(request: &HttpRequest) -> Option<Response> {
-    if matches!(request.method.as_str(), "GET" | "HEAD") {
-        return None;
-    }
-    if request.header(CSRF_HEADER).is_none() {
-        return Some(Response::error(
-            403,
-            &format!("missing {CSRF_HEADER} header"),
-        ));
-    }
-    if let (Some(origin), Some(host)) = (request.header("origin"), request.header("host")) {
-        let origin_host = origin
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(origin);
-        if !origin_host.eq_ignore_ascii_case(host) {
-            return Some(Response::error(403, "cross-origin request rejected"));
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
-// Routing
+// Public endpoints
 
 fn is_acme_token(token: &str) -> bool {
     !token.is_empty()
@@ -374,301 +465,35 @@ fn is_acme_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-async fn blocking<T, F>(work: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| anyhow!("background task failed: {error}"))?
-}
-
-fn json_body<T: for<'de> Deserialize<'de>>(
-    request: &HttpRequest,
-) -> std::result::Result<T, Response> {
-    serde_json::from_slice(&request.body)
-        .map_err(|error| Response::error(400, &format!("invalid JSON: {error}")))
-}
-
-fn result_response<T: serde::Serialize>(result: Result<T>, error_status: u16) -> Response {
-    match result {
-        Ok(value) => Response::json(200, &value),
-        Err(error) => Response::error(error_status, &format!("{error:#}")),
-    }
-}
-
-fn require_db(state: &AdminState) -> std::result::Result<String, Response> {
-    state
-        .db_path
-        .clone()
-        .ok_or_else(|| Response::error(400, "no database is configured (global.db_path)"))
-}
-
-pub(crate) async fn route(request: HttpRequest, peer: &str, state: &Arc<AdminState>) -> Response {
-    let method = request.method.as_str();
-    let path = request.path.as_str();
-
-    // Public endpoints.
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        if method != "GET" {
-            return method_not_allowed();
-        }
-        let (Some(dir), true) = (state.acme_dir.as_ref(), is_acme_token(token)) else {
-            return Response::text(404, "Not Found");
-        };
-        return match tokio::fs::read(PathBuf::from(dir).join(token)).await {
-            Ok(body) => Response::new(200, "text/plain", body),
-            Err(_) => Response::text(404, "Not Found"),
-        };
-    }
-    match path {
-        "/health" | "/healthz" => {
-            return if method == "GET" {
-                Response::text(200, "ok")
-            } else {
-                method_not_allowed()
-            };
-        }
-        "/ready" | "/readyz" => {
-            if method != "GET" {
-                return method_not_allowed();
-            }
-            let report = readiness_report(
-                state.mail_root.clone(),
-                state.db_path.clone(),
-                current_readiness(state).await,
-            )
-            .await;
-            return Response::json(if report.ready { 200 } else { 503 }, &report);
-        }
-        _ => {}
-    }
-    if !path.starts_with("/api/") && !matches!(path, "/stats" | "/metrics" | "/dmarc" | "/logs") {
-        return if method == "GET" {
-            static_asset(path)
-        } else {
-            Response::error(404, "not found")
-        };
-    }
-    if let Some(response) = check_csrf(&request) {
-        return response;
-    }
-
-    match (method, path) {
-        ("GET", "/api/session") => return session_info(&request, state).await,
-        ("POST", "/api/login") => return login(&request, peer, state).await,
-        ("POST", "/api/logout") => {
-            if let Some(token) = request
-                .header("cookie")
-                .and_then(|cookie| websession::cookie_value(cookie, SESSION_COOKIE))
-                && let Some(session) = websession::verify(&state.session_key, token)
-            {
-                state.revoked.revoke(token, session.expires_at);
-            }
-            return Response::ok().with_header("Set-Cookie", clear_cookie(state));
-        }
-        _ => {}
-    }
-
-    let principal = match authenticate(&request, peer, state).await {
-        Ok(principal) => principal,
-        Err(response) => return response,
+/// ACME http-01 challenges. Tokens are a single URL-safe segment, so paths
+/// can never leave the challenge directory.
+async fn acme_challenge(State(state): State<Shared>, UrlPath(token): UrlPath<String>) -> Response {
+    let (Some(dir), true) = (state.acme_dir.as_ref(), is_acme_token(&token)) else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
     };
-
-    let mail_root = state.mail_root.clone();
-    let db_path = state.db_path.clone();
-    match (method, path) {
-        ("GET", "/stats") => {
-            let root = mail_root.clone();
-            match blocking(move || scan_maildirs_sync(&root)).await {
-                Ok(mut stats) => {
-                    stats.delivered_count = tokio::fs::read_to_string(
-                        rmail_common::runtime::delivered_count_path(&mail_root),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|text| text.trim().parse().ok())
-                    .unwrap_or(0);
-                    Response::json(200, &stats)
-                }
-                Err(error) => Response::error(500, &error.to_string()),
-            }
-        }
-        ("GET", "/metrics") => Response::new(
-            200,
-            "text/plain; version=0.0.4",
-            metrics_text(&mail_root).await,
-        ),
-        ("GET", "/dmarc") => match require_db(state) {
-            Ok(db) => result_response(blocking(move || dmarc_summary_sync(&db)).await, 500),
-            Err(response) => response,
-        },
-        ("GET", "/logs") => {
-            let params = request.query_params();
-            let component = params
-                .get("component")
-                .map(String::as_str)
-                .unwrap_or("smtpd");
-            let lines = params
-                .get("lines")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(200)
-                .min(2000);
-            if !matches!(
-                component,
-                "smtpd" | "imapd" | "web" | "outbound" | "webmail"
-            ) {
-                return Response::error(400, "invalid component");
-            }
-            let path = rmail_common::runtime::log_path(&mail_root, component);
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => {
-                    Response::text(200, tail_lines(&String::from_utf8_lossy(&bytes), lines))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Response::text(200, "")
-                }
-                Err(error) => Response::error(500, &format!("reading {}: {error}", path.display())),
-            }
-        }
-        ("GET", "/api/overview") => result_response(
-            blocking(move || overview_summary_sync(&mail_root, db_path.as_deref())).await,
-            500,
-        ),
-        ("GET", "/api/queue/summary") => {
-            result_response(blocking(move || queue_summary_sync(&mail_root)).await, 500)
-        }
-        ("GET", "/api/queue") => {
-            let spool = request
-                .query_params()
-                .get("spool")
-                .cloned()
-                .unwrap_or_else(|| "queue".to_string());
-            result_response(
-                blocking(move || queue_listing_sync(&mail_root, &spool)).await,
-                400,
-            )
-        }
-        ("POST", "/api/queue/action") => queue_action(&request, None, state).await,
-        ("POST", "/api/queue/requeue") => queue_action(&request, Some("requeue"), state).await,
-        ("POST", "/api/queue/promote") => queue_action(&request, Some("promote"), state).await,
-        ("POST", "/api/queue/delete") => queue_action(&request, Some("delete"), state).await,
-        (
-            _,
-            "/api/queue/action" | "/api/queue/requeue" | "/api/queue/promote" | "/api/queue/delete",
-        ) => method_not_allowed(),
-        ("GET", "/api/accounts") => result_response(
-            blocking(move || account_summaries_sync(&mail_root, db_path.as_deref())).await,
-            500,
-        ),
-        ("POST" | "PATCH", "/api/accounts") => {
-            let db = match require_db(state) {
-                Ok(db) => db,
-                Err(response) => return response,
-            };
-            let mut input: AccountRequest = match json_body(&request) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            input.must_exist = method == "PATCH";
-            result_response(
-                blocking(move || {
-                    upsert_account_sync(&mail_root, &db, input).map(|_| json!({"result": "ok"}))
-                })
-                .await,
-                400,
-            )
-        }
-        ("DELETE", "/api/accounts") => {
-            let db = match require_db(state) {
-                Ok(db) => db,
-                Err(response) => return response,
-            };
-            let input: AccountDeleteRequest = match json_body(&request) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            result_response(
-                blocking(move || delete_account_sync(&db, input).map(|_| json!({"result": "ok"})))
-                    .await,
-                400,
-            )
-        }
-        ("GET", "/api/routing") => result_response(
-            blocking(move || routing_summary_sync(db_path.as_deref())).await,
-            500,
-        ),
-        ("POST" | "DELETE", "/api/routing/alias") => {
-            let db = match require_db(state) {
-                Ok(db) => db,
-                Err(response) => return response,
-            };
-            let mut input: AliasRequest = match json_body(&request) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            if method == "DELETE" {
-                input.targets = None;
-            }
-            result_response(
-                blocking(move || upsert_alias_sync(&db, input).map(|_| json!({"result": "ok"})))
-                    .await,
-                400,
-            )
-        }
-        ("POST" | "DELETE", "/api/routing/catchall") => {
-            let db = match require_db(state) {
-                Ok(db) => db,
-                Err(response) => return response,
-            };
-            let mut input: CatchallRequest = match json_body(&request) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            if method == "DELETE" {
-                input.target = None;
-            }
-            result_response(
-                blocking(move || upsert_catchall_sync(&db, input).map(|_| json!({"result": "ok"})))
-                    .await,
-                400,
-            )
-        }
-        ("GET", "/api/settings") => match require_db(state) {
-            Ok(db) => result_response(blocking(move || settings_view_sync(&db)).await, 500),
-            Err(_) => Response::json(200, &json!({"managed": false})),
-        },
-        ("PUT", "/api/settings") => {
-            let db = match require_db(state) {
-                Ok(db) => db,
-                Err(response) => return response,
-            };
-            #[derive(Deserialize)]
-            struct Changes {
-                changes: BTreeMap<String, Value>,
-            }
-            let input: Changes = match json_body(&request) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            let result = blocking(move || {
-                let mut conn = rmail_common::settings::open(&db)?;
-                rmail_common::settings::update(&mut conn, &input.changes)?;
-                settings_view_sync(&db)
-            })
-            .await;
-            if let Ok(view) = &result {
-                web_log!("info", "settings_updated", { "peer": peer, "revision": view["revision"] });
-            }
-            result_response(result, 422)
-        }
-        ("POST", "/api/admin/credentials") => {
-            change_admin_credentials(&request, &principal, state).await
-        }
-        (_, path) if path.starts_with("/api/") => Response::error(404, "not found"),
-        _ => method_not_allowed(),
+    match tokio::fs::read(PathBuf::from(dir).join(&token)).await {
+        Ok(body) => ([(header::CONTENT_TYPE, "text/plain")], body).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+async fn ready(State(state): State<Shared>) -> Response {
+    let report = readiness_report(
+        state.mail_root.clone(),
+        state.db_path.clone(),
+        current_readiness(&state).await,
+    )
+    .await;
+    let status = if report.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(report)).into_response()
 }
 
 async fn current_readiness(state: &AdminState) -> ReadinessConfig {
@@ -682,34 +507,41 @@ async fn current_readiness(state: &AdminState) -> ReadinessConfig {
         .unwrap_or(fallback)
 }
 
-async fn session_info(request: &HttpRequest, state: &AdminState) -> Response {
-    let credentials = match admin_credentials(state).await {
+async fn fallback(method: Method, uri: axum::http::Uri) -> Response {
+    let path = uri.path();
+    if method != Method::GET || path.starts_with("/api/") {
+        return error(StatusCode::NOT_FOUND, "not found");
+    }
+    match read_admin_static(path) {
+        Some((content_type, body)) => {
+            ([(header::CONTENT_TYPE, content_type)], body).into_response()
+        }
+        None if path == "/" || !path.contains('.') => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            admin_app_html(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    }
+}
+
+async fn session_info(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let credentials = match admin_credentials(&state).await {
         Ok(credentials) => credentials,
-        Err(error) => return Response::error(503, &error.to_string()),
+        Err(err) => return error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
     };
     let setup_required = credentials.is_none();
-    // Only look at the cookie here; Basic credentials are checked on use.
-    let user = credentials.and_then(|(user, hash)| {
-        let token = request
-            .header("cookie")
-            .and_then(|cookie| websession::cookie_value(cookie, SESSION_COOKIE))?;
-        if state.revoked.is_revoked(token) {
-            return None;
-        }
-        let session = websession::verify(&state.session_key, token)?;
-        (session.subject == user
-            && session.binding == websession::credential_binding(&state.session_key, &hash))
-        .then_some(user)
-    });
-    Response::json(
-        200,
-        &json!({
-            "authenticated": setup_required || user.is_some(),
-            "user": user,
-            "setup_required": setup_required,
-            "settings_managed": state.db_path.is_some(),
-        }),
-    )
+    // Only the cookie counts here; Basic credentials are checked on use.
+    let user = credentials
+        .filter(|(user, hash)| cookie_user(&headers, &state, user, hash))
+        .map(|(user, _)| user);
+    Json(json!({
+        "authenticated": setup_required || user.is_some(),
+        "user": user,
+        "setup_required": setup_required,
+        "settings_managed": state.db_path.is_some(),
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -718,133 +550,174 @@ struct LoginRequest {
     password: String,
 }
 
-async fn login(request: &HttpRequest, peer: &str, state: &AdminState) -> Response {
-    let input: LoginRequest = match json_body(request) {
+async fn login(
+    State(state): State<Shared>,
+    Extension(peer): Extension<Peer>,
+    body: Bytes,
+) -> Response {
+    let input: LoginRequest = match parse(&body) {
         Ok(input) => input,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
-    let ip = peer_ip(peer);
-    if let Some(remaining) = ip.and_then(|ip| state.throttle.blocked_for(ip)) {
+    if let Some(remaining) = peer.ip().and_then(|ip| state.throttle.blocked_for(ip)) {
         return too_many_attempts(remaining);
     }
-    let credentials = match admin_credentials(state).await {
+    let credentials = match admin_credentials(&state).await {
         Ok(credentials) => credentials,
-        Err(error) => return Response::error(503, &error.to_string()),
+        Err(err) => return error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
     };
     let Some((user, hash)) = credentials else {
-        return Response::error(409, "no admin account exists yet; set a password first");
+        return error(
+            StatusCode::CONFLICT,
+            "no admin account exists yet; set a password first",
+        );
     };
-    if check_password(state, &user, &hash, input.username.trim(), &input.password).await {
-        if let Some(ip) = ip {
+    if check_password(&state, &user, &hash, input.username.trim(), &input.password).await {
+        if let Some(ip) = peer.ip() {
             state.throttle.reset(ip);
         }
-        web_log!("info", "admin_login", { "peer": peer, "user": user });
-        Response::json(200, &json!({"user": user}))
-            .with_header("Set-Cookie", session_cookie(state, &user, &hash))
+        web_log!("info", "admin_login", { "peer": peer.0.map(|a| a.to_string()), "user": user });
+        with_cookie(
+            Json(json!({"user": user})),
+            session_cookie(&state, &user, &hash),
+        )
     } else {
-        if let Some(ip) = ip {
+        if let Some(ip) = peer.ip() {
             state.throttle.record_failure(ip);
         }
-        web_log!("warn", "admin_login_failed", { "peer": peer });
-        Response::error(401, "invalid username or password")
+        web_log!("warn", "admin_login_failed", { "peer": peer.0.map(|a| a.to_string()) });
+        error(StatusCode::UNAUTHORIZED, "invalid username or password")
     }
 }
 
-#[derive(Deserialize)]
-struct CredentialsRequest {
-    username: String,
-    #[serde(default)]
-    current_password: Option<String>,
-    new_password: String,
-}
-
-async fn change_admin_credentials(
-    request: &HttpRequest,
-    principal: &Principal,
-    state: &AdminState,
-) -> Response {
-    let db = match require_db(state) {
-        Ok(db) => db,
-        Err(_) => {
-            return Response::error(
-                400,
-                "admin credentials are set in the configuration file when no database is configured",
-            );
-        }
-    };
-    let input: CredentialsRequest = match json_body(request) {
-        Ok(input) => input,
-        Err(response) => return response,
-    };
-    let username = input.username.trim().to_string();
-    if username.is_empty() || username.contains(':') {
-        return Response::error(422, "username must be non-empty and must not contain ':'");
-    }
-    if input.new_password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
-        return Response::error(
-            422,
-            &format!("password must be at least {MIN_ADMIN_PASSWORD_CHARS} characters"),
-        );
-    }
-    if let Principal::Admin(_) = principal {
-        let (user, hash) = match admin_credentials(state).await {
-            Ok(Some(credentials)) => credentials,
-            Ok(None) => return Response::error(409, "admin credentials disappeared"),
-            Err(error) => return Response::error(503, &error.to_string()),
-        };
-        let current = input.current_password.unwrap_or_default();
-        if !check_password(state, &user, &hash, &user, &current).await {
-            return Response::error(403, "current password is incorrect");
-        }
-    }
-    let new_password = input.new_password;
-    let hash = match blocking(move || {
-        use argon2::password_hash::{PasswordHasher, SaltString};
-        let salt = SaltString::generate(&mut rand::rngs::OsRng);
-        argon2::Argon2::default()
-            .hash_password(new_password.as_bytes(), &salt)
-            .map(|hash| hash.to_string())
-            .map_err(|error| anyhow!(error.to_string()))
-    })
-    .await
+async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    if let Some(token) = session_token(&headers)
+        && let Some(session) = websession::verify(&state.session_key, token)
     {
-        Ok(hash) => hash,
-        Err(error) => return Response::error(500, &error.to_string()),
-    };
-    let stored_hash = hash.clone();
-    let stored_user = username.clone();
-    let result = blocking(move || {
-        let mut conn = rmail_common::settings::open(&db)?;
-        rmail_common::settings::write_raw(
-            &mut conn,
-            &BTreeMap::from([
-                (
-                    "global.web_admin_user".to_string(),
-                    Some(Value::from(stored_user)),
-                ),
-                (
-                    "global.web_admin_password_hash".to_string(),
-                    Some(Value::from(stored_hash)),
-                ),
-            ]),
-        )
-    })
-    .await;
-    match result {
-        Ok(_) => {
-            web_log!("info", "admin_credentials_changed", { "user": username });
-            // Changing the hash invalidates every other session; keep this one.
-            Response::json(200, &json!({"user": username}))
-                .with_header("Set-Cookie", session_cookie(state, &username, &hash))
+        state.revoked.revoke(token, session.expires_at);
+    }
+    with_cookie(ok(), clear_cookie(&state))
+}
+
+// ---------------------------------------------------------------------------
+// Protected endpoints
+
+async fn stats(State(state): State<Shared>) -> Response {
+    let root = state.mail_root.clone();
+    match blocking(move || scan_maildirs_sync(&root)).await {
+        Ok(mut stats) => {
+            stats.delivered_count = tokio::fs::read_to_string(
+                rmail_common::runtime::delivered_count_path(&state.mail_root),
+            )
+            .await
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0);
+            Json(stats).into_response()
         }
-        Err(error) => Response::error(500, &error.to_string()),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 
-async fn queue_action(request: &HttpRequest, fixed: Option<&str>, state: &AdminState) -> Response {
-    let input: Value = match json_body(request) {
+async fn metrics(State(state): State<Shared>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics_text(&state.mail_root).await,
+    )
+        .into_response()
+}
+
+async fn dmarc(State(state): State<Shared>) -> Response {
+    match require_db(&state) {
+        Ok(db) => outcome(
+            blocking(move || dmarc_summary_sync(&db)).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn logs(
+    State(state): State<Shared>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let component = params
+        .get("component")
+        .map(String::as_str)
+        .unwrap_or("smtpd");
+    let lines = params
+        .get("lines")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(200)
+        .min(2000);
+    if !matches!(
+        component,
+        "smtpd" | "imapd" | "web" | "outbound" | "webmail"
+    ) {
+        return error(StatusCode::BAD_REQUEST, "invalid component");
+    }
+    let path = rmail_common::runtime::log_path(&state.mail_root, component);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => tail_lines(&String::from_utf8_lossy(&bytes), lines).into_response(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new().into_response(),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reading {}: {err}", path.display()),
+        ),
+    }
+}
+
+async fn overview(State(state): State<Shared>) -> Response {
+    let (root, db) = (state.mail_root.clone(), state.db_path.clone());
+    outcome(
+        blocking(move || overview_summary_sync(&root, db.as_deref())).await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+async fn queue_summary(State(state): State<Shared>) -> Response {
+    let root = state.mail_root.clone();
+    outcome(
+        blocking(move || queue_summary_sync(&root)).await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+async fn queue_listing(
+    State(state): State<Shared>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let root = state.mail_root.clone();
+    let spool = params
+        .get("spool")
+        .cloned()
+        .unwrap_or_else(|| "queue".to_string());
+    outcome(
+        blocking(move || queue_listing_sync(&root, &spool)).await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn queue_action(State(state): State<Shared>, body: Bytes) -> Response {
+    run_queue_action(&state, None, &body).await
+}
+
+/// Legacy `/api/queue/{requeue,promote,delete}` endpoints.
+async fn queue_action_path(
+    State(state): State<Shared>,
+    UrlPath(action): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    if !matches!(action.as_str(), "requeue" | "promote" | "delete") {
+        return error(StatusCode::NOT_FOUND, "not found");
+    }
+    run_queue_action(&state, Some(&action), &body).await
+}
+
+async fn run_queue_action(state: &AdminState, fixed: Option<&str>, body: &Bytes) -> Response {
+    let input: Value = match parse(body) {
         Ok(input) => input,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
     let action = fixed
         .map(str::to_string)
@@ -856,7 +729,7 @@ async fn queue_action(request: &HttpRequest, fixed: Option<&str>, state: &AdminS
         })
         .unwrap_or_default();
     if !matches!(action.as_str(), "requeue" | "promote" | "delete") {
-        return Response::error(400, "unknown action");
+        return error(StatusCode::BAD_REQUEST, "unknown action");
     }
     let name = input
         .get("name")
@@ -868,7 +741,7 @@ async fn queue_action(request: &HttpRequest, fixed: Option<&str>, state: &AdminS
         .map(str::to_string);
     let priority = input.get("priority").and_then(Value::as_i64).unwrap_or(0) as i32;
     let root = state.mail_root.clone();
-    let result = blocking(move || -> Result<usize> {
+    let result = blocking(move || {
         let targets = match (name, pattern) {
             (Some(name), _) => {
                 let (spool, eml, control) = find_message_sync(&root, &name)?
@@ -894,20 +767,251 @@ async fn queue_action(request: &HttpRequest, fixed: Option<&str>, state: &AdminS
     })
     .await;
     match result {
-        Ok(count) => Response::json(200, &json!({"result": "ok", "affected": count})),
-        Err(error) if error.to_string().contains("not found") => {
-            Response::error(404, &error.to_string())
+        Ok(count) => Json(json!({"result": "ok", "affected": count})).into_response(),
+        Err(err) if err.to_string().contains("not found") => {
+            error(StatusCode::NOT_FOUND, err.to_string())
         }
-        Err(error) => Response::error(400, &format!("{error:#}")),
+        Err(err) => error(StatusCode::BAD_REQUEST, format!("{err:#}")),
     }
 }
 
-fn static_asset(path: &str) -> Response {
-    match read_admin_static(path) {
-        Some((content_type, body)) => Response::new(200, content_type, body),
-        None if path == "/" || !path.contains('.') => {
-            Response::new(200, "text/html; charset=utf-8", admin_app_html())
+async fn accounts(State(state): State<Shared>) -> Response {
+    let (root, db) = (state.mail_root.clone(), state.db_path.clone());
+    outcome(
+        blocking(move || account_summaries_sync(&root, db.as_deref())).await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+async fn save_account(State(state): State<Shared>, body: Bytes) -> Response {
+    write_account(&state, &body, false).await
+}
+
+async fn update_account(State(state): State<Shared>, body: Bytes) -> Response {
+    write_account(&state, &body, true).await
+}
+
+async fn write_account(state: &AdminState, body: &Bytes, must_exist: bool) -> Response {
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let mut input: AccountRequest = match parse(body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    input.must_exist = must_exist;
+    let root = state.mail_root.clone();
+    outcome(
+        blocking(move || upsert_account_sync(&root, &db, input).map(|_| json!({"result": "ok"})))
+            .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn delete_account(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: AccountDeleteRequest = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || delete_account_sync(&db, input).map(|_| json!({"result": "ok"}))).await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn routing(State(state): State<Shared>) -> Response {
+    let db = state.db_path.clone();
+    outcome(
+        blocking(move || routing_summary_sync(db.as_deref())).await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+async fn save_alias(State(state): State<Shared>, body: Bytes) -> Response {
+    write_alias(&state, &body, false).await
+}
+
+async fn delete_alias(State(state): State<Shared>, body: Bytes) -> Response {
+    write_alias(&state, &body, true).await
+}
+
+async fn write_alias(state: &AdminState, body: &Bytes, delete: bool) -> Response {
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let mut input: AliasRequest = match parse(body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    if delete {
+        input.targets = None;
+    }
+    outcome(
+        blocking(move || upsert_alias_sync(&db, input).map(|_| json!({"result": "ok"}))).await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn save_catchall(State(state): State<Shared>, body: Bytes) -> Response {
+    write_catchall(&state, &body, false).await
+}
+
+async fn delete_catchall(State(state): State<Shared>, body: Bytes) -> Response {
+    write_catchall(&state, &body, true).await
+}
+
+async fn write_catchall(state: &AdminState, body: &Bytes, delete: bool) -> Response {
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let mut input: CatchallRequest = match parse(body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    if delete {
+        input.target = None;
+    }
+    outcome(
+        blocking(move || upsert_catchall_sync(&db, input).map(|_| json!({"result": "ok"}))).await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn settings(State(state): State<Shared>) -> Response {
+    match require_db(&state) {
+        Ok(db) => outcome(
+            blocking(move || settings_view_sync(&db)).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        Err(_) => Json(json!({"managed": false})).into_response(),
+    }
+}
+
+async fn update_settings(
+    State(state): State<Shared>,
+    Extension(peer): Extension<Peer>,
+    body: Bytes,
+) -> Response {
+    #[derive(Deserialize)]
+    struct Changes {
+        changes: BTreeMap<String, Value>,
+    }
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: Changes = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    let result = blocking(move || {
+        let mut conn = rmail_common::settings::open(&db)?;
+        rmail_common::settings::update(&mut conn, &input.changes)?;
+        settings_view_sync(&db)
+    })
+    .await;
+    if let Ok(view) = &result {
+        web_log!("info", "settings_updated", { "peer": peer.0.map(|a| a.to_string()), "revision": view["revision"] });
+    }
+    outcome(result, StatusCode::UNPROCESSABLE_ENTITY)
+}
+
+#[derive(Deserialize)]
+struct CredentialsRequest {
+    username: String,
+    #[serde(default)]
+    current_password: Option<String>,
+    new_password: String,
+}
+
+async fn change_credentials(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> Response {
+    let Some(db) = state.db_path.clone() else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "admin credentials are set in the configuration file when no database is configured",
+        );
+    };
+    let input: CredentialsRequest = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    let username = input.username.trim().to_string();
+    if username.is_empty() || username.contains(':') {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "username must be non-empty and must not contain ':'",
+        );
+    }
+    if input.new_password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("password must be at least {MIN_ADMIN_PASSWORD_CHARS} characters"),
+        );
+    }
+    // Setup mode (no credentials yet) needs no current password.
+    if let Principal::Admin(_) = principal {
+        let (user, hash) = match admin_credentials(&state).await {
+            Ok(Some(credentials)) => credentials,
+            Ok(None) => return error(StatusCode::CONFLICT, "admin credentials disappeared"),
+            Err(err) => return error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+        };
+        let current = input.current_password.unwrap_or_default();
+        if !check_password(&state, &user, &hash, &user, &current).await {
+            return error(StatusCode::FORBIDDEN, "current password is incorrect");
         }
-        None => Response::text(404, "Not Found"),
+    }
+    let new_password = input.new_password;
+    let hash = match blocking(move || {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let salt = SaltString::generate(&mut rand::rngs::OsRng);
+        argon2::Argon2::default()
+            .hash_password(new_password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|err| anyhow!(err.to_string()))
+    })
+    .await
+    {
+        Ok(hash) => hash,
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let (stored_user, stored_hash) = (username.clone(), hash.clone());
+    let result = blocking(move || {
+        let mut conn = rmail_common::settings::open(&db)?;
+        rmail_common::settings::write_raw(
+            &mut conn,
+            &BTreeMap::from([
+                (
+                    "global.web_admin_user".to_string(),
+                    Some(Value::from(stored_user)),
+                ),
+                (
+                    "global.web_admin_password_hash".to_string(),
+                    Some(Value::from(stored_hash)),
+                ),
+            ]),
+        )
+    })
+    .await;
+    match result {
+        Ok(_) => {
+            web_log!("info", "admin_credentials_changed", { "user": username });
+            // The new hash invalidates every other session; keep this one.
+            with_cookie(
+                Json(json!({"user": username})),
+                session_cookie(&state, &username, &hash),
+            )
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
