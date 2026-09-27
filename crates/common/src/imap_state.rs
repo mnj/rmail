@@ -983,11 +983,31 @@ pub fn delete_messages_by_uid(
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
     let tx = conn.transaction()?;
-    let dir = mailbox_dir(maildir_root, domain, localpart, &name)?;
-    let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
+    let (deleted, staged) =
+        expunge_uids_in_tx(&tx, maildir_root, domain, localpart, &name, &requested)?;
+    tx.commit()?;
+    finish_expunge(staged);
+    Ok(deleted)
+}
+
+type ExpungeTombstones = Vec<(FileMutationGuard, PathBuf)>;
+
+/// Expunge messages inside `tx`: each file is moved to a tombstone whose
+/// guard restores it unless [`finish_expunge`] runs after the commit.
+/// `uids` must be sorted and deduplicated; missing UIDs are skipped.
+fn expunge_uids_in_tx(
+    tx: &Connection,
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    name: &str,
+    uids: &[u64],
+) -> Result<(Vec<u64>, ExpungeTombstones)> {
+    let dir = mailbox_dir(maildir_root, domain, localpart, name)?;
+    let folder_id = folder_id(tx, name)?.context("missing folder")?;
     let mut staged = Vec::new();
     let mut deleted = Vec::new();
-    for uid in requested {
+    for &uid in uids {
         let Some((filename, subdir)) = tx
             .query_row(
                 "SELECT filename, subdir FROM messages WHERE folder_id = ?1 AND uid = ?2",
@@ -1010,22 +1030,25 @@ pub fn delete_messages_by_uid(
                 .with_context(|| format!("staging message UID {uid} for expunge"))?;
             staged.push((FileMutationGuard::moved(path, tombstone.clone()), tombstone));
         }
-        let modseq = next_modseq(&tx, folder_id)?;
-        record_expunge(&tx, folder_id, uid, modseq)?;
+        let modseq = next_modseq(tx, folder_id)?;
+        record_expunge(tx, folder_id, uid, modseq)?;
         tx.execute(
             "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
             params![folder_id, uid as i64],
         )?;
         deleted.push(uid);
     }
-    tx.commit()?;
+    Ok((deleted, staged))
+}
+
+/// Remove the tombstones of a committed expunge.
+fn finish_expunge(staged: ExpungeTombstones) {
     for (guard, tombstone) in staged {
         guard.commit();
         if let Err(error) = fs::remove_file(&tombstone) {
             crate::structured_log!("warn", "storage", "tombstone_cleanup_failed", { "path": tombstone.display().to_string(), "error": error.to_string() });
         }
     }
-    Ok(deleted)
 }
 
 enum FileMutationRollback {
@@ -1814,12 +1837,38 @@ pub fn publish_staged_appends(
     mailbox: &str,
     staged: Vec<StagedAppend>,
 ) -> Result<(u64, Vec<u64>)> {
+    let metadata = validate_staged_appends(maildir_root, domain, localpart, &staged)?;
+    let name = normalize_mailbox_name(mailbox)?;
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (uidvalidity, uids, guards) = publish_staged_in_tx(
+        &tx,
+        maildir_root,
+        domain,
+        localpart,
+        &name,
+        staged,
+        &metadata,
+    )?;
+    tx.commit()?;
+    for guard in guards {
+        guard.commit();
+    }
+    Ok((uidvalidity, uids))
+}
+
+fn validate_staged_appends(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    staged: &[StagedAppend],
+) -> Result<Vec<fs::Metadata>> {
     if staged.is_empty() {
         anyhow::bail!("APPEND batch is empty");
     }
     let expected_parent = account_maildir(maildir_root, domain, localpart).join("tmp");
     let mut metadata = Vec::with_capacity(staged.len());
-    for item in &staged {
+    for item in staged {
         let valid_stage = item.path.parent() == Some(expected_parent.as_path())
             && item
                 .path
@@ -1840,25 +1889,36 @@ pub fn publish_staged_appends(
         anyhow::bail!("zero-length MULTIAPPEND message");
     }
 
-    let name = normalize_mailbox_name(mailbox)?;
-    let mut conn = open_account(maildir_root, domain, localpart)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if folder_id(&tx, &name)?.is_none() {
+    Ok(metadata)
+}
+
+/// Move staged files into `name` and index them inside `tx`. The returned
+/// guards remove the published files unless committed after `tx` commits.
+fn publish_staged_in_tx(
+    tx: &Connection,
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    name: &str,
+    staged: Vec<StagedAppend>,
+    metadata: &[fs::Metadata],
+) -> Result<(u64, Vec<u64>, Vec<FileMutationGuard>)> {
+    if folder_id(tx, name)?.is_none() {
         anyhow::bail!("destination mailbox does not exist");
     }
-    reconcile_folder(&tx, maildir_root, domain, localpart, &name)?;
+    reconcile_folder(tx, maildir_root, domain, localpart, name)?;
     let total_size = metadata.iter().try_fold(0_u64, |total, item| {
         total
             .checked_add(item.len())
             .context("APPEND batch too large")
     })?;
-    enforce_storage_quota(&tx, total_size)?;
+    enforce_storage_quota(tx, total_size)?;
 
-    let directory = mailbox_dir(maildir_root, domain, localpart, &name)?;
+    let directory = mailbox_dir(maildir_root, domain, localpart, name)?;
     ensure_maildir(&directory)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let folder = get_folder(&tx, &name)?.context("missing destination folder")?;
-    let folder_id = folder_id(&tx, &name)?.context("missing destination folder")?;
+    let folder = get_folder(tx, name)?.context("missing destination folder")?;
+    let folder_id = folder_id(tx, name)?.context("missing destination folder")?;
     let mut uid = folder.uidnext;
     let mut uids = Vec::with_capacity(staged.len());
     let mut guards = Vec::with_capacity(staged.len());
@@ -1877,7 +1937,7 @@ pub fn publish_staged_appends(
         let new_path = directory.join("new").join(&filename);
         fs::rename(&item.path, &new_path)?;
         guards.push(FileMutationGuard::copied(new_path));
-        let modseq = next_modseq(&tx, folder_id)?;
+        let modseq = next_modseq(tx, folder_id)?;
         tx.execute(
             "INSERT INTO messages(folder_id, filename, subdir, uid, flags, size, internaldate, internaldate_tz, save_date, modseq)
              VALUES(?1, ?2, 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1900,11 +1960,60 @@ pub fn publish_staged_appends(
         "UPDATE folders SET uidnext = ?1 WHERE id = ?2",
         params![uid as i64, folder_id],
     )?;
+    Ok((folder.uidvalidity, uids, guards))
+}
+
+/// Outcome of [`replace_message`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceOutcome {
+    pub uidvalidity: u64,
+    pub uid: u64,
+    /// Whether the replaced message was still present and was expunged.
+    pub expunged: bool,
+}
+
+/// RFC 8508 REPLACE: publish a staged message in `destination` and expunge
+/// `source_uid` from `source_mailbox` in one index transaction. The old
+/// message is expunged first so that the quota check counts its space as
+/// freed; if publishing fails, the expunge is rolled back.
+#[allow(clippy::too_many_arguments)]
+pub fn replace_message(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    source_mailbox: &str,
+    source_uid: u64,
+    destination: &str,
+    staged: StagedAppend,
+) -> Result<ReplaceOutcome> {
+    let staged = vec![staged];
+    let metadata = validate_staged_appends(maildir_root, domain, localpart, &staged)?;
+    let source = normalize_mailbox_name(source_mailbox)?;
+    let destination = normalize_mailbox_name(destination)?;
+    let mut conn = open_account(maildir_root, domain, localpart)?;
+    ensure_folder(&conn, maildir_root, domain, localpart, &source)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (expunged, tombstones) =
+        expunge_uids_in_tx(&tx, maildir_root, domain, localpart, &source, &[source_uid])?;
+    let (uidvalidity, uids, guards) = publish_staged_in_tx(
+        &tx,
+        maildir_root,
+        domain,
+        localpart,
+        &destination,
+        staged,
+        &metadata,
+    )?;
     tx.commit()?;
     for guard in guards {
         guard.commit();
     }
-    Ok((folder.uidvalidity, uids))
+    finish_expunge(tombstones);
+    Ok(ReplaceOutcome {
+        uidvalidity,
+        uid: uids[0],
+        expunged: !expunged.is_empty(),
+    })
 }
 
 #[cfg(unix)]

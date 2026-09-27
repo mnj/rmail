@@ -467,12 +467,9 @@ impl Session {
                 return Err(error.into());
             }
         };
-        // APPEND streams its own literals; other commands get them inlined.
-        let is_append = std::str::from_utf8(&line)
-            .ok()
-            .and_then(|line| line.split_ascii_whitespace().nth(1))
-            .is_some_and(|command| command.eq_ignore_ascii_case("APPEND"));
-        if is_append || trailing_literal_marker(&line).is_none() {
+        // APPEND and REPLACE stream their own literals; other commands get
+        // them inlined.
+        if streams_own_literals(&line) || trailing_literal_marker(&line).is_none() {
             return Ok(Line::Command(line));
         }
         let rejection: &[u8] = match read_textual_command_literals(reader, line, line_limit).await {
@@ -569,6 +566,10 @@ impl Session {
                 .await
             }
             Command::Append => self.append(reader, call).await,
+            Command::Replace => {
+                self.replace(reader, call.tag, &call.name, call.args, false)
+                    .await
+            }
             Command::List { .. } | Command::Lsub => self.list(reader, call).await,
             Command::Create | Command::Delete | Command::Rename | Command::Subscribe { .. } => {
                 self.manage_mailbox(reader, call).await
@@ -629,6 +630,23 @@ impl Session {
     /// messages or report usage.
     async fn sync_quota(&self) -> Result<()> {
         sync_account_storage_quota(&self.mail_root, self.address(), self.db_path.as_deref()).await
+    }
+}
+
+/// Whether a command line is an APPEND, REPLACE or UID REPLACE, whose
+/// message literal the command handler reads itself.
+fn streams_own_literals(line: &[u8]) -> bool {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let mut words = line.split_ascii_whitespace().skip(1);
+    match words.next() {
+        Some(command) if command.eq_ignore_ascii_case("APPEND") => true,
+        Some(command) if command.eq_ignore_ascii_case("REPLACE") => true,
+        Some(command) if command.eq_ignore_ascii_case("UID") => words
+            .next()
+            .is_some_and(|sub| sub.eq_ignore_ascii_case("REPLACE")),
+        _ => false,
     }
 }
 

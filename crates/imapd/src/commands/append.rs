@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 const APPEND_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
-enum LiteralStreamError {
+pub(crate) enum LiteralStreamError {
     Io(std::io::Error),
     InvalidUtf8,
 }
@@ -44,7 +44,7 @@ impl Utf8StreamValidator {
     }
 }
 
-async fn stream_literal_to_stage(
+pub(crate) async fn stream_literal_to_stage(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     path: &Path,
     length: usize,
@@ -404,7 +404,7 @@ async fn remove_staged_appends(staged: &[rmail_common::imap_state::StagedAppend]
     }
 }
 
-fn split_catenate_args(args: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_catenate_args(args: &str) -> Option<(&str, &str)> {
     let bytes = args.as_bytes();
     let mut quoted = false;
     let mut escaped = false;
@@ -690,12 +690,12 @@ async fn handle_catenate(
     }
 }
 
-fn bounded_internal_date(date: Option<parser::AppendDate>) -> Option<(i64, i32)> {
+pub(crate) fn bounded_internal_date(date: Option<parser::AppendDate>) -> Option<(i64, i32)> {
     date.filter(|date| date.timestamp <= chrono::Utc::now().timestamp() + 2 * 60 * 60)
         .map(|date| (date.timestamp, date.timezone_offset_minutes))
 }
 
-async fn create_append_stage(
+pub(crate) async fn create_append_stage(
     mail_root: &str,
     domain: &str,
     local: &str,
@@ -731,7 +731,7 @@ async fn read_multiappend_continuation(
     Ok(Some(line))
 }
 
-fn catenate_error_response(tag: &str, error: CatenateError) -> Response {
+pub(crate) fn catenate_error_response(tag: &str, error: CatenateError) -> Response {
     match error {
         CatenateError::BadUrl(url) => Response::new().status(
             StatusLine::tagged(tag, Status::No, "CATENATE URL could not be resolved")
@@ -746,7 +746,7 @@ fn catenate_error_response(tag: &str, error: CatenateError) -> Response {
 }
 
 #[derive(Debug)]
-enum CatenateError {
+pub(crate) enum CatenateError {
     Syntax,
     TooBig,
     TooBigDesynchronized,
@@ -754,7 +754,7 @@ enum CatenateError {
     Io(std::io::Error),
 }
 
-async fn stream_catenate_parts(
+pub(crate) async fn stream_catenate_parts(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     initial_parts: &str,
     staged_path: &Path,
@@ -1082,7 +1082,7 @@ fn unavailable(tag: &str, error: impl std::fmt::Display) -> Response {
     )
 }
 
-async fn write_response(
+pub(crate) async fn write_response(
     reader: &mut BufReader<Box<dyn AsyncStream + Send + 'static>>,
     response: Response,
 ) -> Result<()> {

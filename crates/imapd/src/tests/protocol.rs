@@ -103,6 +103,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "METADATA",
             "NOTIFY",
             "UIDONLY",
+            "REPLACE",
             "APPENDLIMIT=104857600",
         ])
     );

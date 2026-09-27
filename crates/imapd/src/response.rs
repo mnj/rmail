@@ -262,6 +262,7 @@ pub(crate) fn capability_tokens_with_policy(
             "METADATA",
             "NOTIFY",
             "UIDONLY",
+            "REPLACE",
         ]),
     }
     let mut caps = caps.join(" ");
