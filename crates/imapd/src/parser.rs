@@ -889,6 +889,22 @@ pub(crate) enum SearchCriterion {
     And(Vec<SearchCriterion>),
 }
 
+impl SearchCriterion {
+    /// Whether the criterion contains a message sequence set, which UIDONLY
+    /// forbids (RFC 9586 §3.5).
+    pub(crate) fn uses_sequence_numbers(&self) -> bool {
+        match self {
+            SearchCriterion::SeqSet(_) => true,
+            SearchCriterion::Not(inner) => inner.uses_sequence_numbers(),
+            SearchCriterion::Or(left, right) => {
+                left.uses_sequence_numbers() || right.uses_sequence_numbers()
+            }
+            SearchCriterion::And(criteria) => criteria.iter().any(Self::uses_sequence_numbers),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SearchMessage<'a> {
     pub(crate) seq: usize,

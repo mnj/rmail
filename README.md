@@ -16,7 +16,7 @@ screenshots of every page, and a quick start.
 - **SMTP, submission and LMTP**: phase-aware ESMTP with STARTTLS, PIPELINING, 8BITMIME, SMTPUTF8,
   CHUNKING/BINARYMIME, DSN and REQUIRETLS; AUTH PLAIN, SCRAM-SHA-256 and optional OAUTHBEARER/XOAUTH2.
 - **IMAP4rev1 and IMAP4rev2** over Maildir: IDLE, CONDSTORE/QRESYNC, MOVE, SORT/THREAD, PREVIEW,
-  QUOTA, METADATA, NOTIFY, COMPRESS and SCRAM-SHA-256-PLUS.
+  QUOTA, METADATA, NOTIFY, UIDONLY, COMPRESS and SCRAM-SHA-256-PLUS.
 - **Mail authentication**: inbound SPF, DKIM, DMARC (with aggregate reports) and ARC; outbound DKIM
   and ARC signing; optional ClamAV and rspamd filtering.
 - **Outbound relay queue** with retries, per-destination limits, connection reuse and
@@ -174,6 +174,7 @@ or conformance-validation gaps.
 | RFC 8474 | `OBJECTID` | 90% | Permanent `MAILBOXID` (kept across RENAME) and `EMAILID` (kept across COPY and MOVE) come from random IDs stored in the index, never reused. They are reported by CREATE, SELECT/EXAMINE, STATUS, LIST-STATUS and FETCH, and `SEARCH EMAILID` works. `THREADID` is always `NIL`, as the RFC allows when a server has no permanent thread IDs. |
 | RFC 5464 | `METADATA` | 90% | `GETMETADATA` (with `MAXSIZE`/`LONGENTRIES` and `DEPTH`) and atomic `SETMETADATA` for server (`""`) and mailbox entries under `/private` and `/shared`. Entries are stored in the account index, follow a mailbox across RENAME and are removed with it. Limits: 64 KiB per value (`MAXSIZE`) and 512 entries per account (`TOOMANY`); `/shared/admin` is read-only. Values must be UTF-8 text (no `literal8`); unsolicited METADATA change notifications are sent only through `NOTIFY`. |
 | RFC 5465 | `NOTIFY` | 85% | `NOTIFY SET [STATUS]` and `NOTIFY NONE` with the `SELECTED`, `SELECTED-DELAYED`, `INBOXES`, `PERSONAL`, `SUBSCRIBED`, `SUBTREE` and `MAILBOXES` filters. Events: `MessageNew` (with fetch attributes for the selected mailbox), `MessageExpunge`, `FlagChange`, `MailboxName`, `SubscriptionChange`, `MailboxMetadataChange` and `ServerMetadataChange`; `AnnotationChange` is refused with `BADEVENT`. Changes are found by polling storage between commands and during IDLE (every second for the selected mailbox, every two seconds for the others), so they arrive with that delay; the session's own changes are reported too. More than 1000 changes in one scan end notifications with `NOTIFICATIONOVERFLOW`. |
+| RFC 9586 | `UIDONLY` | 100% | After `ENABLE UIDONLY`, FETCH, STORE, SEARCH, SORT, THREAD, COPY and MOVE, a sequence-set search key in the UID forms, and the QRESYNC message sequence match data are refused with `BAD [UIDREQUIRED]`. Message data goes out as `UIDFETCH` and expunges as `VANISHED` in command responses, unsolicited updates, IDLE and NOTIFY; SELECT leaves out the sequence-numbered `UNSEEN` code. |
 | RFC 8437 | `UNAUTHENTICATE` | 100% | Returns the session to the not-authenticated state while keeping TLS and compression. |
 
 IMAP4rev2 is dual-advertised with IMAP4rev1 for compatibility; clients enable

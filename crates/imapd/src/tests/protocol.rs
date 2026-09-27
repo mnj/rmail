@@ -101,6 +101,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "OBJECTID",
             "METADATA",
             "NOTIFY",
+            "UIDONLY",
             "APPENDLIMIT=104857600",
         ])
     );

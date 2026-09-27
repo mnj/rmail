@@ -13,6 +13,8 @@ use crate::{
 pub(crate) struct StoreContext {
     pub(crate) condstore: bool,
     pub(crate) imap4rev2: bool,
+    /// RFC 9586: responses are UIDFETCH.
+    pub(crate) uidonly: bool,
 }
 
 pub(crate) struct Outcome {
@@ -136,11 +138,22 @@ pub(crate) async fn handle(
             continue;
         };
         applied.push((*uid, flags.clone(), *modseq));
+        // RFC 9586 §3.3: UIDFETCH starts with the UID instead.
+        let (prefix, uid_item) = if context.uidonly {
+            (format!("{uid} UIDFETCH"), String::new())
+        } else {
+            (format!("{sequence} FETCH"), format!("UID {uid}"))
+        };
+        let modseq_item = condstore.then(|| format!("MODSEQ ({modseq})"));
         if request.silent {
             // RFC 7162 §3.1.3: a silent STORE still reports the new
             // mod-sequence once CONDSTORE is enabled.
-            if condstore {
-                response = response.data(format!("{sequence} FETCH (UID {uid} MODSEQ ({modseq}))"));
+            if let Some(modseq_item) = modseq_item {
+                let items = [uid_item, modseq_item]
+                    .into_iter()
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>();
+                response = response.data(format!("{prefix} ({})", items.join(" ")));
             }
             continue;
         }
@@ -150,17 +163,16 @@ pub(crate) async fn handle(
             response_flags.sort();
             response_flags.dedup();
         }
-        response = response.data(if condstore {
-            format!(
-                "{sequence} FETCH (FLAGS ({}) UID {uid} MODSEQ ({modseq}))",
-                response_flags.join(" ")
-            )
-        } else {
-            format!(
-                "{sequence} FETCH (FLAGS ({}) UID {uid})",
-                response_flags.join(" ")
-            )
-        });
+        let items = [
+            Some(format!("FLAGS ({})", response_flags.join(" "))),
+            Some(uid_item),
+            modseq_item,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+        response = response.data(format!("{prefix} ({})", items.join(" ")));
     }
     let mut completion = StatusLine::tagged(tag, Status::Ok, format!("{command} completed"));
     if !modified.is_empty() {

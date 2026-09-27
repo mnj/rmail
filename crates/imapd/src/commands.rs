@@ -65,6 +65,36 @@ pub(crate) fn preflight(
     None
 }
 
+/// RFC 9586 §3: once UIDONLY is enabled, a command that uses message
+/// sequence numbers is refused.
+pub(crate) fn uid_required(tag: &str) -> StatusLine {
+    StatusLine::tagged(
+        tag,
+        Status::Bad,
+        "Message numbers are not allowed once UIDONLY is enabled",
+    )
+    .with_code("UIDREQUIRED")
+}
+
+/// Whether a UID SEARCH, SORT or THREAD addresses messages by sequence
+/// number through a `sequence-set` search key (RFC 9586 §3.5, §3.8).
+/// Arguments that do not parse are left to the command's own error.
+pub(crate) fn uid_search_uses_sequence_numbers(subcommand: &str, args: &str) -> bool {
+    let criterion = match subcommand {
+        "SEARCH" => parser::parse_search_request(args)
+            .ok()
+            .map(|request| request.criterion),
+        "SORT" => parser::parse_sort_request(args)
+            .ok()
+            .map(|request| request.search),
+        "THREAD" => parser::parse_thread_request(args)
+            .ok()
+            .map(|request| request.search),
+        _ => None,
+    };
+    criterion.is_some_and(|criterion| criterion.uses_sequence_numbers())
+}
+
 const ANY: CommandSpec = CommandSpec {
     auth: CommandAuth::Any,
     tls_required: false,
@@ -386,7 +416,8 @@ mod tests {
         }
     }
 }
-use crate::parser::{Command, UidCommand};
+use crate::parser::{self, Command, UidCommand};
+use crate::response::{Status, StatusLine};
 pub(crate) mod append;
 pub(crate) mod authenticate;
 pub(crate) mod basic;

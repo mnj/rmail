@@ -21,6 +21,14 @@ impl Session {
             .split_once(|character: char| character.is_ascii_whitespace())
             .map(|(_, args)| args.trim_start())
             .unwrap_or("");
+        if self.state.uidonly_enabled()
+            && commands::uid_search_uses_sequence_numbers(subcommand, args)
+        {
+            let response = crate::response::Response::new()
+                .status(commands::uid_required(tag))
+                .encode();
+            return self.respond(reader, tag, &call.name, response).await;
+        }
         match subcommand {
             "FETCH" => self.fetch(reader, tag, args, true).await,
             "THREAD" => self.thread(reader, tag, args, true).await,
@@ -34,7 +42,7 @@ impl Session {
                     &self.mail_root,
                     self.selected(),
                     self.state.saved_search_uids(),
-                    self.state.feature_enabled("QRESYNC"),
+                    self.state.vanished_enabled(),
                 )
                 .await;
                 self.apply_selection_effect(outcome.selection_effect)
@@ -69,9 +77,10 @@ impl Session {
             self.state.saved_search_uids(),
             uid,
             commands::fetch::FetchContext {
-                qresync: self.state.feature_enabled("QRESYNC"),
+                qresync: self.state.vanished_enabled(),
                 condstore: self.state.condstore_enabled(),
                 imap4rev2: self.state.imap4rev2_enabled(),
+                uidonly: self.state.uidonly_enabled(),
             },
         )
         .await?;
@@ -99,6 +108,7 @@ impl Session {
             commands::store::StoreContext {
                 condstore: self.state.condstore_enabled(),
                 imap4rev2: self.state.imap4rev2_enabled(),
+                uidonly: self.state.uidonly_enabled(),
             },
         )
         .await;
@@ -196,7 +206,7 @@ impl Session {
             self.state.saved_search_uids(),
             uid,
             self.state.utf8_enabled(),
-            self.state.feature_enabled("QRESYNC"),
+            self.state.vanished_enabled(),
         )
         .await;
         if let Some(selected) = self.selected.as_mut() {
@@ -219,7 +229,7 @@ impl Session {
                 call.tag,
                 &self.mail_root,
                 self.selected(),
-                self.state.feature_enabled("QRESYNC"),
+                self.state.vanished_enabled(),
             )
             .await
         };
