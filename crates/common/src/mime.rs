@@ -1,20 +1,21 @@
-//! Parsing stored messages for display: headers (RFC 2047), MIME
-//! multipart bodies, transfer encodings, inline images, and sanitizing HTML
-//! for the sandboxed reader.
+//! Parsing stored messages: headers (RFC 2047), MIME multipart bodies,
+//! transfer encodings, inline images, and sanitizing HTML for the webmail
+//! reader. Shared by webmail and the mail classifier.
 
 use std::collections::HashMap;
 
 use base64::Engine;
 
 #[derive(Default)]
-pub(crate) struct ParsedMessage {
-    pub(crate) from: String,
-    pub(crate) to: String,
-    pub(crate) subject: String,
-    pub(crate) date: String,
-    pub(crate) text_body: String,
-    pub(crate) html_body: Option<String>,
-    pub(crate) inline_images: HashMap<String, String>,
+pub struct ParsedMessage {
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub date: String,
+    pub list_id: String,
+    pub text_body: String,
+    pub html_body: Option<String>,
+    pub inline_images: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -24,7 +25,7 @@ struct MultipartParsed {
     inline_images: HashMap<String, String>,
 }
 
-pub(crate) fn parse_message(bytes: &[u8]) -> ParsedMessage {
+pub fn parse_message(bytes: &[u8]) -> ParsedMessage {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
     let (headers, body) = text.split_once("\n\n").unwrap_or(("", &text));
     parse_message_parts(headers, body)
@@ -37,6 +38,7 @@ fn parse_message_parts(headers: &str, body: &str) -> ParsedMessage {
     parsed.to = header_map.get("to").cloned().unwrap_or_default();
     parsed.subject = header_map.get("subject").cloned().unwrap_or_default();
     parsed.date = header_map.get("date").cloned().unwrap_or_default();
+    parsed.list_id = header_map.get("list-id").cloned().unwrap_or_default();
 
     let content_type_raw = header_map
         .get("content-type")
@@ -372,7 +374,7 @@ fn remove_html_comments(input: &str) -> String {
     out
 }
 
-pub(crate) fn has_remote_content(html: &str) -> bool {
+pub fn has_remote_content(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
     [
         "src=\"http",
@@ -402,7 +404,7 @@ fn message_csp(allow_remote_content: bool) -> &'static str {
     }
 }
 
-pub(crate) fn sanitize_email_html(input: &str, allow_remote_content: bool) -> String {
+pub fn sanitize_email_html(input: &str, allow_remote_content: bool) -> String {
     let input = remove_html_block(input, "script");
     let input = remove_html_block(&input, "iframe");
     let input = remove_html_block(&input, "object");
@@ -496,7 +498,7 @@ fn sanitize_html_tag(tag: &str) -> String {
     cleaned
 }
 
-pub(crate) fn snippet(input: &str) -> String {
+pub fn snippet(input: &str) -> String {
     let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(160).collect()
 }

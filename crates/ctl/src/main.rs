@@ -17,6 +17,7 @@ const RMAIL_SYSTEMD_UNITS: &[&str] = &[
     "rmail_web.service",
     "rmail_webmail.service",
     "rmail_outbound.service",
+    "rmail_classifier.service",
 ];
 
 /// rmail_ctl: minimal control CLI for managing mailboxes and generating password hashes.
@@ -917,7 +918,7 @@ mod tests {
             dry_run: false,
         };
         let units = selected_units(&opts, true).unwrap();
-        assert_eq!(units.first().copied(), Some("rmail_outbound.service"));
+        assert_eq!(units.first().copied(), Some("rmail_classifier.service"));
         assert_eq!(units.last().copied(), Some("rmail_smtpd.service"));
     }
 

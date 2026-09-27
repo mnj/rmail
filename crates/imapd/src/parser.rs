@@ -279,7 +279,7 @@ pub(crate) fn parse_id_args(
         return Err(ParseError::TrailingData);
     }
     let mut fields = Vec::with_capacity(items.len() / 2);
-    for pair in items.chunks_exact(2) {
+    for pair in items.as_chunks::<2>().0 {
         let ImapArg::String(key) = &pair[0] else {
             return Err(ParseError::InvalidAtom);
         };

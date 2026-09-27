@@ -5,6 +5,9 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod auth;
+pub mod classifier_control;
+pub mod classifier_models;
+pub mod classifier_store;
 pub mod config;
 pub mod db;
 pub mod domain;
@@ -13,6 +16,7 @@ pub mod imap_state;
 pub mod mail_auth;
 pub mod maildir;
 pub mod metrics;
+pub mod mime;
 pub mod net;
 pub mod oauth;
 pub mod outbound;

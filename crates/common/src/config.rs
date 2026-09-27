@@ -224,6 +224,9 @@ pub struct Config {
     pub global: Global,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Local-model mail organization (the `rmail_classifier` daemon).
+    #[serde(default)]
+    pub classifier: ClassifierConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -454,7 +457,91 @@ fn default_rspamd_quarantine_actions() -> Vec<String> {
     ]
 }
 
+/// Settings for the `rmail_classifier` daemon, which suggests folders for new
+/// INBOX mail using local GGUF models stored under `<mail_root>/models`.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ClassifierConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// File name of the embedding model in the models directory; empty disables
+    /// classification.
+    #[serde(default)]
+    pub embed_model: String,
+    /// File name of the optional chat model used when the embedding vote is
+    /// not confident; empty disables the fallback.
+    #[serde(default)]
+    pub chat_model: String,
+    /// Inference threads; zero picks the number of CPUs.
+    #[serde(default)]
+    pub threads: u32,
+    #[serde(default = "default_classifier_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// Most recent messages per folder learned when an account opts in.
+    #[serde(default = "default_classifier_backfill_per_folder")]
+    pub backfill_per_folder: u32,
+    /// Bytes of message text given to the models.
+    #[serde(default = "default_classifier_max_input_bytes")]
+    pub max_input_bytes: usize,
+    /// Minimum embedding vote (percent) before a folder is suggested without
+    /// asking the chat model.
+    #[serde(default = "default_classifier_knn_confidence")]
+    pub knn_confidence: u32,
+    /// Minimum confidence (percent) before a message is moved automatically
+    /// into a folder the user enabled auto-move for.
+    #[serde(default = "default_classifier_autofile_confidence")]
+    pub autofile_confidence: u32,
+    /// Folders with fewer learned messages than this defer to the chat model.
+    #[serde(default = "default_classifier_min_examples")]
+    pub min_examples: u32,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            embed_model: String::new(),
+            chat_model: String::new(),
+            threads: 0,
+            poll_interval_seconds: default_classifier_poll_interval_seconds(),
+            backfill_per_folder: default_classifier_backfill_per_folder(),
+            max_input_bytes: default_classifier_max_input_bytes(),
+            knn_confidence: default_classifier_knn_confidence(),
+            autofile_confidence: default_classifier_autofile_confidence(),
+            min_examples: default_classifier_min_examples(),
+        }
+    }
+}
+
+fn default_classifier_poll_interval_seconds() -> u64 {
+    15
+}
+fn default_classifier_backfill_per_folder() -> u32 {
+    300
+}
+fn default_classifier_max_input_bytes() -> usize {
+    2048
+}
+fn default_classifier_knn_confidence() -> u32 {
+    60
+}
+fn default_classifier_autofile_confidence() -> u32 {
+    85
+}
+fn default_classifier_min_examples() -> u32 {
+    5
+}
+
 impl Config {
+    /// Directory holding downloaded classifier models.
+    pub fn models_dir(&self) -> std::path::PathBuf {
+        crate::classifier_models::models_dir(Path::new(&self.global.mail_root))
+    }
+
+    /// Unix socket the classifier daemon accepts control commands on.
+    pub fn classifier_socket(&self) -> std::path::PathBuf {
+        crate::classifier_control::socket_path(Path::new(&self.global.mail_root))
+    }
+
     /// Parse a TOML file as-is, without consulting the settings database.
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {
         let s = fs::read_to_string(path)?;

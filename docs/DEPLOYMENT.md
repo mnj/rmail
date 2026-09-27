@@ -14,6 +14,7 @@ The daemons are:
 - `rmail_web`: admin/status web UI
 - `rmail_webmail`: user-facing mailbox webmail UI
 - `rmail_outbound`: outbound queue worker
+- `rmail_classifier`: optional folder suggestions from local models (see [Mail organization](#mail-organization))
 
 Administrative tools:
 
@@ -53,6 +54,7 @@ sudo install -m 0755 target/release/rmail_imapd /usr/bin/rmail_imapd
 sudo install -m 0755 target/release/rmail_web /usr/bin/rmail_web
 sudo install -m 0755 target/release/rmail_webmail /usr/bin/rmail_webmail
 sudo install -m 0755 target/release/rmail_outbound /usr/bin/rmail_outbound
+sudo install -m 0755 target/release/rmail_classifier /usr/bin/rmail_classifier
 sudo install -m 0755 target/release/rmail_ctl /usr/bin/rmail_ctl
 sudo install -m 0755 target/release/rmail_queuectl /usr/bin/rmail_queuectl
 ```
@@ -307,6 +309,7 @@ sudo install -m 0644 packaging/systemd/rmail_imapd.service /usr/lib/systemd/syst
 sudo install -m 0644 packaging/systemd/rmail_web.service /usr/lib/systemd/system/rmail_web.service
 sudo install -m 0644 packaging/systemd/rmail_webmail.service /usr/lib/systemd/system/rmail_webmail.service
 sudo install -m 0644 packaging/systemd/rmail_outbound.service /usr/lib/systemd/system/rmail_outbound.service
+sudo install -m 0644 packaging/systemd/rmail_classifier.service /usr/lib/systemd/system/rmail_classifier.service
 sudo systemctl daemon-reload
 ```
 
@@ -318,6 +321,7 @@ sudo systemctl enable --now rmail_imapd.service
 sudo systemctl enable --now rmail_web.service
 sudo systemctl enable --now rmail_webmail.service
 sudo systemctl enable --now rmail_outbound.service
+sudo systemctl enable --now rmail_classifier.service   # optional
 ```
 
 After the units are enabled, `rmail_ctl` can control the whole service set:
@@ -341,8 +345,43 @@ sudo rmail_ctl service stop --unit rmail_web.service
 
 ```bash
 sudo rmail_ctl service status
-journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_webmail.service -u rmail_outbound.service -n 200 --no-pager
+journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_webmail.service -u rmail_outbound.service -u rmail_classifier.service -n 200 --no-pager
 ```
+
+## Mail organization
+
+`rmail_classifier` suggests folders for new INBOX mail. It learns from how each user files their mail
+and runs small GGUF models in-process with llama.cpp: no external model server, and mail never
+leaves the machine. It never runs in the SMTP path; mail always lands in INBOX first.
+
+1. On the admin console **Organization** page, download an embedding model (required) and, if you want,
+   a chat model (optional fallback for uncertain messages). Models are stored in `<mail_root>/models`.
+   Every download records its SHA-256. A model added by URL can require a specific checksum.
+2. Click **Use** on each model and turn on **Enabled**. The console saves the `classifier.*` settings and
+   tells the daemon to reload over its control socket (`<mail_root>/run/classifier.sock`), so no
+   restart is needed. `systemctl reload rmail_classifier` does the same.
+3. Users opt in from webmail (**Organize my mail**). Each opted-in account gets
+   `Maildir/classifier.sqlite` next to its IMAP state. That file holds the learned examples,
+   suggestions and preferences, and it only exists once the account opts in.
+4. Use **Try it** on the Organization page to check an embedding and a chat answer and their timings.
+
+How it decides:
+
+- The daemon learns from messages in the user's own folders, excluding special-use folders (Sent,
+  Drafts, Trash, Junk, Archive) and anything the user excludes. Mail filed from any IMAP client counts.
+- New INBOX mail gets a suggestion when earlier mail from the same sender or list went to one folder,
+  or when the embedding vote among similar filed messages is confident. Otherwise the chat model (if
+  configured) picks from the user's folder list, and a grammar keeps it from inventing a folder.
+- Suggestions show in webmail with Move and Dismiss buttons, and IMAP clients see the `$Suggested`
+  keyword. A message is moved automatically only when the user turned on auto-move for that folder,
+  the confidence is at least `classifier.autofile_confidence`, and the vote came from the user's own
+  filing (never from the chat model alone).
+
+Resource notes: embedding models cost roughly 100–900 MB RAM and milliseconds per message on CPU.
+Chat models (1–2 GB) take seconds per uncertain message. The unit runs at `Nice=10` with a reduced
+CPU weight so inference yields to the mail daemons. Building `rmail_classifier` needs cmake and a C/C++
+compiler. Build with `--no-default-features` to leave out llama.cpp. For GPU inference, pass the
+`cuda`, `vulkan` or `metal` feature.
 
 ## Notes On Privileged Ports
 

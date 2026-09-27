@@ -13,6 +13,7 @@ Repository layout:
 - crates/queue-manager, crates/queuectl — outbound spool management
 - crates/webui — admin console (`rmail_web`) and its React/Vite frontend
 - crates/webmail — user-facing webmail server and React/Vite SPA
+- crates/classifier — `rmail_classifier`, optional folder suggestions from local GGUF models (llama.cpp in-process)
 - crates/ctl — `rmail_ctl` CLI for accounts, settings, certificates and services
 - crates/bench — live performance workloads
 

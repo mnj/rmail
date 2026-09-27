@@ -26,6 +26,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::*;
 
+mod organization;
+
 pub(crate) const SESSION_COOKIE: &str = "rmail_admin";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 /// Mutating requests must carry this header. Browsers cannot add custom
@@ -52,6 +54,7 @@ pub(crate) struct AdminState {
     pub throttle: AuthThrottle,
     pub revoked: websession::RevocationList,
     basic_cache: Mutex<HashMap<[u8; 32], Instant>>,
+    downloads: organization::Downloads,
 }
 
 impl AdminState {
@@ -76,6 +79,7 @@ impl AdminState {
             throttle: AuthThrottle::default(),
             revoked: websession::RevocationList::default(),
             basic_cache: Mutex::new(HashMap::new()),
+            downloads: organization::Downloads::default(),
         }
     }
 }
@@ -108,6 +112,7 @@ pub(crate) fn router(state: Shared) -> Router {
         )
         .route("/api/settings", get(settings).put(update_settings))
         .route("/api/admin/credentials", post(change_credentials))
+        .merge(organization::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let app = Router::new()
         .route("/.well-known/acme-challenge/{*token}", get(acme_challenge))
@@ -272,7 +277,7 @@ async fn require_admin(State(state): State<Shared>, mut request: Request, next: 
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -352,7 +357,7 @@ async fn authenticate(
     headers: &HeaderMap,
     peer: Peer,
     state: &AdminState,
-) -> std::result::Result<Principal, Response> {
+) -> std::result::Result<Principal, Box<Response>> {
     let credentials = admin_credentials(state)
         .await
         .map_err(|err| error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
@@ -367,10 +372,10 @@ async fn authenticate(
         .and_then(|value| value.to_str().ok())
         .and_then(parse_basic)
     else {
-        return Err(unauthorized(headers));
+        return Err(Box::new(unauthorized(headers)));
     };
     if let Some(remaining) = peer.ip().and_then(|ip| state.throttle.blocked_for(ip)) {
-        return Err(too_many_attempts(remaining));
+        return Err(Box::new(too_many_attempts(remaining)));
     }
     if check_password(state, &user, &hash, &basic_user, &basic_password).await {
         Ok(Principal::Admin(user))
@@ -378,7 +383,7 @@ async fn authenticate(
         if let Some(ip) = peer.ip() {
             state.throttle.record_failure(ip);
         }
-        Err(unauthorized(headers))
+        Err(Box::new(unauthorized(headers)))
     }
 }
 
@@ -652,7 +657,7 @@ async fn logs(
         .min(2000);
     if !matches!(
         component,
-        "smtpd" | "imapd" | "web" | "outbound" | "webmail"
+        "smtpd" | "imapd" | "web" | "outbound" | "webmail" | "classifier"
     ) {
         return error(StatusCode::BAD_REQUEST, "invalid component");
     }

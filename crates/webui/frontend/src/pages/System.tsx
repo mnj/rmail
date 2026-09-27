@@ -9,6 +9,7 @@ const serviceLabels: Record<string, string> = {
   outbound: 'Outbound delivery',
   web: 'Admin console',
   webmail: 'Webmail',
+  classifier: 'Mail organization',
 };
 
 export function AdminCredentialsForm({ session, onChanged, setup }: { session: Session; onChanged: (user: string) => void; setup?: boolean }) {
