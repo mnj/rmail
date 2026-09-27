@@ -161,6 +161,16 @@ input:disabled { background: #f2f4f7; color: #667085; }
 .rowActions { text-align: right; white-space: nowrap; }
 .rowActions .iconButton { display: inline-grid; margin-left: 6px; }
 td.wrap { white-space: normal; word-break: break-word; max-width: 420px; }
+/* Queue table: fixed layout so a long spool filename cannot starve the error column. */
+.tableScroll { overflow-x: auto; }
+.queueTable { table-layout: fixed; min-width: 760px; }
+.queueTable col.queueName { width: 30%; }
+.queueTable col.queueNum { width: 96px; }
+.queueTable col.queueNext { width: 130px; }
+.queueTable col.queueError { width: auto; }
+.queueTable col.queueActions { width: 124px; }
+.queueNameCell code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clampText { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; }
 .pill.warn { background: #fef0c7; color: #93370d; }
 .pill.ok { background: #d1fadf; color: #067647; }
 .banner { display: flex; align-items: center; gap: 8px; }

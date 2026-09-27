@@ -48,25 +48,28 @@ export function DeliveryPage() {
         subtitle={spools.find((item) => item.id === spool)?.help}
         actions={<div className="tabs">{spools.map((item) => <button key={item.id} className={spool === item.id ? 'active' : ''} onClick={() => setSpool(item.id)}>{item.label}<small>{numberFmt.format(counts[item.id])}</small></button>)}</div>}
       >
-        <table>
-          <thead><tr><th>Message</th><th>Attempts</th><th>Priority</th><th>Next attempt</th><th>Last error</th><th /></tr></thead>
-          <tbody>
-            {entries.map((item) => (
-              <tr key={item.name}>
-                <td><code>{item.name}</code></td>
-                <td>{item.control?.attempts ?? 0}{item.control?.max_attempts ? ` / ${item.control.max_attempts}` : ''}</td>
-                <td>{item.control?.priority ?? 0}</td>
-                <td title={item.control?.next_try ? new Date(item.control.next_try * 1000).toLocaleString() : ''}>{item.control?.next_try ? formatRelative(item.control.next_try) : 'now'}</td>
-                <td className="muted wrap">{item.control?.last_error || '—'}</td>
-                <td className="rowActions">
-                  {spool !== 'inflight' && <button className="iconButton" title="Requeue now (resets attempts)" onClick={() => act('requeue', { name: item.name })}><RotateCcw size={15} /></button>}
-                  {spool === 'queue' && <button className="iconButton" title="Promote (deliver first)" onClick={() => act('promote', { name: item.name })}><ArrowUpToLine size={15} /></button>}
-                  {spool !== 'inflight' && <button className="iconButton danger" title="Delete" onClick={() => act('delete', { name: item.name })}><Trash2 size={15} /></button>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="tableScroll">
+          <table className="queueTable">
+            <colgroup><col className="queueName" /><col className="queueNum" /><col className="queueNum" /><col className="queueNext" /><col className="queueError" /><col className="queueActions" /></colgroup>
+            <thead><tr><th>Message</th><th>Attempts</th><th>Priority</th><th>Next attempt</th><th>Last error</th><th /></tr></thead>
+            <tbody>
+              {entries.map((item) => (
+                <tr key={item.name}>
+                  <td className="queueNameCell"><code title={item.name}>{item.name}</code></td>
+                  <td>{item.control?.attempts ?? 0}{item.control?.max_attempts ? ` / ${item.control.max_attempts}` : ''}</td>
+                  <td>{item.control?.priority ?? 0}</td>
+                  <td title={item.control?.next_try ? new Date(item.control.next_try * 1000).toLocaleString() : ''}>{item.control?.next_try ? formatRelative(item.control.next_try) : 'now'}</td>
+                  <td className="muted"><span className="clampText" title={item.control?.last_error || undefined}>{item.control?.last_error || '—'}</span></td>
+                  <td className="rowActions">
+                    {spool !== 'inflight' && <button className="iconButton" title="Requeue now (resets attempts)" onClick={() => act('requeue', { name: item.name })}><RotateCcw size={15} /></button>}
+                    {spool === 'queue' && <button className="iconButton" title="Promote (deliver first)" onClick={() => act('promote', { name: item.name })}><ArrowUpToLine size={15} /></button>}
+                    {spool !== 'inflight' && <button className="iconButton danger" title="Delete" onClick={() => act('delete', { name: item.name })}><Trash2 size={15} /></button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
         {!listing.loading && entries.length === 0 && <Empty>No messages in this spool.</Empty>}
       </Panel>
 

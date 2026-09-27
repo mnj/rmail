@@ -41,11 +41,11 @@ const mobile = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, is
   await page.fill('input[type=password]', password);
   await page.click('button.primary');
   await page.waitForSelector('.sidebar');
-  // Delivery is left out until its queue table handles long error messages.
   for (const [path, name] of [
     ['/', 'admin-overview'],
     ['/accounts', 'admin-mailboxes'],
     ['/routing', 'admin-routing'],
+    ['/delivery', 'admin-delivery'],
     ['/settings', 'admin-settings'],
     ['/observability', 'admin-observability'],
     ['/system', 'admin-system'],
@@ -99,6 +99,12 @@ async function signIn(page) {
   await signIn(page);
   await page.waitForTimeout(500);
   await shot(page, 'mobile-inbox');
+  await page.click('button[title=Folders]');
+  await page.waitForTimeout(400);
+  await shot(page, 'mobile-folders');
+  await page.click('.folders button:has-text("INBOX")');
+  await page.waitForSelector('.message-list .row');
+  await page.waitForTimeout(400);
   await page.click('text=Q4 infrastructure review');
   await page.waitForTimeout(700);
   await shot(page, 'mobile-message');

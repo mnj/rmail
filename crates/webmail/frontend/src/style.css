@@ -42,10 +42,10 @@ button, input { font: inherit; }
 @media (max-width: 820px) {
   .app { grid-template-columns: 1fr; }
   .folders, .mailbox, .reader { grid-column: 1; grid-row: 1; height: 100vh; }
-  .folders, .reader { display: none; }
-  .mobile-folders .folders, .mobile-list .mailbox { display: block; }
-  .mobile-message .reader { display: flex; }
+  .folders, .mailbox, .reader { display: none; }
+  .mobile-folders .folders { display: block; }
   .mobile-list .mailbox { display: grid; }
+  .mobile-message .reader { display: flex; }
   .mobile-only { display: grid; }
   .row button { grid-template-columns: 1fr; }
   .snippet { grid-column: 1; }
