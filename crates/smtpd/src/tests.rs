@@ -1115,7 +1115,9 @@ async fn overlong_data_line_is_drained_before_next_command() {
 
 #[tokio::test]
 async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization() {
-    let input = b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: bad\n\nbody\n.\nQUIT\r\n"
+    // Bare LF inside the content fails the message, but only the real
+    // <CRLF>.<CRLF> ends it; the lines in between are never commands.
+    let input = b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: bad\n\nbody\nNOOP\r\n.\r\nQUIT\r\n"
             .to_vec();
     let (responses, td) = run_session(input, 16 * 1024).await;
     assert_eq!(
@@ -1124,6 +1126,12 @@ async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization(
             .filter(|response| response.starts_with("554 5.6.0"))
             .count(),
         1
+    );
+    // The NOOP inside the drained content was not executed.
+    assert!(
+        !responses
+            .iter()
+            .any(|response| response.starts_with("250 2.0.0 OK"))
     );
     assert!(
         responses
@@ -1135,6 +1143,51 @@ async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization(
             .join("mail/example.test/user/Maildir/new")
             .exists()
     );
+}
+
+#[tokio::test]
+async fn smtp_smuggling_with_non_canonical_end_of_data_is_not_delivered() {
+    for terminator in [
+        "\r\n.\n",
+        "\n.\n",
+        "\n.\r\n",
+        "\r\n.\r",
+        "\r.\r\n",
+        "\r\n\r.\r\n",
+    ] {
+        let input = format!(
+            "EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: first\r\n\r\nbody{terminator}MAIL FROM:<ceo@example.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: smuggled\r\n\r\nsmuggled\r\n.\r\nQUIT\r\n"
+        );
+        let (responses, td) = run_session(input.into_bytes(), 16 * 1024).await;
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.starts_with("250 2.1.0"))
+                .count(),
+            1,
+            "{terminator:?}: {responses:?}"
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("554 ")),
+            "{terminator:?}: {responses:?}"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.starts_with("354 "))
+                .count(),
+            1,
+            "{terminator:?}: {responses:?}"
+        );
+        assert!(
+            !td.path()
+                .join("mail/example.test/user/Maildir/new")
+                .exists(),
+            "{terminator:?}: smuggled message delivered"
+        );
+    }
 }
 
 #[tokio::test]
