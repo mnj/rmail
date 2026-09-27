@@ -38,6 +38,8 @@ pub struct FolderSummary {
     pub folder: Folder,
     pub messages: usize,
     pub unseen: usize,
+    /// Messages with the \Deleted flag (IMAP4rev2 STATUS DELETED).
+    pub deleted: usize,
     pub size: u64,
 }
 
@@ -1291,6 +1293,7 @@ pub fn list_folder_summaries(
             folder,
             messages: messages.len(),
             unseen,
+            deleted: count_deleted(&messages),
             size: messages.iter().map(|message| message.size).sum(),
         });
     }
@@ -1325,10 +1328,23 @@ pub fn folder_summary(
                     .any(|flag| flag.eq_ignore_ascii_case("\\Seen"))
             })
             .count(),
+        deleted: count_deleted(&messages),
         size: messages.iter().map(|message| message.size).sum(),
         messages: messages.len(),
         folder,
     }))
+}
+
+fn count_deleted(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Deleted"))
+        })
+        .count()
 }
 
 pub fn list_message_metadata(

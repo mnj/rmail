@@ -1942,6 +1942,8 @@ pub(crate) enum StatusItem {
     Unseen,
     HighestModSeq,
     Size,
+    /// RFC 9051 STATUS DELETED: messages with the \Deleted flag.
+    Deleted,
 }
 
 impl StatusItem {
@@ -1957,6 +1959,7 @@ impl StatusItem {
             "UNSEEN" => Ok(Self::Unseen),
             "HIGHESTMODSEQ" => Ok(Self::HighestModSeq),
             "SIZE" => Ok(Self::Size),
+            "DELETED" => Ok(Self::Deleted),
             _ => Err(ParseError::InvalidAtom),
         }
     }

@@ -125,6 +125,7 @@ impl Session {
             self.state.saved_search_uids(),
             uid,
             self.state.utf8_enabled(),
+            self.state.imap4rev2_enabled(),
         )
         .await;
         if let Some(saved) = outcome.saved_uids {

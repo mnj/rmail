@@ -5,15 +5,22 @@
 use super::*;
 use std::path::PathBuf;
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
-    mail_root: PathBuf,
-    uids: Vec<u64>,
+    pub(super) mail_root: PathBuf,
+    pub(super) uids: Vec<u64>,
     reader: BufReader<tokio::io::DuplexStream>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 async fn selected_session(messages: usize) -> Fixture {
+    let mut fixture = authenticated_session(messages).await;
+    fixture.command("S1 SELECT INBOX", "S1 OK").await;
+    fixture
+}
+
+/// A logged-in session (no mailbox selected) with `messages` in INBOX.
+pub(super) async fn authenticated_session(messages: usize) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let mail_root = dir.path().join("mail");
     let db_path = dir.path().join("config.db");
@@ -68,12 +75,11 @@ async fn selected_session(messages: usize) -> Fixture {
     fixture
         .command("L1 LOGIN \"user@example.test\" \"password\"", "L1 OK")
         .await;
-    fixture.command("S1 SELECT INBOX", "S1 OK").await;
     fixture
 }
 
 impl Fixture {
-    async fn command(&mut self, command: &str, done: &str) -> Vec<String> {
+    pub(super) async fn command(&mut self, command: &str, done: &str) -> Vec<String> {
         self.reader
             .get_mut()
             .write_all(format!("{command}\r\n").as_bytes())
@@ -83,7 +89,19 @@ impl Fixture {
         read_until_contains_bounded(&mut self.reader, done).await
     }
 
-    fn expunge_elsewhere(&self, uid: u64) {
+    /// Deliver a message as the MTA does, so it is \Recent.
+    pub(super) fn deliver_recent(&mut self) {
+        let (_, uid) = rmail_common::imap_state::deliver_message(
+            &self.mail_root,
+            "example.test",
+            "user",
+            b"Subject: delivered\r\n\r\nbody\r\n",
+        )
+        .expect("deliver");
+        self.uids.push(uid);
+    }
+
+    pub(super) fn expunge_elsewhere(&self, uid: u64) {
         rmail_common::imap_state::delete_message_by_uid(
             &self.mail_root,
             "example.test",
@@ -94,7 +112,7 @@ impl Fixture {
         .expect("external expunge");
     }
 
-    fn flags(&self, uid: u64) -> Vec<String> {
+    pub(super) fn flags(&self, uid: u64) -> Vec<String> {
         rmail_common::imap_state::load_folder(&self.mail_root, "example.test", "user", "INBOX")
             .expect("load folder")
             .1
@@ -104,7 +122,7 @@ impl Fixture {
             .unwrap_or_default()
     }
 
-    async fn finish(mut self) {
+    pub(super) async fn finish(mut self) {
         self.command("Z LOGOUT", "Z OK").await;
         self.server.await.expect("join").expect("server");
     }

@@ -7,6 +7,7 @@ mod compat;
 mod fetch;
 mod mailboxes;
 mod protocol;
+mod rev2;
 mod scram;
 mod search;
 mod sync;

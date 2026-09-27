@@ -216,8 +216,12 @@ impl Session {
             self.state.feature_enabled("CONDSTORE"),
             self.state.feature_enabled("QRESYNC"),
             self.selected.is_some(),
+            self.state.imap4rev2_enabled(),
         )
         .await;
+        if outcome.condstore_activated {
+            self.state.activate_condstore();
+        }
         self.selected = outcome.selected;
         self.state.selected_mailbox = self
             .selected

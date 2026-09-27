@@ -62,6 +62,7 @@ impl SessionState {
 fn supported_enable_feature(feature: &str) -> bool {
     matches!(
         feature,
-        "IMAP4REV1" | "IMAP4REV2" | "CONDSTORE" | "QRESYNC" | "UTF8=ACCEPT"
+        // IMAP4rev1 is the base protocol, not an ENABLE-able extension.
+        "IMAP4REV2" | "CONDSTORE" | "QRESYNC" | "UTF8=ACCEPT"
     )
 }
