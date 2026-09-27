@@ -921,7 +921,7 @@ impl MessageAnalyzer {
         if !self.header_complete {
             if byte == b'\n'
                 && (self.previous_header_bytes[2] == b'\n'
-                    || self.previous_header_bytes == [b'\r', b'\n', b'\r'])
+                    || self.previous_header_bytes == *b"\r\n\r")
             {
                 self.header_complete = true;
             }
