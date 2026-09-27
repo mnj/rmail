@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_bench"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_classifier"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -3095,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_common"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2 0.4.1",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_ctl"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2 0.4.1",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_imapd"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_outbound"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3196,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_queue_manager"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3209,7 +3209,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_queuectl"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_smtpd"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_web"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -3268,7 +3268,7 @@ dependencies = [
 
 [[package]]
 name = "rmail_webmail"
-version = "0.8.11"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
