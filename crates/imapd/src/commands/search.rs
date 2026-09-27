@@ -74,8 +74,8 @@ pub(crate) async fn handle(
     let save = request
         .return_options
         .as_ref()
-        .is_some_and(|options| options.save)
-        .then(|| matches.iter().map(|(_, uid)| *uid).collect());
+        .filter(|options| options.save)
+        .map(|options| saved_result(&matches, options));
     let mut result = Response::new();
     if let Some(data) = result_data(
         tag,
@@ -142,6 +142,32 @@ fn execute(
     Ok(matches)
 }
 
+/// The UIDs SEARCH RETURN (SAVE ...) stores as `$`: everything found, unless
+/// only MIN, MAX and/or PARTIAL were requested, in which case just the
+/// messages those report (RFC 5182 §2.4, RFC 9394 §3.2 Table 1).
+fn saved_result(matches: &[(u64, u64)], options: &parser::SearchReturnOptions) -> Vec<u64> {
+    let everything =
+        options.all || options.count || (!options.min && !options.max && options.partial.is_none());
+    if everything {
+        return matches.iter().map(|(_, uid)| *uid).collect();
+    }
+    let mut uids = std::collections::BTreeSet::new();
+    if let Some(range) = options.partial {
+        uids.extend(range.select(matches).iter().map(|(_, uid)| *uid));
+    }
+    if options.min
+        && let Some((_, uid)) = matches.first()
+    {
+        uids.insert(*uid);
+    }
+    if options.max
+        && let Some((_, uid)) = matches.last()
+    {
+        uids.insert(*uid);
+    }
+    uids.into_iter().collect()
+}
+
 fn response(line: StatusLine) -> Outcome {
     Outcome {
         response: Response::new().status(line),
@@ -172,31 +198,60 @@ fn result_data(
             ));
         }
     };
-    if options.save && !options.min && !options.max && !options.all && !options.count {
+    if options.save
+        && !options.min
+        && !options.max
+        && !options.all
+        && !options.count
+        && options.partial.is_none()
+    {
         return None;
     }
+    Some(esearch_data(tag, uid_mode, ids, options))
+}
+
+/// An ESEARCH response line for `ids`, which are in result order (mailbox
+/// order for SEARCH; sort order for SORT RETURN). MIN and MAX are the lowest
+/// and highest ids, and PARTIAL selects by position in `ids`.
+pub(crate) fn esearch_data(
+    tag: &str,
+    uid_mode: bool,
+    ids: &[u64],
+    options: &parser::SearchReturnOptions,
+) -> String {
     let escaped_tag = tag.replace('\\', "\\\\").replace('"', "\\\"");
     let mut data = format!("ESEARCH (TAG \"{escaped_tag}\")");
     if uid_mode {
         data.push_str(" UID");
     }
     if options.min
-        && let Some(minimum) = ids.first()
+        && let Some(minimum) = ids.iter().min()
     {
         data.push_str(&format!(" MIN {minimum}"));
     }
     if options.max
-        && let Some(maximum) = ids.last()
+        && let Some(maximum) = ids.iter().max()
     {
         data.push_str(&format!(" MAX {maximum}"));
     }
     if options.all && !ids.is_empty() {
         data.push_str(&format!(" ALL {}", compress_ids(ids)));
     }
+    if let Some(range) = options.partial {
+        // RFC 9394 §3.1: the requested range is echoed, with NIL when no
+        // result falls inside it.
+        let selected = range.select(ids);
+        let results = if selected.is_empty() {
+            "NIL".to_string()
+        } else {
+            compress_ids(selected)
+        };
+        data.push_str(&format!(" PARTIAL ({range} {results})"));
+    }
     if options.count {
         data.push_str(&format!(" COUNT {}", ids.len()));
     }
-    Some(data)
+    data
 }
 
 pub(crate) fn compress_ids(ids: &[u64]) -> String {
@@ -229,6 +284,7 @@ mod tests {
             all: true,
             count: true,
             save: false,
+            partial: None,
         };
         assert_eq!(
             result_data("A1", true, &[2, 3, 4, 8], Some(&options), false),
@@ -238,6 +294,61 @@ mod tests {
             result_data("A1", false, &[], Some(&options), false),
             Some("ESEARCH (TAG \"A1\") COUNT 0".to_string())
         );
+    }
+
+    fn options(spec: &str) -> parser::SearchReturnOptions {
+        parser::parse_search_request(&format!("RETURN ({spec}) ALL"))
+            .unwrap()
+            .return_options
+            .unwrap()
+    }
+
+    #[test]
+    fn esearch_partial_pages_results_and_combines_with_aggregates() {
+        let ids = [2, 3, 4, 8, 9, 12];
+        assert_eq!(
+            result_data("A1", true, &ids, Some(&options("PARTIAL 2:4")), false),
+            Some("ESEARCH (TAG \"A1\") UID PARTIAL (2:4 3:4,8)".to_string())
+        );
+        assert_eq!(
+            result_data("A1", false, &ids, Some(&options("PARTIAL -1:-2")), false),
+            Some("ESEARCH (TAG \"A1\") PARTIAL (-1:-2 9,12)".to_string())
+        );
+        assert_eq!(
+            result_data(
+                "A1",
+                false,
+                &ids,
+                Some(&options("MIN MAX COUNT PARTIAL 5:10")),
+                false
+            ),
+            Some("ESEARCH (TAG \"A1\") MIN 2 MAX 12 PARTIAL (5:10 9,12) COUNT 6".to_string())
+        );
+        assert_eq!(
+            result_data("A1", false, &ids, Some(&options("PARTIAL 7:9")), false),
+            Some("ESEARCH (TAG \"A1\") PARTIAL (7:9 NIL)".to_string())
+        );
+        assert_eq!(
+            result_data("A1", false, &[], Some(&options("SAVE PARTIAL 1:5")), false),
+            Some("ESEARCH (TAG \"A1\") PARTIAL (1:5 NIL)".to_string())
+        );
+    }
+
+    #[test]
+    fn saved_results_follow_rfc_9394_table_1() {
+        let matches = (1..=6).map(|seq| (seq, seq * 10)).collect::<Vec<_>>();
+        let saved = |spec: &str| saved_result(&matches, &options(spec));
+        assert_eq!(saved("SAVE"), vec![10, 20, 30, 40, 50, 60]);
+        assert_eq!(saved("SAVE PARTIAL 2:3"), vec![20, 30]);
+        assert_eq!(saved("SAVE PARTIAL 2:3 MIN"), vec![10, 20, 30]);
+        assert_eq!(saved("SAVE PARTIAL 2:3 MAX"), vec![20, 30, 60]);
+        assert_eq!(saved("SAVE PARTIAL -1:-2 MIN MAX"), vec![10, 50, 60]);
+        assert_eq!(
+            saved("SAVE PARTIAL 2:3 COUNT MIN"),
+            vec![10, 20, 30, 40, 50, 60]
+        );
+        assert_eq!(saved("SAVE PARTIAL 9:10"), Vec::<u64>::new());
+        assert_eq!(saved("SAVE MIN"), vec![10]);
     }
 
     #[tokio::test]

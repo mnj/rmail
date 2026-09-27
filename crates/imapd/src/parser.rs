@@ -1162,6 +1162,67 @@ fn parse_search_tokens(tokens: &[String]) -> Option<SearchCriterion> {
     }
 }
 
+/// An RFC 9394 `partial-range`: 1-based positions into a result list in
+/// mailbox order. Negative ranges count from the end, so `-1:-100` is the
+/// last hundred results. The bounds are kept as the client sent them, since
+/// the ESEARCH `PARTIAL` response echoes the requested range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PartialRange {
+    pub(crate) first: u32,
+    pub(crate) last: u32,
+    pub(crate) from_end: bool,
+}
+
+impl PartialRange {
+    /// Parses `nz-number ":" nz-number` or `"-" nz-number ":" "-" nz-number`.
+    pub(crate) fn parse(input: &str) -> Option<Self> {
+        fn nz_number(text: &str) -> Option<u32> {
+            if text.is_empty() || text.starts_with('0') || !text.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            text.parse().ok()
+        }
+        let (first, last) = input.split_once(':')?;
+        let (first, last, from_end) = match (first.strip_prefix('-'), last.strip_prefix('-')) {
+            (Some(first), Some(last)) => (first, last, true),
+            (None, None) => (first, last, false),
+            _ => return None,
+        };
+        Some(Self {
+            first: nz_number(first)?,
+            last: nz_number(last)?,
+            from_end,
+        })
+    }
+
+    /// The part of `items` (in mailbox order) that the range selects;
+    /// positions past the end of `items` are ignored.
+    pub(crate) fn select<'a, T>(&self, items: &'a [T]) -> &'a [T] {
+        let low = self.first.min(self.last) as usize;
+        let high = self.first.max(self.last) as usize;
+        let len = items.len();
+        let (start, end) = if self.from_end {
+            (len.saturating_sub(high), len.saturating_sub(low - 1))
+        } else {
+            (low - 1, high.min(len))
+        };
+        if start >= end {
+            &[]
+        } else {
+            &items[start..end]
+        }
+    }
+}
+
+impl std::fmt::Display for PartialRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.from_end { "-" } else { "" };
+        write!(f, "{sign}{}:{sign}{}", self.first, self.last)
+    }
+}
+
+/// ESEARCH-style result options (RFC 4731, RFC 5182, RFC 9394).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SearchReturnOptions {
     pub(crate) min: bool,
@@ -1169,6 +1230,59 @@ pub(crate) struct SearchReturnOptions {
     pub(crate) all: bool,
     pub(crate) count: bool,
     pub(crate) save: bool,
+    pub(crate) partial: Option<PartialRange>,
+}
+
+impl SearchReturnOptions {
+    /// Parses an optional `RETURN (...)` clause starting at `tokens[*pos]`
+    /// (tokens from [`tokenize_search`]), advancing `pos` past it. Shared by
+    /// SEARCH and SORT (RFC 5267 ESORT), which take the same options.
+    /// `RETURN ()` means `RETURN (ALL)`; ALL and PARTIAL are exclusive
+    /// (RFC 9394 §3.1).
+    pub(crate) fn parse_clause(tokens: &[String], pos: &mut usize) -> Result<Option<Self>, ()> {
+        if !tokens
+            .get(*pos)
+            .is_some_and(|token| token.eq_ignore_ascii_case("RETURN"))
+        {
+            return Ok(None);
+        }
+        let mut index = *pos + 1;
+        if tokens.get(index).map(String::as_str) != Some("(") {
+            return Err(());
+        }
+        index += 1;
+        let mut options = Self::default();
+        while tokens.get(index).map(String::as_str) != Some(")") {
+            match tokens.get(index).ok_or(())?.to_ascii_uppercase().as_str() {
+                "MIN" => options.min = true,
+                "MAX" => options.max = true,
+                "ALL" => options.all = true,
+                "COUNT" => options.count = true,
+                "SAVE" => options.save = true,
+                "PARTIAL" if options.partial.is_none() => {
+                    index += 1;
+                    let range = tokens.get(index).ok_or(())?;
+                    options.partial = Some(PartialRange::parse(range).ok_or(())?);
+                }
+                _ => return Err(()),
+            }
+            index += 1;
+        }
+        if options.all && options.partial.is_some() {
+            return Err(());
+        }
+        if !options.min
+            && !options.max
+            && !options.all
+            && !options.count
+            && !options.save
+            && options.partial.is_none()
+        {
+            options.all = true;
+        }
+        *pos = index + 1;
+        Ok(Some(options))
+    }
 }
 
 #[derive(Debug)]
@@ -1187,40 +1301,8 @@ pub(crate) enum SearchParseError {
 pub(crate) fn parse_search_request(input: &str) -> Result<SearchRequest, SearchParseError> {
     let tokens = tokenize_search(input).map_err(|_| SearchParseError::Syntax)?;
     let mut pos = 0;
-    let return_options = if tokens
-        .first()
-        .is_some_and(|token| token.eq_ignore_ascii_case("RETURN"))
-    {
-        pos += 1;
-        if tokens.get(pos).map(String::as_str) != Some("(") {
-            return Err(SearchParseError::Syntax);
-        }
-        pos += 1;
-        let mut options = SearchReturnOptions::default();
-        while tokens.get(pos).map(String::as_str) != Some(")") {
-            match tokens
-                .get(pos)
-                .ok_or(SearchParseError::Syntax)?
-                .to_ascii_uppercase()
-                .as_str()
-            {
-                "MIN" => options.min = true,
-                "MAX" => options.max = true,
-                "ALL" => options.all = true,
-                "COUNT" => options.count = true,
-                "SAVE" => options.save = true,
-                _ => return Err(SearchParseError::Syntax),
-            }
-            pos += 1;
-        }
-        pos += 1;
-        if !options.min && !options.max && !options.all && !options.count && !options.save {
-            options.all = true;
-        }
-        Some(options)
-    } else {
-        None
-    };
+    let return_options = SearchReturnOptions::parse_clause(&tokens, &mut pos)
+        .map_err(|()| SearchParseError::Syntax)?;
     let charset = if tokens
         .get(pos)
         .is_some_and(|token| token.eq_ignore_ascii_case("CHARSET"))
@@ -1479,6 +1561,8 @@ pub(crate) struct FetchCommandRequest {
     pub(crate) raw_items: String,
     pub(crate) changed_since: Option<u64>,
     pub(crate) vanished: bool,
+    /// RFC 9394 PARTIAL modifier (UID FETCH only).
+    pub(crate) partial: Option<PartialRange>,
 }
 
 fn split_fetch_item_list(spec: &str) -> Result<(&str, &str), ParseError> {
@@ -1696,19 +1780,27 @@ pub(crate) fn parse_fetch_command_request(input: &str) -> Result<FetchCommandReq
         .and_then(|modifier| raw_items.strip_suffix(modifier))
         .map(str::trim_end)
         .unwrap_or(raw_items);
-    let (changed_since, vanished) = parse_fetch_modifiers(request.modifier_spec.as_deref())?;
+    let modifiers = parse_fetch_modifiers(request.modifier_spec.as_deref())?;
     Ok(FetchCommandRequest {
         message_set: message_set.to_string(),
         items: request.items,
         raw_items: item_spec.to_string(),
-        changed_since,
-        vanished,
+        changed_since: modifiers.changed_since,
+        vanished: modifiers.vanished,
+        partial: modifiers.partial,
     })
 }
 
-fn parse_fetch_modifiers(spec: Option<&str>) -> Result<(Option<u64>, bool), ParseError> {
+#[derive(Debug, Default)]
+struct FetchModifiers {
+    changed_since: Option<u64>,
+    vanished: bool,
+    partial: Option<PartialRange>,
+}
+
+fn parse_fetch_modifiers(spec: Option<&str>) -> Result<FetchModifiers, ParseError> {
     let Some(spec) = spec else {
-        return Ok((None, false));
+        return Ok(FetchModifiers::default());
     };
     let arguments = parse_imap_args(spec)?;
     let [ImapArg::List(modifiers)] = arguments.as_slice() else {
@@ -1716,6 +1808,7 @@ fn parse_fetch_modifiers(spec: Option<&str>) -> Result<(Option<u64>, bool), Pars
     };
     let mut changed_since = None;
     let mut vanished = false;
+    let mut partial = None;
     let mut index = 0;
     while index < modifiers.len() {
         let ImapArg::Atom(name) = &modifiers[index] else {
@@ -1730,6 +1823,12 @@ fn parse_fetch_modifiers(spec: Option<&str>) -> Result<(Option<u64>, bool), Pars
             index += 1;
         } else if name.eq_ignore_ascii_case("VANISHED") && !vanished {
             vanished = true;
+        } else if name.eq_ignore_ascii_case("PARTIAL") && partial.is_none() {
+            let Some(ImapArg::Atom(range)) = modifiers.get(index) else {
+                return Err(ParseError::InvalidAtom);
+            };
+            partial = Some(PartialRange::parse(range).ok_or(ParseError::InvalidAtom)?);
+            index += 1;
         } else {
             return Err(ParseError::InvalidAtom);
         }
@@ -1737,7 +1836,11 @@ fn parse_fetch_modifiers(spec: Option<&str>) -> Result<(Option<u64>, bool), Pars
     if vanished && changed_since.is_none() {
         return Err(ParseError::InvalidAtom);
     }
-    Ok((changed_since, vanished))
+    Ok(FetchModifiers {
+        changed_since,
+        vanished,
+        partial,
+    })
 }
 
 pub(crate) fn split_fetch_items(spec: &str) -> Vec<&str> {
@@ -2615,11 +2718,78 @@ mod tests {
                 raw_items: "(UID FLAGS BODY.PEEK[HEADER.FIELDS (From Subject)])".to_string(),
                 changed_since: Some(42),
                 vanished: true,
+                partial: None,
             }
         );
         assert!(parse_fetch_command_request("1 FLAGS (VANISHED)").is_err());
         assert!(parse_fetch_command_request("1 FLAGS (CHANGEDSINCE nope)").is_err());
         assert!(parse_fetch_command_request("bogus FLAGS").is_err());
+    }
+
+    #[test]
+    fn parses_and_applies_partial_ranges() {
+        let items = (1..=10).collect::<Vec<u32>>();
+        let select = |range: &str| PartialRange::parse(range).unwrap().select(&items).to_vec();
+        assert_eq!(select("1:3"), vec![1, 2, 3]);
+        assert_eq!(select("3:1"), vec![1, 2, 3]);
+        assert_eq!(select("9:20"), vec![9, 10]);
+        assert_eq!(select("11:20"), Vec::<u32>::new());
+        assert_eq!(select("-1:-3"), vec![8, 9, 10]);
+        assert_eq!(select("-3:-1"), vec![8, 9, 10]);
+        assert_eq!(select("-9:-20"), vec![1, 2]);
+        assert_eq!(select("-11:-20"), Vec::<u32>::new());
+        assert_eq!(select("4294967295:4294967295"), Vec::<u32>::new());
+        assert_eq!(
+            PartialRange::parse("-1:-100").unwrap().to_string(),
+            "-1:-100"
+        );
+        assert_eq!(
+            PartialRange::parse("500:400").unwrap().to_string(),
+            "500:400"
+        );
+        for invalid in [
+            "0:1",
+            "1:0",
+            "-0:-1",
+            "1:-1",
+            "-1:1",
+            "1",
+            "1:*",
+            "01:2",
+            "1:2:3",
+            "4294967296:1",
+            "",
+            ":",
+            "-1:-",
+        ] {
+            assert!(PartialRange::parse(invalid).is_none(), "accepted {invalid}");
+        }
+
+        let request = parse_search_request("RETURN (PARTIAL -1:-100 COUNT MIN) ALL").unwrap();
+        let options = request.return_options.unwrap();
+        assert_eq!(options.partial.unwrap().to_string(), "-1:-100");
+        assert!(options.count && options.min && !options.all);
+        assert!(parse_search_request("RETURN (partial 1:5) ALL").is_ok());
+        for invalid in [
+            "RETURN (PARTIAL) ALL",
+            "RETURN (PARTIAL 1:5 ALL) ALL",
+            "RETURN (ALL PARTIAL 1:5) ALL",
+            "RETURN (PARTIAL 1:5 PARTIAL 6:10) ALL",
+            "RETURN (PARTIAL 0:5) ALL",
+            "RETURN (PARTIAL 1:*) ALL",
+        ] {
+            assert!(parse_search_request(invalid).is_err(), "accepted {invalid}");
+        }
+
+        let fetch =
+            parse_fetch_command_request("1:* (FLAGS) (PARTIAL -1:-30 CHANGEDSINCE 7)").unwrap();
+        assert_eq!(fetch.partial, PartialRange::parse("-1:-30"));
+        assert_eq!(fetch.changed_since, Some(7));
+        let fetch = parse_fetch_command_request("1:* FLAGS (CHANGEDSINCE 7 PARTIAL 1:5)").unwrap();
+        assert_eq!(fetch.partial, PartialRange::parse("1:5"));
+        assert!(parse_fetch_command_request("1:* FLAGS (PARTIAL)").is_err());
+        assert!(parse_fetch_command_request("1:* FLAGS (PARTIAL 1:5 PARTIAL 1:5)").is_err());
+        assert!(parse_fetch_command_request("1:* FLAGS (PARTIAL -1:5)").is_err());
     }
 
     #[test]
@@ -2633,6 +2803,7 @@ mod tests {
                 all: true,
                 count: true,
                 save: false,
+                partial: None,
             })
         );
         assert!(matches!(request.criterion, SearchCriterion::Unseen));
