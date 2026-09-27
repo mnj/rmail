@@ -44,6 +44,8 @@ pub struct Global {
     pub tls_key: Option<String>,
     #[serde(default)]
     pub tls: TlsPolicy,
+    /// error, warn, info (default) or debug.
+    #[serde(default = "default_log_level")]
     pub log_level: Option<String>,
     /// Optional SQLite database path for mailboxes/catchalls
     pub db_path: Option<String>,
@@ -114,6 +116,10 @@ impl Default for TrackingConfig {
             prune_batch_size: default_tracking_prune_batch_size(),
         }
     }
+}
+
+fn default_log_level() -> Option<String> {
+    Some("info".to_string())
 }
 
 fn default_tracking_retention_days() -> u32 {

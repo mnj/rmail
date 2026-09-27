@@ -5,25 +5,53 @@ import { Empty, ErrorBanner, Panel, useResource } from '../ui';
 
 const components = ['smtpd', 'imapd', 'outbound', 'web', 'webmail'];
 
+type LogEntry = { raw: string; time?: number; level?: string; event?: string; fields?: Record<string, unknown> };
+
+const levels = ['error', 'warn', 'info', 'debug'];
+
+function parseLine(raw: string): LogEntry {
+  try {
+    const value = JSON.parse(raw);
+    if (value && typeof value === 'object' && 'event' in value) {
+      return { raw, time: value.timestamp_unix_ms, level: value.level, event: value.event, fields: value.fields || {} };
+    }
+  } catch {
+    // not structured
+  }
+  return { raw };
+}
+
+function formatField(value: unknown): string {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
 export function ObservabilityPage() {
   const [component, setComponent] = useState('smtpd');
   const [lines, setLines] = useState(300);
   const [logFilter, setLogFilter] = useState('');
+  const [minLevel, setMinLevel] = useState('debug');
+  const [raw, setRaw] = useState(false);
   const [metricFilter, setMetricFilter] = useState('');
   const logs = useResource(() => apiText(`/logs?component=${component}&lines=${lines}`), [component, lines], 15000);
   const metrics = useResource(() => apiText('/metrics'), [], 30000);
-  const logRef = useRef<HTMLPreElement>(null);
+  const logRef = useRef<HTMLDivElement>(null);
 
-  const logText = useMemo(() => {
-    const text = logs.data || '';
-    if (!logFilter.trim()) return text;
-    const needle = logFilter.toLowerCase();
-    return text.split('\n').filter((line) => line.toLowerCase().includes(needle)).join('\n');
-  }, [logs.data, logFilter]);
+  const entries = useMemo(() => {
+    const needle = logFilter.trim().toLowerCase();
+    const maxRank = levels.indexOf(minLevel);
+    return (logs.data || '')
+      .split('\n')
+      .filter(Boolean)
+      .map(parseLine)
+      .filter((entry) => !entry.level || levels.indexOf(entry.level) <= maxRank)
+      .filter((entry) => !needle || entry.raw.toLowerCase().includes(needle));
+  }, [logs.data, logFilter, minLevel]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [logText]);
+  }, [entries, raw]);
 
   const samples = useMemo(() => {
     const needle = metricFilter.toLowerCase();
@@ -50,9 +78,31 @@ export function ObservabilityPage() {
           <button className="iconButton" title="Refresh" onClick={() => logs.reload()}><RefreshCw size={15} className={logs.loading ? 'spin' : ''} /></button>
         </>}
       >
-        <div className="panelFilter"><div className="searchBox"><Search size={16} /><input value={logFilter} onChange={(event) => setLogFilter(event.target.value)} placeholder="Filter lines (e.g. a message ID or peer address)" /></div></div>
+        <div className="panelFilter logTools">
+          <div className="searchBox"><Search size={16} /><input value={logFilter} onChange={(event) => setLogFilter(event.target.value)} placeholder="Filter (message ID, connection ID, address, event…)" /></div>
+          <select value={minLevel} onChange={(event) => setMinLevel(event.target.value)} aria-label="Minimum level">
+            {levels.map((level) => <option key={level} value={level}>{level === 'debug' ? 'All levels' : `${level} and above`}</option>)}
+          </select>
+          <label className="checkLabel"><input type="checkbox" checked={raw} onChange={(event) => setRaw(event.target.checked)} /> Raw</label>
+        </div>
         <ErrorBanner error={logs.error} />
-        <pre className="logView" ref={logRef}>{logText || 'No log lines available.'}</pre>
+        <div className="logView" ref={logRef}>
+          {entries.length === 0 && <div className="logEmpty">No log lines match.</div>}
+          {raw
+            ? <pre>{entries.map((entry) => entry.raw).join('\n')}</pre>
+            : entries.map((entry, index) => entry.event ? (
+              <div className={`logLine ${entry.level}`} key={index}>
+                <time>{entry.time ? new Date(entry.time).toLocaleTimeString() : ''}</time>
+                <span className="logLevel">{entry.level}</span>
+                <strong>{entry.event}</strong>
+                <span className="logFields">
+                  {Object.entries(entry.fields || {}).filter(([, value]) => value !== null && value !== undefined).map(([key, value]) => (
+                    <button key={key} className="logField" title="Filter by this value" onClick={() => setLogFilter(formatField(value))}><em>{key}</em>={formatField(value)}</button>
+                  ))}
+                </span>
+              </div>
+            ) : <div className="logLine plain" key={index}>{entry.raw}</div>)}
+        </div>
       </Panel>
       <Panel
         title="Prometheus metrics"

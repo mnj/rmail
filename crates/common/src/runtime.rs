@@ -1,10 +1,34 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
 
+/// Most verbose level that is written: 0 error, 1 warn, 2 info, 3 debug.
+static LOG_THRESHOLD: AtomicU8 = AtomicU8::new(2);
+
+fn level_rank(level: &str) -> u8 {
+    match level {
+        "error" => 0,
+        "warn" => 1,
+        "debug" | "trace" => 3,
+        _ => 2,
+    }
+}
+
+/// Apply `global.log_level` (error, warn, info or debug; default info).
+pub fn set_log_level(level: Option<&str>) {
+    LOG_THRESHOLD.store(level.map_or(2, level_rank), Ordering::Relaxed);
+}
+
+pub fn log_enabled(level: &str) -> bool {
+    level_rank(level) <= LOG_THRESHOLD.load(Ordering::Relaxed)
+}
+
 pub fn structured_log(level: &str, component: &str, event: &str, fields: serde_json::Value) {
+    if !log_enabled(level) {
+        return;
+    }
     let encoded = structured_log_value(level, component, event, fields).to_string();
     if matches!(level, "error" | "warn") {
         eprintln!("{encoded}");

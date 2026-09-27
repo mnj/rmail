@@ -225,10 +225,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(path) => {
             let cfg = rmail_common::config::Config::load(&path)
                 .with_context(|| format!("loading configuration from {path}"))?;
+            rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
             if let Err(error) = rmail_common::settings::record_service_start(&cfg, "outbound") {
-                eprintln!(
-                    "rmail: could not record outbound start in the settings database: {error:#}"
-                );
+                rmail_common::structured_log!("warn", "outbound", "service_state_failed", { "error": format!("{error:#}") });
             }
             cfg.global.tracking
         }

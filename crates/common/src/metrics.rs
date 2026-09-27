@@ -448,10 +448,10 @@ pub fn spawn_prometheus_snapshot_task(
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    eprintln!("metrics snapshot update failed for {component}: {error}");
+                    crate::structured_log!("warn", component, "metrics_snapshot_failed", { "error": error.to_string() });
                 }
                 Err(error) => {
-                    eprintln!("metrics snapshot task failed for {component}: {error}");
+                    crate::structured_log!("warn", component, "metrics_snapshot_failed", { "error": error.to_string() });
                 }
             }
         }

@@ -187,7 +187,7 @@ fn run_event_loop(
     let mut subscribers = HashSet::<PathBuf>::new();
     let mut subscribe_buffer = [0_u8; 4096];
     if let Err(error) = prune_tracking_events(&connection, config, true) {
-        eprintln!("failed to prune tracking events at startup: {error}");
+        crate::structured_log!("warn", "tracking", "prune_failed", { "phase": "startup", "error": error.to_string() });
     }
     let prune_interval = Duration::from_secs(config.prune_interval_seconds.max(60));
     let mut next_prune = std::time::Instant::now() + prune_interval;
@@ -225,7 +225,7 @@ fn run_event_loop(
         }
         if std::time::Instant::now() >= next_prune {
             if let Err(error) = prune_tracking_events(&connection, config, false) {
-                eprintln!("failed to prune tracking events: {error}");
+                crate::structured_log!("warn", "tracking", "prune_failed", { "phase": "periodic", "error": error.to_string() });
             }
             next_prune = std::time::Instant::now() + prune_interval;
         }
@@ -335,7 +335,7 @@ fn persist_and_publish(
         ],
     ) {
         crate::metrics::inc_tracking_events_dropped();
-        eprintln!("failed to persist tracking event: {error}");
+        crate::structured_log!("warn", "tracking", "event_dropped", { "error": error.to_string() });
         return;
     }
     let Ok(serialized) = serde_json::to_vec(event) else {

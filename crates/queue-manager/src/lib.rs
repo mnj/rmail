@@ -641,7 +641,7 @@ pub fn dead_letter_cleanup(maildrop_dir: &Path, older_than_secs: i64) -> Result<
         if age >= older_than_secs {
             let dst_eml = dead_dir.join(p.file_name().unwrap());
             if let Err(e) = move_message_and_control(&p, &dst_eml) {
-                eprintln!("failed to move failed eml to dead: {}", e);
+                rmail_common::structured_log!("warn", "outbound", "dead_letter_move_failed", { "message": p.file_name().map(|name| name.to_string_lossy().into_owned()), "error": e.to_string() });
                 continue;
             }
             moved += 1;

@@ -48,6 +48,7 @@ const ALL_LISTENERS: &[&str] = &["smtpd", "imapd", "web", "webmail"];
 const TRACKING: &[&str] = &["smtpd", "outbound"];
 const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
+const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail"];
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -124,6 +125,11 @@ pub const GROUPS: &[SettingGroup] = &[
         id: "oauth",
         label: "OAuth",
         description: "RFC 7662 token introspection used by OAUTHBEARER and XOAUTH2. Leave the URL empty to disable.",
+    },
+    SettingGroup {
+        id: "logging",
+        label: "Logging",
+        description: "Structured JSON logs written by every daemon, shown on the Logs page.",
     },
     SettingGroup {
         id: "tracking",
@@ -565,6 +571,16 @@ pub const SETTINGS: &[SettingSpec] = &[
         MAIL,
     ),
     spec(
+        "global.log_level",
+        "logging",
+        "Log level",
+        "debug adds per-transaction detail such as MAIL FROM and DATA start.",
+        SettingKind::Choice {
+            options: &["error", "warn", "info", "debug"],
+        },
+        ALL,
+    ),
+    spec(
         "global.tracking.retention_days",
         "tracking",
         "Retention (days)",
@@ -886,11 +902,12 @@ pub fn resolve_config(file: Value, source: &str) -> Result<Config> {
         .map(|(key, _)| key.as_str())
         .collect::<Vec<_>>();
     if !ignored.is_empty() {
-        eprintln!(
-            "rmail: {source}: ignoring {} file setting(s) that differ from the settings database {db_path} (edit them in the admin UI or with `rmail_ctl settings`): {}",
-            ignored.len(),
-            ignored.join(", ")
-        );
+        crate::structured_log!("warn", "settings", "file_settings_ignored", {
+            "config_file": source,
+            "database": db_path,
+            "keys": ignored,
+            "hint": "settings are managed in the admin UI or with `rmail_ctl settings`",
+        });
     }
     let mut config = build_config(&file_flat, &stored)
         .with_context(|| format!("settings stored in {db_path}"))?;

@@ -480,11 +480,7 @@ pub fn delete_folder(
     if let Some(guard) = guard {
         guard.commit();
         if let Err(error) = fs::remove_dir_all(&tombstone) {
-            eprintln!(
-                "failed to remove committed mailbox tombstone {}: {}",
-                tombstone.display(),
-                error
-            );
+            crate::structured_log!("warn", "storage", "tombstone_cleanup_failed", { "path": tombstone.display().to_string(), "error": error.to_string() });
         }
     }
     Ok(())
@@ -793,11 +789,7 @@ pub fn delete_messages_by_uid(
     for (guard, tombstone) in staged {
         guard.commit();
         if let Err(error) = fs::remove_file(&tombstone) {
-            eprintln!(
-                "failed to remove committed expunge tombstone {}: {}",
-                tombstone.display(),
-                error
-            );
+            crate::structured_log!("warn", "storage", "tombstone_cleanup_failed", { "path": tombstone.display().to_string(), "error": error.to_string() });
         }
     }
     Ok(deleted)

@@ -277,3 +277,26 @@ td.wrap { white-space: normal; word-break: break-word; max-width: 420px; }
   .searchBox input { min-width: 0; }
   .panelHead { flex-wrap: wrap; }
 }
+
+/* ---- Structured log viewer ------------------------------------------------ */
+.logTools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.logTools .searchBox { flex: 1; min-width: 220px; }
+.checkLabel { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #475467; }
+div.logView { margin: 12px 16px 16px; border-radius: 10px; max-height: 560px; overflow: auto; background: #172228; color: #d8f3ef; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 8px 0; }
+div.logView pre { margin: 0; padding: 6px 14px; white-space: pre-wrap; word-break: break-word; background: none; }
+.logLine { display: grid; grid-template-columns: 76px 48px minmax(120px, auto) 1fr; gap: 10px; padding: 3px 14px; align-items: baseline; }
+.logLine:hover { background: rgba(255,255,255,.04); }
+.logLine time { color: #7c9aa3; }
+.logLine strong { color: #fff; font-weight: 600; }
+.logLevel { text-transform: uppercase; font-size: 10px; font-weight: 700; color: #7c9aa3; }
+.logLine.warn .logLevel { color: #fdb022; }
+.logLine.error .logLevel { color: #f97066; }
+.logLine.error strong { color: #fda29b; }
+.logLine.debug { opacity: .7; }
+.logLine.plain { display: block; color: #a9c3c9; }
+.logFields { display: flex; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }
+.logField { border: 0; background: none; padding: 0; color: #b9d6dc; font: inherit; cursor: pointer; text-align: left; word-break: break-all; }
+.logField:hover { color: #fff; text-decoration: underline; }
+.logField em { font-style: normal; color: #7c9aa3; }
+.logEmpty { padding: 10px 14px; color: #7c9aa3; }
+@media (max-width: 720px) { .logLine { grid-template-columns: 70px 1fr; } .logLine .logFields { grid-column: 1 / -1; } }

@@ -125,6 +125,7 @@ struct MessageDetail {
 async fn main() -> Result<()> {
     let cfg_path = env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {cfg_path}"))?;
+    rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
     let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "webmail")
         .context("redirecting logs")?;

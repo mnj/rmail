@@ -272,8 +272,9 @@ async fn main() -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
+    rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "imapd") {
-        eprintln!("rmail: could not record imapd start in the settings database: {error:#}");
+        rmail_common::structured_log!("warn", "imapd", "service_state_failed", { "error": format!("{error:#}") });
     }
     let auth_policy = Arc::new(
         auth::AuthPolicy::from_security(&cfg.security)

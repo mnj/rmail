@@ -54,15 +54,15 @@ pub fn spawn_web_tls_reloader(
     tokio::spawn(async move {
         let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         else {
-            eprintln!("{component}: failed to install SIGHUP TLS reload handler");
+            crate::structured_log!("error", component, "tls_reload_handler_failed", {});
             return;
         };
         while signal.recv().await.is_some() {
             match reload_server_tls_context(&sender, &cert_path, &key_path, &policy) {
-                Ok(()) => println!("{component}: reloaded TLS certificate, key, and OCSP bundle"),
-                Err(error) => eprintln!(
-                    "{component}: TLS reload failed; keeping current TLS bundle: {error:#}"
-                ),
+                Ok(()) => crate::structured_log!("info", component, "tls_reloaded", {}),
+                Err(error) => {
+                    crate::structured_log!("error", component, "tls_reload_failed", { "error": format!("{error:#}"), "action": "keeping current TLS bundle" })
+                }
             }
         }
     });

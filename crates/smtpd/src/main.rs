@@ -41,20 +41,6 @@ macro_rules! smtp_log {
     };
 }
 
-// Keep low-frequency diagnostics machine-readable while their call sites are
-// gradually promoted to more specific event names and fields.
-macro_rules! println {
-    ($($argument:tt)*) => {
-        smtp_log!("info", "operational_message", { "message": format!($($argument)*) })
-    };
-}
-
-macro_rules! eprintln {
-    ($($argument:tt)*) => {
-        smtp_log!("error", "operational_error", { "message": format!($($argument)*) })
-    };
-}
-
 // Trait object helper: combine AsyncRead + AsyncWrite into a single object-safe trait and require Unpin
 // so that boxed trait objects can be used with tokio::io::BufReader.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
@@ -395,8 +381,9 @@ async fn main() -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
+    rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
-        eprintln!("rmail: could not record smtpd start in the settings database: {error:#}");
+        smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
     }
 
     let mail_root = cfg.global.mail_root.clone();
@@ -1456,7 +1443,7 @@ async fn process_stream(
                         mail_from_seen = true;
                         bdat_buffer.clear();
                         bdat_started = false;
-                        println!("SMTP MAIL FROM peer={:?} parsed={:?}", peer, mail_from);
+                        smtp_log!("debug", "mail_from_accepted", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "mail_from": mail_from });
                     }
                     Err(protocol::EnvelopeError::UnsupportedParameter) => {
                         mail_from = None;
@@ -1471,7 +1458,7 @@ async fn process_stream(
                     Err(protocol::EnvelopeError::Syntax) => {
                         mail_from = None;
                         mail_from_seen = false;
-                        println!("SMTP MAIL FROM peer={:?} parse failed", peer);
+                        smtp_log!("debug", "mail_from_rejected", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "reason": "syntax" });
                     }
                 }
                 if !mail_from_seen {
@@ -1504,7 +1491,6 @@ async fn process_stream(
                             notify: parsed.dsn_notify,
                             original_recipient: parsed.original_recipient,
                         };
-                        println!("SMTP RCPT TO peer={:?} parsed={}", peer, addr);
                         // DB is authoritative — must be configured at startup
                         if let Some(dbp) = db_path.as_ref() {
                             let dbp2 = dbp.clone();
@@ -1535,12 +1521,7 @@ async fn process_stream(
                                         recipient_dsn
                                             .insert(target.clone(), (dsn_generation, dsn.clone()));
                                         rcpts.push(target);
-                                        println!(
-                                            "SMTP RCPT accepted peer={:?} rcpt_count={} current_rcpts={:?}",
-                                            peer,
-                                            rcpts.len(),
-                                            rcpts
-                                        );
+                                        smtp_log!("info", "rcpt_accepted", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": rcpts.last(), "recipient_count": rcpts.len() });
                                         let w = reader.get_mut();
                                         w.write_all(b"250 2.1.5 Recipient OK\r\n").await?;
                                         w.flush().await?;
@@ -1561,10 +1542,7 @@ async fn process_stream(
                                         .await
                                         {
                                             Ok(Ok(Some(targets))) => {
-                                                println!(
-                                                    "SMTP RCPT alias match peer={:?} rcpt={} targets={:?}",
-                                                    peer, addr, targets
-                                                );
+                                                smtp_log!("info", "rcpt_alias", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "targets": targets });
                                                 let lmtp_targets_are_local = if service
                                                     == SmtpService::Lmtp
                                                     && !targets.is_empty()
@@ -1657,10 +1635,7 @@ async fn process_stream(
                                                 .await
                                                 {
                                                     Ok(Ok(Some(target))) => {
-                                                        println!(
-                                                            "SMTP RCPT catchall match peer={:?} rcpt={} target={}",
-                                                            peer, addr, target
-                                                        );
+                                                        smtp_log!("info", "rcpt_catchall", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "target": target });
                                                         let lmtp_target_is_local = if service
                                                             == SmtpService::Lmtp
                                                         {
@@ -1756,7 +1731,7 @@ async fn process_stream(
                                                         }
                                                     }
                                                     Ok(Err(e)) => {
-                                                        eprintln!("db get_catchall error: {}", e);
+                                                        smtp_log!("error", "recipient_lookup_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "lookup": "catchall", "error": e.to_string() });
                                                         let w = reader.get_mut();
                                                         w.write_all(
                                                             b"451 4.3.0 Temporary local error\r\n",
@@ -1765,7 +1740,7 @@ async fn process_stream(
                                                         w.flush().await?;
                                                     }
                                                     Err(e) => {
-                                                        eprintln!("db task join error: {}", e);
+                                                        smtp_log!("error", "recipient_lookup_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "lookup": "task", "error": e.to_string() });
                                                         let w = reader.get_mut();
                                                         w.write_all(
                                                             b"451 4.3.0 Temporary local error\r\n",
@@ -1776,14 +1751,14 @@ async fn process_stream(
                                                 }
                                             }
                                             Ok(Err(e)) => {
-                                                eprintln!("db get_alias_targets error: {}", e);
+                                                smtp_log!("error", "recipient_lookup_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "lookup": "alias", "error": e.to_string() });
                                                 let w = reader.get_mut();
                                                 w.write_all(b"451 4.3.0 Temporary local error\r\n")
                                                     .await?;
                                                 w.flush().await?;
                                             }
                                             Err(e) => {
-                                                eprintln!("db task join error: {}", e);
+                                                smtp_log!("error", "recipient_lookup_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "lookup": "task", "error": e.to_string() });
                                                 let w = reader.get_mut();
                                                 w.write_all(b"451 4.3.0 Temporary local error\r\n")
                                                     .await?;
@@ -1798,13 +1773,13 @@ async fn process_stream(
                                     }
                                 }
                                 Ok(Err(e)) => {
-                                    eprintln!("db mailbox_exists error: {}", e);
+                                    smtp_log!("error", "recipient_lookup_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "lookup": "mailbox", "error": e.to_string() });
                                     let w = reader.get_mut();
                                     w.write_all(b"451 4.3.0 Temporary local error\r\n").await?;
                                     w.flush().await?;
                                 }
                                 Err(e) => {
-                                    eprintln!("db task join error: {}", e);
+                                    smtp_log!("error", "recipient_lookup_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "rcpt": addr, "lookup": "task", "error": e.to_string() });
                                     let w = reader.get_mut();
                                     w.write_all(b"451 4.3.0 Temporary local error\r\n").await?;
                                     w.flush().await?;
@@ -1860,9 +1835,7 @@ async fn process_stream(
                             writer.flush().await?;
                             continue;
                         }
-                        println!(
-                            "SMTP DATA begin peer={peer:?} mail_from={mail_from:?} rcpts={rcpts:?}"
-                        );
+                        smtp_log!("debug", "data_started", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "recipient_count": rcpts.len() });
                         let writer = reader.get_mut();
                         writer
                             .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
@@ -2116,10 +2089,7 @@ async fn process_stream(
                                 );
                             }
                             ScanAction::Reject => {
-                                println!(
-                                    "SMTP scanner rejected peer={:?} reason={:?}",
-                                    peer, verdict.reason
-                                );
+                                smtp_log!("warn", "message_rejected_by_scanner", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "reason": verdict.reason });
                                 let w = reader.get_mut();
                                 write_message_completion(
                                     w,
@@ -2136,7 +2106,7 @@ async fn process_stream(
                             }
                         },
                         Err(e) => {
-                            eprintln!("SMTP scanner error peer={:?}: {}", peer, e);
+                            smtp_log!("error", "scanner_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "error": e.to_string() });
                             let w = reader.get_mut();
                             match security.scanner_failure_action {
                                 ScannerFailureAction::Accept => {}
@@ -2177,12 +2147,7 @@ async fn process_stream(
                 {
                     // account bytes received
                     metrics::add_bytes_received(data.len() as u64);
-                    println!(
-                        "SMTP DATA received peer={:?} bytes={} rcpts={:?}",
-                        peer,
-                        data.len(),
-                        rcpts
-                    );
+                    smtp_log!("info", "message_received", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "bytes": data.len(), "recipient_count": rcpts.len() });
                     let peer_ip_for_analysis = peer.map(|peer| peer.ip());
                     let auth = match rmail_common::mail_auth::analyze_message(
                         &data,
@@ -2195,7 +2160,7 @@ async fn process_stream(
                     {
                         Ok(results) => results,
                         Err(error) => {
-                            eprintln!("mail auth analyze error: {error}");
+                            smtp_log!("warn", "mail_auth_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "error": error.to_string() });
                             rmail_common::mail_auth::AuthenticationResults::default()
                         }
                     };
@@ -2284,7 +2249,7 @@ async fn process_stream(
                                 if scanner_quarantine || dmarc_res.as_deref() == Some("quarantine")
                                 {
                                     match maildir::deliver_quarantine(&mr, &domain, &local, &data) {
-                                        Ok(path) => {
+                                        Ok(_) => {
                                             any_accepted = true;
                                             local_delivered = true;
                                             lmtp_status.insert(rcpt.clone(), "250 2.1.5 Delivered");
@@ -2298,26 +2263,16 @@ async fn process_stream(
                                                 elapsed_us,
                                             );
 
-                                            println!(
-                                                "SMTP local quarantine peer={:?} rcpt={} path={:?} bytes={} dmarc={:?}",
-                                                peer,
-                                                rcpt,
-                                                path,
-                                                data.len(),
-                                                dmarc_res
-                                            );
+                                            smtp_log!("info", "delivered", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "folder": "Junk", "bytes": data.len(), "dmarc": dmarc_res });
                                             // update simple on-disk metric; failures are non-fatal
                                             if let Err(e) = increment_delivery_counter(&mr).await {
-                                                eprintln!("metrics update failed: {}", e);
+                                                smtp_log!("warn", "delivery_counter_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "error": e.to_string() });
                                             }
                                         }
                                         Err(e) => {
                                             any_rejected = true;
                                             rmail_common::metrics::inc_failed_deliveries();
-                                            eprintln!(
-                                                "quarantine deliver error for {}: {}",
-                                                rcpt, e
-                                            );
+                                            smtp_log!("error", "delivery_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "folder": "Junk", "error": e.to_string() });
                                         }
                                     }
                                 } else {
@@ -2347,17 +2302,10 @@ async fn process_stream(
                                                 elapsed_us,
                                             );
 
-                                            println!(
-                                                "SMTP local delivery peer={:?} rcpt={} uid={} bytes={} dmarc={:?}",
-                                                peer,
-                                                rcpt,
-                                                uid,
-                                                data.len(),
-                                                dmarc_res
-                                            );
+                                            smtp_log!("info", "delivered", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "folder": "INBOX", "uid": uid, "bytes": data.len(), "dmarc": dmarc_res });
                                             // update simple on-disk metric; failures are non-fatal
                                             if let Err(e) = increment_delivery_counter(&mr).await {
-                                                eprintln!("metrics update failed: {}", e);
+                                                smtp_log!("warn", "delivery_counter_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "error": e.to_string() });
                                             }
                                         }
                                         Err(e) => {
@@ -2373,7 +2321,7 @@ async fn process_stream(
                                                 );
                                             }
                                             rmail_common::metrics::inc_failed_deliveries();
-                                            eprintln!("deliver error for {}: {}", rcpt, e);
+                                            smtp_log!("error", "delivery_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "folder": "INBOX", "error": e.to_string() });
                                         }
                                     }
                                 }
@@ -2384,9 +2332,7 @@ async fn process_stream(
                                     && let Err(error) =
                                         queue_local_success_notification(&mr, sender, rcpt, dsn)
                                 {
-                                    eprintln!(
-                                        "failed to queue local DSN success notification for {rcpt}: {error}"
-                                    );
+                                    smtp_log!("error", "dsn_queue_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "error": error.to_string() });
                                 }
                             } else {
                                 if service == SmtpService::Lmtp {
@@ -2425,9 +2371,7 @@ async fn process_stream(
                                             }
                                             Err(error) => {
                                                 any_rejected = true;
-                                                eprintln!(
-                                                    "failed to ARC-seal forwarded message for {rcpt}: {error:#}"
-                                                );
+                                                smtp_log!("error", "arc_seal_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "error": format!("{error:#}") });
                                                 continue;
                                             }
                                         }
@@ -2463,21 +2407,15 @@ async fn process_stream(
                                     {
                                         Ok(Ok(path)) => {
                                             any_accepted = true;
-                                            println!(
-                                                "SMTP outbound queued peer={:?} rcpt={} path={:?} bytes={}",
-                                                peer,
-                                                rcpt,
-                                                path,
-                                                data.len()
-                                            );
+                                            smtp_log!("info", "queued_outbound", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "queue_file": path.file_name().map(|name| name.to_string_lossy().into_owned()), "bytes": data.len() });
                                         }
                                         Ok(Err(e)) => {
                                             any_rejected = true;
-                                            eprintln!("failed to queue outbound {}: {}", rcpt, e);
+                                            smtp_log!("error", "queue_outbound_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "error": e.to_string() });
                                         }
                                         Err(e) => {
                                             any_rejected = true;
-                                            eprintln!("queue spawn_blocking join error: {}", e);
+                                            smtp_log!("error", "queue_outbound_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "rcpt": rcpt, "error": e.to_string() });
                                         }
                                     }
                                 }
@@ -2564,16 +2502,10 @@ async fn process_stream(
                         {
                             record_submission_message(user);
                         }
-                        println!(
-                            "SMTP DATA completed peer={:?} accepted=true rejected={}",
-                            peer, any_rejected
-                        );
+                        smtp_log!("info", "data_completed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "result": if any_rejected { "partially_accepted" } else { "accepted" } });
                         w.write_all(b"250 2.0.0 Message accepted\r\n").await?;
                     } else if any_rejected {
-                        println!(
-                            "SMTP DATA completed peer={:?} accepted=false temporary_failure=true",
-                            peer
-                        );
+                        smtp_log!("warn", "data_completed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "result": "temporary_failure", "quota_exceeded": any_quota_exceeded });
                         if any_quota_exceeded {
                             w.write_all(b"452 4.2.2 Mailbox storage limit exceeded\r\n")
                                 .await?;
@@ -2582,10 +2514,7 @@ async fn process_stream(
                                 .await?;
                         }
                     } else {
-                        println!(
-                            "SMTP DATA completed peer={:?} accepted=false rejected=false",
-                            peer
-                        );
+                        smtp_log!("info", "data_completed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "message_id": tracking_message_id, "result": "no_recipients" });
                         w.write_all(b"250 2.0.0 Message accepted\r\n").await?;
                     }
                     w.flush().await?;
@@ -2630,14 +2559,12 @@ async fn process_stream(
                 w.flush().await?;
             }
             SmtpCommand::Quit => {
-                println!("SMTP QUIT peer={:?}", peer);
                 let w = reader.get_mut();
                 w.write_all(b"221 2.0.0 Bye\r\n").await?;
                 w.flush().await?;
                 break;
             }
             SmtpCommand::StartTls => {
-                println!("SMTP STARTTLS peer={:?}", peer);
                 // if we have an acceptor available, perform TLS handshake and continue inside TLS
                 if let Some(acceptor_ctx) = tls_ctx.clone() {
                     if !reader.buffer().is_empty() {
@@ -2670,7 +2597,7 @@ async fn process_stream(
                     metrics::observe_tls_handshake_duration(started.elapsed());
                     match handshake {
                         Ok(Ok(tls_stream)) => {
-                            println!("SMTP STARTTLS handshake success peer={:?}", peer);
+                            smtp_log!("info", "starttls_completed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()) });
                             // Box the TLS stream to the AsyncStream trait object and recurse inside TLS context.
                             let fut = Box::pin(process_stream(
                                 Box::new(tls_stream),
@@ -2688,12 +2615,12 @@ async fn process_stream(
                             return fut.await;
                         }
                         Ok(Err(e)) => {
-                            eprintln!("SMTP STARTTLS handshake failed peer={:?}: {}", peer, e);
+                            smtp_log!("warn", "starttls_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "error": e.to_string() });
                             // We can't continue; return error to close connection
                             return Err(anyhow::anyhow!("TLS accept error: {}", e));
                         }
                         Err(_) => {
-                            eprintln!("SMTP STARTTLS handshake timeout peer={:?}", peer);
+                            smtp_log!("warn", "starttls_failed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "error": "handshake timed out" });
                             return Err(anyhow::anyhow!("TLS accept timeout"));
                         }
                     }
@@ -2710,20 +2637,14 @@ async fn process_stream(
                 w.flush().await?;
             }
             SmtpCommand::Unknown => {
-                eprintln!(
-                    "SMTP unknown or unsupported command peer={:?} encrypted={} cmd={:?}",
-                    peer, session_encrypted, cmd
-                );
+                smtp_log!("warn", "unknown_command", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted });
                 let w = reader.get_mut();
                 w.write_all(b"500 5.5.2 Command unrecognized\r\n").await?;
                 w.flush().await?;
             }
         }
     }
-    println!(
-        "SMTP session peer={:?} encrypted={} closed",
-        peer, session_encrypted
-    );
+    smtp_log!("info", "session_closed", { "connection_id": trace.id, "peer": peer.map(|address| address.to_string()), "encrypted": session_encrypted });
     let mut disconnected =
         TrackingEvent::new("smtpd", &trace.id, "inbound", "connection", "disconnected");
     disconnected.message_id = tracking_message_id;
