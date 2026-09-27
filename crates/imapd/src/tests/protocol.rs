@@ -96,6 +96,9 @@ fn capability_advertises_starttls_and_login_policy() {
             "COMPRESS=DEFLATE",
             "MOVE",
             "UNSELECT",
+            "UNAUTHENTICATE",
+            "CREATE-SPECIAL-USE",
+            "APPENDLIMIT=104857600",
         ])
     );
     assert!(

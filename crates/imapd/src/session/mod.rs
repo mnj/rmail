@@ -527,6 +527,19 @@ impl Session {
                 self.quota(reader, call).await
             }
             Command::Unselect => self.unselect(reader, call).await,
+            Command::Unauthenticate => {
+                // RFC 8437: back to the not-authenticated state as if the
+                // connection were new; TLS and compression stay active.
+                let account = self.state.authenticated_mailbox.clone();
+                self.clear_selection();
+                self.state = state::SessionState::default();
+                imap_log!("info", "unauthenticated", { "peer": self.peer_label(), "mailbox": account });
+                self.send(
+                    reader,
+                    commands::basic::completed(call.tag, "UNAUTHENTICATE").encode(),
+                )
+                .await
+            }
             Command::Append => self.append(reader, call).await,
             Command::List { .. } | Command::Lsub => self.list(reader, call).await,
             Command::Create | Command::Delete | Command::Rename | Command::Subscribe { .. } => {

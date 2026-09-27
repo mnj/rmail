@@ -145,7 +145,8 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
         | Command::Subscribe { .. }
         | Command::Enable
         | Command::Compress
-        | Command::Select { .. } => Some(AUTH),
+        | Command::Select { .. }
+        | Command::Unauthenticate => Some(AUTH),
         Command::Fetch
         | Command::Search
         | Command::Sort
@@ -222,6 +223,7 @@ mod tests {
             "STARTTLS",
             "STATUS INBOX (MESSAGES)",
             "UNSELECT",
+            "UNAUTHENTICATE",
             "APPEND INBOX {1}",
             "LIST \"\" \"*\"",
             "XLIST \"\" \"*\"",
