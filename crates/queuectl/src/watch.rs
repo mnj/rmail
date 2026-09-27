@@ -312,8 +312,8 @@ struct EventFeed {
 
 impl EventFeed {
     fn connect(root: &Path) -> Result<Self> {
+        rmail_common::tracking::prepare_socket_runtime_directory(root)?;
         let directory = watcher_directory(root);
-        std::fs::create_dir_all(&directory)?;
         let path = directory.join(format!(
             "watch-{}-{:x}.sock",
             std::process::id(),

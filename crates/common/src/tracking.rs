@@ -90,17 +90,132 @@ pub fn tracking_db_path(mail_root: &Path) -> PathBuf {
     mail_root.join("_tracking").join("events.sqlite")
 }
 
+/// Longest socket path that fits in `sockaddr_un.sun_path` (108 bytes on Linux,
+/// including the trailing NUL; macOS allows fewer, but the fallback is short).
+#[cfg(unix)]
+const MAX_SOCKET_PATH_BYTES: usize = 107;
+/// Room reserved for socket file names: service sockets such as
+/// `outbound.sock` and watcher sockets `watch-<pid>-<u32 hex>.sock`.
+#[cfg(unix)]
+const MAX_SOCKET_NAME_BYTES: usize = 32;
+/// Short, fixed base used when `mail_root` is too long for socket paths. It is
+/// deliberately not `$TMPDIR` or `$XDG_RUNTIME_DIR`, which can differ between
+/// daemons that must all agree on where the sockets live.
+#[cfg(unix)]
+const SHORT_SOCKET_BASE: &str = "/tmp";
+
+/// Directory holding the tracking sockets (`events/` and `watch/`).
+///
+/// This is `<mail_root>/_runtime` unless socket paths below it would exceed
+/// the `sun_path` limit, in which case it is `/tmp/rmail-<hash>` where the hash
+/// is derived from the canonical `mail_root`. Every component that binds or
+/// connects to a tracking socket derives its path through here, so they agree.
+#[cfg(unix)]
+pub fn socket_runtime_directory(mail_root: &Path) -> PathBuf {
+    resolve_socket_runtime_directory(mail_root).0
+}
+
+#[cfg(unix)]
+fn resolve_socket_runtime_directory(mail_root: &Path) -> (PathBuf, bool) {
+    let preferred = mail_root.join("_runtime");
+    // Decide on the absolute form so relative and absolute spellings of the
+    // same mail_root pick the same directory.
+    let absolute = std::path::absolute(&preferred).unwrap_or_else(|_| preferred.clone());
+    let longest_directory = absolute.join("events").as_os_str().len();
+    if longest_directory + 1 + MAX_SOCKET_NAME_BYTES <= MAX_SOCKET_PATH_BYTES {
+        return (preferred, false);
+    }
+    (fallback_socket_runtime_directory(mail_root), true)
+}
+
+#[cfg(unix)]
+fn fallback_socket_runtime_directory(mail_root: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let identity = std::fs::canonicalize(mail_root)
+        .or_else(|_| std::path::absolute(mail_root))
+        .unwrap_or_else(|_| mail_root.to_path_buf());
+    let digest = Sha256::digest(identity.as_os_str().as_bytes());
+    let mut name = String::from("rmail-");
+    for byte in &digest[..8] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    Path::new(SHORT_SOCKET_BASE).join(name)
+}
+
+/// Create the socket runtime directory and its `events/` and `watch/`
+/// subdirectories, returning the runtime directory.
+#[cfg(unix)]
+pub fn prepare_socket_runtime_directory(mail_root: &Path) -> Result<PathBuf> {
+    Ok(ensure_socket_runtime_directory(mail_root)?.0)
+}
+
+#[cfg(unix)]
+fn ensure_socket_runtime_directory(mail_root: &Path) -> Result<(PathBuf, bool)> {
+    // The fallback name hashes the canonical mail_root, so it must exist first.
+    std::fs::create_dir_all(mail_root)
+        .with_context(|| format!("creating mail root {}", mail_root.display()))?;
+    let (directory, fallback) = resolve_socket_runtime_directory(mail_root);
+    if fallback {
+        create_fallback_directory(mail_root, &directory)?;
+    }
+    for child in ["events", "watch"] {
+        let path = directory.join(child);
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("creating socket directory {}", path.display()))?;
+    }
+    Ok((directory, fallback))
+}
+
+/// The fallback lives in a shared, world-writable base, so refuse a directory
+/// that someone other than us or the mail_root owner planted there.
+#[cfg(unix)]
+fn create_fallback_directory(mail_root: &Path, directory: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let root_metadata = std::fs::metadata(mail_root)
+        .with_context(|| format!("reading mail root {}", mail_root.display()))?;
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {
+            // Share with the same group as mail_root, never with everyone.
+            let mode = (root_metadata.mode() & 0o770) | 0o700;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("securing socket directory {}", directory.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("creating socket directory {}", directory.display()));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(directory)
+        .with_context(|| format!("inspecting socket directory {}", directory.display()))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let effective_uid = unsafe { libc::geteuid() };
+    let trusted_owner = metadata.uid() == effective_uid || metadata.uid() == root_metadata.uid();
+    if !metadata.is_dir() || !trusted_owner || metadata.mode() & 0o002 != 0 {
+        anyhow::bail!(
+            "refusing untrusted socket directory {} (must be a directory owned by uid {} or {} and not world-writable)",
+            directory.display(),
+            effective_uid,
+            root_metadata.uid()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub fn service_socket_path(mail_root: &Path, service: &str) -> PathBuf {
-    mail_root
-        .join("_runtime")
+    socket_runtime_directory(mail_root)
         .join("events")
         .join(format!("{service}.sock"))
 }
 
 #[cfg(unix)]
 pub fn watcher_directory(mail_root: &Path) -> PathBuf {
-    mail_root.join("_runtime").join("watch")
+    socket_runtime_directory(mail_root).join("watch")
 }
 
 pub struct TrackingHub {
@@ -122,15 +237,21 @@ impl TrackingHub {
         use std::os::unix::net::UnixDatagram;
 
         let db_path = tracking_db_path(mail_root);
-        let socket_path = service_socket_path(mail_root, service);
-        let watch_dir = watcher_directory(mail_root);
+        let (runtime_dir, fallback) = ensure_socket_runtime_directory(mail_root)?;
+        let socket_path = runtime_dir.join("events").join(format!("{service}.sock"));
+        let watch_dir = runtime_dir.join("watch");
+        if fallback {
+            crate::structured_log!("info", "tracking", "socket_path_fallback", {
+                "service": service,
+                "mail_root": mail_root.display().to_string(),
+                "preferred": mail_root.join("_runtime").display().to_string(),
+                "socket_dir": runtime_dir.display().to_string(),
+                "max_socket_path_bytes": MAX_SOCKET_PATH_BYTES,
+            });
+        }
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::create_dir_all(&watch_dir)?;
         let _ = std::fs::remove_file(&socket_path);
 
         let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
@@ -432,6 +553,71 @@ mod tests {
         let persisted = recent_events(temporary.path(), 10, Some("msg-1")).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0], live);
+    }
+
+    #[test]
+    fn long_mail_root_falls_back_to_short_socket_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mail_root = temporary
+            .path()
+            .join("a-rather-long-scratch-directory-name-used-by-e2e-runs")
+            .join("another-deeply-nested-component-to-exceed-sun-path")
+            .join("mail");
+        assert!(
+            mail_root
+                .join("_runtime/events/smtpd.sock")
+                .as_os_str()
+                .len()
+                > 108
+        );
+
+        let hub = TrackingHub::start(&mail_root, "smtpd").unwrap();
+        let socket_dir = socket_runtime_directory(&mail_root);
+        let service_path = service_socket_path(&mail_root, "smtpd");
+        assert!(!socket_dir.starts_with(&mail_root));
+        assert!(service_path.starts_with(&socket_dir));
+        assert!(service_path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
+        // Another spelling of the same root resolves to the same sockets.
+        let respelled = mail_root.join("..").join("mail");
+        assert_eq!(service_socket_path(&respelled, "smtpd"), service_path);
+
+        let watcher_path =
+            watcher_directory(&mail_root).join(format!("watch-{}-{:x}.sock", u32::MAX, u32::MAX));
+        assert!(watcher_path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
+        let watcher = UnixDatagram::bind(&watcher_path).unwrap();
+        watcher
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        watcher
+            .send_to(watcher_path.to_string_lossy().as_bytes(), &service_path)
+            .unwrap();
+        let mut buffer = [0_u8; MAX_DATAGRAM_BYTES];
+        let length = watcher.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], b"{\"subscribed\":true}");
+
+        assert!(hub.emit(TrackingEvent::new(
+            "smtpd",
+            "conn-long",
+            "inbound",
+            "command",
+            "helo"
+        )));
+        let length = watcher.recv(&mut buffer).unwrap();
+        let live: TrackingEvent = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert_eq!(live.connection_id, "conn-long");
+
+        drop(watcher);
+        drop(hub);
+        let _ = std::fs::remove_dir_all(socket_dir);
+    }
+
+    #[test]
+    fn short_mail_root_keeps_sockets_under_runtime() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert_eq!(
+            socket_runtime_directory(temporary.path()),
+            temporary.path().join("_runtime")
+        );
     }
 
     #[test]
