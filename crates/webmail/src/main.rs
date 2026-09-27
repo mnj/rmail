@@ -1,7 +1,6 @@
 //! rmail_webmail: browser webmail for rMail accounts.
 //!
 //! - `api` is the HTTP API (axum) with signed-cookie sessions.
-//! - `mime` turns stored messages into display data and sanitized HTML.
 //! - `assets` serves the single-page app.
 
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
@@ -22,7 +21,6 @@ macro_rules! webmail_log {
 
 mod api;
 mod assets;
-mod mime;
 
 #[tokio::main]
 async fn main() -> Result<()> {

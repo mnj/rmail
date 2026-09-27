@@ -3,7 +3,7 @@ import { RefreshCw, Search } from 'lucide-react';
 import { apiText } from '../api';
 import { Empty, ErrorBanner, Panel, useResource } from '../ui';
 
-const components = ['smtpd', 'imapd', 'outbound', 'web', 'webmail'];
+const components = ['smtpd', 'imapd', 'outbound', 'web', 'webmail', 'classifier'];
 
 type LogEntry = { raw: string; time?: number; level?: string; event?: string; fields?: Record<string, unknown> };
 

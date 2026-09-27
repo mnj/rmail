@@ -11,4 +11,5 @@ members = [
   "crates/queuectl",
   "crates/queue-manager",
   "crates/bench",
+  "crates/classifier",
 ]

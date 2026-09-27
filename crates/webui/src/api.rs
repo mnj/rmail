@@ -26,6 +26,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::*;
 
+mod organization;
+
 pub(crate) const SESSION_COOKIE: &str = "rmail_admin";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 /// Mutating requests must carry this header. Browsers cannot add custom
@@ -52,6 +54,7 @@ pub(crate) struct AdminState {
     pub throttle: AuthThrottle,
     pub revoked: websession::RevocationList,
     basic_cache: Mutex<HashMap<[u8; 32], Instant>>,
+    downloads: organization::Downloads,
 }
 
 impl AdminState {
@@ -76,6 +79,7 @@ impl AdminState {
             throttle: AuthThrottle::default(),
             revoked: websession::RevocationList::default(),
             basic_cache: Mutex::new(HashMap::new()),
+            downloads: organization::Downloads::default(),
         }
     }
 }
@@ -108,6 +112,7 @@ pub(crate) fn router(state: Shared) -> Router {
         )
         .route("/api/settings", get(settings).put(update_settings))
         .route("/api/admin/credentials", post(change_credentials))
+        .merge(organization::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let app = Router::new()
         .route("/.well-known/acme-challenge/{*token}", get(acme_challenge))
@@ -652,7 +657,7 @@ async fn logs(
         .min(2000);
     if !matches!(
         component,
-        "smtpd" | "imapd" | "web" | "outbound" | "webmail"
+        "smtpd" | "imapd" | "web" | "outbound" | "webmail" | "classifier"
     ) {
         return error(StatusCode::BAD_REQUEST, "invalid component");
     }

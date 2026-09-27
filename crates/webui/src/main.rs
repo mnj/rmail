@@ -2087,4 +2087,152 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
     }
+
+    fn organization_db(td: &std::path::Path) -> String {
+        let db_path = td.join("rmail.sqlite");
+        rmail_common::db::init_db(&db_path).expect("init db");
+        db_path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn organization_overview_lists_catalog_and_reports_missing_daemon() {
+        let td = tempdir().unwrap();
+        let db = organization_db(td.path());
+        let response = send_request_with_db(
+            td.path().to_path_buf(),
+            "GET /api/organization HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+            Some(db),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("bge-small-en-v1.5-q8_0.gguf"),
+            "{response}"
+        );
+        assert!(response.contains("\"running\":false"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn organization_activate_requires_installed_models_of_the_right_kind() {
+        let td = tempdir().unwrap();
+        let db = organization_db(td.path());
+        let models = rmail_common::classifier_models::models_dir(td.path());
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("embed.gguf"), b"gguf").unwrap();
+
+        let missing = send_request_with_db(
+            td.path().to_path_buf(),
+            post(
+                "/api/organization/activate",
+                r#"{"embed_model":"absent.gguf"}"#,
+                "",
+            ),
+            Some(db.clone()),
+        )
+        .await;
+        assert!(missing.starts_with("HTTP/1.1 422"), "{missing}");
+
+        let traversal = send_request_with_db(
+            td.path().to_path_buf(),
+            post(
+                "/api/organization/activate",
+                r#"{"embed_model":"../rmail.sqlite"}"#,
+                "",
+            ),
+            Some(db.clone()),
+        )
+        .await;
+        assert!(traversal.starts_with("HTTP/1.1 422"), "{traversal}");
+
+        let ok = send_request_with_db(
+            td.path().to_path_buf(),
+            post(
+                "/api/organization/activate",
+                r#"{"enabled":true,"embed_model":"embed.gguf"}"#,
+                "",
+            ),
+            Some(db.clone()),
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+        assert!(ok.contains("\"reloaded\":false"), "{ok}");
+        let conn = rmail_common::settings::open(&db).unwrap();
+        assert_eq!(
+            rmail_common::settings::get_string(&conn, "classifier.embed_model")
+                .unwrap()
+                .as_deref(),
+            Some("embed.gguf")
+        );
+
+        let refused = send_request_with_db(
+            td.path().to_path_buf(),
+            post("/api/organization/delete", r#"{"file":"embed.gguf"}"#, ""),
+            Some(db.clone()),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        assert!(models.join("embed.gguf").exists());
+    }
+
+    #[tokio::test]
+    async fn organization_rejects_unsafe_downloads() {
+        let td = tempdir().unwrap();
+        let db = organization_db(td.path());
+        for body in [
+            r#"{"file":"m.gguf","url":"http://example.test/m.gguf","kind":"embedding"}"#,
+            r#"{"file":"../m.gguf","url":"https://example.test/m.gguf","kind":"embedding"}"#,
+            r#"{"catalog_id":"nope"}"#,
+        ] {
+            let response = send_request_with_db(
+                td.path().to_path_buf(),
+                post("/api/organization/download", body, ""),
+                Some(db.clone()),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{body}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn organization_tests_are_proxied_to_the_daemon_socket() {
+        let td = tempdir().unwrap();
+        let db = organization_db(td.path());
+        let socket = rmail_common::classifier_control::socket_path(td.path());
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(read), &mut line)
+                .await
+                .unwrap();
+            let request: rmail_common::classifier_control::Request =
+                serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(
+                request,
+                rmail_common::classifier_control::Request::TestChat {
+                    text: "Your flight".into(),
+                    folders: vec!["Travel".into(), "Receipts".into()],
+                }
+            );
+            write
+                .write_all(b"{\"ok\":true,\"data\":{\"folder\":\"Travel\",\"confidence\":0.9}}\n")
+                .await
+                .unwrap();
+        });
+        let response = send_request_with_db(
+            td.path().to_path_buf(),
+            post(
+                "/api/organization/test",
+                r#"{"kind":"chat","text":"Your flight","folders":["Travel"," ","Receipts"]}"#,
+                "",
+            ),
+            Some(db),
+        )
+        .await;
+        daemon.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"folder\":\"Travel\""), "{response}");
+    }
 }

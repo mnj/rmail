@@ -300,3 +300,10 @@ div.logView pre { margin: 0; padding: 6px 14px; white-space: pre-wrap; word-brea
 .logField em { font-style: normal; color: #7c9aa3; }
 .logEmpty { padding: 10px 14px; color: #7c9aa3; }
 @media (max-width: 720px) { .logLine { grid-template-columns: 70px 1fr; } .logLine .logFields { grid-column: 1 / -1; } }
+
+.organizationPage { display: grid; gap: 18px; }
+.heroActions { display: flex; align-items: center; gap: 12px; }
+.organizationPage .button { white-space: nowrap; }
+.panelNote { margin: 0; padding: 12px 18px; color: #667085; font-size: 13px; }
+.rawAnswer { display: block; margin-top: 6px; font-size: 12px; word-break: break-all; }
+.banner.info { display: block; background: #eff8ff; border-color: #b2ddff; color: #175cd3; }

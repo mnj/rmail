@@ -18,7 +18,9 @@ use rmail_common::throttle::AuthThrottle;
 use rmail_common::{auth, db, imap_state, websession};
 use serde::{Deserialize, Serialize};
 
-use crate::mime::{has_remote_content, parse_message, sanitize_email_html, snippet};
+use rmail_common::mime::{has_remote_content, parse_message, sanitize_email_html, snippet};
+
+mod organize;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -54,6 +56,7 @@ pub(crate) fn router(state: Shared) -> Router {
             get(message_detail).patch(patch_message),
         )
         .route("/api/folders/{folder}/messages/bulk", post(bulk))
+        .merge(organize::routes())
         .fallback(fallback)
         .layer(middleware::from_fn(reject_cross_site))
         .layer(middleware::from_fn(security_headers))
@@ -329,6 +332,8 @@ pub(crate) struct MessageListItem {
     pub to: String,
     pub subject: String,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<organize::SuggestionView>,
 }
 
 #[derive(Serialize)]
@@ -409,12 +414,22 @@ async fn message_list(
 ) -> Response {
     let needle = query.q.to_ascii_lowercase();
     let result = blocking(move || {
-        let (_, mut messages) = imap_state::load_folder(
+        let (info, mut messages) = imap_state::load_folder(
             &state.mail_root,
             &session.domain,
             &session.localpart,
             &folder,
         )?;
+        let mut suggestions = if info.name == "INBOX" {
+            organize::pending_for_inbox(
+                &state.mail_root,
+                &session.domain,
+                &session.localpart,
+                info.uidvalidity,
+            )
+        } else {
+            Default::default()
+        };
         messages.sort_by(|a, b| b.internaldate.cmp(&a.internaldate).then(b.uid.cmp(&a.uid)));
         Ok(messages
             .into_iter()
@@ -437,6 +452,7 @@ async fn message_list(
                     to: parsed.to,
                     subject: parsed.subject,
                     snippet: snippet(&parsed.text_body),
+                    suggestion: suggestions.remove(&message.uid),
                 })
             })
             .skip(query.offset)
@@ -955,5 +971,146 @@ mod tests {
         )
         .await;
         assert_eq!(locked.status, 429);
+    }
+
+    #[tokio::test]
+    async fn organize_opt_in_suggestions_accept_and_dismiss() {
+        use rmail_common::classifier_store as store;
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (&state.mail_root, "example.test", "user");
+        imap_state::init_account(root, d, l).unwrap();
+        imap_state::create_folder(root, d, l, "Receipts").unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+
+        let before = route(req("GET", "/api/organize", b"", cookie.clone()), &state).await;
+        assert_eq!(before.status, 200);
+        let body = String::from_utf8(before.body).unwrap();
+        assert!(body.contains("\"enabled\":false"), "{body}");
+        assert!(body.contains("\"name\":\"Receipts\""), "{body}");
+        assert!(
+            !body.contains("\"name\":\"Sent\""),
+            "special-use folders are not offered: {body}"
+        );
+        assert!(
+            store::open_existing(root, d, l).unwrap().is_none(),
+            "reading does not opt in"
+        );
+
+        let saved = route(
+            req(
+                "PUT",
+                "/api/organize",
+                br#"{"enabled":true,"excluded_folders":["Nope"],"autofile_folders":["Receipts"]}"#,
+                cookie.clone(),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(saved.status, 204);
+        let conn = store::open_existing(root, d, l).unwrap().unwrap();
+        let prefs = store::prefs(&conn).unwrap();
+        assert!(prefs.enabled);
+        assert!(
+            prefs.excluded_folders.is_empty(),
+            "unknown folders are dropped"
+        );
+        assert_eq!(prefs.autofile_folders, vec!["Receipts".to_string()]);
+
+        // Simulate the daemon's work: two INBOX messages with suggestions.
+        let mut uids = Vec::new();
+        for subject in ["Receipt one", "Receipt two"] {
+            let data = format!("From: shop@example.net\r\nSubject: {subject}\r\n\r\nthanks");
+            let (uidvalidity, uid) =
+                imap_state::deliver_message(root, d, l, data.as_bytes()).unwrap();
+            store::record_suggestion(
+                &conn,
+                &store::Suggestion {
+                    uidvalidity,
+                    uid,
+                    folder: "Receipts".into(),
+                    score: 0.9,
+                    method: "knn".into(),
+                    state: "pending".into(),
+                    sender: "shop@example.net".into(),
+                    created_at: store::now(),
+                },
+            )
+            .unwrap();
+            store::set_keyword(root, d, l, "INBOX", uid, store::SUGGESTED_KEYWORD, true).unwrap();
+            uids.push(uid);
+        }
+
+        let list = route(
+            req("GET", "/api/folders/INBOX/messages", b"", cookie.clone()),
+            &state,
+        )
+        .await;
+        let body = String::from_utf8(list.body).unwrap();
+        assert_eq!(
+            body.matches("\"suggestion\":{\"folder\":\"Receipts\"")
+                .count(),
+            2,
+            "{body}"
+        );
+
+        let accepted = route(
+            req(
+                "POST",
+                &format!("/api/suggestions/{}/accept", uids[0]),
+                b"",
+                cookie.clone(),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(accepted.status, 200);
+        let (_, receipts) = imap_state::load_folder(root, d, l, "Receipts").unwrap();
+        assert_eq!(receipts.len(), 1);
+
+        let dismissed = route(
+            req(
+                "POST",
+                &format!("/api/suggestions/{}/dismiss", uids[1]),
+                b"",
+                cookie.clone(),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(dismissed.status, 204);
+        let again = route(
+            req(
+                "POST",
+                &format!("/api/suggestions/{}/accept", uids[1]),
+                b"",
+                cookie.clone(),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            again.status, 409,
+            "dismissed suggestions cannot be accepted"
+        );
+        let (_, inbox) = imap_state::load_folder(root, d, l, "INBOX").unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(!inbox[0].flags.iter().any(|f| f == store::SUGGESTED_KEYWORD));
+        assert_eq!(
+            store::dismissals(&conn).unwrap()["shop@example.net"],
+            vec!["Receipts".to_string()]
+        );
+
+        let other = route(
+            req("POST", "/api/suggestions/abc/accept", b"", cookie.clone()),
+            &state,
+        )
+        .await;
+        assert_eq!(other.status, 404);
+        let anonymous = route(req("GET", "/api/organize", b"", None), &state).await;
+        assert_eq!(anonymous.status, 401);
     }
 }

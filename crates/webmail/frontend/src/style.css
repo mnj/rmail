@@ -54,3 +54,28 @@ button, input { font: inherit; }
 .remote-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; background: #fff7e0; color: #5c4400; font-size: 13px; }
 .remote-banner span { flex: 1; }
 .remote-banner button { border: 1px solid #d9b54a; background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+
+.row .suggestion-chip { grid-column: 2; display: flex; gap: 4px; margin: -4px 0 10px; }
+.suggestion-chip button { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #b9d3ff; background: #eef4ff; color: #1d4fb8; border-radius: 999px; padding: 2px 9px; font-size: 12px; cursor: pointer; }
+.suggestion-chip .chip-dismiss { padding: 2px 5px; background: #fff; border-color: #cfd7dc; color: #667780; }
+.accept-all { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #b9d3ff; background: #eef4ff; color: #1d4fb8; border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; }
+.suggestion-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; background: #eef4ff; color: #1d3f86; font-size: 13px; }
+.suggestion-banner span { flex: 1; }
+.suggestion-banner button { border: 1px solid #b9d3ff; background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.dialog-scrim { position: fixed; inset: 0; background: rgba(16, 24, 32, 0.45); display: grid; place-items: center; padding: 16px; z-index: 10; }
+.dialog { width: min(640px, 100%); max-height: calc(100vh - 32px); overflow: auto; background: #fff; border-radius: 10px; padding: 20px 22px; display: grid; gap: 12px; }
+.dialog header, .dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dialog footer { justify-content: flex-end; }
+.dialog h2 { margin: 0; font-size: 20px; }
+.dialog p { margin: 0; }
+.dialog-intro, .dialog-hint { color: #4b5a62; font-size: 14px; line-height: 1.45; }
+.dialog-hint { font-size: 13px; }
+.notice { padding: 8px 12px; border-radius: 8px; background: #fff7e0; color: #5c4400; font-size: 13px; }
+.switch-row { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.organize-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.organize-table th { text-align: left; font-size: 12px; color: #667780; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #e3e8eb; }
+.organize-table td { padding: 8px; border-bottom: 1px solid #eef1f3; vertical-align: middle; }
+.organize-table td small { display: block; color: #7b8a91; font-size: 12px; }
+.dialog footer button { border-radius: 6px; padding: 8px 14px; cursor: pointer; border: 1px solid #cfd7dc; background: #fff; }
+.dialog footer .primary { border: 0; background: #276ef1; color: #fff; }
+@media (max-width: 820px) { .organize-table th:nth-child(4), .organize-table td:nth-child(4) { display: none; } }

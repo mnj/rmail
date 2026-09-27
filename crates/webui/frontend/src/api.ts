@@ -126,6 +126,31 @@ export type SettingsView =
       services: ServiceState[];
     };
 
+export type ModelKind = 'embedding' | 'chat';
+export type CatalogModel = { id: string; name: string; kind: ModelKind; file: string; url: string; sha256: string | null; size_mb: number; ram_mb: number; license: string; prefix: string; notes: string };
+export type InstalledModel = { file: string; size: number; meta: { kind: ModelKind; url: string; sha256: string; size: number; downloaded_at: number } | null };
+export type ModelDownload = { file: string; received: number; total: number; status: { state: 'running' } | { state: 'done'; sha256: string } | { state: 'failed'; error: string } };
+export type LoadedModel = { file: string; load_ms: number };
+export type ClassifierStatus = {
+  enabled: boolean;
+  local_models: boolean;
+  embed_model: LoadedModel | null;
+  chat_model: LoadedModel | null;
+  errors: string[];
+  accounts: { opted_in?: number; opted_out?: number };
+  loaded_at: number;
+  last_cycle: { finished_at: number; duration_ms: number; report: { accounts: number; learned: number; classified: number; suggested: number; moved: number; errors: string[] } } | null;
+};
+export type Organization = {
+  managed: boolean;
+  models_dir: string;
+  catalog: CatalogModel[];
+  installed: InstalledModel[];
+  downloads: ModelDownload[];
+  settings: Record<string, unknown>;
+  daemon: { running: true; status: ClassifierStatus } | { running: false; error: string };
+};
+
 export async function readiness(): Promise<Readiness> {
   // /readyz answers 503 with a full report when a dependency is down.
   const res = await fetch('/readyz', { credentials: 'same-origin' });

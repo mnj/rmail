@@ -38,7 +38,7 @@ pub const RESERVED_KEYS: &[&str] = &[
 /// and are never part of the [`Config`] tree.
 pub const INTERNAL_PREFIX: &str = "internal.";
 
-pub const SERVICES: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail"];
+pub const SERVICES: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail", "classifier"];
 
 const SMTP: &[&str] = &["smtpd"];
 const IMAP: &[&str] = &["imapd"];
@@ -48,7 +48,8 @@ const ALL_LISTENERS: &[&str] = &["smtpd", "imapd", "web", "webmail"];
 const TRACKING: &[&str] = &["smtpd", "outbound"];
 const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
-const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail"];
+const CLASSIFIER: &[&str] = &["classifier"];
+const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail", "classifier"];
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -125,6 +126,11 @@ pub const GROUPS: &[SettingGroup] = &[
         id: "oauth",
         label: "OAuth",
         description: "RFC 7662 token introspection used by OAUTHBEARER and XOAUTH2. Leave the URL empty to disable.",
+    },
+    SettingGroup {
+        id: "classifier",
+        label: "Mail organization",
+        description: "Folder suggestions from local models. Download and pick models on the Organization page; changes apply without a restart.",
     },
     SettingGroup {
         id: "logging",
@@ -569,6 +575,86 @@ pub const SETTINGS: &[SettingSpec] = &[
         "Only for a loopback identity provider.",
         SettingKind::Bool,
         MAIL,
+    ),
+    spec(
+        "classifier.enabled",
+        "classifier",
+        "Enabled",
+        "Run the classifier for accounts that opt in from webmail.",
+        SettingKind::Bool,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.embed_model",
+        "classifier",
+        "Embedding model",
+        "File name in the models directory.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.chat_model",
+        "classifier",
+        "Chat model",
+        "Optional fallback for uncertain messages. Empty disables it.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.threads",
+        "classifier",
+        "Inference threads",
+        "Zero uses every CPU.",
+        int(0, 256),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.poll_interval_seconds",
+        "classifier",
+        "Poll interval (s)",
+        "How often mailboxes are checked for new mail.",
+        int(1, 3_600),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.backfill_per_folder",
+        "classifier",
+        "Backfill per folder",
+        "Recent messages learned from each folder when an account opts in.",
+        int(0, 100_000),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.max_input_bytes",
+        "classifier",
+        "Max input (bytes)",
+        "Message text given to the models.",
+        int(256, 65_536),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.knn_confidence",
+        "classifier",
+        "Suggestion confidence (%)",
+        "Below this the chat model is asked, when one is configured.",
+        int(1, 100),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.autofile_confidence",
+        "classifier",
+        "Auto-move confidence (%)",
+        "Minimum confidence to move mail into folders users enabled auto-move for.",
+        int(1, 100),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.min_examples",
+        "classifier",
+        "Minimum examples",
+        "Folders with fewer learned messages defer to the chat model.",
+        int(1, 1_000),
+        CLASSIFIER,
     ),
     spec(
         "global.log_level",

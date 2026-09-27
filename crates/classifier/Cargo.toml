@@ -1,0 +1,28 @@
+[package]
+name = "rmail_classifier"
+version = "0.8.11"
+edition = "2024"
+
+[[bin]]
+name = "rmail_classifier"
+path = "src/main.rs"
+
+[features]
+default = ["local-models"]
+# Run GGUF models in-process with llama.cpp. Needs a C/C++ toolchain and cmake.
+local-models = ["dep:llama-cpp-2", "dep:encoding_rs"]
+cuda = ["local-models", "llama-cpp-2/cuda"]
+vulkan = ["local-models", "llama-cpp-2/vulkan"]
+metal = ["local-models", "llama-cpp-2/metal"]
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+rmail_common = { path = "../common" }
+llama-cpp-2 = { version = "0.1.157", default-features = false, features = ["openmp"], optional = true }
+encoding_rs = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3.5"
