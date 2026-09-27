@@ -244,7 +244,7 @@ impl UpdateContext {
     }
 
     /// Bring the result up to date with `view`; returns the ESEARCH line.
-    fn refresh(&mut self, view: &SelectedMailbox, imap4rev2: bool) -> Result<Option<String>> {
+    fn refresh(&mut self, view: &SelectedMailbox, imap4rev2: bool) -> Option<String> {
         let now = chrono::Utc::now().timestamp();
         let needs_data = parser::search_requires_message_data(&self.criterion);
         let in_results = self
@@ -273,8 +273,13 @@ impl UpdateContext {
             if self.evaluated.get(uid) == Some(&state) {
                 continue;
             }
+            // A file that cannot be read was most likely expunged elsewhere;
+            // the message stays unevaluated until synchronization drops it.
             let mut data = if needs_data {
-                Some(std::fs::read(path)?)
+                match std::fs::read(path) {
+                    Ok(data) => Some(data),
+                    Err(_) => continue,
+                }
             } else {
                 None
             };
@@ -303,7 +308,13 @@ impl UpdateContext {
                     let record = if self.sorted().is_some() {
                         let data = match data.take() {
                             Some(data) => data,
-                            None => std::fs::read(path)?,
+                            None => match std::fs::read(path) {
+                                Ok(data) => data,
+                                Err(_) => {
+                                    self.evaluated.remove(uid);
+                                    continue;
+                                }
+                            },
                         };
                         Some(SortRecord::from_message(*uid, *uid, internal_date, &data))
                     } else {
@@ -322,7 +333,7 @@ impl UpdateContext {
             items.extend(self.remove(&removed, view));
         }
         items.extend(self.add(added, view));
-        Ok((!items.is_empty()).then(|| self.esearch(&items.join(" "))))
+        (!items.is_empty()).then(|| self.esearch(&items.join(" ")))
     }
 
     fn esearch(&self, items: &str) -> String {
@@ -440,19 +451,16 @@ impl UpdateContexts {
         let view = view.clone();
         let (contexts, output) = tokio::task::spawn_blocking(move || {
             let mut response = Response::new();
-            let mut failure = None;
             for context in &mut contexts {
-                match context.refresh(&view, imap4rev2) {
-                    Ok(Some(line)) => response = response.data(line),
-                    Ok(None) => {}
-                    Err(error) => failure = Some(error),
+                if let Some(line) = context.refresh(&view, imap4rev2) {
+                    response = response.data(line);
                 }
             }
-            (contexts, failure.map_or(Ok(response.encode()), Err))
+            (contexts, response.encode())
         })
         .await?;
         self.contexts = contexts;
-        output
+        Ok(output)
     }
 }
 
