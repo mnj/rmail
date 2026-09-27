@@ -32,6 +32,21 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  labels:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Ensure release labels exist
+        run: |
+          gh label create release:major --force --color B60205 --description "Release as a new major version"
+          gh label create release:minor --force --color FBCA04 --description "Release as a new minor version"
+          gh label create release:patch --force --color 0E8A16 --description "Release as a new patch version"
+          gh label create release:skip --force --color CCCCCC --description "Merge without publishing a release"
+
   version:
     runs-on: ubuntu-latest
     permissions:
