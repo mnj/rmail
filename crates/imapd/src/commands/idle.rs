@@ -1,12 +1,13 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     AsyncStream, MAX_AUTHENTICATED_LINE_BYTES,
-    mailbox::SelectedMailbox,
+    mailbox::{SelectedMailbox, SyncOptions},
     response::{Response, Status, StatusLine},
+    session::AUTOLOGOUT_BYE,
     sync_selected_mailbox,
 };
 
@@ -24,13 +25,15 @@ pub(crate) async fn handle(
     tag: &str,
     mail_root: &str,
     selected: &mut Option<SelectedMailbox>,
-    qresync_enabled: bool,
+    options: SyncOptions,
+    max_duration: Duration,
 ) -> Result<Outcome> {
+    let deadline = Instant::now() + max_duration;
     write(reader, Response::new().continuation("idling")).await?;
 
     // Synchronize after entering IDLE so changes racing with the continuation
     // cannot be missed before the periodic notification loop starts.
-    sync_selected_mailbox(reader, mail_root, selected, qresync_enabled).await?;
+    sync_selected_mailbox(reader, mail_root, selected, options).await?;
 
     let mut keepalive_elapsed = Duration::ZERO;
     let mut line = Vec::new();
@@ -60,7 +63,14 @@ pub(crate) async fn handle(
                 return Ok(Outcome::Completed);
             }
             ReadEvent::Tick => {
-                sync_selected_mailbox(reader, mail_root, selected, qresync_enabled).await?;
+                sync_selected_mailbox(reader, mail_root, selected, options).await?;
+                if Instant::now() >= deadline {
+                    // A client still idling after the autologout period is
+                    // gone or broken (RFC 2177: re-issue IDLE every 29 min).
+                    reader.get_mut().write_all(AUTOLOGOUT_BYE).await?;
+                    reader.get_mut().flush().await?;
+                    return Ok(Outcome::Disconnected);
+                }
                 keepalive_elapsed += SYNC_INTERVAL;
                 if keepalive_elapsed >= KEEPALIVE_INTERVAL {
                     write(

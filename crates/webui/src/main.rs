@@ -502,8 +502,10 @@ fn password_material(
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .to_string();
-    let scram = rmail_common::auth::create_scram_verifier(password, 4096)?;
-    Ok((Some(hash), Some(scram)))
+    // SASLprep rejects some passwords (e.g. control characters); those can
+    // still log in with PLAIN/LOGIN but get no SCRAM verifier.
+    let scram = rmail_common::auth::create_scram_verifier(password, 4096).ok();
+    Ok((Some(hash), scram))
 }
 
 fn account_summaries_sync(

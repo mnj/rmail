@@ -96,6 +96,9 @@ fn capability_advertises_starttls_and_login_policy() {
             "COMPRESS=DEFLATE",
             "MOVE",
             "UNSELECT",
+            "UNAUTHENTICATE",
+            "CREATE-SPECIAL-USE",
+            "APPENDLIMIT=104857600",
         ])
     );
     assert!(
@@ -636,7 +639,7 @@ async fn enable_tracks_supported_session_features_only_after_authentication() {
     assert!(
         enabled
             .iter()
-            .any(|l| l.trim_end() == "* ENABLED CONDSTORE IMAP4REV1 QRESYNC UTF8=ACCEPT")
+            .any(|l| l.trim_end() == "* ENABLED CONDSTORE QRESYNC UTF8=ACCEPT")
     );
     assert!(enabled.iter().any(|l| l.contains("QRESYNC")));
     assert!(enabled.iter().any(|l| l.contains("UTF8=ACCEPT")));

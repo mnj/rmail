@@ -38,6 +38,8 @@ pub struct FolderSummary {
     pub folder: Folder,
     pub messages: usize,
     pub unseen: usize,
+    /// Messages with the \Deleted flag (IMAP4rev2 STATUS DELETED).
+    pub deleted: usize,
     pub size: u64,
 }
 
@@ -408,6 +410,33 @@ pub fn create_folder(
     localpart: &str,
     mailbox: &str,
 ) -> Result<()> {
+    create_folder_with_special_use(maildir_root, domain, localpart, mailbox, None)
+}
+
+/// Special-use attributes a created mailbox may carry (RFC 6154 §3,
+/// CREATE-SPECIAL-USE). \All and \Flagged are virtual views and are not
+/// supported for real folders.
+pub const CREATABLE_SPECIAL_USES: &[&str] =
+    &["\\Archive", "\\Drafts", "\\Junk", "\\Sent", "\\Trash"];
+
+/// Create a mailbox, optionally with a special-use attribute from
+/// [`CREATABLE_SPECIAL_USES`] (matched case-insensitively).
+pub fn create_folder_with_special_use(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    special_use: Option<&str>,
+) -> Result<()> {
+    let special_use = match special_use {
+        Some(requested) => Some(
+            *CREATABLE_SPECIAL_USES
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(requested))
+                .ok_or_else(|| anyhow::anyhow!("unsupported special-use attribute {requested}"))?,
+        ),
+        None => None,
+    };
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
     if folder_id(&conn, &name)?.is_some() {
@@ -422,8 +451,13 @@ pub fn create_folder(
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq)
-         VALUES(?1, ?2, NULL, 1, ?3, 1, 1)",
-        params![name, folder_path(&name)?, new_uidvalidity() as i64],
+         VALUES(?1, ?2, ?3, 1, ?4, 1, 1)",
+        params![
+            name,
+            folder_path(&name)?,
+            special_use,
+            new_uidvalidity() as i64
+        ],
     )?;
     tx.execute(
         "INSERT OR IGNORE INTO subscriptions(name) VALUES(?1)",
@@ -1291,6 +1325,7 @@ pub fn list_folder_summaries(
             folder,
             messages: messages.len(),
             unseen,
+            deleted: count_deleted(&messages),
             size: messages.iter().map(|message| message.size).sum(),
         });
     }
@@ -1325,10 +1360,23 @@ pub fn folder_summary(
                     .any(|flag| flag.eq_ignore_ascii_case("\\Seen"))
             })
             .count(),
+        deleted: count_deleted(&messages),
         size: messages.iter().map(|message| message.size).sum(),
         messages: messages.len(),
         folder,
     }))
+}
+
+fn count_deleted(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Deleted"))
+        })
+        .count()
 }
 
 pub fn list_message_metadata(

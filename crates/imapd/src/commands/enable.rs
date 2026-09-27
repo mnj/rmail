@@ -59,10 +59,10 @@ mod tests {
         .encode();
         assert_eq!(
             response,
-            "* ENABLED CONDSTORE IMAP4REV1\r\n* OK [HIGHESTMODSEQ 42] Highest\r\nA1 OK ENABLE completed\r\n"
+            "* ENABLED CONDSTORE\r\n* OK [HIGHESTMODSEQ 42] Highest\r\nA1 OK ENABLE completed\r\n"
         );
         assert!(session.feature_enabled("CONDSTORE"));
-        assert!(session.feature_enabled("IMAP4REV1"));
+        assert!(!session.feature_enabled("IMAP4REV1"));
         assert!(!session.feature_enabled("unknown"));
     }
 

@@ -67,6 +67,18 @@ impl Session {
                     .fail_message(reader, "554 5.6.0 DATA lines must end with CRLF")
                     .await;
             }
+            DataReadResult::AmbiguousTerminator => {
+                // The bytes after a non-canonical end-of-data sequence may be
+                // a smuggled transaction; never parse them as commands.
+                session_log!(self, "warn", "data_ambiguous_terminator", { "message_id": self.message_id });
+                self.complete_message(
+                    reader,
+                    "554 5.5.2 Bare CR or LF in end-of-data sequence; closing connection",
+                )
+                .await?;
+                self.abort_transaction();
+                return Ok(Flow::Close);
+            }
             DataReadResult::Timeout => {
                 let writer = reader.get_mut();
                 let _ = writer.write_all(b"421 4.4.2 Timeout\r\n").await;

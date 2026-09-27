@@ -99,21 +99,21 @@ certification results.
 
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
-| RFC 5321 | SMTP transport and transactions | 95% | Strict command/reply framing, path grammar, Postmaster handling, DATA transparency, sequencing, limits, one-reply transaction behavior, and relay policy are implemented; multi-destination storage is not yet one cross-backend atomic commit and external conformance testing remains. |
+| RFC 5321 | SMTP transport and transactions | 95% | Strict command/reply framing, path grammar (256-octet path limit, extension-aware MAIL/RCPT line limits), Postmaster handling, DATA transparency with strict `<CRLF>.<CRLF>` termination (non-canonical terminators close the connection to prevent SMTP smuggling), nested-MAIL rejection, a configurable server hostname for greetings, EHLO and trace fields, sequencing, limits, and relay policy are implemented; multi-destination storage is not yet one cross-backend atomic commit and external conformance testing remains. |
 | RFC 1869 | ESMTP framework | 95% | EHLO negotiation and extension parameters are implemented; no external conformance certification. |
 | RFC 1870 | `SIZE` | 100% | The fixed maximum is advertised and declared or received oversized messages are rejected while preserving stream synchronization. |
 | RFC 6152 | `8BITMIME` | 100% | BODY declarations are parsed and retained, undeclared 8-bit content is rejected after safe DATA draining, and outbound relay negotiates and declares 8BITMIME. |
 | RFC 2920 | `PIPELINING` | 100% | Command pipelining is supported with ordered replies and guarded STARTTLS transitions. |
 | RFC 3207 | `STARTTLS` | 95% | A real TLS upgrade, state reset, fresh EHLO requirement, timeout, and plaintext-pipelining rejection are integration-tested; external conformance testing remains. |
-| RFC 4954 | SMTP AUTH | 95% | Configurable TLS-gated mechanisms, strict grammar, initial responses, bounded continuations, cancellation, state restrictions, and enhanced replies are implemented; external conformance testing remains. |
+| RFC 4954 | SMTP AUTH | 95% | Configurable TLS-gated mechanisms, strict grammar, initial responses, bounded continuations, cancellation, state restrictions, the `AUTH=` MAIL parameter, and enhanced replies are implemented; external conformance testing remains. |
 | RFC 4616 | SASL `PLAIN` | 100% | Initial and continuation forms, authzid policy, UTF-8 validation, and shared credential verification are implemented under TLS. |
-| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Strict SCRAM grammar, stored verifiers, nonce/channel-binding downgrade checks, client proof validation, and server-final data are implemented and integration-tested. |
+| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` and `SCRAM-SHA-256-PLUS` | 100% | Strict SCRAM grammar, stored verifiers, `y`-flag downgrade detection when -PLUS is offered, fake challenges for unknown users, client proof validation, and server-final data are implemented and integration-tested. -PLUS supports `tls-server-end-point` (RFC 5929) and `tls-exporter` on TLS 1.3 (RFC 9266). |
 | RFC 6531 | `SMTPUTF8` | 100% | UTF-8 envelope/header use is declaration-gated, outbound relay negotiates and declares SMTPUTF8, and internationalized envelope domains are canonicalized to IDNA A-labels at persistence, routing, DNS, and authentication boundaries. RFC 6531 does not require downgrade support. |
 | RFC 5890 / RFC 5891 | IDNA2008 domain handling | 95% | SMTP envelope domains, mailbox/alias/catchall identities, outbound DNS routes, and SPF/DKIM/DMARC alignment inputs share validated U-label-to-A-label canonicalization with DNS length checks; broad multilingual interoperability corpus testing remains. |
 | RFC 3463 / RFC 2034 | Enhanced status codes | 100% | `ENHANCEDSTATUSCODES` is advertised and command, transaction, policy, delivery, TLS, and authentication replies carry class-appropriate enhanced codes. |
 | RFC 3848 | Received trace protocol identifiers | 100% | Generated trace fields distinguish SMTP, ESMTP, TLS, and authenticated submission with the appropriate protocol token. |
 | RFC 3461 | Delivery Status Notifications | 100% | `DSN`, `RET`, `ENVID`, `NOTIFY`, and `ORCPT` are implemented with private queue metadata and loop-safe success/failure reports. |
-| RFC 8689 | `REQUIRETLS` | 100% | Submission, durable queue metadata, relay advertisement checks, and downgrade-resistant TLS enforcement are implemented. |
+| RFC 8689 | `REQUIRETLS` | 100% | Advertised and accepted only on TLS sessions; submission, durable queue metadata, relay advertisement checks, and downgrade-resistant TLS enforcement are implemented. |
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 95% | Both extensions are advertised together. The receiver supports exact-octet, multi-command BDAT transactions, LAST and zero-length chunks, cumulative SIZE enforcement with stream-preserving drains, DATA/BDAT state exclusion, and BODY=BINARYMIME validation. Relay capability negotiation selects binary-safe BDAT and requires both extensions for binary content; external conformance corpus testing remains. |
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
 | RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
@@ -139,8 +139,8 @@ or conformance-validation gaps.
 
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
-| RFC 3501 | IMAP4rev1 core | 95% | No formal protocol test-suite certification or exhaustive live-client matrix yet. |
-| RFC 9051 | IMAP4rev2 core | 90% | Dual-advertised compatibility mode and rev2 UTF-8 behavior are implemented; no external rev2 conformance certification yet. |
+| RFC 3501 | IMAP4rev1 core | 95% | Includes sequence-number stability: EXPUNGE is never sent during FETCH, STORE or SEARCH, and messages expunged by other sessions keep their slot (`EXPUNGEISSUED`) until the next allowed point; an inactivity autologout (3 minutes before login, 30 minutes after, including IDLE) is enforced. No formal protocol test-suite certification or exhaustive live-client matrix yet. |
+| RFC 9051 | IMAP4rev2 core | 90% | Dual-advertised; after `ENABLE IMAP4rev2` the session uses UTF-8, omits `RECENT`/`\Recent`, answers SEARCH with ESEARCH, and includes the mailbox LIST line in SELECT. `STATUS DELETED` is supported. LIST `OLDNAME` is not implemented; no external rev2 conformance certification yet. |
 | RFC 2595 | IMAP `STARTTLS` and `LOGINDISABLED` | 95% | A real TLS upgrade and resumed IMAP session are integration-tested, but not yet against an external conformance harness. |
 | RFC 2177 | `IDLE` | 100% | Implemented with mailbox synchronization, keepalives, fragmented `DONE`, and bounded input. |
 | RFC 2342 | `NAMESPACE` | 100% | Complete for rMail's single personal Maildir namespace. |
@@ -154,8 +154,8 @@ or conformance-validation gaps.
 | RFC 5032 | `WITHIN` | 100% | `OLDER` and `YOUNGER` search keys are implemented. |
 | RFC 5258 | `LIST-EXTENDED` | 95% | Selection/return options and hierarchy attributes are implemented; exotic namespace combinations are not applicable. |
 | RFC 5819 | `LIST-STATUS` | 100% | STATUS return data is supported in extended LIST responses. |
-| RFC 6154 | `SPECIAL-USE` | 100% | Discovery and requested special-use mailbox attributes are implemented. |
-| RFC 7162 | `CONDSTORE` and `QRESYNC` | 90% | Mod-sequences, `CHANGEDSINCE`, `VANISHED`, and QRESYNC SELECT are implemented; no multi-server replication validation. |
+| RFC 6154 | `SPECIAL-USE` and `CREATE-SPECIAL-USE` | 100% | Discovery, requested special-use mailbox attributes, and CREATE with `USE` are implemented. |
+| RFC 7162 | `CONDSTORE` and `QRESYNC` | 90% | Mod-sequences, `CHANGEDSINCE`, `UNCHANGEDSINCE`, `VANISHED`, QRESYNC SELECT, implicit CONDSTORE enabling, and UID/MODSEQ in every untagged FETCH are implemented; no multi-server replication validation. |
 | RFC 6851 | `MOVE` | 100% | Sequence and UID forms include UIDPLUS response data. |
 | RFC 6855 | `UTF8=ACCEPT` | 85% | UTF-8 mailbox/message operation is implemented; `UTF8=ONLY` is not advertised or implemented. |
 | RFC 3516 | `BINARY` | 95% | Binary FETCH sections and sizes are implemented; exhaustive MIME corpus validation remains. |
@@ -167,8 +167,11 @@ or conformance-validation gaps.
 | RFC 4978 | `COMPRESS=DEFLATE` | 100% | Compression negotiation and post-negotiation command transport are implemented. |
 | RFC 4959 | SASL initial response | 100% | Initial, empty, continuation, and cancellation responses are supported. |
 | RFC 4616 | SASL `PLAIN` | 100% | Available only under the configured encrypted-transport policy. |
-| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials and verifier checks. |
-| RFC 5929 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Uses TLS server-end-point channel binding. |
+| RFC 5802 / RFC 7677 | `SCRAM-SHA-256` | 100% | Includes stored SCRAM credentials, verifier checks, `y`-flag downgrade detection, and fake challenges for unknown users. |
+| RFC 5929 / RFC 9266 | `SCRAM-SHA-256-PLUS` channel binding | 100% | Supports `tls-server-end-point`, and `tls-exporter` on TLS 1.3. |
+| RFC 4013 | SASLprep | 100% | Usernames and SCRAM passwords are prepared with full SASLprep (mapping, NFKC, prohibited characters, bidi checks). |
+| RFC 7889 | `APPENDLIMIT` | 100% | The server-wide APPEND size limit is advertised. |
+| RFC 8437 | `UNAUTHENTICATE` | 100% | Returns the session to the not-authenticated state while keeping TLS and compression. |
 
 IMAP4rev2 is dual-advertised with IMAP4rev1 for compatibility; clients enable
 rev2 UTF-8 behavior with `ENABLE IMAP4rev2`. OAuth mechanisms can be enabled

@@ -9,7 +9,8 @@ use crate::{
 
 pub(crate) struct Outcome {
     pub(crate) response: Response,
-    pub(crate) refresh_selected: bool,
+    /// Source messages MOVE removed and reported as expunged.
+    pub(crate) removed_uids: Vec<u64>,
 }
 
 pub(crate) async fn handle(
@@ -22,6 +23,7 @@ pub(crate) async fn handle(
     saved_uids: &[u64],
     uid_mode: bool,
     utf8_accept: bool,
+    qresync_enabled: bool,
 ) -> Outcome {
     let move_messages = command_name.ends_with("MOVE");
     let request = match parser::parse_transfer_request(raw_args) {
@@ -40,6 +42,20 @@ pub(crate) async fn handle(
         Err(_) => return failure(bad(tag, "Invalid mailbox name".to_string())),
     };
     let source_uids = resolve_uids(&request.message_set, selected, saved_uids, uid_mode);
+    if source_uids.iter().any(|uid| selected.is_expunged(*uid)) {
+        // COPY is all-or-nothing (RFC 3501 §6.4.7); a message expunged by
+        // another session can no longer be copied (RFC 2180 §4.4.1).
+        return failure(
+            Response::new().status(
+                StatusLine::tagged(
+                    tag,
+                    Status::No,
+                    "Some of the requested messages no longer exist",
+                )
+                .with_code("EXPUNGEISSUED"),
+            ),
+        );
+    }
     let root = mail_root.to_string();
     let domain = selected.domain.clone();
     let local = selected.local.clone();
@@ -95,7 +111,12 @@ pub(crate) async fn handle(
     let mapped_source_uids = mappings.iter().map(|mapping| mapping.0).collect::<Vec<_>>();
     let destination_uids = mappings.iter().map(|mapping| mapping.1).collect::<Vec<_>>();
     let mut response = Response::new();
-    if move_messages {
+    if move_messages && qresync_enabled && !mapped_source_uids.is_empty() {
+        // RFC 6851 §3.3 / RFC 7162 §3.2.10: VANISHED replaces EXPUNGE.
+        let mut uids = mapped_source_uids.clone();
+        uids.sort_unstable();
+        response = response.data(format!("VANISHED {}", compress_ids(&uids)));
+    } else if move_messages {
         let mut sequences = mapped_source_uids
             .iter()
             .filter_map(|uid| {
@@ -122,7 +143,11 @@ pub(crate) async fn handle(
     }
     Outcome {
         response: response.status(completion),
-        refresh_selected: move_messages,
+        removed_uids: if move_messages {
+            mapped_source_uids
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -183,7 +208,7 @@ fn storage_operation_error(tag: &str, command_name: &str, error: anyhow::Error) 
 fn failure(response: Response) -> Outcome {
     Outcome {
         response,
-        refresh_selected: false,
+        removed_uids: Vec::new(),
     }
 }
 
@@ -234,13 +259,14 @@ mod tests {
             &[],
             false,
             false,
+            false,
         )
         .await;
         let response = outcome.response.encode();
         assert!(response.starts_with("* 2 EXPUNGE\r\n* 1 EXPUNGE\r\n"));
         assert!(response.contains("A1 OK [COPYUID "));
         assert!(response.ends_with(" MOVE completed\r\n"));
-        assert!(outcome.refresh_selected);
+        assert_eq!(outcome.removed_uids.len(), 2);
         assert!(
             rmail_common::imap_state::load_folder(temp.path(), "example.test", "user", "INBOX")
                 .unwrap()

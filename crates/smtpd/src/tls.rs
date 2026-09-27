@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rmail_common::config::TlsPolicy;
+use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
 
 /// TLS acceptor wrapper that also stores the server_end_point (certificate fingerprint)
@@ -8,6 +9,8 @@ use tokio_rustls::TlsAcceptor;
 /// SHA-256 digest of the server certificate DER bytes.
 pub struct TlsContext {
     pub acceptor: TlsAcceptor,
+    /// RFC 5929 tls-server-end-point channel-binding data.
+    pub server_end_point: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -25,13 +28,29 @@ pub fn load_tls_context_with_policy(
         key_path,
         policy.ocsp_response.as_deref(),
     )?;
+    // SHA-256 of the leaf certificate for tls-server-end-point channel binding.
+    let server_end_point = Sha256::digest(&material.leaf_der).to_vec();
     let server_config = rmail_common::tls::build_server_config(material, policy)?;
 
-    // compute SHA-256 of first certificate's DER bytes for tls-server-end-point channel binding
     let ctx = TlsContext {
         acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        server_end_point,
     };
     Ok(Arc::new(ctx))
+}
+
+impl TlsContext {
+    /// Channel-binding data for a connection accepted with this context:
+    /// tls-server-end-point always, tls-exporter (RFC 9266) on TLS 1.3.
+    pub fn channel_bindings(
+        &self,
+        connection: &tokio_rustls::rustls::ServerConnection,
+    ) -> rmail_common::auth::ChannelBindings {
+        rmail_common::auth::ChannelBindings::for_connection(
+            Some(&self.server_end_point),
+            connection,
+        )
+    }
 }
 
 pub fn reload_tls_context(

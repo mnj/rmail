@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rmail_common::auth::{ChannelBindings, ScramChannelBindingPolicy};
 use rmail_common::config::SecurityConfig;
 use rmail_common::metrics;
 use rmail_common::oauth::OAuthValidator;
@@ -29,7 +30,7 @@ use crate::protocol::{self, Command as SmtpCommand, parse_command, parse_mail_fr
 use crate::trace::{ConnectionTrace, ReplyTrackingStream, emit_tracking};
 use crate::{
     AsyncStream, COMMAND_IDLE_TIMEOUT, MAX_MESSAGE_BYTES, STARTTLS_HANDSHAKE_TIMEOUT, SmtpService,
-    authenticate, tls,
+    authenticate, server_hostname, tls,
 };
 
 #[cfg(test)]
@@ -65,6 +66,9 @@ struct Transaction {
     body: protocol::MailBody,
     smtp_utf8: bool,
     require_tls: bool,
+    /// RFC 4954 AUTH= submitter, kept only when the session's authenticated
+    /// identity vouches for it; otherwise it is treated as `AUTH=<>`.
+    auth_submitter: Option<String>,
     dsn: DsnOptions,
     rcpts: Vec<String>,
     bdat_buffer: Vec<u8>,
@@ -79,6 +83,7 @@ impl Default for Transaction {
             body: protocol::MailBody::SevenBit,
             smtp_utf8: false,
             require_tls: false,
+            auth_submitter: None,
             dsn: DsnOptions::default(),
             rcpts: Vec::new(),
             bdat_buffer: Vec::new(),
@@ -90,6 +95,8 @@ impl Default for Transaction {
 pub(super) struct Session {
     mail_root: String,
     tls_ctx: Option<Arc<tls::TlsContext>>,
+    /// Channel-binding data of this TLS session (empty when plaintext).
+    channel_bindings: ChannelBindings,
     db_path: Option<String>,
     peer: Option<SocketAddr>,
     /// The stream is TLS-protected (SMTPS or after STARTTLS).
@@ -123,6 +130,8 @@ pub(super) struct Session {
 // session_encrypted indicates whether the stream is protected by TLS (SMTPS,
 // or after a successful STARTTLS upgrade). Password mechanisms are only
 // offered on encrypted sessions.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_stream(
     stream: Box<dyn AsyncStream + Send + 'static>,
     mail_root: String,
@@ -136,6 +145,52 @@ pub(crate) async fn process_stream(
     service: SmtpService,
     trace: Option<ConnectionTrace>,
 ) -> Result<()> {
+    process_stream_with_bindings(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        enforce_dmarc,
+        send_greeting,
+        security,
+        service,
+        trace,
+        None,
+    )
+    .await
+}
+
+// `channel_bindings` carries the TLS channel-binding data captured at the
+// handshake. Without it an encrypted session only offers
+// tls-server-end-point from the TLS context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_stream_with_bindings(
+    stream: Box<dyn AsyncStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    enforce_dmarc: bool,
+    send_greeting: bool,
+    security: Arc<SecurityConfig>,
+    service: SmtpService,
+    trace: Option<ConnectionTrace>,
+    channel_bindings: Option<ChannelBindings>,
+) -> Result<()> {
+    let channel_bindings = match channel_bindings {
+        Some(bindings) => bindings,
+        None if session_encrypted => ChannelBindings {
+            tls_server_end_point: tls_ctx
+                .as_ref()
+                .map(|context| context.server_end_point.clone())
+                .filter(|binding| !binding.is_empty()),
+            tls_exporter: None,
+        },
+        None => ChannelBindings::default(),
+    };
     let oauth = security
         .oauth
         .clone()
@@ -148,6 +203,7 @@ pub(crate) async fn process_stream(
     let mut session = Session {
         mail_root,
         tls_ctx,
+        channel_bindings,
         db_path,
         peer,
         encrypted: session_encrypted,
@@ -175,12 +231,14 @@ pub(crate) async fn process_stream(
     };
     session_log!(session, "info", "session_started", { "service": service.as_str(), "encrypted": session_encrypted, "tls_configured": session.tls_ctx.is_some(), "dmarc_enforced": enforce_dmarc });
     if send_greeting {
-        let greeting: &[u8] = if service == SmtpService::Lmtp {
-            b"220 rMail LMTP ready\r\n"
+        // RFC 5321 section 4.2: the greeting starts with the server's domain.
+        let host = server_hostname();
+        let greeting = if service == SmtpService::Lmtp {
+            format!("220 {host} LMTP rMail ready\r\n")
         } else {
-            b"220 rMail SMTPD ready\r\n"
+            format!("220 {host} ESMTP rMail ready\r\n")
         };
-        send(&mut reader, greeting).await?;
+        send(&mut reader, greeting.as_bytes()).await?;
     }
 
     loop {
@@ -218,8 +276,9 @@ pub(crate) async fn process_stream(
                 return match handshake {
                     Ok(Ok(tls_stream)) => {
                         session_log!(session, "info", "starttls_completed", {});
+                        let channel_bindings = acceptor.channel_bindings(tls_stream.get_ref().1);
                         // RFC 3207: all state is discarded; the client must EHLO again.
-                        Box::pin(process_stream(
+                        Box::pin(process_stream_with_bindings(
                             Box::new(tls_stream),
                             session.mail_root,
                             Some(acceptor),
@@ -231,6 +290,7 @@ pub(crate) async fn process_stream(
                             session.security,
                             service,
                             Some(session.trace),
+                            Some(channel_bindings),
                         ))
                         .await
                     }
@@ -294,8 +354,7 @@ impl Session {
             send(reader, b"421 4.7.0 Command rate limit exceeded\r\n").await?;
             return Ok(Flow::Close);
         }
-        if line.len() > protocol::MAX_COMMAND_LINE_BYTES && !matches!(command, SmtpCommand::Auth(_))
-        {
+        if line.len() > protocol::command_line_limit(&command) {
             return reply(reader, b"500 5.5.2 Line too long\r\n").await;
         }
         self.record_command(&command, cmd);
@@ -321,6 +380,13 @@ impl Session {
                 reply(
                     reader,
                     b"252 2.5.2 Cannot VRFY user, but will accept message if valid\r\n",
+                )
+                .await
+            }
+            SmtpCommand::Help => {
+                reply(
+                    reader,
+                    b"214 2.0.0 Commands: HELO EHLO MAIL RCPT DATA BDAT RSET NOOP QUIT STARTTLS AUTH VRFY HELP\r\n",
                 )
                 .await
             }
@@ -419,6 +485,8 @@ impl Session {
                         | SmtpCommand::Helo(_)
                         | SmtpCommand::StartTls
                         | SmtpCommand::Noop
+                        | SmtpCommand::Rset
+                        | SmtpCommand::Help
                         | SmtpCommand::Quit
                 )
             {
@@ -462,6 +530,27 @@ impl Session {
         self.tx.bdat_started = false;
     }
 
+    /// This TLS session has channel-binding data for SCRAM-SHA-256-PLUS.
+    fn channel_binding_available(&self) -> bool {
+        self.encrypted && self.channel_bindings.is_available()
+    }
+
+    /// SCRAM-SHA-256-PLUS is configured and listed in the EHLO reply.
+    fn scram_plus_advertised(&self) -> bool {
+        self.channel_binding_available()
+            && self
+                .security
+                .smtp_sasl_mechanisms
+                .iter()
+                .any(|mechanism| mechanism.eq_ignore_ascii_case("SCRAM-SHA-256-PLUS"))
+    }
+
+    /// The AUTH extension is offered on this session (EHLO lists it until
+    /// the client authenticates).
+    fn auth_supported(&self) -> bool {
+        self.service != SmtpService::Lmtp && self.encrypted && self.db_path.is_some()
+    }
+
     async fn greet(&mut self, reader: &mut SmtpReader, name: &str, verb: &str) -> Result<Flow> {
         if !protocol::valid_helo_domain(name) {
             return reply(reader, b"501 5.5.2 Invalid HELO/EHLO domain\r\n").await;
@@ -471,18 +560,17 @@ impl Session {
         self.helo_name = Some(name.to_string());
         self.extended_smtp = extended;
         let response = if extended {
-            let mut response = format!("250-rMail Hello {name}\r\n");
+            let mut response = format!("250-{} Hello {name}\r\n", server_hostname());
             if self.service != SmtpService::Lmtp && !self.encrypted && self.tls_ctx.is_some() {
                 response.push_str("250-STARTTLS\r\n");
             }
-            if self.service != SmtpService::Lmtp
-                && self.encrypted
-                && self.db_path.is_some()
-                && self.authenticated_user.is_none()
-            {
+            if self.auth_supported() && self.authenticated_user.is_none() {
                 response.push_str(&format!(
                     "250-AUTH {}\r\n",
-                    protocol::advertised_sasl_mechanisms(&self.security.smtp_sasl_mechanisms)
+                    protocol::advertised_sasl_mechanisms(
+                        &self.security.smtp_sasl_mechanisms,
+                        self.channel_binding_available()
+                    )
                 ));
             }
             response.push_str(&format!("250-SIZE {MAX_MESSAGE_BYTES}\r\n"));
@@ -492,15 +580,19 @@ impl Session {
                 "BINARYMIME",
                 "PIPELINING",
                 "SMTPUTF8",
-                "REQUIRETLS",
                 "DSN",
             ] {
                 response.push_str(&format!("250-{extension}\r\n"));
             }
+            // RFC 8689: REQUIRETLS is only offered on TLS-protected sessions.
+            if self.encrypted {
+                response.push_str("250-REQUIRETLS\r\n");
+            }
             response.push_str("250 ENHANCEDSTATUSCODES\r\n");
             response
         } else {
-            format!("250 2.0.0 rMail Hello {name}\r\n")
+            // RFC 2034: HELO/EHLO replies carry no enhanced status code.
+            format!("250 {} Hello {name}\r\n", server_hostname())
         };
         send(reader, response.as_bytes()).await?;
         self.reset_transaction();
@@ -547,7 +639,38 @@ impl Session {
                 authenticate::handle_password(reader, &mechanism, initial, db_path, self.peer).await
             }
             "SCRAM-SHA-256" => {
-                authenticate::handle_scram(reader, initial, db_path, self.peer).await
+                let policy = if self.scram_plus_advertised() {
+                    ScramChannelBindingPolicy::OfferedButNotSelected
+                } else {
+                    ScramChannelBindingPolicy::NotOffered
+                };
+                authenticate::handle_scram(
+                    reader,
+                    initial,
+                    db_path,
+                    self.peer,
+                    policy,
+                    &self.channel_bindings,
+                )
+                .await
+            }
+            "SCRAM-SHA-256-PLUS" => {
+                if !self.channel_binding_available() {
+                    return reply(
+                        reader,
+                        b"504 5.5.4 SCRAM-SHA-256-PLUS requires TLS channel binding\r\n",
+                    )
+                    .await;
+                }
+                authenticate::handle_scram(
+                    reader,
+                    initial,
+                    db_path,
+                    self.peer,
+                    ScramChannelBindingPolicy::Required,
+                    &self.channel_bindings,
+                )
+                .await
             }
             "OAUTHBEARER" | "XOAUTH2" => {
                 let Some(validator) = self.oauth.as_ref() else {
@@ -590,6 +713,20 @@ impl Session {
         if !self.extended_smtp && parsed.has_esmtp_parameters {
             return reply(reader, b"555 5.5.4 ESMTP parameters require EHLO\r\n").await;
         }
+        if parsed.require_tls && !self.encrypted {
+            return reply(
+                reader,
+                b"530 5.7.10 REQUIRETLS requires a TLS-protected session\r\n",
+            )
+            .await;
+        }
+        if parsed.auth_mailbox.is_some() && !self.auth_supported() {
+            return reply(
+                reader,
+                b"555 5.5.4 AUTH parameter requires the AUTH extension\r\n",
+            )
+            .await;
+        }
         if parsed
             .declared_size
             .is_some_and(|size| size > MAX_MESSAGE_BYTES)
@@ -599,6 +736,15 @@ impl Session {
         self.tx.body = parsed.body;
         self.tx.smtp_utf8 = parsed.smtp_utf8;
         self.tx.require_tls = parsed.require_tls;
+        // RFC 4954 section 5: an AUTH= mailbox from a client that is not
+        // authenticated (or that names someone else) is not trusted and is
+        // handled as AUTH=<>, so it is never propagated.
+        self.tx.auth_submitter = match (parsed.auth_mailbox, self.authenticated_user.as_deref()) {
+            (Some(Some(mailbox)), Some(user)) if mailbox.eq_ignore_ascii_case(user) => {
+                Some(mailbox)
+            }
+            _ => None,
+        };
         self.tx.dsn = DsnOptions {
             envelope_id: parsed.dsn_envelope_id,
             return_content: parsed.dsn_return,
@@ -637,7 +783,7 @@ impl Session {
         self.tx.bdat_buffer.clear();
         self.tx.bdat_started = false;
         self.tx.rcpts.clear();
-        session_log!(self, "debug", "mail_from_accepted", { "mail_from": self.tx.mail_from });
+        session_log!(self, "debug", "mail_from_accepted", { "mail_from": self.tx.mail_from, "auth_submitter": self.tx.auth_submitter });
         reply(reader, b"250 2.1.0 Sender OK\r\n").await
     }
 

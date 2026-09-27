@@ -240,9 +240,19 @@ pub(crate) fn capability_tokens_with_policy(
             "COMPRESS=DEFLATE",
             "MOVE",
             "UNSELECT",
+            "UNAUTHENTICATE",
+            "CREATE-SPECIAL-USE",
         ]),
     }
-    caps.join(" ")
+    let mut caps = caps.join(" ");
+    if matches!(
+        phase,
+        CapabilityPhase::Authenticated | CapabilityPhase::Selected
+    ) {
+        // RFC 7889: the largest message APPEND accepts.
+        caps.push_str(&format!(" APPENDLIMIT={}", crate::MAX_APPEND_LITERAL_BYTES));
+    }
+    caps
 }
 
 pub(crate) fn greeting(capabilities: &str) -> String {

@@ -46,6 +46,7 @@ const MAIL: &[&str] = &["smtpd", "imapd"];
 const ALL_TLS: &[&str] = &["smtpd", "imapd", "web", "webmail"];
 const ALL_LISTENERS: &[&str] = &["smtpd", "imapd", "web", "webmail"];
 const TRACKING: &[&str] = &["smtpd", "outbound"];
+const SMTP_IDENTITY: &[&str] = &["smtpd", "outbound"];
 const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
 const CLASSIFIER: &[&str] = &["classifier"];
@@ -92,6 +93,11 @@ pub struct SettingGroup {
 }
 
 pub const GROUPS: &[SettingGroup] = &[
+    SettingGroup {
+        id: "identity",
+        label: "Server identity",
+        description: "How this server names itself to other mail systems.",
+    },
     SettingGroup {
         id: "network",
         label: "Listeners",
@@ -152,7 +158,14 @@ const IMAP_SASL: &[&str] = &[
     "OAUTHBEARER",
     "XOAUTH2",
 ];
-const SMTP_SASL: &[&str] = &["PLAIN", "LOGIN", "SCRAM-SHA-256", "OAUTHBEARER", "XOAUTH2"];
+const SMTP_SASL: &[&str] = &[
+    "PLAIN",
+    "LOGIN",
+    "SCRAM-SHA-256",
+    "SCRAM-SHA-256-PLUS",
+    "OAUTHBEARER",
+    "XOAUTH2",
+];
 const OAUTH_MECHANISMS: &[&str] = &["OAUTHBEARER", "XOAUTH2"];
 
 const fn int(min: i64, max: i64) -> SettingKind {
@@ -178,6 +191,14 @@ const fn spec(
 }
 
 pub const SETTINGS: &[SettingSpec] = &[
+    spec(
+        "global.hostname",
+        "identity",
+        "Hostname",
+        "Fully qualified domain name used in the SMTP/LMTP greeting, EHLO/HELO and Received headers. Empty uses the system hostname.",
+        SettingKind::Text,
+        SMTP_IDENTITY,
+    ),
     spec(
         "global.listeners.smtp",
         "network",
@@ -935,6 +956,11 @@ pub fn build_config(
 /// Checks that span several keys and would otherwise only fail at daemon
 /// startup.
 pub fn validate_semantics(config: &Config) -> Result<()> {
+    if let Some(hostname) = config.global.hostname.as_deref() {
+        crate::domain::canonicalize_domain(hostname.trim()).map_err(|error| {
+            anyhow!("global.hostname: {hostname:?} is not a valid domain name ({error})")
+        })?;
+    }
     let oauth = config.security.oauth.is_some();
     for (key, mechanisms) in [
         (
@@ -1538,6 +1564,32 @@ mod tests {
     }
 
     #[test]
+    fn hostname_setting_is_validated_and_defaults_to_the_system_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rmail.db");
+        let config = resolve_config(file(&db, ""), "test").unwrap();
+        assert_eq!(config.global.hostname, None);
+        assert_eq!(
+            config.global.server_hostname(),
+            crate::config::system_hostname()
+        );
+        let mut conn = open(&db).unwrap();
+        let change = |value: Value| BTreeMap::from([("global.hostname".to_string(), value)]);
+        assert!(update(&mut conn, &change(json!("not a host"))).is_err());
+        assert!(update(&mut conn, &change(json!("-bad.example"))).is_err());
+        update(&mut conn, &change(json!("MX1.Example.TEST"))).unwrap();
+        let config = resolve_config(file(&db, ""), "test").unwrap();
+        assert_eq!(config.global.server_hostname(), "mx1.example.test");
+        assert!(
+            describe(&conn)
+                .unwrap()
+                .settings
+                .iter()
+                .any(|setting| setting.spec.key == "global.hostname" && setting.is_set)
+        );
+    }
+
+    #[test]
     fn internal_secrets_are_generated_once() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open(dir.path().join("rmail.db")).unwrap();
@@ -1555,6 +1607,7 @@ mod tests {
                 || matches!(
                     spec.key,
                     "global.tls_cert"
+                        | "global.hostname"
                         | "global.tls_key"
                         | "global.tls.ocsp_response"
                         | "global.acme_challenge_dir"

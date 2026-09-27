@@ -6,6 +6,11 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Global {
     pub mail_root: String,
+    /// Fully qualified domain name this server announces in SMTP/LMTP
+    /// greetings, EHLO/HELO and Received headers. Defaults to the system
+    /// hostname; see [`Global::server_hostname`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     /// Durable SMTP tracking retention and pruning limits.
     #[serde(default)]
     pub tracking: TrackingConfig,
@@ -148,7 +153,26 @@ pub struct ListenerEndpoints {
     pub webmail: Option<Vec<String>>,
 }
 
+/// The kernel's hostname, canonicalized as a DNS name, or `localhost` when
+/// it cannot be read or is not a valid domain name.
+pub fn system_hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .filter_map(|source| fs::read_to_string(source).ok())
+        .find_map(|text| crate::domain::canonicalize_domain(text.trim()).ok())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
 impl Global {
+    /// Name used for the server's SMTP identity (RFC 5321 sections 4.1.1.1,
+    /// 4.2 and 4.4): the configured `hostname`, or the system hostname.
+    pub fn server_hostname(&self) -> String {
+        self.hostname
+            .as_deref()
+            .and_then(|name| crate::domain::canonicalize_domain(name.trim()).ok())
+            .unwrap_or_else(system_hostname)
+    }
+
     pub fn smtp_listeners(&self) -> Vec<String> {
         self.listeners
             .smtp
@@ -420,6 +444,7 @@ fn default_smtp_sasl_mechanisms() -> Vec<String> {
         "PLAIN".to_string(),
         "LOGIN".to_string(),
         "SCRAM-SHA-256".to_string(),
+        "SCRAM-SHA-256-PLUS".to_string(),
     ]
 }
 
@@ -596,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             cfg.security.smtp_sasl_mechanisms,
-            ["PLAIN", "LOGIN", "SCRAM-SHA-256"]
+            ["PLAIN", "LOGIN", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
         );
         assert!(cfg.security.oauth.is_none());
         assert!(!cfg.security.rspamd_enabled);

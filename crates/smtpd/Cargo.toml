@@ -18,6 +18,7 @@ tokio-rustls = { version = "0.23", features = ["dangerous_configuration"] }
 rustls = "0.21"
 rustls-pemfile = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 rmail_common = { path = "../common", features = ["insecure-plaintext-passwords", "test-support"] }

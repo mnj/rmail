@@ -122,6 +122,15 @@ async fn reply_tracking_counts_wire_bytes_and_stops_below_starttls() {
 }
 
 fn scram_client_final(password: &str, client_first_bare: &str, server_first: &str) -> String {
+    scram_client_final_with_binding(password, client_first_bare, server_first, "biws")
+}
+
+fn scram_client_final_with_binding(
+    password: &str,
+    client_first_bare: &str,
+    server_first: &str,
+    channel_binding: &str,
+) -> String {
     use hmac::Mac;
     use hmac::digest::KeyInit;
     use pbkdf2::pbkdf2;
@@ -137,7 +146,7 @@ fn scram_client_final(password: &str, client_first_bare: &str, server_first: &st
     let salt = BASE64_ENGINE.decode(attribute("s=")).expect("salt");
     let iterations = attribute("i=").parse::<u32>().expect("iterations");
     let nonce = attribute("r=");
-    let without_proof = format!("c=biws,r={nonce}");
+    let without_proof = format!("c={channel_binding},r={nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
     let mut salted_password = [0u8; 32];
     pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted_password)
@@ -263,7 +272,17 @@ async fn run_prepared_session(
     let mut reader = BufReader::new(client);
     let mut line = String::new();
     reader.read_line(&mut line).await.expect("greeting");
-    assert!(line.starts_with("220 "));
+    // RFC 5321 section 4.2: the server's domain comes first.
+    let expected_greeting = format!(
+        "220 {} {} rMail ready\r\n",
+        super::server_hostname(),
+        if service == SmtpService::Lmtp {
+            "LMTP"
+        } else {
+            "ESMTP"
+        }
+    );
+    assert_eq!(line, expected_greeting);
     reader.get_mut().write_all(&input).await.expect("write");
     reader.get_mut().flush().await.expect("flush");
 
@@ -620,7 +639,11 @@ async fn smtp_data_preserves_non_utf8_bytes() {
         .collect();
     assert_eq!(entries.len(), 1);
     let body = std::fs::read(&entries[0]).expect("read message");
-    assert!(body.starts_with(b"Received: from localhost by rMail SMTPD with ESMTP;"));
+    let expected = format!(
+        "Received: from localhost by {} (rMail) with ESMTP;",
+        super::server_hostname()
+    );
+    assert!(body.starts_with(expected.as_bytes()));
     assert!(body.windows(8).any(|w| w == b"binary:\xff"));
     assert!(Path::new(&entries[0]).exists());
 }
@@ -957,11 +980,8 @@ async fn lmtp_requires_lhlo_and_reports_each_recipient_delivery() {
             .iter()
             .any(|line| line == "500 5.5.1 LMTP requires LHLO\r\n")
     );
-    assert!(
-        responses
-            .iter()
-            .any(|line| line.starts_with("250-rMail Hello"))
-    );
+    let hello = format!("250-{} Hello localhost\r\n", super::server_hostname());
+    assert!(responses.contains(&hello));
     assert!(
         responses
             .iter()
@@ -1115,7 +1135,9 @@ async fn overlong_data_line_is_drained_before_next_command() {
 
 #[tokio::test]
 async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization() {
-    let input = b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: bad\n\nbody\n.\nQUIT\r\n"
+    // Bare LF inside the content fails the message, but only the real
+    // <CRLF>.<CRLF> ends it; the lines in between are never commands.
+    let input = b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: bad\n\nbody\nNOOP\r\n.\r\nQUIT\r\n"
             .to_vec();
     let (responses, td) = run_session(input, 16 * 1024).await;
     assert_eq!(
@@ -1124,6 +1146,12 @@ async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization(
             .filter(|response| response.starts_with("554 5.6.0"))
             .count(),
         1
+    );
+    // The NOOP inside the drained content was not executed.
+    assert!(
+        !responses
+            .iter()
+            .any(|response| response.starts_with("250 2.0.0 OK"))
     );
     assert!(
         responses
@@ -1134,6 +1162,233 @@ async fn bare_lf_data_is_drained_and_rejected_without_command_desynchronization(
         !td.path()
             .join("mail/example.test/user/Maildir/new")
             .exists()
+    );
+}
+
+#[tokio::test]
+async fn smtp_smuggling_with_non_canonical_end_of_data_is_not_delivered() {
+    for terminator in [
+        "\r\n.\n",
+        "\n.\n",
+        "\n.\r\n",
+        "\r\n.\r",
+        "\r.\r\n",
+        "\r\n\r.\r\n",
+    ] {
+        let input = format!(
+            "EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: first\r\n\r\nbody{terminator}MAIL FROM:<ceo@example.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: smuggled\r\n\r\nsmuggled\r\n.\r\nQUIT\r\n"
+        );
+        let (responses, td) = run_session(input.into_bytes(), 16 * 1024).await;
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.starts_with("250 2.1.0"))
+                .count(),
+            1,
+            "{terminator:?}: {responses:?}"
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.starts_with("554 ")),
+            "{terminator:?}: {responses:?}"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.starts_with("354 "))
+                .count(),
+            1,
+            "{terminator:?}: {responses:?}"
+        );
+        assert!(
+            !td.path()
+                .join("mail/example.test/user/Maildir/new")
+                .exists(),
+            "{terminator:?}: smuggled message delivered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nested_mail_is_rejected_and_a_rejected_mail_leaves_no_transaction() {
+    let (responses, td) = run_session(
+        b"EHLO localhost\r\nMAIL FROM:<a..b@example.test>\r\nMAIL FROM:<first@example.test>\r\nMAIL FROM:<second@example.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: x\r\n\r\nbody\r\n.\r\nMAIL FROM:<third@example.test>\r\nRSET\r\nMAIL FROM:<fourth@example.test>\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    let replies = responses
+        .iter()
+        .filter(|response| !response.starts_with("250-") && !response.starts_with("250 ENH"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replies,
+        [
+            "501 5.5.2 Syntax: MAIL FROM:<address>\r\n",
+            "250 2.1.0 Sender OK\r\n",
+            "503 5.5.1 Nested MAIL command\r\n",
+            "250 2.1.5 Recipient OK\r\n",
+            "354 End data with <CR><LF>.<CR><LF>\r\n",
+            "250 2.0.0 Message accepted\r\n",
+            "250 2.1.0 Sender OK\r\n",
+            "250 2.0.0 Reset state\r\n",
+            "250 2.1.0 Sender OK\r\n",
+            "221 2.0.0 Bye\r\n",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_dir(td.path().join("mail/example.test/user/Maildir/new"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dsn_parameters_may_extend_mail_and_rcpt_beyond_512_octets() {
+    let envid = "e".repeat(100);
+    let orcpt = format!("rfc822;{}+40example.test", "o".repeat(60));
+    let mail = format!(
+        "MAIL FROM:<{}@example.test> SIZE=100 BODY=8BITMIME ENVID={envid} RET=HDRS",
+        "s".repeat(60)
+    );
+    let rcpt = format!("RCPT TO:<user@example.test> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT={orcpt}");
+    let padded_rcpt = format!("{rcpt}{}", " ".repeat(600 - rcpt.len()));
+    let padded_mail = format!("{mail}{}", " ".repeat(600 - mail.len()));
+    let noop = format!("NOOP {}", "x".repeat(600));
+    let (responses, _td) = run_session(
+        format!("EHLO localhost\r\n{padded_mail}\r\n{padded_rcpt}\r\n{noop}\r\nQUIT\r\n")
+            .into_bytes(),
+        16 * 1024,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "250 2.1.0 Sender OK\r\n"),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "250 2.1.5 Recipient OK\r\n"),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "500 5.5.2 Line too long\r\n"),
+        "{responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn mail_auth_parameter_is_accepted_when_auth_is_supported() {
+    let responses = run_encrypted_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> AUTH=<>\r\nRSET\r\nMAIL FROM:<a@example.test> AUTH=someone+2Belse@example.test\r\nRSET\r\nMAIL FROM:<a@example.test> AUTH=<> AUTH=<>\r\nMAIL FROM:<a@example.test> AUTH=bad+ZZ\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.as_str() == "250 2.1.0 Sender OK\r\n")
+            .count(),
+        2,
+        "{responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.starts_with("501 5.5.2"))
+            .count(),
+        2,
+        "{responses:?}"
+    );
+
+    // Without TLS the AUTH extension is not offered, so neither is AUTH=.
+    let (plaintext, _td) = run_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> AUTH=<>\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert!(
+        plaintext
+            .iter()
+            .any(|response| response.starts_with("555 5.5.4 AUTH parameter")),
+        "{plaintext:?}"
+    );
+}
+
+#[tokio::test]
+async fn requiretls_is_only_offered_and_accepted_over_tls() {
+    let (plaintext, _td) = run_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> REQUIRETLS\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert!(!plaintext.iter().any(|line| line == "250-REQUIRETLS\r\n"));
+    assert!(
+        plaintext
+            .iter()
+            .any(|line| line.starts_with("530 5.7.10 REQUIRETLS")),
+        "{plaintext:?}"
+    );
+
+    let encrypted = run_encrypted_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@example.test> REQUIRETLS\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert!(encrypted.iter().any(|line| line == "250-REQUIRETLS\r\n"));
+    assert!(
+        encrypted
+            .iter()
+            .any(|line| line == "250 2.1.0 Sender OK\r\n"),
+        "{encrypted:?}"
+    );
+}
+
+#[tokio::test]
+async fn helo_reply_help_and_plaintext_submission_rset() {
+    let (responses, _td) = run_session(
+        b"HELO client.example\r\nHELP\r\nHELP MAIL\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+    )
+    .await;
+    assert_eq!(
+        responses[0],
+        format!("250 {} Hello client.example\r\n", super::server_hostname())
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|line| line.starts_with("214 "))
+            .count(),
+        2
+    );
+
+    let (submission, _td) = run_session_with_policy(
+        b"EHLO localhost\r\nRSET\r\nHELP\r\nMAIL FROM:<user@example.test>\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Submission,
+    )
+    .await;
+    assert!(
+        submission
+            .iter()
+            .any(|line| line == "250 2.0.0 Reset state\r\n")
+    );
+    assert!(submission.iter().any(|line| line.starts_with("214 ")));
+    assert!(
+        submission
+            .iter()
+            .any(|line| line.starts_with("530 5.7.0 Must issue STARTTLS"))
     );
 }
 
@@ -1174,7 +1429,7 @@ async fn advertised_enhanced_status_codes_are_used_for_command_replies() {
             .any(|response| response == "250 ENHANCEDSTATUSCODES\r\n")
     );
     assert!(
-        responses
+        !responses
             .iter()
             .any(|response| response == "250-REQUIRETLS\r\n")
     );
@@ -1204,11 +1459,8 @@ async fn bare_lf_command_is_rejected_without_losing_following_crlf_commands() {
             .iter()
             .any(|response| response.starts_with("500 5.5.2 Command line must end with CRLF"))
     );
-    assert!(
-        responses
-            .iter()
-            .any(|response| response.starts_with("250-rMail Hello"))
-    );
+    let hello = format!("250-{} Hello localhost\r\n", super::server_hostname());
+    assert!(responses.contains(&hello));
     assert!(
         responses
             .iter()
@@ -1265,6 +1517,7 @@ async fn starttls_rejects_pipelined_plaintext_without_losing_commands() {
         ));
     let tls_context = Arc::new(super::tls::TlsContext {
         acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+        server_end_point: Vec::new(),
     });
     let (client, server) = duplex(16 * 1024);
     let server_task = tokio::spawn(process_stream(
@@ -1309,48 +1562,13 @@ async fn starttls_rejects_pipelined_plaintext_without_losing_commands() {
 
 #[tokio::test]
 async fn starttls_completes_real_handshake_and_requires_fresh_ehlo() {
-    use std::io::Cursor;
-    use std::time::SystemTime;
     use tokio_rustls::TlsConnector;
-    use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
-    use tokio_rustls::rustls::{
-        Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
-    };
-
-    struct PinnedCertificate(Vec<u8>);
-    impl ServerCertVerifier for PinnedCertificate {
-        fn verify_server_cert(
-            &self,
-            end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: SystemTime,
-        ) -> Result<ServerCertVerified, TlsError> {
-            if end_entity.0 == self.0 {
-                Ok(ServerCertVerified::assertion())
-            } else {
-                Err(TlsError::General(
-                    "STARTTLS test received unexpected certificate".to_string(),
-                ))
-            }
-        }
-    }
+    use tokio_rustls::rustls::ServerName;
 
     let (_td, mail_root, db_path) = setup_mailbox();
     let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
     let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
-    let certificate_pem = std::fs::read(cert_path).expect("certificate");
-    let certificates =
-        rustls_pemfile::certs(&mut Cursor::new(certificate_pem)).expect("parse certificate");
-    let mut client_config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(RootCertStore::empty())
-        .with_no_client_auth();
-    client_config
-        .dangerous()
-        .set_certificate_verifier(Arc::new(PinnedCertificate(certificates[0].clone())));
+    let (client_config, _) = pinned_tls_client_config();
 
     let (client, server) = duplex(32 * 1024);
     let server_task = tokio::spawn(process_stream(
@@ -1542,6 +1760,325 @@ async fn auth_scram_sha256_verifies_a_real_client_proof() {
             .contains("221 2.0.0 Bye")
     );
     server_task.await.expect("join").expect("server");
+}
+
+/// Client configuration that trusts exactly the test certificate, and that
+/// certificate's DER bytes.
+fn pinned_tls_client_config() -> (tokio_rustls::rustls::ClientConfig, Vec<u8>) {
+    use std::io::Cursor;
+    use std::time::SystemTime;
+    use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
+    use tokio_rustls::rustls::{
+        Certificate, ClientConfig, Error as TlsError, RootCertStore, ServerName,
+    };
+
+    struct PinnedCertificate(Vec<u8>);
+    impl ServerCertVerifier for PinnedCertificate {
+        fn verify_server_cert(
+            &self,
+            end_entity: &Certificate,
+            _intermediates: &[Certificate],
+            _server_name: &ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: SystemTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            if end_entity.0 == self.0 {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(TlsError::General(
+                    "TLS test received unexpected certificate".to_string(),
+                ))
+            }
+        }
+    }
+
+    let (cert_path, _) = rmail_common::test_support::localhost_cert();
+    let certificate_pem = std::fs::read(cert_path).expect("certificate");
+    let certificates =
+        rustls_pemfile::certs(&mut Cursor::new(certificate_pem)).expect("parse certificate");
+    let mut client_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    client_config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(PinnedCertificate(certificates[0].clone())));
+    (client_config, certificates[0].clone())
+}
+
+#[tokio::test]
+async fn auth_scram_sha256_plus_binds_to_the_tls_certificate_and_detects_downgrade() {
+    use sha2::{Digest, Sha256};
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::ServerName;
+
+    let (_td, mail_root, db_path) = setup_mailbox();
+    let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
+    let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
+    let (client_config, certificate) = pinned_tls_client_config();
+    let server_end_point = Sha256::digest(&certificate).to_vec();
+    assert_eq!(tls_context.server_end_point, server_end_point);
+
+    let (client, server) = duplex(32 * 1024);
+    let server_task = tokio::spawn(async move {
+        let tls_stream = tls_context
+            .acceptor
+            .accept(server)
+            .await
+            .expect("server TLS handshake");
+        process_stream(
+            Box::new(tls_stream),
+            mail_root.to_string_lossy().to_string(),
+            Some(tls_context),
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+            SmtpService::Submission,
+            None,
+        )
+        .await
+    });
+    let tls_stream = TlsConnector::from(Arc::new(client_config))
+        .connect(ServerName::try_from("localhost").unwrap(), client)
+        .await
+        .expect("client TLS handshake");
+    let mut reader = BufReader::new(tls_stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.expect("greeting");
+
+    async fn send<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        reader: &mut BufReader<S>,
+        line: &str,
+    ) -> String {
+        reader
+            .get_mut()
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
+            .unwrap();
+        reader.get_mut().flush().await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        response
+    }
+    fn server_first(challenge: &str) -> String {
+        String::from_utf8(
+            BASE64_ENGINE
+                .decode(challenge.trim().strip_prefix("334 ").expect("challenge"))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    reader
+        .get_mut()
+        .write_all(b"EHLO client.example\r\n")
+        .await
+        .unwrap();
+    let capabilities = read_until(&mut reader, "250 ENHANCEDSTATUSCODES").await;
+    assert!(
+        capabilities.contains("250-AUTH PLAIN LOGIN SCRAM-SHA-256 SCRAM-SHA-256-PLUS\r\n"),
+        "{capabilities}"
+    );
+
+    // Downgrade: the client supports binding ("y") but the server offered -PLUS.
+    let bare = "n=user@example.test,r=downgrade";
+    let first = BASE64_ENGINE.encode(format!("y,,{bare}"));
+    let response = send(&mut reader, &format!("AUTH SCRAM-SHA-256 {first}")).await;
+    assert!(response.starts_with("535 5.7.8"), "{response:?}");
+
+    // -PLUS with channel-binding data for a different certificate fails.
+    let gs2 = "p=tls-server-end-point,,";
+    let bare = "n=user@example.test,r=wrongbinding";
+    let first = BASE64_ENGINE.encode(format!("{gs2}{bare}"));
+    let challenge = send(&mut reader, &format!("AUTH SCRAM-SHA-256-PLUS {first}")).await;
+    let wrong = BASE64_ENGINE.encode([gs2.as_bytes(), &[0u8; 32]].concat());
+    let final_message =
+        scram_client_final_with_binding("password", bare, &server_first(&challenge), &wrong);
+    let response = send(&mut reader, &BASE64_ENGINE.encode(final_message)).await;
+    assert!(response.starts_with("535 5.7.8"), "{response:?}");
+
+    // A client that does not send channel binding cannot use -PLUS.
+    let first = BASE64_ENGINE.encode("n,,n=user@example.test,r=nobinding");
+    let response = send(&mut reader, &format!("AUTH SCRAM-SHA-256-PLUS {first}")).await;
+    assert!(response.starts_with("501 5.5.2"), "{response:?}");
+
+    // Correct tls-server-end-point binding authenticates.
+    let bare = "n=user@example.test,r=plusnonce";
+    let first = BASE64_ENGINE.encode(format!("{gs2}{bare}"));
+    let challenge = send(&mut reader, &format!("AUTH SCRAM-SHA-256-PLUS {first}")).await;
+    let binding = BASE64_ENGINE.encode([gs2.as_bytes(), &server_end_point].concat());
+    let final_message =
+        scram_client_final_with_binding("password", bare, &server_first(&challenge), &binding);
+    let response = send(&mut reader, &BASE64_ENGINE.encode(final_message)).await;
+    assert!(response.starts_with("235 2.7.0 "), "{response:?}");
+
+    let response = send(&mut reader, "QUIT").await;
+    assert!(response.starts_with("221 "), "{response:?}");
+    server_task.await.expect("join").expect("server");
+}
+
+#[tokio::test]
+async fn auth_scram_sha256_plus_accepts_tls_exporter_binding_on_tls13() {
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::{ProtocolVersion, ServerName};
+
+    let (_td, mail_root, db_path) = setup_mailbox();
+    let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
+    let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
+    let (client_config, _) = pinned_tls_client_config();
+
+    let (client, server) = duplex(32 * 1024);
+    let server_task = tokio::spawn(async move {
+        let tls_stream = tls_context
+            .acceptor
+            .accept(server)
+            .await
+            .expect("server TLS handshake");
+        let bindings = tls_context.channel_bindings(tls_stream.get_ref().1);
+        assert!(bindings.tls_exporter.is_some(), "TLS 1.3 exporter binding");
+        super::session::process_stream_with_bindings(
+            Box::new(tls_stream),
+            mail_root.to_string_lossy().to_string(),
+            Some(tls_context),
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+            SmtpService::Submission,
+            None,
+            Some(bindings),
+        )
+        .await
+    });
+    let tls_stream = TlsConnector::from(Arc::new(client_config))
+        .connect(ServerName::try_from("localhost").unwrap(), client)
+        .await
+        .expect("client TLS handshake");
+    assert_eq!(
+        tls_stream.get_ref().1.protocol_version(),
+        Some(ProtocolVersion::TLSv1_3)
+    );
+    let mut exporter = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", Some(&[]))
+        .expect("exporter");
+    let mut reader = BufReader::new(tls_stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.expect("greeting");
+    reader
+        .get_mut()
+        .write_all(b"EHLO client.example\r\n")
+        .await
+        .unwrap();
+    let capabilities = read_until(&mut reader, "250 ENHANCEDSTATUSCODES").await;
+    assert!(
+        capabilities.contains("SCRAM-SHA-256-PLUS"),
+        "{capabilities}"
+    );
+
+    let gs2 = "p=tls-exporter,,";
+    let bare = "n=user@example.test,r=exporternonce";
+    let first = BASE64_ENGINE.encode(format!("{gs2}{bare}"));
+    reader
+        .get_mut()
+        .write_all(format!("AUTH SCRAM-SHA-256-PLUS {first}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut challenge = String::new();
+    reader.read_line(&mut challenge).await.unwrap();
+    let server_first = String::from_utf8(
+        BASE64_ENGINE
+            .decode(challenge.trim().strip_prefix("334 ").expect("challenge"))
+            .unwrap(),
+    )
+    .unwrap();
+    let binding = BASE64_ENGINE.encode([gs2.as_bytes(), &exporter].concat());
+    let final_message = scram_client_final_with_binding("password", bare, &server_first, &binding);
+    reader
+        .get_mut()
+        .write_all(format!("{}\r\n", BASE64_ENGINE.encode(final_message)).as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert!(response.starts_with("235 2.7.0 "), "{response:?}");
+    reader.get_mut().write_all(b"QUIT\r\n").await.unwrap();
+    assert!(read_until(&mut reader, "221 ").await.contains("221 "));
+    server_task.await.expect("join").expect("server");
+}
+
+#[tokio::test]
+async fn scram_unknown_user_gets_a_stable_fake_challenge_and_fails_at_client_final() {
+    fn server_first(responses: &[String], nth: usize) -> String {
+        let challenge = responses
+            .iter()
+            .filter(|line| line.starts_with("334 "))
+            .nth(nth)
+            .expect("SCRAM challenge");
+        String::from_utf8(
+            BASE64_ENGINE
+                .decode(challenge.trim().strip_prefix("334 ").unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    let first = BASE64_ENGINE.encode("n,,n=nobody@example.test,r=fakenonce");
+    let final_message = BASE64_ENGINE.encode("c=biws,r=fakenonce,p=AAAA");
+    let input = format!(
+        "EHLO localhost\r\nAUTH SCRAM-SHA-256 {first}\r\n*\r\nAUTH SCRAM-SHA-256 {first}\r\n{final_message}\r\nQUIT\r\n"
+    );
+    let responses = run_encrypted_session(input.into_bytes(), 16 * 1024).await;
+    let first_challenge = server_first(&responses, 0);
+    let second_challenge = server_first(&responses, 1);
+    assert!(first_challenge.contains(",s="), "{first_challenge}");
+    let salt = |message: &str| {
+        message
+            .split(',')
+            .find(|part| part.starts_with("s="))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(salt(&first_challenge), salt(&second_challenge));
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("535 5.7.8 Authentication credentials invalid")),
+        "{responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn scram_plus_is_not_offered_without_tls_binding_data() {
+    let responses = run_encrypted_session(
+        b"EHLO localhost\r\nAUTH SCRAM-SHA-256-PLUS cD10bHMtc2VydmVyLWVuZC1wb2ludCwsbj11LHI9eA==\r\nAUTH SCRAM-SHA-256 eSwsbj11c2VyQGV4YW1wbGUudGVzdCxyPWFiYw==\r\n*\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    let auth = responses
+        .iter()
+        .find(|line| line.starts_with("250-AUTH "))
+        .expect("AUTH capability");
+    assert!(!auth.contains("SCRAM-SHA-256-PLUS"), "{auth:?}");
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("504 5.5.4 SCRAM-SHA-256-PLUS requires TLS")),
+        "{responses:?}"
+    );
+    // Without -PLUS on offer, gs2 flag "y" is legitimate.
+    assert!(
+        responses.iter().any(|line| line.starts_with("334 ")),
+        "{responses:?}"
+    );
 }
 
 #[tokio::test]

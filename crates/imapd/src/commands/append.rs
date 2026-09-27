@@ -106,7 +106,6 @@ use crate::{
 };
 
 pub(crate) struct Outcome {
-    pub(crate) appended_mailbox: Option<String>,
     pub(crate) close_connection: bool,
 }
 
@@ -261,10 +260,7 @@ pub(crate) async fn handle(
                         remove_staged_appends(&staged).await;
                         let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
                         write_response(reader, catenate_error_response(tag, error)).await?;
-                        return Ok(Outcome {
-                            appended_mailbox: None,
-                            close_connection,
-                        });
+                        return Ok(Outcome { close_connection });
                     }
                 }
             }
@@ -382,7 +378,6 @@ pub(crate) async fn handle(
             )
             .await?;
             Ok(Outcome {
-                appended_mailbox: Some(mailbox_name),
                 close_connection: false,
             })
         }
@@ -526,10 +521,7 @@ async fn handle_catenate(
             let _ = tokio::fs::remove_file(&staged_path).await;
             let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
             write_response(reader, catenate_error_response(tag, error)).await?;
-            return Ok(Outcome {
-                appended_mailbox: None,
-                close_connection,
-            });
+            return Ok(Outcome { close_connection });
         }
     };
     let mut staged = vec![rmail_common::imap_state::StagedAppend {
@@ -581,10 +573,7 @@ async fn handle_catenate(
                     remove_staged_appends(&staged).await;
                     let close_connection = matches!(error, CatenateError::TooBigDesynchronized);
                     write_response(reader, catenate_error_response(tag, error)).await?;
-                    return Ok(Outcome {
-                        appended_mailbox: None,
-                        close_connection,
-                    });
+                    return Ok(Outcome { close_connection });
                 }
             }
             staged.push(rmail_common::imap_state::StagedAppend {
@@ -680,7 +669,6 @@ async fn handle_catenate(
             )
             .await?;
             Ok(Outcome {
-                appended_mailbox: Some(mailbox_name),
                 close_connection: false,
             })
         }
@@ -1073,7 +1061,6 @@ fn quote_response_code(value: &str) -> String {
 
 fn failure() -> Outcome {
     Outcome {
-        appended_mailbox: None,
         close_connection: false,
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::{
@@ -7,9 +8,19 @@ use crate::{
     response::{Response, Status, StatusLine},
 };
 
+/// Session state that shapes STORE responses.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StoreContext {
+    pub(crate) condstore: bool,
+    pub(crate) imap4rev2: bool,
+}
+
 pub(crate) struct Outcome {
     pub(crate) response: Response,
-    pub(crate) refresh_selected: bool,
+    /// Flags this STORE changed as (uid, flags, modseq).
+    pub(crate) flag_updates: Vec<(u64, Vec<String>, u64)>,
+    /// UNCHANGEDSINCE enables CONDSTORE (RFC 7162 §3.1).
+    pub(crate) condstore_activated: bool,
 }
 
 pub(crate) async fn handle(
@@ -19,17 +30,24 @@ pub(crate) async fn handle(
     selected: &SelectedMailbox,
     saved_uids: &[u64],
     uid_mode: bool,
+    context: StoreContext,
 ) -> Outcome {
     let command = if uid_mode { "UID STORE" } else { "STORE" };
     let request = match parser::parse_store_request(raw_args) {
         Ok(request) => request,
-        Err(_) => return outcome(bad(tag, format!("Invalid {command} arguments")), false),
+        Err(_) => return outcome(bad(tag, format!("Invalid {command} arguments"))),
     };
+    let condstore_activated = request.unchanged_since.is_some();
+    let condstore = context.condstore || condstore_activated;
     if selected.read_only {
-        return outcome(
-            Response::new().status(StatusLine::tagged(tag, Status::No, "Mailbox is read-only")),
-            false,
-        );
+        return Outcome {
+            condstore_activated,
+            ..outcome(Response::new().status(StatusLine::tagged(
+                tag,
+                Status::No,
+                "Mailbox is read-only",
+            )))
+        };
     }
     let targets = if uid_mode {
         uid_targets(&request.message_set, selected, saved_uids)
@@ -45,6 +63,11 @@ pub(crate) async fn handle(
         .cloned()
         .collect::<Vec<_>>();
     for (sequence, uid, current_flags, modseq) in targets {
+        // Messages expunged by another session keep their sequence number
+        // until the expunge is reported; there is nothing left to store.
+        if selected.is_expunged(uid) {
+            continue;
+        }
         if request
             .unchanged_since
             .is_some_and(|threshold| modseq > threshold)
@@ -77,46 +100,77 @@ pub(crate) async fn handle(
     })
     .await
     {
-        Ok(Ok(modseqs)) => modseqs,
+        Ok(Ok(modseqs)) => modseqs.into_iter().collect::<HashMap<_, _>>(),
         Ok(Err(error)) => {
-            return outcome(
-                Response::new().status(
-                    StatusLine::tagged(tag, Status::No, format!("{command} failed: {error}"))
-                        .with_code("UNAVAILABLE"),
-                ),
-                false,
-            );
+            return Outcome {
+                condstore_activated,
+                ..outcome(
+                    Response::new().status(
+                        StatusLine::tagged(tag, Status::No, format!("{command} failed: {error}"))
+                            .with_code("UNAVAILABLE"),
+                    ),
+                )
+            };
         }
         Err(error) => {
-            return outcome(
-                Response::new().status(
-                    StatusLine::tagged(tag, Status::No, format!("{command} task failed: {error}"))
+            return Outcome {
+                condstore_activated,
+                ..outcome(
+                    Response::new().status(
+                        StatusLine::tagged(
+                            tag,
+                            Status::No,
+                            format!("{command} task failed: {error}"),
+                        )
                         .with_code("UNAVAILABLE"),
-                ),
-                false,
-            );
+                    ),
+                )
+            };
         }
     };
     let mut response = Response::new();
-    if !request.silent {
-        for ((sequence, uid, flags), (_, modseq)) in updates.iter().zip(modseqs.iter()) {
-            let mut response_flags = flags.clone();
-            if selected.recent_uids.contains(uid) {
-                response_flags.push("\\Recent".to_string());
-                response_flags.sort();
-                response_flags.dedup();
+    let mut applied = Vec::new();
+    for (sequence, uid, flags) in &updates {
+        // Storage skips messages that vanished meanwhile.
+        let Some(modseq) = modseqs.get(uid) else {
+            continue;
+        };
+        applied.push((*uid, flags.clone(), *modseq));
+        if request.silent {
+            // RFC 7162 §3.1.3: a silent STORE still reports the new
+            // mod-sequence once CONDSTORE is enabled.
+            if condstore {
+                response = response.data(format!("{sequence} FETCH (UID {uid} MODSEQ ({modseq}))"));
             }
-            response = response.data(format!(
+            continue;
+        }
+        let mut response_flags = flags.clone();
+        if !context.imap4rev2 && selected.recent_uids.contains(uid) {
+            response_flags.push("\\Recent".to_string());
+            response_flags.sort();
+            response_flags.dedup();
+        }
+        response = response.data(if condstore {
+            format!(
                 "{sequence} FETCH (FLAGS ({}) UID {uid} MODSEQ ({modseq}))",
                 response_flags.join(" ")
-            ));
-        }
+            )
+        } else {
+            format!(
+                "{sequence} FETCH (FLAGS ({}) UID {uid})",
+                response_flags.join(" ")
+            )
+        });
     }
     let mut completion = StatusLine::tagged(tag, Status::Ok, format!("{command} completed"));
     if !modified.is_empty() {
         completion = completion.with_code(format!("MODIFIED {}", compress_ids(&modified)));
     }
-    outcome(response.status(completion), true)
+    Outcome {
+        response: response.status(completion),
+        flag_updates: applied,
+        condstore_activated,
+    }
 }
 
 fn sequence_targets(
@@ -191,10 +245,11 @@ fn bad(tag: &str, text: String) -> Response {
     Response::new().status(StatusLine::tagged(tag, Status::Bad, text))
 }
 
-fn outcome(response: Response, refresh_selected: bool) -> Outcome {
+fn outcome(response: Response) -> Outcome {
     Outcome {
         response,
-        refresh_selected,
+        flag_updates: Vec::new(),
+        condstore_activated: false,
     }
 }
 
@@ -247,6 +302,7 @@ mod tests {
             &selected,
             &[],
             false,
+            StoreContext::default(),
         )
         .await;
         assert_eq!(
@@ -268,6 +324,7 @@ mod tests {
             &selected,
             &[],
             true,
+            StoreContext::default(),
         )
         .await;
         assert_eq!(committed.response.encode(), "A2 OK UID STORE completed\r\n");

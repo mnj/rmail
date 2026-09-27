@@ -244,7 +244,8 @@ async fn login(
         }
         return response;
     }
-    let address = auth::saslprep(input.address.trim()).to_ascii_lowercase();
+    // A name SASLprep rejects is empty here and fails the split below.
+    let address = auth::normalize_login_name(input.address.trim()).unwrap_or_default();
     let reject = || {
         if let Some(ip) = peer.ip() {
             state.throttle.record_failure(ip);

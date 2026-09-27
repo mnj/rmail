@@ -9,6 +9,9 @@ pub(crate) struct MailFromArgs {
     pub(crate) require_tls: bool,
     pub(crate) dsn_envelope_id: Option<String>,
     pub(crate) dsn_return: Option<DsnReturn>,
+    /// RFC 4954 AUTH= parameter: `Some(None)` for `AUTH=<>`, `Some(Some(_))`
+    /// for a decoded mailbox.
+    pub(crate) auth_mailbox: Option<Option<String>>,
     pub(crate) has_esmtp_parameters: bool,
 }
 
@@ -55,6 +58,7 @@ pub(crate) enum Command<'a> {
     Auth(&'a str),
     Vrfy,
     Expn,
+    Help,
     Unknown,
     BadSyntax,
 }
@@ -72,6 +76,10 @@ pub(crate) struct SessionContext {
 pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Option<&'static [u8]> {
     match command {
         Command::Mail(_) if !session.greeted => Some(b"503 5.5.1 Send HELO/EHLO first\r\n"),
+        // RFC 5321 section 4.1.4: MAIL must not be sent inside a transaction.
+        Command::Mail(_) if session.transaction_active => {
+            Some(b"503 5.5.1 Nested MAIL command\r\n")
+        }
         Command::Rcpt(_) if !session.greeted => Some(b"503 5.5.1 Send HELO/EHLO first\r\n"),
         Command::Rcpt(_) if !session.transaction_active => {
             Some(b"503 5.5.1 MAIL required before RCPT\r\n")
@@ -137,6 +145,7 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "AUTH" if !args.is_empty() => Command::Auth(args),
         "VRFY" if !args.is_empty() => Command::Vrfy,
         "EXPN" if !args.is_empty() => Command::Expn,
+        "HELP" => Command::Help,
         "HELO" | "EHLO" | "LHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT"
         | "STARTTLS" | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
         _ => Command::Unknown,
@@ -290,7 +299,7 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
         return None;
     }
     let mut rest = trimmed[prefix_len..].trim_start();
-    if !rest.starts_with('<') || rest.len() > 256 {
+    if !rest.starts_with('<') {
         return None;
     }
     let mut quoted = false;
@@ -310,6 +319,10 @@ fn parse_path_with_params<'a>(args: &'a str, keyword: &str) -> Option<(&'a str, 
     }
     let end = end?;
     let path = &rest[..=end];
+    // The limit applies to the path alone, not to the ESMTP parameters.
+    if path.len() > MAX_PATH_BYTES {
+        return None;
+    }
     rest = &rest[end + 1..];
     if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
         return None;
@@ -326,6 +339,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut require_tls = false;
     let mut dsn_envelope_id = None;
     let mut dsn_return = None;
+    let mut auth_value: Option<String> = None;
     for parameter in params.split_whitespace() {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
@@ -360,6 +374,11 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
                 return Err(EnvelopeError::Syntax);
             }
             dsn_envelope_id = Some(decode_xtext(value).map_err(|_| EnvelopeError::Syntax)?);
+        } else if name.eq_ignore_ascii_case("AUTH") {
+            if auth_value.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            auth_value = Some(decode_xtext(value).map_err(|_| EnvelopeError::Syntax)?);
         } else if name.eq_ignore_ascii_case("RET") {
             if dsn_return.is_some() {
                 return Err(EnvelopeError::Syntax);
@@ -384,6 +403,14 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     } else {
         Some(parse_mailbox(inner, smtp_utf8).ok_or(EnvelopeError::Syntax)?)
     };
+    // RFC 4954 section 5: AUTH=<> or an xtext-encoded addr-spec.
+    let auth_mailbox = match auth_value {
+        None => None,
+        Some(value) if value == "<>" => Some(None),
+        Some(value) => Some(Some(
+            parse_mailbox(&value, smtp_utf8).ok_or(EnvelopeError::Syntax)?,
+        )),
+    };
     Ok(MailFromArgs {
         sender,
         declared_size,
@@ -392,6 +419,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
         require_tls,
         dsn_envelope_id,
         dsn_return,
+        auth_mailbox,
         has_esmtp_parameters: !params.is_empty(),
     })
 }
@@ -409,6 +437,9 @@ pub(crate) fn parse_rcpt_to_args(args: &str, smtp_utf8: bool) -> Result<RcptToAr
             let mut notify = DsnNotify::default();
             for item in value.split(',') {
                 if item.eq_ignore_ascii_case("NEVER") {
+                    if notify.never {
+                        return Err(EnvelopeError::Syntax);
+                    }
                     notify.never = true;
                 } else if item.eq_ignore_ascii_case("SUCCESS") {
                     if notify.success {
@@ -550,6 +581,17 @@ mod tests {
         };
         assert!(preflight(&Command::Auth("PLAIN"), ready).is_none());
         assert!(preflight(&Command::Data, ready).is_some());
+        assert!(preflight(&Command::Mail("FROM:<a@b>"), ready).is_none());
+        assert_eq!(
+            preflight(
+                &Command::Mail("FROM:<a@b>"),
+                SessionContext {
+                    transaction_active: true,
+                    ..ready
+                }
+            ),
+            Some(&b"503 5.5.1 Nested MAIL command\r\n"[..])
+        );
         assert!(
             preflight(
                 &Command::Auth("PLAIN"),
@@ -589,6 +631,7 @@ mod tests {
                 require_tls: false,
                 dsn_envelope_id: None,
                 dsn_return: None,
+                auth_mailbox: None,
                 has_esmtp_parameters: true,
             })
         );
@@ -644,6 +687,7 @@ mod tests {
                 require_tls: false,
                 dsn_envelope_id: None,
                 dsn_return: None,
+                auth_mailbox: None,
                 has_esmtp_parameters: true,
             })
         );
@@ -670,7 +714,77 @@ mod tests {
         assert!(
             parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER,FAILURE", false).is_err()
         );
+        assert!(parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER,NEVER", false).is_err());
+        assert!(
+            parse_rcpt_to_args("TO:<target@example.test> NOTIFY=NEVER", false)
+                .unwrap()
+                .dsn_notify
+                .unwrap()
+                .never
+        );
         assert!(parse_mail_from_args("FROM:<sender@example.test> ENVID=bad+0Avalue").is_err());
+    }
+
+    #[test]
+    fn path_limit_excludes_parameters_and_mail_rcpt_lines_are_extended() {
+        let local = "l".repeat(64);
+        let label = "d".repeat(60);
+        let domain = format!("{label}.{label}.example.test");
+        let address = format!("{local}@{domain}");
+        assert!(address.len() + 2 <= 256);
+        let envid = "e".repeat(100);
+        let long_mail = format!("FROM:<{address}> SIZE=1000 ENVID={envid} RET=HDRS");
+        assert!(long_mail.len() > 256);
+        assert!(parse_mail_from_args(&long_mail).is_ok());
+        let orcpt = format!("rfc822;{address}");
+        let long_rcpt = format!("TO:<{address}> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT={orcpt}");
+        assert!(parse_rcpt_to_args(&long_rcpt, false).is_ok());
+
+        // A syntactically valid mailbox whose path exceeds 256 octets.
+        let long_domain = [label.as_str(); 4].join(".");
+        assert!(rmail_common::domain::canonicalize_domain(&long_domain).is_ok());
+        let overlong_path = format!("FROM:<{local}@{long_domain}>");
+        assert!(parse_mail_from_args(&overlong_path).is_err());
+
+        assert_eq!(command_line_limit(&Command::Mail("")), MAX_MAIL_LINE_BYTES);
+        assert!(command_line_limit(&Command::Mail("")) >= 512 + 26 + 100 + 500);
+        assert!(command_line_limit(&Command::Rcpt("")) >= 1012);
+        assert_eq!(command_line_limit(&Command::Noop), 512);
+    }
+
+    #[test]
+    fn mail_auth_parameter_is_decoded_strictly() {
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> AUTH=<>")
+                .unwrap()
+                .auth_mailbox,
+            Some(None)
+        );
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> AUTH=e+3Dmc2@Example.TEST")
+                .unwrap()
+                .auth_mailbox,
+            Some(Some("e=mc2@example.test".to_string()))
+        );
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test>")
+                .unwrap()
+                .auth_mailbox,
+            None
+        );
+        for invalid in [
+            "FROM:<a@example.test> AUTH=<> AUTH=<>",
+            "FROM:<a@example.test> AUTH=",
+            "FROM:<a@example.test> AUTH=bad+ZZ@example.test",
+            "FROM:<a@example.test> AUTH=not-a-mailbox",
+            "FROM:<a@example.test> AUTH=a=b@example.test",
+        ] {
+            assert_eq!(
+                parse_mail_from_args(invalid),
+                Err(EnvelopeError::Syntax),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -678,6 +792,8 @@ mod tests {
         assert_eq!(parse_command(" DATA"), Command::BadSyntax);
         assert_eq!(parse_command("VRFY"), Command::BadSyntax);
         assert_eq!(parse_command("QUITzzz"), Command::Unknown);
+        assert_eq!(parse_command("HELP"), Command::Help);
+        assert_eq!(parse_command("help MAIL"), Command::Help);
         assert!(valid_helo_domain("mail.example.test"));
         assert!(valid_helo_domain("[IPv6:2001:db8::1]"));
         assert!(!valid_helo_domain("-bad.example"));
@@ -703,8 +819,21 @@ mod tests {
         let configured = vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()];
         validate_sasl_mechanisms(&configured, false).unwrap();
         assert_eq!(
-            advertised_sasl_mechanisms(&configured),
+            advertised_sasl_mechanisms(&configured, false),
             "SCRAM-SHA-256 PLAIN"
+        );
+        let with_plus = vec![
+            "SCRAM-SHA-256-PLUS".to_string(),
+            "scram-sha-256".to_string(),
+        ];
+        validate_sasl_mechanisms(&with_plus, false).unwrap();
+        assert_eq!(
+            advertised_sasl_mechanisms(&with_plus, true),
+            "SCRAM-SHA-256-PLUS SCRAM-SHA-256"
+        );
+        assert_eq!(
+            advertised_sasl_mechanisms(&with_plus, false),
+            "SCRAM-SHA-256"
         );
         assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()], false).is_err());
         assert!(validate_sasl_mechanisms(&["XOAUTH2".to_string()], true).is_ok());
@@ -715,10 +844,37 @@ mod tests {
 }
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
+/// RFC 5321 section 4.5.3.1.4: command line including CRLF.
 pub(crate) const MAX_COMMAND_LINE_BYTES: usize = 512;
+/// MAIL grows by the advertised extensions' allowances: SIZE (RFC 1870,
+/// +26), ENVID/RET (RFC 3461, +100), AUTH= (RFC 4954, +500) and a margin
+/// for the keyword-only parameters (BODY=, SMTPUTF8, REQUIRETLS).
+pub(crate) const MAX_MAIL_LINE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 26 + 100 + 500 + 50;
+/// RCPT grows by 500 for NOTIFY and ORCPT (RFC 3461 section 4).
+pub(crate) const MAX_RCPT_LINE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 500;
+/// Largest RFC 5321 path, including the angle brackets (section 4.5.3.1.3).
+const MAX_PATH_BYTES: usize = 256;
+
+/// Line length limit for a command; AUTH lines are bounded separately.
+pub(crate) fn command_line_limit(command: &Command<'_>) -> usize {
+    match command {
+        Command::Mail(_) => MAX_MAIL_LINE_BYTES,
+        Command::Rcpt(_) => MAX_RCPT_LINE_BYTES,
+        Command::Auth(_) => MAX_AUTH_LINE_BYTES,
+        _ => MAX_COMMAND_LINE_BYTES,
+    }
+}
 pub(crate) const MAX_AUTH_LINE_BYTES: usize = 12 * 1024;
-pub(crate) const SMTP_SASL_MECHANISMS: &[&str] =
-    &["PLAIN", "LOGIN", "SCRAM-SHA-256", "OAUTHBEARER", "XOAUTH2"];
+pub(crate) const SMTP_SASL_MECHANISMS: &[&str] = &[
+    "PLAIN",
+    "LOGIN",
+    "SCRAM-SHA-256",
+    "SCRAM-SHA-256-PLUS",
+    "OAUTHBEARER",
+    "XOAUTH2",
+];
+/// Mechanisms that need TLS channel-binding data (RFC 5802 section 6).
+pub(crate) const CHANNEL_BINDING_MECHANISMS: &[&str] = &["SCRAM-SHA-256-PLUS"];
 
 pub(crate) fn validate_sasl_mechanisms(
     configured: &[String],
@@ -749,7 +905,12 @@ pub(crate) fn validate_sasl_mechanisms(
     Ok(())
 }
 
-pub(crate) fn advertised_sasl_mechanisms(configured: &[String]) -> String {
+/// Configured mechanisms in configuration order. Channel-binding
+/// mechanisms are left out unless the session has TLS binding data.
+pub(crate) fn advertised_sasl_mechanisms(
+    configured: &[String],
+    channel_binding_available: bool,
+) -> String {
     configured
         .iter()
         .filter_map(|configured| {
@@ -757,6 +918,9 @@ pub(crate) fn advertised_sasl_mechanisms(configured: &[String]) -> String {
                 .iter()
                 .copied()
                 .find(|supported| supported.eq_ignore_ascii_case(configured))
+        })
+        .filter(|mechanism| {
+            channel_binding_available || !CHANNEL_BINDING_MECHANISMS.contains(mechanism)
         })
         .collect::<Vec<_>>()
         .join(" ")

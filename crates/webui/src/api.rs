@@ -353,6 +353,8 @@ fn cookie_user(headers: &HeaderMap, state: &AdminState, user: &str, hash: &str) 
     })
 }
 
+// The error is an HTTP response returned straight to axum.
+#[allow(clippy::result_large_err)]
 async fn authenticate(
     headers: &HeaderMap,
     peer: Peer,

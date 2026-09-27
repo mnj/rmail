@@ -81,7 +81,9 @@ impl Session {
             .await?;
             return Ok(Flow::Continue);
         }
-        if metadata.channel_binding_required && (!self.encrypted || self.tls_ctx.is_none()) {
+        if metadata.channel_binding_required
+            && (!self.encrypted || !self.channel_bindings.is_available())
+        {
             write(
                 reader,
                 format!("{tag} NO Channel binding is not available\r\n").as_bytes(),
@@ -116,18 +118,21 @@ impl Session {
             }
             // SCRAM-SHA-256 and SCRAM-SHA-256-PLUS.
             _ => {
-                let binding = self
-                    .tls_ctx
-                    .as_ref()
-                    .map(|context| context.server_end_point.as_slice());
+                let policy = if metadata.channel_binding_required {
+                    sasl::ScramChannelBindingPolicy::Required
+                } else if self.scram_plus_advertised() {
+                    sasl::ScramChannelBindingPolicy::OfferedButNotSelected
+                } else {
+                    sasl::ScramChannelBindingPolicy::NotOffered
+                };
                 commands::authenticate::handle_scram(
                     reader,
                     tag,
                     initial,
                     db_path,
                     self.peer,
-                    metadata.channel_binding_required,
-                    binding,
+                    policy,
+                    &self.channel_bindings,
                     &caps,
                 )
                 .await

@@ -76,11 +76,31 @@ pub(crate) fn handle(
     utf8_accept: bool,
 ) -> Outcome {
     let command = operation.command();
+    let mut special_uses = Vec::new();
     let parsed = match operation {
         Operation::Rename => parser::parse_rename_arguments(raw_args)
             .map(|(source, destination)| vec![source, destination]),
+        Operation::Create => parser::parse_create_arguments(raw_args).map(|(mailbox, uses)| {
+            special_uses = uses;
+            vec![mailbox]
+        }),
         _ => parser::parse_mailbox_argument(raw_args).map(|mailbox| vec![mailbox]),
     };
+    // CREATE-SPECIAL-USE (RFC 6154 §3): one real folder has one use.
+    if special_uses.len() > 1
+        || special_uses.iter().any(|requested| {
+            !rmail_common::imap_state::CREATABLE_SPECIAL_USES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(requested))
+        })
+    {
+        return Outcome::response(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Unsupported special-use attribute")
+                    .with_code("USEATTR"),
+            ),
+        );
+    }
     let wire_names = match parsed {
         Ok(names) => names,
         Err(_) => return Outcome::response(bad(tag, format!("Invalid {command} arguments"))),
@@ -99,9 +119,16 @@ pub(crate) fn handle(
     };
 
     let result = match operation {
-        Operation::Create => {
-            rmail_common::maildir::create_mailbox(mail_root, &domain, &local, &names[0])
-        }
+        Operation::Create => match special_uses.first() {
+            Some(special_use) => rmail_common::imap_state::create_folder_with_special_use(
+                mail_root,
+                &domain,
+                &local,
+                &names[0],
+                Some(special_use),
+            ),
+            None => rmail_common::maildir::create_mailbox(mail_root, &domain, &local, &names[0]),
+        },
         Operation::Delete => {
             rmail_common::maildir::delete_mailbox(mail_root, &domain, &local, &names[0])
         }

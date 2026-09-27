@@ -84,6 +84,9 @@ pub(crate) fn status_values(
     if requested(parser::StatusItem::Size) {
         values.push(format!("SIZE {}", summary.size));
     }
+    if requested(parser::StatusItem::Deleted) {
+        values.push(format!("DELETED {}", summary.deleted));
+    }
     values
 }
 

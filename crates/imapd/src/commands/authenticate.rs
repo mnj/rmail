@@ -63,8 +63,8 @@ pub(crate) async fn handle_password(
 
     let user = credentials.authcid;
     if credentials.authzid.as_ref().is_some_and(|authzid| {
-        !rmail_common::auth::saslprep(authzid)
-            .eq_ignore_ascii_case(&rmail_common::auth::saslprep(&user))
+        let authzid = rmail_common::auth::normalize_login_name(authzid);
+        authzid.is_err() || authzid != rmail_common::auth::normalize_login_name(&user)
     }) {
         record_failure(peer);
         return terminal(
@@ -228,8 +228,8 @@ pub(crate) async fn handle_scram(
     initial: Option<&str>,
     db_path: Option<&String>,
     peer: Option<SocketAddr>,
-    channel_binding_required: bool,
-    tls_server_end_point: Option<&[u8]>,
+    policy: auth::ScramChannelBindingPolicy,
+    channel_bindings: &rmail_common::auth::ChannelBindings,
     authenticated_capabilities: &str,
 ) -> Outcome {
     let initial = match initial {
@@ -244,28 +244,12 @@ pub(crate) async fn handle_scram(
             }
         }
     };
-    let mut exchange = auth::ScramExchange::new(channel_binding_required);
+    let mut exchange = auth::ScramExchange::new(policy);
     let client_first = match auth::SaslExchange::start(&mut exchange, Some(&initial)) {
         Ok(auth::SaslProgress::ScramClientFirst(first)) => first,
-        _ => return terminal(tag, Status::Bad, "Invalid SCRAM client-first message", None),
-    };
-    let user = rmail_common::auth::saslprep(&client_first.username).to_ascii_lowercase();
-    if client_first
-        .authzid
-        .as_ref()
-        .is_some_and(|authzid| rmail_common::auth::saslprep(authzid).to_ascii_lowercase() != user)
-    {
-        record_failure(peer);
-        return terminal(
-            tag,
-            Status::No,
-            "Authorization identity is not permitted",
-            Some("AUTHORIZATIONFAILED"),
-        );
-    }
-    let mailbox = match auth::lookup_mailbox(db_path, &user).await {
-        Ok(Some(mailbox)) => mailbox,
-        Ok(None) => {
+        Err(auth::SaslExchangeError::ChannelBindingDowngrade) => {
+            // RFC 5802 §6: the client supports channel binding and believes
+            // the server does not, although -PLUS was advertised.
             record_failure(peer);
             return terminal(
                 tag,
@@ -274,29 +258,54 @@ pub(crate) async fn handle_scram(
                 Some("AUTHENTICATIONFAILED"),
             );
         }
-        Err(error) => {
-            rmail_common::structured_log!("error", "imapd", "scram_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
-            return terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"));
-        }
+        _ => return terminal(tag, Status::Bad, "Invalid SCRAM client-first message", None),
     };
-    let Some(verifier) = mailbox.scram.as_ref() else {
+    // A name SASLprep rejects matches no account; it goes through the same
+    // fake exchange as an unknown user.
+    let user = rmail_common::auth::normalize_login_name(&client_first.username).ok();
+    if client_first.authzid.as_ref().is_some_and(|authzid| {
+        user.is_none() || rmail_common::auth::normalize_login_name(authzid).ok() != user
+    }) {
         record_failure(peer);
         return terminal(
             tag,
             Status::No,
-            "Authentication failed",
-            Some("AUTHENTICATIONFAILED"),
+            "Authorization identity is not permitted",
+            Some("AUTHORIZATIONFAILED"),
         );
+    }
+    let mailbox = match user.as_deref() {
+        Some(user) => match auth::lookup_mailbox(db_path, user).await {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                rmail_common::structured_log!("error", "imapd", "scram_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
+                return terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"));
+            }
+        },
+        None => None,
     };
-    let (salt, iterations) = match rmail_common::auth::parse_scram_verifier(verifier) {
-        Ok(verifier) => verifier,
-        Err(error) => {
-            rmail_common::structured_log!(
-                "error", "imapd", "scram_verifier_parse_failed",
-                { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
-            );
-            return terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"));
-        }
+    // Unknown users and users without SCRAM credentials get a deterministic
+    // fake salt and fail only at client-final, so the exchange does not
+    // reveal which accounts exist (RFC 5802 §9).
+    let account = mailbox.and_then(|mailbox| {
+        let verifier = mailbox.scram.clone()?;
+        Some((mailbox, verifier))
+    });
+    let (salt, iterations) = match account.as_ref() {
+        Some((mailbox, verifier)) => match rmail_common::auth::parse_scram_verifier(verifier) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                rmail_common::structured_log!(
+                    "error", "imapd", "scram_verifier_parse_failed",
+                    { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
+                );
+                return terminal(tag, Status::No, "Authentication error", Some("UNAVAILABLE"));
+            }
+        },
+        None => rmail_common::auth::scram_fake_verifier(
+            db_path.map(String::as_str),
+            user.as_deref().unwrap_or(&client_first.username),
+        ),
     };
     let nonce = format!("{}{}", client_first.nonce, auth::generate_scram_nonce());
     let server_first = format!("r={nonce},s={salt},i={iterations}");
@@ -314,17 +323,20 @@ pub(crate) async fn handle_scram(
         Ok(auth::SaslProgress::ScramClientFinal(final_message)) => final_message,
         _ => return terminal(tag, Status::Bad, "Invalid SCRAM client-final message", None),
     };
-    let binding_valid = if channel_binding_required {
-        tls_server_end_point.is_some_and(|binding| {
-            rmail_common::auth::verify_tls_server_end_point_binding(
-                &client_first.gs2_header,
-                binding,
-                &client_final.channel_binding,
-            )
-            .is_ok()
-        })
-    } else {
-        client_final.channel_binding == BASE64_ENGINE.encode(client_first.gs2_header.as_bytes())
+    let binding_valid = rmail_common::auth::verify_scram_channel_binding(
+        &client_first,
+        channel_bindings,
+        &client_final.channel_binding,
+    )
+    .is_ok();
+    let Some((mailbox, verifier)) = account else {
+        record_failure(peer);
+        return terminal(
+            tag,
+            Status::No,
+            "Authentication failed",
+            Some("AUTHENTICATIONFAILED"),
+        );
     };
     if client_final.nonce != nonce || !binding_valid {
         record_failure(peer);
@@ -340,7 +352,7 @@ pub(crate) async fn handle_scram(
         client_first.bare, server_first, client_final.without_proof
     );
     let server_signature = match rmail_common::auth::verify_scram_proof(
-        verifier,
+        &verifier,
         &auth_message,
         &client_final.proof,
     ) {
