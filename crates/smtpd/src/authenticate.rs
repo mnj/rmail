@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use rmail_common::auth::{
-    LoginExchange, PasswordAuthResult, PasswordSaslExchange, PasswordSaslProgress, PlainExchange,
+    ChannelBindings, LoginExchange, PasswordAuthResult, PasswordSaslExchange, PasswordSaslProgress,
+    PlainExchange, ScramChannelBindingPolicy, ScramClientFirstError,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
@@ -209,23 +210,13 @@ async fn oauth_failure_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Channel binding for a SCRAM exchange (RFC 5802 section 6).
-#[derive(Clone, Copy)]
-pub(crate) enum ScramBinding<'a> {
-    /// SCRAM-SHA-256. `plus_advertised` records whether the server offered
-    /// SCRAM-SHA-256-PLUS, in which case a client that claims the server
-    /// lacks channel binding (gs2 flag "y") is the victim of a downgrade.
-    Unsupported { plus_advertised: bool },
-    /// SCRAM-SHA-256-PLUS bound to this RFC 5929 tls-server-end-point value.
-    TlsServerEndPoint(&'a [u8]),
-}
-
 pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     initial_response: Option<&str>,
     db_path: Option<&String>,
     peer: Option<SocketAddr>,
-    binding: ScramBinding<'_>,
+    policy: ScramChannelBindingPolicy,
+    channel_bindings: &ChannelBindings,
 ) -> Outcome {
     let first_wire = match initial_response {
         Some(response) => response.to_string(),
@@ -243,31 +234,25 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         Some(message) => message,
         None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-first message\r\n").await,
     };
-    let channel_binding_required = matches!(binding, ScramBinding::TlsServerEndPoint(_));
-    let client_first = match rmail_common::auth::parse_scram_client_first(
-        &first_message,
-        channel_binding_required,
-    ) {
-        Some(first) => first,
-        None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-first message\r\n").await,
-    };
-    // RFC 5802 section 6: "y" means the client supports channel binding but
-    // believes the server does not. Having advertised -PLUS, that can only
-    // be a downgrade of the mechanism list, so the exchange must fail.
-    if matches!(
-        binding,
-        ScramBinding::Unsupported {
-            plus_advertised: true
-        }
-    ) && client_first.gs2_header.starts_with("y,")
-    {
-        record_failure(peer);
-        return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
-    }
-    // A name SASLprep rejects is empty here and matches no account.
-    let user = rmail_common::auth::normalize_login_name(&client_first.username).unwrap_or_default();
+    let client_first =
+        match rmail_common::auth::parse_scram_client_first_with_policy(&first_message, policy) {
+            Ok(first) => first,
+            // RFC 5802 section 6: "y" means the client supports channel
+            // binding but believes the server does not. Having advertised
+            // -PLUS, that can only be a downgrade of the mechanism list.
+            Err(ScramClientFirstError::ChannelBindingDowngrade) => {
+                record_failure(peer);
+                return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
+            }
+            Err(_) => {
+                return failure(reader, b"501 5.5.2 Invalid SCRAM client-first message\r\n").await;
+            }
+        };
+    // A name SASLprep rejects matches no account; it goes through the same
+    // fake exchange as an unknown user.
+    let user = rmail_common::auth::normalize_login_name(&client_first.username).ok();
     if client_first.authzid.as_ref().is_some_and(|authzid| {
-        rmail_common::auth::normalize_login_name(authzid).ok() != Some(user.clone())
+        user.is_none() || rmail_common::auth::normalize_login_name(authzid).ok() != user
     }) {
         record_failure(peer);
         return failure(
@@ -276,30 +261,38 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await;
     }
-    let mailbox = match rmail_common::auth::lookup_mailbox(db_path, &user).await {
-        Ok(Some(mailbox)) => mailbox,
-        Ok(None) => {
-            record_failure(peer);
-            return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
-        }
-        Err(error) => {
-            rmail_common::structured_log!("error", "smtpd", "scram_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
-            return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
-        }
+    let mailbox = match user.as_deref() {
+        Some(user) => match rmail_common::auth::lookup_mailbox(db_path, user).await {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                rmail_common::structured_log!("error", "smtpd", "scram_mailbox_lookup_failed", { "peer": peer.map(|address| address.to_string()), "error": error.to_string() });
+                return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
+            }
+        },
+        None => None,
     };
-    let Some(verifier) = mailbox.scram.as_ref() else {
-        record_failure(peer);
-        return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
-    };
-    let (salt, iterations) = match rmail_common::auth::parse_scram_verifier(verifier) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            rmail_common::structured_log!(
-                "error", "smtpd", "scram_verifier_parse_failed",
-                { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
-            );
-            return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
-        }
+    // Unknown users and users without SCRAM credentials get a deterministic
+    // fake salt and fail only at client-final, so the exchange does not
+    // reveal which accounts exist (RFC 5802 section 9).
+    let account = mailbox.and_then(|mailbox| {
+        let verifier = mailbox.scram.clone()?;
+        Some((mailbox, verifier))
+    });
+    let (salt, iterations) = match account.as_ref() {
+        Some((mailbox, verifier)) => match rmail_common::auth::parse_scram_verifier(verifier) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                rmail_common::structured_log!(
+                    "error", "smtpd", "scram_verifier_parse_failed",
+                    { "peer": peer.map(|address| address.to_string()), "mailbox": mailbox.address, "error": error.to_string() }
+                );
+                return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
+            }
+        },
+        None => rmail_common::auth::scram_fake_verifier(
+            db_path.map(String::as_str),
+            user.as_deref().unwrap_or(&client_first.username),
+        ),
     };
     let nonce = format!(
         "{}{}",
@@ -323,18 +316,15 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         Some(final_message) => final_message,
         None => return failure(reader, b"501 5.5.2 Invalid SCRAM client-final message\r\n").await,
     };
-    let binding_valid = match binding {
-        ScramBinding::TlsServerEndPoint(server_end_point) => {
-            rmail_common::auth::verify_tls_server_end_point_binding(
-                &client_first.gs2_header,
-                server_end_point,
-                &client_final.channel_binding,
-            )
-            .is_ok()
-        }
-        ScramBinding::Unsupported { .. } => {
-            client_final.channel_binding == BASE64_ENGINE.encode(client_first.gs2_header.as_bytes())
-        }
+    let binding_valid = rmail_common::auth::verify_scram_channel_binding(
+        &client_first,
+        channel_bindings,
+        &client_final.channel_binding,
+    )
+    .is_ok();
+    let Some((mailbox, verifier)) = account else {
+        record_failure(peer);
+        return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
     };
     if client_final.nonce != nonce || !binding_valid {
         record_failure(peer);
@@ -345,7 +335,7 @@ pub(crate) async fn handle_scram<S: AsyncRead + AsyncWrite + Unpin>(
         client_first.bare, server_first, client_final.without_proof
     );
     let server_signature = match rmail_common::auth::verify_scram_proof(
-        verifier,
+        &verifier,
         &auth_message,
         &client_final.proof,
     ) {

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rmail_common::auth::{ChannelBindings, ScramChannelBindingPolicy};
 use rmail_common::config::SecurityConfig;
 use rmail_common::metrics;
 use rmail_common::oauth::OAuthValidator;
@@ -94,6 +95,8 @@ impl Default for Transaction {
 pub(super) struct Session {
     mail_root: String,
     tls_ctx: Option<Arc<tls::TlsContext>>,
+    /// Channel-binding data of this TLS session (empty when plaintext).
+    channel_bindings: ChannelBindings,
     db_path: Option<String>,
     peer: Option<SocketAddr>,
     /// The stream is TLS-protected (SMTPS or after STARTTLS).
@@ -127,6 +130,8 @@ pub(super) struct Session {
 // session_encrypted indicates whether the stream is protected by TLS (SMTPS,
 // or after a successful STARTTLS upgrade). Password mechanisms are only
 // offered on encrypted sessions.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_stream(
     stream: Box<dyn AsyncStream + Send + 'static>,
     mail_root: String,
@@ -140,6 +145,52 @@ pub(crate) async fn process_stream(
     service: SmtpService,
     trace: Option<ConnectionTrace>,
 ) -> Result<()> {
+    process_stream_with_bindings(
+        stream,
+        mail_root,
+        tls_ctx,
+        db_path,
+        peer,
+        session_encrypted,
+        enforce_dmarc,
+        send_greeting,
+        security,
+        service,
+        trace,
+        None,
+    )
+    .await
+}
+
+// `channel_bindings` carries the TLS channel-binding data captured at the
+// handshake. Without it an encrypted session only offers
+// tls-server-end-point from the TLS context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_stream_with_bindings(
+    stream: Box<dyn AsyncStream + Send + 'static>,
+    mail_root: String,
+    tls_ctx: Option<Arc<tls::TlsContext>>,
+    db_path: Option<String>,
+    peer: Option<SocketAddr>,
+    session_encrypted: bool,
+    enforce_dmarc: bool,
+    send_greeting: bool,
+    security: Arc<SecurityConfig>,
+    service: SmtpService,
+    trace: Option<ConnectionTrace>,
+    channel_bindings: Option<ChannelBindings>,
+) -> Result<()> {
+    let channel_bindings = match channel_bindings {
+        Some(bindings) => bindings,
+        None if session_encrypted => ChannelBindings {
+            tls_server_end_point: tls_ctx
+                .as_ref()
+                .map(|context| context.server_end_point.clone())
+                .filter(|binding| !binding.is_empty()),
+            tls_exporter: None,
+        },
+        None => ChannelBindings::default(),
+    };
     let oauth = security
         .oauth
         .clone()
@@ -152,6 +203,7 @@ pub(crate) async fn process_stream(
     let mut session = Session {
         mail_root,
         tls_ctx,
+        channel_bindings,
         db_path,
         peer,
         encrypted: session_encrypted,
@@ -224,8 +276,9 @@ pub(crate) async fn process_stream(
                 return match handshake {
                     Ok(Ok(tls_stream)) => {
                         session_log!(session, "info", "starttls_completed", {});
+                        let channel_bindings = acceptor.channel_bindings(tls_stream.get_ref().1);
                         // RFC 3207: all state is discarded; the client must EHLO again.
-                        Box::pin(process_stream(
+                        Box::pin(process_stream_with_bindings(
                             Box::new(tls_stream),
                             session.mail_root,
                             Some(acceptor),
@@ -237,6 +290,7 @@ pub(crate) async fn process_stream(
                             session.security,
                             service,
                             Some(session.trace),
+                            Some(channel_bindings),
                         ))
                         .await
                     }
@@ -476,20 +530,14 @@ impl Session {
         self.tx.bdat_started = false;
     }
 
-    /// tls-server-end-point binding data of this TLS session, if any.
-    fn channel_binding(&self) -> Option<&[u8]> {
-        if !self.encrypted {
-            return None;
-        }
-        self.tls_ctx
-            .as_deref()
-            .map(|context| context.server_end_point.as_slice())
-            .filter(|binding| !binding.is_empty())
+    /// This TLS session has channel-binding data for SCRAM-SHA-256-PLUS.
+    fn channel_binding_available(&self) -> bool {
+        self.encrypted && self.channel_bindings.is_available()
     }
 
     /// SCRAM-SHA-256-PLUS is configured and listed in the EHLO reply.
     fn scram_plus_advertised(&self) -> bool {
-        self.channel_binding().is_some()
+        self.channel_binding_available()
             && self
                 .security
                 .smtp_sasl_mechanisms
@@ -521,7 +569,7 @@ impl Session {
                     "250-AUTH {}\r\n",
                     protocol::advertised_sasl_mechanisms(
                         &self.security.smtp_sasl_mechanisms,
-                        self.channel_binding().is_some()
+                        self.channel_binding_available()
                     )
                 ));
             }
@@ -591,21 +639,38 @@ impl Session {
                 authenticate::handle_password(reader, &mechanism, initial, db_path, self.peer).await
             }
             "SCRAM-SHA-256" => {
-                let binding = authenticate::ScramBinding::Unsupported {
-                    plus_advertised: self.scram_plus_advertised(),
+                let policy = if self.scram_plus_advertised() {
+                    ScramChannelBindingPolicy::OfferedButNotSelected
+                } else {
+                    ScramChannelBindingPolicy::NotOffered
                 };
-                authenticate::handle_scram(reader, initial, db_path, self.peer, binding).await
+                authenticate::handle_scram(
+                    reader,
+                    initial,
+                    db_path,
+                    self.peer,
+                    policy,
+                    &self.channel_bindings,
+                )
+                .await
             }
             "SCRAM-SHA-256-PLUS" => {
-                let Some(server_end_point) = self.channel_binding() else {
+                if !self.channel_binding_available() {
                     return reply(
                         reader,
                         b"504 5.5.4 SCRAM-SHA-256-PLUS requires TLS channel binding\r\n",
                     )
                     .await;
-                };
-                let binding = authenticate::ScramBinding::TlsServerEndPoint(server_end_point);
-                authenticate::handle_scram(reader, initial, db_path, self.peer, binding).await
+                }
+                authenticate::handle_scram(
+                    reader,
+                    initial,
+                    db_path,
+                    self.peer,
+                    ScramChannelBindingPolicy::Required,
+                    &self.channel_bindings,
+                )
+                .await
             }
             "OAUTHBEARER" | "XOAUTH2" => {
                 let Some(validator) = self.oauth.as_ref() else {

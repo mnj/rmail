@@ -1922,6 +1922,140 @@ async fn auth_scram_sha256_plus_binds_to_the_tls_certificate_and_detects_downgra
 }
 
 #[tokio::test]
+async fn auth_scram_sha256_plus_accepts_tls_exporter_binding_on_tls13() {
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::{ProtocolVersion, ServerName};
+
+    let (_td, mail_root, db_path) = setup_mailbox();
+    let (cert_path, key_path) = rmail_common::test_support::localhost_cert();
+    let tls_context = super::tls::load_tls_context(cert_path, key_path).expect("TLS context");
+    let (client_config, _) = pinned_tls_client_config();
+
+    let (client, server) = duplex(32 * 1024);
+    let server_task = tokio::spawn(async move {
+        let tls_stream = tls_context
+            .acceptor
+            .accept(server)
+            .await
+            .expect("server TLS handshake");
+        let bindings = tls_context.channel_bindings(tls_stream.get_ref().1);
+        assert!(bindings.tls_exporter.is_some(), "TLS 1.3 exporter binding");
+        super::session::process_stream_with_bindings(
+            Box::new(tls_stream),
+            mail_root.to_string_lossy().to_string(),
+            Some(tls_context),
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+            SmtpService::Submission,
+            None,
+            Some(bindings),
+        )
+        .await
+    });
+    let tls_stream = TlsConnector::from(Arc::new(client_config))
+        .connect(ServerName::try_from("localhost").unwrap(), client)
+        .await
+        .expect("client TLS handshake");
+    assert_eq!(
+        tls_stream.get_ref().1.protocol_version(),
+        Some(ProtocolVersion::TLSv1_3)
+    );
+    let mut exporter = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", Some(&[]))
+        .expect("exporter");
+    let mut reader = BufReader::new(tls_stream);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.expect("greeting");
+    reader
+        .get_mut()
+        .write_all(b"EHLO client.example\r\n")
+        .await
+        .unwrap();
+    let capabilities = read_until(&mut reader, "250 ENHANCEDSTATUSCODES").await;
+    assert!(
+        capabilities.contains("SCRAM-SHA-256-PLUS"),
+        "{capabilities}"
+    );
+
+    let gs2 = "p=tls-exporter,,";
+    let bare = "n=user@example.test,r=exporternonce";
+    let first = BASE64_ENGINE.encode(format!("{gs2}{bare}"));
+    reader
+        .get_mut()
+        .write_all(format!("AUTH SCRAM-SHA-256-PLUS {first}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut challenge = String::new();
+    reader.read_line(&mut challenge).await.unwrap();
+    let server_first = String::from_utf8(
+        BASE64_ENGINE
+            .decode(challenge.trim().strip_prefix("334 ").expect("challenge"))
+            .unwrap(),
+    )
+    .unwrap();
+    let binding = BASE64_ENGINE.encode([gs2.as_bytes(), &exporter].concat());
+    let final_message = scram_client_final_with_binding("password", bare, &server_first, &binding);
+    reader
+        .get_mut()
+        .write_all(format!("{}\r\n", BASE64_ENGINE.encode(final_message)).as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert!(response.starts_with("235 2.7.0 "), "{response:?}");
+    reader.get_mut().write_all(b"QUIT\r\n").await.unwrap();
+    assert!(read_until(&mut reader, "221 ").await.contains("221 "));
+    server_task.await.expect("join").expect("server");
+}
+
+#[tokio::test]
+async fn scram_unknown_user_gets_a_stable_fake_challenge_and_fails_at_client_final() {
+    fn server_first(responses: &[String], nth: usize) -> String {
+        let challenge = responses
+            .iter()
+            .filter(|line| line.starts_with("334 "))
+            .nth(nth)
+            .expect("SCRAM challenge");
+        String::from_utf8(
+            BASE64_ENGINE
+                .decode(challenge.trim().strip_prefix("334 ").unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    let first = BASE64_ENGINE.encode("n,,n=nobody@example.test,r=fakenonce");
+    let final_message = BASE64_ENGINE.encode("c=biws,r=fakenonce,p=AAAA");
+    let input = format!(
+        "EHLO localhost\r\nAUTH SCRAM-SHA-256 {first}\r\n*\r\nAUTH SCRAM-SHA-256 {first}\r\n{final_message}\r\nQUIT\r\n"
+    );
+    let responses = run_encrypted_session(input.into_bytes(), 16 * 1024).await;
+    let first_challenge = server_first(&responses, 0);
+    let second_challenge = server_first(&responses, 1);
+    assert!(first_challenge.contains(",s="), "{first_challenge}");
+    let salt = |message: &str| {
+        message
+            .split(',')
+            .find(|part| part.starts_with("s="))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(salt(&first_challenge), salt(&second_challenge));
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("535 5.7.8 Authentication credentials invalid")),
+        "{responses:?}"
+    );
+}
+
+#[tokio::test]
 async fn scram_plus_is_not_offered_without_tls_binding_data() {
     let responses = run_encrypted_session(
         b"EHLO localhost\r\nAUTH SCRAM-SHA-256-PLUS cD10bHMtc2VydmVyLWVuZC1wb2ludCwsbj11LHI9eA==\r\nAUTH SCRAM-SHA-256 eSwsbj11c2VyQGV4YW1wbGUudGVzdCxyPWFiYw==\r\n*\r\nQUIT\r\n"

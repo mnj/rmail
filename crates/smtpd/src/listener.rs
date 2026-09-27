@@ -13,7 +13,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::time::timeout;
 
 use crate::limits::accept_connection_from;
-use crate::session::process_stream;
+use crate::session::process_stream_with_bindings;
 use crate::trace::{ConnectionTrace, emit_tracking};
 use crate::{STARTTLS_HANDSHAKE_TIMEOUT, SmtpService, tls};
 
@@ -84,30 +84,32 @@ pub(crate) async fn run_listener(
             let _session = session;
             let _permit = permit;
             let connection_id = trace.id.clone();
-            let stream: Box<dyn crate::AsyncStream + Send> = match tls_context.clone() {
-                Some(tls) if ctx.implicit_tls => {
-                    let started = Instant::now();
-                    let handshake =
-                        timeout(STARTTLS_HANDSHAKE_TIMEOUT, tls.acceptor.accept(stream)).await;
-                    metrics::observe_tls_handshake_duration(started.elapsed());
-                    match handshake {
-                        Ok(Ok(tls_stream)) => {
-                            smtp_log!("info", "tls_handshake_succeeded", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true });
-                            Box::new(tls_stream)
-                        }
-                        Ok(Err(error)) => {
-                            smtp_log!("error", "tls_handshake_failed", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true, "error": error.to_string() });
-                            return;
-                        }
-                        Err(_) => {
-                            smtp_log!("error", "tls_handshake_failed", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true, "error": "handshake timed out" });
-                            return;
+            let (stream, channel_bindings): (Box<dyn crate::AsyncStream + Send>, _) =
+                match tls_context.clone() {
+                    Some(tls) if ctx.implicit_tls => {
+                        let started = Instant::now();
+                        let handshake =
+                            timeout(STARTTLS_HANDSHAKE_TIMEOUT, tls.acceptor.accept(stream)).await;
+                        metrics::observe_tls_handshake_duration(started.elapsed());
+                        match handshake {
+                            Ok(Ok(tls_stream)) => {
+                                smtp_log!("info", "tls_handshake_succeeded", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true });
+                                let bindings = tls.channel_bindings(tls_stream.get_ref().1);
+                                (Box::new(tls_stream), Some(bindings))
+                            }
+                            Ok(Err(error)) => {
+                                smtp_log!("error", "tls_handshake_failed", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true, "error": error.to_string() });
+                                return;
+                            }
+                            Err(_) => {
+                                smtp_log!("error", "tls_handshake_failed", { "connection_id": connection_id, "peer": peer.to_string(), "implicit": true, "error": "handshake timed out" });
+                                return;
+                            }
                         }
                     }
-                }
-                _ => Box::new(stream),
-            };
-            if let Err(error) = process_stream(
+                    _ => (Box::new(stream), None),
+                };
+            if let Err(error) = process_stream_with_bindings(
                 stream,
                 ctx.mail_root,
                 tls_context,
@@ -119,6 +121,7 @@ pub(crate) async fn run_listener(
                 ctx.security,
                 ctx.service,
                 Some(trace),
+                channel_bindings,
             )
             .await
             {
