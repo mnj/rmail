@@ -1,0 +1,203 @@
+name: Release
+
+# Every merge to main runs CI, builds the packages and publishes two releases:
+#   vX.Y.Z  - immutable SemVer release, marked as the repository's "Latest"
+#   latest  - rolling release whose tag is moved to the newest build, with
+#             version-less asset names for stable download URLs
+#
+# Version bump (see scripts/next-version.sh):
+#   PR label release:major / release:minor / release:patch, else the PR title
+#   ("feat!:" -> major, "feat:" -> minor, anything else -> patch).
+#   Label release:skip, or "[skip release]" in the commit message, skips it.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  labels:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Ensure release labels exist
+        run: |
+          gh label create release:major --force --color B60205 --description "Release as a new major version"
+          gh label create release:minor --force --color FBCA04 --description "Release as a new minor version"
+          gh label create release:patch --force --color 0E8A16 --description "Release as a new patch version"
+          gh label create release:skip --force --color CCCCCC --description "Merge without publishing a release"
+
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      skip: ${{ steps.next.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          # Re-running a commit that already has a release reuses its version.
+          existing="$(git tag --points-at HEAD -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [[ -n "${existing}" ]]; then
+            echo "version=${existing#v}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Commit already released as ${existing}"
+            exit 0
+          fi
+
+          bump="${INPUT_BUMP:-auto}"
+          title=""
+          skip=false
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ "${COMMIT_MESSAGE}" == *"[skip release]"* ]]; then
+              skip=true
+            fi
+            pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '[.[] | select(.merged_at != null)][0] // empty')"
+            if [[ -n "${pr}" ]]; then
+              title="$(jq -r '.title' <<<"${pr}")"
+              labels="$(jq -r '.labels[].name' <<<"${pr}")"
+              echo "PR #$(jq -r '.number' <<<"${pr}"): ${title}"
+              if grep -qx 'release:skip' <<<"${labels}"; then
+                skip=true
+              elif grep -qx 'release:major' <<<"${labels}"; then
+                bump=major
+              elif grep -qx 'release:minor' <<<"${labels}"; then
+                bump=minor
+              elif grep -qx 'release:patch' <<<"${labels}"; then
+                bump=patch
+              fi
+            else
+              title="$(head -n1 <<<"${COMMIT_MESSAGE}")"
+            fi
+          fi
+
+          version="$(scripts/next-version.sh "${bump}" "${title}")"
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "::error::Tag v${version} already exists on another commit"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+          echo "Next version: ${version} (bump=${bump}, skip=${skip})"
+
+  build:
+    needs: [ci, version]
+    if: needs.version.outputs.skip != 'true'
+    strategy:
+      matrix:
+        include:
+          # 22.04 keeps the glibc floor low enough for Debian 12 / Ubuntu 22.04+.
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - uses: oven-sh/setup-bun@v2
+      - run: sudo apt-get update && sudo apt-get install -y dpkg-dev libssl-dev pkg-config
+      - run: packaging/debian/build-deb.sh "${{ needs.version.outputs.version }}" "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmail-${{ matrix.arch }}
+          path: |
+            target/debian/*.deb
+            target/debian/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish v${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* \
+              --target "${GITHUB_SHA}" \
+              --title "rMail ${VERSION}" \
+              --generate-notes \
+              --latest
+          fi
+
+      - name: Publish rolling latest
+        run: |
+          set -euo pipefail
+          mkdir latest
+          for f in dist/*.deb dist/*.tar.gz; do
+            name="$(basename "${f}")"
+            cp "${f}" "latest/${name/_${VERSION}_/_latest_}"
+          done
+          (cd latest && sha256sum * > SHA256SUMS)
+
+          notes="Rolling build of the newest release, currently [v${VERSION}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}) (${GITHUB_SHA::7})."
+          git tag -f latest "${GITHUB_SHA}"
+          git push -f origin refs/tags/latest
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --title "rMail latest (${VERSION})" --notes "${notes}" --latest=false
+            # Drop assets from older builds whose names no longer match.
+            for asset in $(gh release view latest --json assets --jq '.assets[].name'); do
+              [[ -e "latest/${asset}" ]] || gh release delete-asset latest "${asset}" -y
+            done
+            gh release upload latest latest/* --clobber
+          else
+            gh release create latest latest/* \
+              --verify-tag \
+              --title "rMail latest (${VERSION})" \
+              --notes "${notes}" \
+              --latest=false
+          fi

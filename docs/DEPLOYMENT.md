@@ -397,6 +397,25 @@ That allows binding privileged ports like `25`, `143`, `465`, and `993` without 
 
 Older packaging in this repository included systemd socket units, but the daemons do not currently implement socket activation. Shipping `.socket` units would be misleading and would not work correctly. If socket activation is wanted later, the daemons need explicit support for inherited listeners.
 
+## Prebuilt Releases
+
+Every merge to `main` runs CI and, when it passes, publishes packages for `amd64` and `arm64`
+(`.deb`, a plain `.tar.gz` of the same payload, and `SHA256SUMS`) to two GitHub releases:
+
+- `vX.Y.Z`: an immutable SemVer release, marked as the repository's latest release.
+- `latest`: a rolling release that always points at the newest build, with version-less asset
+  names such as `rmail_latest_amd64.deb`, so download URLs stay stable.
+
+The version is the last `vX.Y.Z` tag plus a bump chosen from the merged PR:
+
+- label `release:major`, `release:minor` or `release:patch`, otherwise
+- the PR title: `feat!:` (or `BREAKING CHANGE`) is major, `feat:` is minor, anything else is patch.
+
+Label a PR `release:skip`, or put `[skip release]` in the merge commit message, to merge without
+releasing. To jump to a specific version, set it in the crates' `Cargo.toml` files with
+`scripts/set-rust-version.sh`; a version ahead of the last tag is released as-is. A release can
+also be started by hand from the Actions tab (Release workflow, "Run workflow").
+
 ## Building A Debian Package
 
 This repository includes:

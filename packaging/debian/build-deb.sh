@@ -89,7 +89,7 @@ Section: mail
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: rMail Maintainers <noreply@example.invalid>
-Depends: systemd
+Depends: systemd, libssl3 | libssl3t64
 Description: rMail daemons and admin tools
  Minimal Rust mail stack packaged with SMTP, IMAP, web, outbound,
  webmail, mail classifier, and administrative CLI binaries for systemd-based
@@ -142,3 +142,8 @@ chmod 0755 "${PKG_ROOT}/DEBIAN/postrm"
 OUT_DEB="${ROOT_DIR}/target/debian/rmail_${VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "${PKG_ROOT}" "${OUT_DEB}"
 echo "Built ${OUT_DEB}"
+
+# Plain tarball of the same payload for non-Debian hosts.
+OUT_TAR="${ROOT_DIR}/target/debian/rmail_${VERSION}_linux_${ARCH}.tar.gz"
+tar --owner=0 --group=0 --exclude=./DEBIAN -C "${PKG_ROOT}" -czf "${OUT_TAR}" .
+echo "Built ${OUT_TAR}"
