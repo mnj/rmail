@@ -1103,6 +1103,192 @@ pub fn unflatten<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Value)>)
     Value::Object(root)
 }
 
+/// First line of the banner [`tidy_config`] adds; also marks a file as tidied.
+pub const TIDY_MARKER: &str = "# rMail: settings below were migrated to the database";
+
+/// Result of [`tidy_config`].
+pub struct TidyReport {
+    /// The rewritten file contents.
+    pub text: String,
+    /// Settings commented out because the database already holds them.
+    pub commented: usize,
+    /// Settings left active because their value differs from the database's
+    /// (the database wins, so these edits have no effect).
+    pub differing: Vec<String>,
+}
+
+/// Comment out the entries of a configuration file whose values were
+/// imported into the settings database, keeping the bootstrap keys and any
+/// entry the database does not hold identically. Comments, blank lines and
+/// layout are preserved, and running it again changes nothing.
+pub fn tidy_config(text: &str, file: &Value, stored: &BTreeMap<String, Value>) -> TidyReport {
+    let file_flat = flatten(file);
+    let mut differing = Vec::new();
+    let mut commented = 0;
+    // True when every value under `path` is stored unchanged.
+    let migrated = |path: &str, differing: &mut Vec<String>| -> bool {
+        let prefix = format!("{path}.");
+        let keys = file_flat
+            .iter()
+            .filter(|(key, _)| key.as_str() == path || key.starts_with(&prefix))
+            .collect::<Vec<_>>();
+        if keys.is_empty() || keys.iter().any(|(key, _)| is_bootstrap(key)) {
+            return false;
+        }
+        let mut all = true;
+        for (key, value) in keys {
+            if stored.get(key.as_str()) != Some(value) {
+                differing.push(key.clone());
+                all = false;
+            }
+        }
+        all
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut table: Option<String> = Some(String::new());
+    // Index in `out` of the current header and whether live lines follow it.
+    let mut header: Option<usize> = None;
+    let mut live = false;
+    let finish_section = |out: &mut Vec<String>, header: Option<usize>, live: bool| {
+        if let (Some(index), false) = (header, live) {
+            out[index] = format!("# {}", out[index]);
+        }
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            finish_section(&mut out, header, live);
+            let array_table = trimmed.starts_with("[[");
+            let name = trimmed
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .split('.')
+                .map(|part| part.trim().trim_matches(['"', '\'']))
+                .collect::<Vec<_>>()
+                .join(".");
+            table = (!array_table).then_some(name);
+            header = Some(out.len());
+            live = array_table;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        // A key = value statement, possibly spanning several lines.
+        let start = i;
+        let mut scan = ValueScan::default();
+        let eq = line.find('=').unwrap_or(line.len());
+        scan.advance(line.get(eq + 1..).unwrap_or(""));
+        i += 1;
+        while (scan.depth > 0 || scan.multiline.is_some()) && i < lines.len() {
+            scan.advance(lines[i]);
+            i += 1;
+        }
+        let key = line[..eq]
+            .split('.')
+            .map(|part| part.trim().trim_matches(['"', '\'']))
+            .collect::<Vec<_>>()
+            .join(".");
+        let hide = match &table {
+            Some(table) if !table.is_empty() => migrated(&format!("{table}.{key}"), &mut differing),
+            Some(_) => migrated(&key, &mut differing),
+            None => false,
+        };
+        if hide {
+            commented += 1;
+            out.extend(
+                lines[start..i]
+                    .iter()
+                    .map(|l| format!("# {l}").trim_end().to_string()),
+            );
+        } else {
+            live = true;
+            out.extend(lines[start..i].iter().map(|l| l.to_string()));
+        }
+    }
+    finish_section(&mut out, header, live);
+    differing.sort();
+    differing.dedup();
+    let mut text = out.join("\n");
+    text.push('\n');
+    if commented > 0 && !text.contains(TIDY_MARKER) {
+        text = format!(
+            "{TIDY_MARKER}.\n# They are managed in the admin console or with `rmail_ctl settings`; commented\n# entries are ignored. Only mail_root and db_path are read from this file.\n\n{text}"
+        );
+    }
+    TidyReport {
+        text,
+        commented,
+        differing,
+    }
+}
+
+/// Tracks bracket depth and multi-line strings across the lines of one TOML value.
+#[derive(Default)]
+struct ValueScan {
+    depth: i32,
+    multiline: Option<&'static str>,
+}
+
+impl ValueScan {
+    fn advance(&mut self, line: &str) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if let Some(delim) = self.multiline {
+                if delim == "\"\"\"" && bytes[i] == b'\\' {
+                    i += 2;
+                } else if line[i..].starts_with(delim) {
+                    self.multiline = None;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            match bytes[i] {
+                b'#' => return,
+                quote @ (b'"' | b'\'') => {
+                    let triple = if quote == b'"' { "\"\"\"" } else { "\'\'\'" };
+                    if line[i..].starts_with(triple) {
+                        self.multiline = Some(triple);
+                        i += 3;
+                        continue;
+                    }
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if quote == b'"' && bytes[i] == b'\\' {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                    i += 1;
+                }
+                b'[' | b'{' => {
+                    self.depth += 1;
+                    i += 1;
+                }
+                b']' | b'}' => {
+                    self.depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
 fn is_bootstrap(key: &str) -> bool {
     BOOTSTRAP_KEYS.contains(&key)
 }
@@ -1580,6 +1766,39 @@ mod tests {
         let config = resolve_config(value, "test").unwrap();
         assert_eq!(config.security.smtp_max_recipients, 7);
         assert_eq!(config.settings_revision, 0);
+    }
+
+    #[test]
+    fn tidy_config_comments_migrated_entries_only() {
+        let text = "# my server\n[global]\nmail_root = \"mail\"\ndb_path = \"x.db\"\nlog_level = \"debug\"\n\n[global.listeners]\nsmtp = [\n  \"[::]:25\", # mx\n]\nadmin = [\"[::]:8080\"]\n\n[security]\nsmtp_max_recipients = 7\n";
+        let file = serde_json::to_value(toml::from_str::<toml::Value>(text).unwrap()).unwrap();
+        let mut stored = BTreeMap::new();
+        for (key, value) in flatten(&file).into_iter().filter(|(k, _)| !is_bootstrap(k)) {
+            stored.insert(key, value);
+        }
+        stored.insert("global.listeners.admin".into(), json!(["127.0.0.1:8080"]));
+        let report = tidy_config(text, &file, &stored);
+        assert_eq!(report.commented, 3);
+        assert_eq!(report.differing, ["global.listeners.admin"]);
+        assert!(report.text.starts_with(TIDY_MARKER));
+        assert!(report.text.contains("\nmail_root = \"mail\"\n"));
+        assert!(report.text.contains("\n# log_level = \"debug\"\n"));
+        assert!(
+            report
+                .text
+                .contains("\n# smtp = [\n#   \"[::]:25\", # mx\n# ]\n")
+        );
+        assert!(report.text.contains("\nadmin = [\"[::]:8080\"]\n"));
+        assert!(
+            report
+                .text
+                .contains("\n# [security]\n# smtp_max_recipients = 7\n")
+        );
+        assert!(report.text.contains("\n[global.listeners]\n"));
+        // Still valid TOML with the same effective bootstrap keys, and stable.
+        let parsed: toml::Value = toml::from_str(&report.text).unwrap();
+        assert_eq!(parsed["global"]["mail_root"].as_str(), Some("mail"));
+        assert_eq!(tidy_config(&report.text, &file, &stored).text, report.text);
     }
 
     #[test]

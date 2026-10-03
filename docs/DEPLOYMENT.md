@@ -306,6 +306,10 @@ Every other setting lives in the `settings` table of that database:
 - Afterwards settings are edited on the console's **Settings** page or with
   `rmail_ctl settings list|get|set|unset`. Values still present in the file are ignored; each daemon
   logs the keys whose file value differs from the database.
+- `rmail_ctl settings tidy-config` comments out the file entries the database already holds
+  (keeping `mail_root` and `db_path`), after saving a `config.toml.pre-db` backup. Entries whose
+  value differs from the database stay active and are reported. Package upgrades run it
+  automatically; `--stdout` previews the result.
 - Daemons read settings at startup and record the revision they loaded. The Settings and System
   pages show which services must be restarted (for example
   `rmail_ctl service restart --unit smtpd`) and which changed keys each one is waiting for.

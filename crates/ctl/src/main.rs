@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use argon2::{
     Argon2,
     password_hash::{PasswordHasher, SaltString},
@@ -141,6 +141,13 @@ enum SettingsAction {
     Set { key: String, value: String },
     /// Remove a stored setting so its default applies
     Unset { key: String },
+    /// Comment out config-file entries that now live in the database, keeping
+    /// mail_root and db_path (writes a .pre-db backup unless --stdout)
+    TidyConfig {
+        /// Print the rewritten file instead of replacing it
+        #[arg(long)]
+        stdout: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,7 +211,11 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("{cfg_path} has no db_path; settings are file-only")
             })?;
             let mut conn = rmail_common::settings::open(&db_path)?;
-            run_settings(&mut conn, action)?;
+            if let SettingsAction::TidyConfig { stdout } = action {
+                tidy_config_file(&cfg_path, &conn, stdout)?;
+            } else {
+                run_settings(&mut conn, action)?;
+            }
         }
         Commands::AdminPassword {
             user,
@@ -716,6 +727,41 @@ fn run_systemctl(action: &str, unit: &str, dry_run: bool) -> Result<()> {
     }
 }
 
+fn tidy_config_file(
+    cfg_path: &str,
+    conn: &rmail_common::settings::Connection,
+    stdout: bool,
+) -> Result<()> {
+    use rmail_common::settings;
+    let text = std::fs::read_to_string(cfg_path).with_context(|| format!("reading {cfg_path}"))?;
+    let file = serde_json::to_value(toml::from_str::<toml::Value>(&text)?)?;
+    let report = settings::tidy_config(&text, &file, &settings::load_all(conn)?);
+    if stdout {
+        print!("{}", report.text);
+        return Ok(());
+    }
+    for key in &report.differing {
+        eprintln!("kept {key}: differs from the database, which takes precedence");
+    }
+    if report.text == text {
+        println!("{cfg_path} is already tidy");
+        return Ok(());
+    }
+    let backup = format!("{cfg_path}.pre-db");
+    if !std::path::Path::new(&backup).exists() {
+        std::fs::copy(cfg_path, &backup).with_context(|| format!("writing {backup}"))?;
+    }
+    let staged = format!("{cfg_path}.tmp");
+    std::fs::write(&staged, &report.text).with_context(|| format!("writing {staged}"))?;
+    std::fs::set_permissions(&staged, std::fs::metadata(cfg_path)?.permissions())?;
+    std::fs::rename(&staged, cfg_path).with_context(|| format!("replacing {cfg_path}"))?;
+    println!(
+        "commented out {} migrated entries in {cfg_path} (backup: {backup})",
+        report.commented
+    );
+    Ok(())
+}
+
 fn run_settings(
     conn: &mut rmail_common::settings::Connection,
     action: SettingsAction,
@@ -782,6 +828,7 @@ fn run_settings(
                 ),
             }
         }
+        SettingsAction::TidyConfig { .. } => unreachable!("handled by the caller"),
         SettingsAction::Unset { key } => {
             let revision = settings::update(
                 conn,
