@@ -232,7 +232,9 @@ certificate, private key, policy, and optional OCSP response.
 When `tls_cert` and `tls_key` are configured, SMTP, IMAP, admin web, and webmail share those
 credentials and the web services serve HTTPS. Set `web_http_only = true` when a reverse proxy
 terminates TLS; this affects only admin web and webmail and leaves mail-protocol TLS enabled.
-Without configured credentials, the web services remain available over HTTP.
+Without configured credentials, admin web and webmail serve HTTPS with a self-signed certificate that
+is generated once and kept in `<mail_root>/tls/selfsigned.pem` (browsers will warn); configure
+`tls_cert`/`tls_key` or automatic certificates to replace it. SMTP and IMAP stay without TLS.
 
 Each TLS daemon reloads its certificate when the certificate, key or OCSP file changes on disk
 (checked every 30 seconds, after the files have stopped changing) and on SIGHUP

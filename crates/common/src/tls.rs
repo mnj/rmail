@@ -29,12 +29,56 @@ pub fn web_tls_channel(global: &Global) -> anyhow::Result<(ServerTlsSender, Serv
         None
     } else {
         match (&global.tls_cert, &global.tls_key) {
-            (None, None) => None,
+            (None, None) => Some(self_signed_context(global)?),
             (Some(cert), Some(key)) => Some(load_server_tls_context(cert, key, &global.tls)?),
             _ => anyhow::bail!("TLS certificate and key must both be configured"),
         }
     };
     Ok(tokio::sync::watch::channel(context))
+}
+
+/// TLS for the web consoles when no certificate is configured: a self-signed
+/// one kept in `<mail_root>/tls` so browsers see the same certificate across
+/// restarts. Configure `global.tls_cert`/`tls_key` (or ACME) to replace it.
+fn self_signed_context(global: &Global) -> anyhow::Result<Arc<ServerTlsContext>> {
+    let dir = std::path::Path::new(&global.mail_root).join("tls");
+    let cert = dir.join("selfsigned.pem");
+    let key = dir.join("selfsigned.key");
+    let (cert_path, key_path) = (cert.to_string_lossy(), key.to_string_lossy());
+    if let Ok(context) = load_server_tls_context(&cert_path, &key_path, &global.tls) {
+        return Ok(context);
+    }
+    let mut names = vec![
+        global.server_hostname(),
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    names.dedup();
+    let generated = rcgen::generate_simple_self_signed(names)
+        .context("generating a self-signed certificate")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(&cert, generated.cert.pem())
+        .with_context(|| format!("writing {}", cert.display()))?;
+    write_private(&key, generated.key_pair.serialize_pem().as_bytes())
+        .with_context(|| format!("writing {}", key.display()))?;
+    crate::structured_log!("warn", "tls", "self_signed_generated", {
+        "certificate": cert_path,
+        "hint": "no global.tls_cert is configured; browsers will warn until a real certificate is installed",
+    });
+    load_server_tls_context(&cert_path, &key_path, &global.tls)
+}
+
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 pub fn spawn_web_tls_reloader(
@@ -274,6 +318,43 @@ fn cipher_suites(policy: &TlsPolicy) -> anyhow::Result<Vec<SupportedCipherSuite>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn global(mail_root: &std::path::Path, extra: &str) -> Global {
+        let text = format!("mail_root = \"{}\"\n{extra}", mail_root.display());
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn web_tls_falls_back_to_a_persistent_self_signed_certificate() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = global(temp.path(), "");
+        let (_, receiver) = web_tls_channel(&config).unwrap();
+        assert!(receiver.borrow().is_some());
+        let cert = temp.path().join("tls/selfsigned.pem");
+        let first = fs::read_to_string(&cert).unwrap();
+        assert!(first.contains("BEGIN CERTIFICATE"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(temp.path().join("tls/selfsigned.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The same certificate is reused on the next start.
+        web_tls_channel(&config).unwrap();
+        assert_eq!(fs::read_to_string(&cert).unwrap(), first);
+    }
+
+    #[test]
+    fn web_tls_stays_off_for_proxied_http_only_setups() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = global(temp.path(), "[tls]\nweb_http_only = true\n");
+        let (_, receiver) = web_tls_channel(&config).unwrap();
+        assert!(receiver.borrow().is_none());
+        assert!(!temp.path().join("tls").exists());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn reload_trigger_fires_once_replaced_files_settle() {
