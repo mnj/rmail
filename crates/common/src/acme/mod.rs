@@ -607,6 +607,13 @@ async fn issue(
     } else {
         directory_url(acme)?
     };
+    // Fail before the CA issues a certificate we could not save.
+    let (install_cert, install_key, repoint) = if options.dry_run {
+        let (cert, key, _) = certificate_paths(config);
+        (cert, key, false)
+    } else {
+        choose_install_paths(config, progress)?
+    };
     let provider = match acme.challenge {
         AcmeChallenge::Dns01 => Some(dns::Provider::from_config(&acme.dns)?),
         AcmeChallenge::Http01 => None,
@@ -617,7 +624,8 @@ async fn issue(
         .iter()
         .map(|name| Identifier::Dns(name.clone()))
         .collect::<Vec<_>>();
-    let (cert_path, key_path, _) = certificate_paths(config);
+    // The certificate currently in service, wherever the new one is installed.
+    let (cert_path, _, _) = certificate_paths(config);
     // Mark the order as replacing the current certificate (RFC 9773) when it
     // came from the same CA; the CA may exempt it from rate limits.
     let status = load_status(db_path).unwrap_or_default();
@@ -775,19 +783,26 @@ async fn issue(
             settings_updated: false,
         });
     }
-    install(&cert_path, &key_path, &chain_pem, &private_key_pem, config)?;
+    install(
+        &install_cert,
+        &install_key,
+        &chain_pem,
+        &private_key_pem,
+        config,
+    )?;
     progress.step(format!(
         "Installed {} and {}",
-        cert_path.display(),
-        key_path.display()
+        install_cert.display(),
+        install_key.display()
     ));
-    let settings_updated = point_settings_at(config, &cert_path, &key_path, progress)?;
+    let settings_updated =
+        point_settings_at(config, &install_cert, &install_key, repoint, progress)?;
     Ok(RunOutcome {
         names: info.names,
         not_after: info.not_after,
         installed: true,
-        cert_path: Some(cert_path.display().to_string()),
-        key_path: Some(key_path.display().to_string()),
+        cert_path: Some(install_cert.display().to_string()),
+        key_path: Some(install_key.display().to_string()),
         settings_updated,
     })
 }
@@ -949,9 +964,19 @@ fn write_temporary(path: &Path, contents: &[u8], private: bool) -> Result<PathBu
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(if private { 0o600 } else { 0o644 });
     }
-    let mut file = options.open(&temporary).with_context(|| {
-        format!(
-            "writing {} (is the directory writable?)",
+    let mut file = options.open(&temporary).map_err(|error| {
+        let hint = match error.raw_os_error() {
+            // EROFS / EACCES: the systemd units only let the daemons write under the
+            // mail root, so a certificate directory elsewhere (such as /etc/letsencrypt) is refused.
+            Some(30) | Some(13) => format!(
+                "; the rMail services may only write under their mail root. Unset global.tls_cert and global.tls_key to \
+                 keep certificates in <mail_root>/tls, or add ReadWritePaths={} to rmail_web.service (and make it writable by the rmail user)",
+                parent.display()
+            ),
+            _ => String::new(),
+        };
+        anyhow!(
+            "writing {} (is the directory writable?): {error}{hint}",
             temporary.display()
         )
     })?;
@@ -1020,15 +1045,52 @@ fn install(
     result
 }
 
+/// Where to install: the configured TLS paths when rMail can write there,
+/// otherwise the managed `<mail_root>/tls` (the services are sandboxed to the
+/// mail root, so certbot-era paths under /etc are read-only to them). The flag
+/// says the TLS settings must be pointed at the returned files. The old
+/// certificate keeps serving until they are, so there is no gap without TLS.
+fn choose_install_paths(
+    config: &Config,
+    progress: &mut Progress,
+) -> Result<(PathBuf, PathBuf, bool)> {
+    let probe = |cert: &Path, key: &Path| -> Result<()> {
+        for path in [cert, key] {
+            let temporary = write_temporary(path, b"", true)?;
+            let _ = fs::remove_file(temporary);
+        }
+        Ok(())
+    };
+    let (cert, key, repoint) = certificate_paths(config);
+    let Err(error) = probe(&cert, &key) else {
+        return Ok((cert, key, repoint));
+    };
+    if repoint {
+        return Err(error);
+    }
+    let dir = Path::new(&config.global.mail_root).join("tls");
+    let (managed_cert, managed_key) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+    if probe(&managed_cert, &managed_key).is_err() {
+        return Err(error);
+    }
+    progress.warn(format!(
+        "{} is not writable by rMail; issuing into {} instead and pointing global.tls_cert/tls_key there",
+        cert.display(),
+        dir.display()
+    ));
+    Ok((managed_cert, managed_key, true))
+}
+
 /// Point `global.tls_cert`/`tls_key` at the installed files when they were
-/// unset. Returns whether the settings changed.
+/// unset or `repoint` is set. Returns whether the settings changed.
 fn point_settings_at(
     config: &Config,
     cert_path: &Path,
     key_path: &Path,
+    repoint: bool,
     progress: &mut Progress,
 ) -> Result<bool> {
-    if config.global.tls_cert.is_some() && config.global.tls_key.is_some() {
+    if !repoint && config.global.tls_cert.is_some() && config.global.tls_key.is_some() {
         return Ok(false);
     }
     let Some(db_path) = config.global.db_path.as_deref() else {
@@ -1342,5 +1404,68 @@ mod tests {
             let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_certificate_directory_explains_the_sandbox() {
+        use std::os::unix::fs::PermissionsExt;
+        // Permission checks do not apply to root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let error = write_temporary(&dir.path().join("fullchain.pem"), b"", false).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("is the directory writable?"), "{text}");
+        assert!(text.contains("ReadWritePaths="), "{text}");
+        assert!(text.contains("global.tls_cert"), "{text}");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_configured_paths_fall_back_to_the_managed_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        // Permission checks do not apply to root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let locked = tempfile::tempdir().unwrap();
+        fs::set_permissions(locked.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let mut progress = Progress {
+            db_path: root.path().join("missing/rmail.db").display().to_string(),
+            record: RunRecord::default(),
+            echo: false,
+        };
+        let mail_root = root.path().join("mail");
+        let cfg = |cert_dir: &Path| {
+            config(&format!(
+                "tls_cert = \"{0}/c.pem\"\ntls_key = \"{0}/k.pem\"\n",
+                cert_dir.display()
+            ))
+        };
+        let mut writable = cfg(root.path());
+        writable.global.mail_root = mail_root.display().to_string();
+        let (cert, _, repoint) = choose_install_paths(&writable, &mut progress).unwrap();
+        assert_eq!(cert, root.path().join("c.pem"));
+        assert!(!repoint);
+
+        let mut readonly = cfg(locked.path());
+        readonly.global.mail_root = mail_root.display().to_string();
+        let (cert, key, repoint) = choose_install_paths(&readonly, &mut progress).unwrap();
+        assert_eq!(cert, mail_root.join("tls/fullchain.pem"));
+        assert_eq!(key, mail_root.join("tls/privkey.pem"));
+        assert!(repoint);
+        assert!(
+            progress
+                .record
+                .log
+                .iter()
+                .any(|line| line.message.contains("not writable"))
+        );
+        fs::set_permissions(locked.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
