@@ -273,6 +273,14 @@ are pointed there; restart the services once so they start serving TLS. Later re
 by the file watch above. The key is ECDSA P-256. OCSP stapling (`global.tls.ocsp_response`) cannot
 be combined with ACME certificates.
 
+The services run sandboxed and can only write under their mail root, so certificates live in
+`<mail_root>/tls` by default. If `global.tls_cert`/`global.tls_key` point somewhere rMail cannot write
+(for example a leftover certbot path under `/etc/letsencrypt`), issuing installs into `<mail_root>/tls`
+instead and points both settings there; the old certificate keeps serving until the services are
+restarted once. To keep a custom directory, add `ReadWritePaths=<dir>` to `rmail_web.service` with a
+drop-in and make the directory writable by the `rmail` user. The directory is checked before the CA is
+asked for a certificate, so a failure never wastes an issuance.
+
 `rmail_web` checks hourly and renews when the CA's ACME Renewal Information (RFC 9773) window opens,
 or after two thirds of the certificate's lifetime when the CA offers none; renewal orders name the
 certificate they replace. Failed attempts are retried after one hour, doubling up to a day. Account
