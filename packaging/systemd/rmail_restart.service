@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart rMail services requested from the admin console
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rmail_ctl service apply-request --file /opt/rmail/mail/restart-request
+ProtectHome=true
+PrivateTmp=true

@@ -124,6 +124,7 @@ export type SettingsView =
       settings: Setting[];
       other: { key: string; value: unknown }[];
       services: ServiceState[];
+      restart_available?: boolean;
     };
 
 export type CertificateInfo = { subject: string; names: string[]; issuer: string; not_before: number; not_after: number; serial: string; self_signed: boolean };

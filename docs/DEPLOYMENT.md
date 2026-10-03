@@ -309,6 +309,11 @@ Every other setting lives in the `settings` table of that database:
 - Daemons read settings at startup and record the revision they loaded. The Settings and System
   pages show which services must be restarted (for example
   `rmail_ctl service restart --unit smtpd`) and which changed keys each one is waiting for.
+- The Settings page's **Restart** button queues `<mail_root>/restart-request`; the root-owned
+  `rmail_restart.path` unit (enabled by the package) runs `rmail_ctl service apply-request`, which
+  restarts only the services waiting on saved changes. The packaged units watch `/opt/rmail/mail`;
+  edit `rmail_restart.path` and `rmail_restart.service` if `mail_root` differs. Without the unit the
+  page shows the `rmail_ctl service restart` command instead.
 - Secrets (admin password hash, OAuth client secret, session signing keys) are stored in the same
   database and are never returned by the API.
 

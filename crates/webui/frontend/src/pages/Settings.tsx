@@ -109,6 +109,7 @@ export function SettingsPage() {
   const [filter, setFilter] = useState('');
   const [group, setGroup] = useState<string>('all');
   const [saving, setSaving] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const view = resource.data;
 
   // Certificate settings have their own page.
@@ -160,6 +161,23 @@ export function SettingsPage() {
     if (ok) notify('info', 'Restart the affected services to apply the changes.');
   }
 
+  async function restart() {
+    const names = view.services.filter((service) => service.restart_required).map((service) => service.service);
+    const ok = await confirm({
+      title: `Restart ${names.join(', ')}?`,
+      message: names.includes('web')
+        ? 'Active connections to these services are dropped. This console restarts too, so it is unavailable for a few seconds.'
+        : 'Active connections to these services are dropped while they restart.',
+      confirmLabel: 'Restart',
+    });
+    if (!ok) return;
+    setRestarting(true);
+    const queued = await run(() => api('/api/services/restart', 'POST'), 'Restart requested');
+    // Services record their new revision as they come back up.
+    if (queued) for (const delay of [3000, 8000, 15000]) window.setTimeout(() => resource.reload(), delay);
+    window.setTimeout(() => setRestarting(false), 15000);
+  }
+
   async function reset(setting: Setting) {
     const ok = await confirm({
       title: `Reset ${setting.label}?`,
@@ -190,7 +208,9 @@ export function SettingsPage() {
             {restartNeeded.map((service) => (
               <p key={service.service}><code>{service.service}</code> — {service.pending_changes.join(', ')}</p>
             ))}
-            <p>Run <code>rmail_ctl service restart {restartNeeded.map((service) => `--unit ${service.service}`).join(' ')}</code> or restart the systemd units.</p>
+            {view.restart_available
+              ? <button className="button primary" onClick={restart} disabled={restarting}><RefreshCw size={16} />{restarting ? 'Restarting…' : `Restart ${restartNeeded.map((service) => service.service).join(', ')}`}</button>
+              : <p>Run <code>rmail_ctl service restart {restartNeeded.map((service) => `--unit ${service.service}`).join(' ')}</code> or restart the systemd units.</p>}
           </div>
         </div>
       )}

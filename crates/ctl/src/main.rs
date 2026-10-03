@@ -169,6 +169,13 @@ enum ServiceAction {
     Reload(ServiceCommandOptions),
     /// Show rMail service status
     Status(ServiceCommandOptions),
+    /// Restart the services named in a request file written by the admin console
+    /// (run by rmail_restart.service; the file is consumed)
+    ApplyRequest {
+        /// Request file, normally <mail_root>/restart-request
+        #[arg(long)]
+        file: String,
+    },
 }
 
 #[derive(clap::Args, Clone)]
@@ -526,6 +533,7 @@ async fn main() -> Result<()> {
             ServiceAction::Restart(opts) => run_service_action("restart", opts)?,
             ServiceAction::Reload(opts) => reload_services(opts)?,
             ServiceAction::Status(opts) => run_service_action("status", opts)?,
+            ServiceAction::ApplyRequest { file } => apply_restart_request(&file)?,
         },
         Commands::Acme { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
@@ -666,6 +674,24 @@ fn normalize_unit_name(name: &str) -> Result<&'static str> {
         "unknown rMail service {trimmed:?}; expected one of: {}",
         RMAIL_SYSTEMD_UNITS.join(", ")
     ))
+}
+
+/// Restart the services in an admin-console request, the web console last so
+/// its own restart cannot cut the others short. The file is removed first so a
+/// failing unit cannot make the path unit re-trigger forever.
+fn apply_restart_request(file: &str) -> Result<()> {
+    let path = std::path::Path::new(file);
+    let services = rmail_common::restart::read_request(path);
+    std::fs::remove_file(path).ok();
+    let mut units = services?
+        .iter()
+        .map(|name| normalize_unit_name(name))
+        .collect::<Result<Vec<_>>>()?;
+    units.sort_by_key(|unit| *unit == "rmail_web.service");
+    for unit in units {
+        run_systemctl("restart", unit, false)?;
+    }
+    Ok(())
 }
 
 fn run_service_action(action: &str, opts: ServiceCommandOptions) -> Result<()> {

@@ -112,6 +112,7 @@ pub(crate) fn router(state: Shared) -> Router {
             post(save_catchall).delete(delete_catchall),
         )
         .route("/api/settings", get(settings).put(update_settings))
+        .route("/api/services/restart", post(restart_services))
         .route("/api/admin/credentials", post(change_credentials))
         .merge(organization::routes())
         .merge(certificates::routes())
@@ -913,6 +914,44 @@ async fn update_settings(
         web_log!("info", "settings_updated", { "peer": peer.0.map(|a| a.to_string()), "revision": view["revision"] });
     }
     outcome(result, StatusCode::UNPROCESSABLE_ENTITY)
+}
+
+/// Queue a restart of the services whose saved settings are not yet applied.
+/// A root-owned systemd path unit performs it (see `rmail_common::restart`).
+async fn restart_services(
+    State(state): State<Shared>,
+    Extension(peer): Extension<Peer>,
+) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    if !rmail_common::restart::helper_installed() {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "the rmail_restart.path unit is not installed; restart services with rmail_ctl",
+        );
+    }
+    let mail_root = state.mail_root.clone();
+    let result = blocking(move || {
+        let conn = rmail_common::settings::open(&db)?;
+        let pending = rmail_common::settings::describe(&conn)?
+            .services
+            .into_iter()
+            .filter(|service| service.restart_required)
+            .map(|service| service.service)
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            anyhow::bail!("no services are waiting for a restart");
+        }
+        rmail_common::restart::write_request(&mail_root, &pending)?;
+        Ok(json!({"restarting": pending}))
+    })
+    .await;
+    if let Ok(body) = &result {
+        web_log!("info", "services_restart_requested", { "peer": peer.0.map(|a| a.to_string()), "services": body["restarting"] });
+    }
+    outcome(result, StatusCode::BAD_REQUEST)
 }
 
 #[derive(Deserialize)]

@@ -1110,6 +1110,7 @@ fn settings_view_sync(db_path: &str) -> Result<serde_json::Value> {
     let conn = rmail_common::settings::open(db_path)?;
     let mut view = serde_json::to_value(rmail_common::settings::describe(&conn)?)?;
     view["managed"] = json!(true);
+    view["restart_available"] = json!(rmail_common::restart::helper_installed());
     Ok(view)
 }
 
