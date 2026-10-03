@@ -161,8 +161,7 @@ export function SettingsPage() {
     if (ok) notify('info', 'Restart the affected services to apply the changes.');
   }
 
-  async function restart() {
-    const names = view.services.filter((service) => service.restart_required).map((service) => service.service);
+  async function restart(names: string[]) {
     const ok = await confirm({
       title: `Restart ${names.join(', ')}?`,
       message: names.includes('web')
@@ -209,7 +208,7 @@ export function SettingsPage() {
               <p key={service.service}><code>{service.service}</code> — {service.pending_changes.join(', ')}</p>
             ))}
             {view.restart_available
-              ? <button className="button primary" onClick={restart} disabled={restarting}><RefreshCw size={16} />{restarting ? 'Restarting…' : `Restart ${restartNeeded.map((service) => service.service).join(', ')}`}</button>
+              ? <button className="button primary" onClick={() => restart(restartNeeded.map((service) => service.service))} disabled={restarting}><RefreshCw size={16} />{restarting ? 'Restarting…' : `Restart ${restartNeeded.map((service) => service.service).join(', ')}`}</button>
               : <p>Run <code>rmail_ctl service restart {restartNeeded.map((service) => `--unit ${service.service}`).join(' ')}</code> or restart the systemd units.</p>}
           </div>
         </div>

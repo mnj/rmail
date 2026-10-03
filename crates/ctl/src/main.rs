@@ -676,10 +676,10 @@ fn normalize_unit_name(name: &str) -> Result<&'static str> {
     ))
 }
 
-/// Restart the services in an admin-console request, the web console last so
-/// its own restart cannot cut the others short. The file is removed first so a
-/// failing unit cannot make the path unit re-trigger forever.
-fn apply_restart_request(file: &str) -> Result<()> {
+/// Consume an admin-console request and return its units in restart order, the
+/// web console last so its own restart cannot cut the others short. The file
+/// is removed first so a failing unit cannot make the path unit re-trigger.
+fn take_restart_request(file: &str) -> Result<Vec<&'static str>> {
     let path = std::path::Path::new(file);
     let services = rmail_common::restart::read_request(path);
     std::fs::remove_file(path).ok();
@@ -688,7 +688,11 @@ fn apply_restart_request(file: &str) -> Result<()> {
         .map(|name| normalize_unit_name(name))
         .collect::<Result<Vec<_>>>()?;
     units.sort_by_key(|unit| *unit == "rmail_web.service");
-    for unit in units {
+    Ok(units)
+}
+
+fn apply_restart_request(file: &str) -> Result<()> {
+    for unit in take_restart_request(file)? {
         run_systemctl("restart", unit, false)?;
     }
     Ok(())
@@ -821,7 +825,7 @@ fn run_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceCommandOptions, normalize_unit_name, selected_units};
+    use super::{ServiceCommandOptions, normalize_unit_name, selected_units, take_restart_request};
 
     #[test]
     fn normalizes_service_short_names() {
@@ -831,6 +835,28 @@ mod tests {
             "rmail_webmail.service"
         );
         assert!(normalize_unit_name("unknown").is_err());
+    }
+
+    #[test]
+    fn restart_request_is_consumed_with_web_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("restart-request");
+        std::fs::write(&file, "web\nsmtpd\nwebmail\n").unwrap();
+        let units = take_restart_request(file.to_str().unwrap()).unwrap();
+        assert_eq!(
+            units,
+            [
+                "rmail_smtpd.service",
+                "rmail_webmail.service",
+                "rmail_web.service"
+            ]
+        );
+        assert!(!file.exists());
+
+        // An invalid request is removed too, so it cannot re-trigger the path unit.
+        std::fs::write(&file, "sshd\n").unwrap();
+        assert!(take_restart_request(file.to_str().unwrap()).is_err());
+        assert!(!file.exists());
     }
 
     #[test]

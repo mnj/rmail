@@ -1969,6 +1969,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_endpoint_needs_a_database_and_the_helper_unit() {
+        let td = tempdir().unwrap();
+        let no_db = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            None,
+            None,
+            ReadinessConfig::default(),
+        ));
+        let response = send_to_state(no_db, "t", post("/api/services/restart", "", "")).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+
+        let db = td.path().join("rmail.db");
+        rmail_common::settings::open(db.to_str().unwrap()).unwrap();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            Some(db.display().to_string()),
+            None,
+            ReadinessConfig::default(),
+        ));
+        let response = send_to_state(state, "t", post("/api/services/restart", "", "")).await;
+        let expected = if rmail_common::restart::helper_installed() {
+            "HTTP/1.1 400" // nothing is waiting for a restart
+        } else {
+            "HTTP/1.1 501"
+        };
+        assert!(response.starts_with(expected), "{response}");
+        assert!(!rmail_common::restart::request_path(td.path()).exists());
+    }
+
+    #[tokio::test]
     async fn oversized_bodies_are_rejected_before_allocation() {
         let td = tempdir().unwrap();
         let state = Arc::new(api::AdminState::new(

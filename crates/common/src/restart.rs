@@ -41,6 +41,23 @@ pub fn write_request(mail_root: &Path, services: &[String]) -> Result<()> {
     fs::rename(&staged, &path).with_context(|| format!("queueing {path:?}"))
 }
 
+/// Queue a restart of every service whose saved settings are not yet applied
+/// and return their names. Errors when nothing is waiting.
+pub fn queue_pending(db_path: &str, mail_root: &Path) -> Result<Vec<String>> {
+    let conn = crate::settings::open(db_path)?;
+    let pending = crate::settings::describe(&conn)?
+        .services
+        .into_iter()
+        .filter(|service| service.restart_required)
+        .map(|service| service.service)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        bail!("no services are waiting for a restart");
+    }
+    write_request(mail_root, &pending)?;
+    Ok(pending)
+}
+
 /// Read a queued request, rejecting anything but a small regular file of known service names.
 pub fn read_request(path: &Path) -> Result<Vec<String>> {
     let meta = fs::symlink_metadata(path).with_context(|| format!("reading {path:?}"))?;
@@ -82,5 +99,50 @@ mod tests {
         );
         assert!(write_request(dir.path(), &["sshd".to_string()]).is_err());
         assert!(write_request(dir.path(), &[]).is_err());
+    }
+
+    #[test]
+    fn read_request_rejects_oversized_and_non_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        fs::write(&big, "smtpd\n".repeat(400)).unwrap();
+        assert!(read_request(&big).is_err());
+        assert!(read_request(dir.path()).is_err());
+        let link = dir.path().join("link");
+        let target = dir.path().join("target");
+        fs::write(&target, "smtpd").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_request(&link).is_err());
+        assert!(read_request(&dir.path().join("missing")).is_err());
+        assert_eq!(read_request(&target).unwrap(), ["smtpd"]);
+    }
+
+    #[test]
+    fn queue_pending_lists_only_services_waiting_on_changes() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rmail.db");
+        let text = format!(
+            "[global]\nmail_root = \"m\"\ndb_path = \"{}\"\n",
+            db.display()
+        );
+        let file = serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap();
+        let config = crate::settings::resolve_config(file, "test").unwrap();
+        let db_path = db.to_str().unwrap();
+        crate::settings::record_service_start(&config, "smtpd").unwrap();
+        assert!(queue_pending(db_path, dir.path()).is_err());
+        assert!(!request_path(dir.path()).exists());
+
+        let mut conn = crate::settings::open(db_path).unwrap();
+        crate::settings::update(
+            &mut conn,
+            &std::collections::BTreeMap::from([(
+                "security.smtp_max_recipients".to_string(),
+                json!(5),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(queue_pending(db_path, dir.path()).unwrap(), ["smtpd"]);
+        assert_eq!(read_request(&request_path(dir.path())).unwrap(), ["smtpd"]);
     }
 }

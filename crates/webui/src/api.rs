@@ -934,17 +934,7 @@ async fn restart_services(
     }
     let mail_root = state.mail_root.clone();
     let result = blocking(move || {
-        let conn = rmail_common::settings::open(&db)?;
-        let pending = rmail_common::settings::describe(&conn)?
-            .services
-            .into_iter()
-            .filter(|service| service.restart_required)
-            .map(|service| service.service)
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            anyhow::bail!("no services are waiting for a restart");
-        }
-        rmail_common::restart::write_request(&mail_root, &pending)?;
+        let pending = rmail_common::restart::queue_pending(&db, &mail_root)?;
         Ok(json!({"restarting": pending}))
     })
     .await;
