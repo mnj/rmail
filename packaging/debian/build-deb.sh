@@ -79,6 +79,8 @@ install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_web.service" "${PKG_ROOT}/u
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_webmail.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_webmail.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_outbound.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_outbound.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_classifier.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_classifier.service"
+install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_restart.path" "${PKG_ROOT}/usr/lib/systemd/system/rmail_restart.path"
+install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_restart.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_restart.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail.env" "${PKG_ROOT}/etc/default/rmail"
 install -m 0644 "${ROOT_DIR}/config/example.toml" "${PKG_ROOT}/etc/rmail/config.toml"
 
@@ -113,6 +115,8 @@ fi
 mkdir -p /opt/rmail/mail /opt/rmail/config /etc/rmail
 chown -R rmail:rmail /opt/rmail
 systemctl daemon-reload || true
+# Lets the admin console restart services after settings changes.
+systemctl enable --now rmail_restart.path >/dev/null 2>&1 || true
 if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
   systemctl enable \
     rmail_smtpd.service \

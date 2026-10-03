@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply rMail service restart requests from the admin console
+
+[Path]
+# The default mail_root; change both this and rmail_restart.service together.
+PathExists=/opt/rmail/mail/restart-request
+Unit=rmail_restart.service
+
+[Install]
+WantedBy=multi-user.target
