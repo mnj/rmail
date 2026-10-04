@@ -21,7 +21,7 @@ const pageMeta: Record<Page, { path: string; label: string; description: string;
   accounts: { path: '/accounts', label: 'Mailboxes', description: 'Create mailboxes, reset passwords and manage quotas.', icon: Users },
   routing: { path: '/routing', label: 'Routing', description: 'Aliases and per-domain catchalls.', icon: Network },
   delivery: { path: '/delivery', label: 'Delivery', description: 'Inspect and recover the outbound queue.', icon: Send },
-  organization: { path: '/organization', label: 'Organization', description: 'Download, choose and test the local models that suggest folders for new mail.', icon: FolderTree },
+  organization: { path: '/organization', label: 'Organization', description: 'Choose, download and test the local or hosted models that suggest folders for new mail.', icon: FolderTree },
   settings: { path: '/settings', label: 'Settings', description: 'Listeners, TLS, authentication, limits and filtering. Stored in the database.', icon: SlidersHorizontal },
   certificates: { path: '/certificates', label: 'Certificates', description: 'Automatic certificates from Let\'s Encrypt or another ACME CA, renewed and reloaded without restarts.', icon: LockKeyhole },
   observability: { path: '/observability', label: 'Logs & metrics', description: 'Daemon logs and Prometheus telemetry.', icon: Activity },

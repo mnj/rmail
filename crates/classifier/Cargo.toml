@@ -23,6 +23,8 @@ tokio = { version = "1", features = ["full"] }
 rmail_common = { path = "../common" }
 llama-cpp-2 = { version = "0.1.157", default-features = false, features = ["openmp"], optional = true }
 encoding_rs = { version = "0.8", optional = true }
+# Hosted providers (OpenRouter, TypeSafe). Calls run on blocking worker threads.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3.5"

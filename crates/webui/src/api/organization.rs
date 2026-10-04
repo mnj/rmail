@@ -61,6 +61,7 @@ fn socket(state: &Shared) -> std::path::PathBuf {
 }
 
 /// Current `classifier.*` settings, from the database when there is one.
+/// Secrets such as API keys are reported only as `true` (set).
 fn current_settings(db: Option<&str>) -> anyhow::Result<BTreeMap<String, Value>> {
     let Some(db) = db else {
         return Ok(BTreeMap::new());
@@ -69,6 +70,10 @@ fn current_settings(db: Option<&str>) -> anyhow::Result<BTreeMap<String, Value>>
     Ok(rmail_common::settings::load_all(&conn)?
         .into_iter()
         .filter_map(|(key, value)| {
+            let secret = rmail_common::settings::spec_for(&key).is_some_and(|spec| {
+                matches!(spec.kind, rmail_common::settings::SettingKind::Secret)
+            });
+            let value = if secret { Value::Bool(true) } else { value };
             key.strip_prefix("classifier.")
                 .map(|k| (k.to_string(), value))
         })

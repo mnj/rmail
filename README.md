@@ -49,7 +49,7 @@ demo instance on loopback ports, fills it with sample data and captures both app
 - crates/queue-manager, crates/queuectl — outbound spool management
 - crates/webui — admin console (`rmail_web`) and its React/Vite frontend
 - crates/webmail — user-facing webmail server and React/Vite SPA
-- crates/classifier — `rmail_classifier`, optional folder suggestions from local GGUF models (llama.cpp in-process)
+- crates/classifier — `rmail_classifier`, optional folder suggestions from local GGUF models (llama.cpp in-process) or hosted providers (OpenRouter, TypeSafe Jev), with per-user consent
 - crates/ctl — `rmail_ctl` CLI for accounts, settings, certificates and services
 - crates/bench — live performance workloads
 - site — the GitHub Pages project site, deployed by `.github/workflows/pages.yml`

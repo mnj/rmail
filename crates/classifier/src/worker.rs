@@ -23,6 +23,12 @@ const LEARN_BUDGET: usize = 256;
 const EMBED_BATCH: usize = 16;
 /// INBOX messages given suggestions when an account first opts in.
 const INITIAL_INBOX_SUGGESTIONS: usize = 50;
+/// Messages labeled per account per cycle; each is one model call.
+const LABEL_BUDGET: usize = 32;
+/// INBOX messages labeled when an account first turns labels on.
+const INITIAL_INBOX_LABELS: usize = 50;
+/// Most labels put on one message.
+const MAX_LABELS_PER_MESSAGE: usize = 3;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct CycleReport {
@@ -31,12 +37,17 @@ pub struct CycleReport {
     pub classified: usize,
     pub suggested: usize,
     pub moved: usize,
+    /// Messages that got at least one label.
+    pub labeled: usize,
+    /// Opted-in accounts skipped (in whole or in part) because a model is a
+    /// cloud provider their user has not agreed to.
+    pub awaiting_consent: usize,
     pub errors: Vec<String>,
 }
 
 pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> CycleReport {
     let mut report = CycleReport::default();
-    if !cfg.enabled || models.embedder.is_none() {
+    if !cfg.enabled || (models.embedder.is_none() && models.chooser.is_none()) {
         return report;
     }
     let accounts = match imap_state::list_accounts(mail_root) {
@@ -57,11 +68,24 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
                 continue;
             }
         };
-        match store::prefs(&conn) {
-            Ok(prefs) if prefs.enabled => {}
+        let prefs = match store::prefs(&conn) {
+            Ok(prefs) if prefs.any_enabled() => prefs,
             _ => continue,
-        }
+        };
         drop(conn);
+        // Mail only reaches a cloud provider the account's user agreed to.
+        let allowed = |provider: Option<&str>| provider.is_none_or(|p| prefs.allows_cloud(&[p]));
+        let embed_allowed = allowed(models.embed_cloud());
+        let chat_allowed = allowed(models.chat_cloud());
+        let folders = prefs.enabled && models.embedder.is_some() && embed_allowed;
+        // Labels have no local stand-in for a cloud model the user refused.
+        let labels = prefs.labels_enabled && models.chooser.is_some() && chat_allowed;
+        if (prefs.enabled && !embed_allowed) || (prefs.labels_enabled && !chat_allowed) {
+            report.awaiting_consent += 1;
+        }
+        if !folders && !labels {
+            continue;
+        }
         report.accounts += 1;
         let mut account = Account {
             mail_root,
@@ -69,9 +93,18 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
             localpart: &localpart,
             cfg,
             models,
+            use_chooser: chat_allowed,
             report: &mut report,
         };
-        if let Err(error) = account.run() {
+        // Label first, so messages auto-moved by the folder pass keep their labels.
+        let mut result = Ok(());
+        if labels {
+            result = account.label_inbox();
+        }
+        if folders && result.is_ok() {
+            result = account.run();
+        }
+        if let Err(error) = result {
             classifier_log!("warn", "account_cycle_failed", { "account": format!("{localpart}@{domain}"), "error": format!("{error:#}") });
             report
                 .errors
@@ -87,10 +120,112 @@ struct Account<'a> {
     localpart: &'a str,
     cfg: &'a ClassifierConfig,
     models: &'a Models,
+    /// False when the chooser is a cloud provider this user has not agreed to.
+    use_chooser: bool,
     report: &'a mut CycleReport,
 }
 
 impl Account<'_> {
+    /// Apply the user's labels to new INBOX mail as IMAP keywords. Resumes
+    /// from its own watermark; a failed model call leaves the message for
+    /// the next cycle.
+    fn label_inbox(&mut self) -> Result<()> {
+        let chooser = self.models.chooser.clone().context("no fallback model")?;
+        let conn = store::open_existing(self.mail_root, self.domain, self.localpart)?
+            .context("store disappeared")?;
+        store::seed_starter_labels(&conn)?;
+        let mut labels = store::labels(&conn)?;
+        let (inbox, messages) =
+            imap_state::load_folder(self.mail_root, self.domain, self.localpart, "INBOX")?;
+        let mark = store::label_mark(&conn)?;
+        let high = messages.iter().map(|m| m.uid).max().unwrap_or(0);
+        let first = mark.is_none_or(|m| m.uidvalidity != inbox.uidvalidity);
+        let discover = self.cfg.label_discovery;
+        if labels.is_empty() && !discover {
+            // Nothing to apply; start from new mail once labels exist.
+            return store::set_label_mark(
+                &conn,
+                Watermark {
+                    uidvalidity: inbox.uidvalidity,
+                    last_uid: high,
+                },
+            );
+        }
+        let mut pending: Vec<&Message> = if first {
+            newest(&messages, INITIAL_INBOX_LABELS)
+        } else {
+            let last = mark.map_or(0, |m| m.last_uid);
+            messages.iter().filter(|m| m.uid > last).collect()
+        };
+        pending.sort_by_key(|m| m.uid);
+        let hint = |label: &store::Label| crate::engine::LabelHint {
+            name: label.name.clone(),
+            description: label.description.clone(),
+        };
+        let mut hints: Vec<crate::engine::LabelHint> = labels.iter().map(hint).collect();
+        let threshold = self.cfg.label_confidence as f64 / 100.0;
+        let mut done = mark.filter(|_| !first).map_or(0, |m| m.last_uid);
+        let caught_up = pending.len() <= LABEL_BUDGET;
+        for message in pending.into_iter().take(LABEL_BUDGET) {
+            if let Some(doc) = read_document(&message.path, self.cfg) {
+                let answer = chooser.label(&doc.text, &hints, discover)?;
+                let mut applied: Vec<(String, f64)> = answer
+                    .labels
+                    .into_iter()
+                    .filter(|(_, probability)| *probability >= threshold)
+                    .collect();
+                applied.sort_by(|a, b| b.1.total_cmp(&a.1));
+                applied.truncate(MAX_LABELS_PER_MESSAGE);
+                // The model found no fitting label and named one; it applies
+                // to this message and is offered for later mail.
+                if let Some((name, description)) = answer.proposed
+                    && applied.len() < MAX_LABELS_PER_MESSAGE
+                    && let Some(label) = store::add_ai_label(&conn, &name, &description)?
+                {
+                    classifier_log!("info", "label_created", { "account": self.name(), "label": label.name });
+                    hints.push(hint(&label));
+                    applied.push((label.name.clone(), 1.0));
+                    labels.push(label);
+                }
+                for (name, _) in &applied {
+                    if let Some(label) = labels.iter().find(|label| &label.name == name) {
+                        store::set_keyword(
+                            self.mail_root,
+                            self.domain,
+                            self.localpart,
+                            "INBOX",
+                            message.uid,
+                            &label.keyword,
+                            true,
+                        )?;
+                    }
+                }
+                if !applied.is_empty() {
+                    store::record_labels(&conn, inbox.uidvalidity, message.uid, &applied)?;
+                    self.report.labeled += 1;
+                }
+            }
+            done = done.max(message.uid);
+            store::set_label_mark(
+                &conn,
+                Watermark {
+                    uidvalidity: inbox.uidvalidity,
+                    last_uid: done,
+                },
+            )?;
+        }
+        if caught_up {
+            store::set_label_mark(
+                &conn,
+                Watermark {
+                    uidvalidity: inbox.uidvalidity,
+                    last_uid: high.max(done),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<()> {
         let embedder = self.models.embedder.clone().context("no embedding model")?;
         let conn = store::open_existing(self.mail_root, self.domain, self.localpart)?
@@ -278,7 +413,7 @@ impl Account<'_> {
                     dismissed: &dismissed,
                 },
                 self.cfg,
-                self.models.chooser.as_deref(),
+                self.models.chooser.as_deref().filter(|_| self.use_chooser),
             )?;
             self.report.classified += 1;
             if let Some(decision) = decision {
@@ -402,15 +537,31 @@ fn read_document(path: &Path, cfg: &ClassifierConfig) -> Option<pipeline::Docume
 }
 
 /// Counts shown by the control socket's status command.
-pub fn folder_counts(mail_root: &Path) -> BTreeMap<String, usize> {
+/// Accounts by opt-in state (to folder suggestions or labels);
+/// `labels_enabled` counts those labeling, and `cloud_consented` opted-in accounts
+/// whose users agreed to every provider in `cloud`.
+pub fn folder_counts(mail_root: &Path, cloud: &[&str]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     if let Ok(accounts) = imap_state::list_accounts(mail_root) {
         for (domain, localpart, _) in accounts {
             if let Ok(Some(conn)) = store::open_existing(mail_root, &domain, &localpart) {
-                let enabled = store::prefs(&conn).map(|p| p.enabled).unwrap_or(false);
+                let prefs = store::prefs(&conn).unwrap_or_default();
                 *counts
-                    .entry(if enabled { "opted_in" } else { "opted_out" }.to_string())
+                    .entry(
+                        if prefs.any_enabled() {
+                            "opted_in"
+                        } else {
+                            "opted_out"
+                        }
+                        .to_string(),
+                    )
                     .or_default() += 1;
+                if prefs.labels_enabled {
+                    *counts.entry("labels_enabled".to_string()).or_default() += 1;
+                }
+                if prefs.any_enabled() && !cloud.is_empty() && prefs.allows_cloud(cloud) {
+                    *counts.entry("cloud_consented".to_string()).or_default() += 1;
+                }
             }
         }
     }
@@ -503,6 +654,8 @@ mod tests {
                 enabled: true,
                 excluded_folders: vec![],
                 autofile_folders: autofile.iter().map(|s| s.to_string()).collect(),
+                cloud_consent: vec![],
+                labels_enabled: false,
             },
         )
         .unwrap();
@@ -511,6 +664,253 @@ mod tests {
     fn inbox_flags(root: &Path, uid: u64) -> Option<Vec<String>> {
         let (_, messages) = imap_state::load_folder(root, D, L, "INBOX").unwrap();
         messages.into_iter().find(|m| m.uid == uid).map(|m| m.flags)
+    }
+
+    fn hosted(provider: &'static str) -> Option<crate::engine::LoadedModel> {
+        Some(crate::engine::LoadedModel {
+            file: format!("{provider}:model"),
+            load_ms: 0,
+            cloud: Some(provider),
+            fingerprint: 0,
+        })
+    }
+
+    fn agree(root: &Path, providers: &[&str]) {
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        let mut prefs = store::prefs(&conn).unwrap();
+        prefs.cloud_consent = providers.iter().map(|p| p.to_string()).collect();
+        store::set_prefs(&conn, &prefs).unwrap();
+    }
+
+    #[test]
+    fn cloud_embeddings_wait_for_the_users_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        seed(root);
+        opt_in(root, &[]);
+        let cloud = Models {
+            embed_info: hosted("openrouter"),
+            ..models()
+        };
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(
+            (report.accounts, report.learned, report.awaiting_consent),
+            (0, 0, 1)
+        );
+
+        // Consent to a different provider is not consent to this one.
+        agree(root, &["typesafe"]);
+        assert_eq!(run_cycle(root, &cfg(), &cloud).awaiting_consent, 1);
+
+        agree(root, &["openrouter"]);
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(
+            (report.accounts, report.learned, report.awaiting_consent),
+            (1, 6, 0)
+        );
+    }
+
+    #[test]
+    fn cloud_fallback_is_only_asked_for_consenting_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        seed(root);
+        opt_in(root, &[]);
+        let chooser = Arc::new(fake::Fixed::new(Some("Receipts"), 0.9));
+        let cloud = Models {
+            chooser: Some(chooser.clone()),
+            chat_info: hosted("typesafe"),
+            ..models()
+        };
+        run_cycle(root, &cfg(), &cloud);
+        // Too unlike either folder for the vote, so only the fallback could decide.
+        let unsure = mail(
+            "x@y.test",
+            "Quarterly statement",
+            "tax statement for the quarter",
+        );
+        imap_state::deliver_message(root, D, L, &unsure).unwrap();
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!((report.classified, report.suggested), (1, 0), "{report:?}");
+        assert_eq!(*chooser.calls.lock().unwrap(), 0);
+
+        agree(root, &["typesafe"]);
+        imap_state::deliver_message(root, D, L, &unsure).unwrap();
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(*chooser.calls.lock().unwrap(), 1);
+        assert_eq!(report.suggested, 1, "{report:?}");
+    }
+
+    fn enable_labels(root: &Path, labels: &[(&str, &str)]) {
+        let conn = store::open_or_create(root, D, L).unwrap();
+        let mut prefs = store::prefs(&conn).unwrap();
+        prefs.labels_enabled = true;
+        store::set_prefs(&conn, &prefs).unwrap();
+        let pairs: Vec<(String, String)> = labels
+            .iter()
+            .map(|(name, description)| (name.to_string(), description.to_string()))
+            .collect();
+        store::set_labels(&conn, &pairs, None).unwrap();
+    }
+
+    #[test]
+    fn labels_are_applied_as_keywords_without_folder_suggestions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        let (_, old) =
+            imap_state::deliver_message(root, D, L, &mail("a@b.test", "Old", "x")).unwrap();
+        enable_labels(root, &[("To do", "Needs action"), ("Family", "")]);
+        let chooser = Arc::new(fake::Fixed::labelling(&[("To do", 0.9), ("Family", 0.4)]));
+        // No embedder at all: labels only need the fallback model.
+        let only_labels = Models {
+            chooser: Some(chooser.clone()),
+            ..Models::default()
+        };
+
+        let report = run_cycle(root, &cfg(), &only_labels);
+        assert_eq!((report.accounts, report.labeled), (1, 1), "{report:?}");
+        let flags = inbox_flags(root, old).unwrap();
+        assert!(flags.iter().any(|f| f == "To_do"), "{flags:?}");
+        assert!(
+            !flags.iter().any(|f| f == "Family"),
+            "below the threshold: {flags:?}"
+        );
+
+        // Only new mail is labeled after that.
+        let (_, new) =
+            imap_state::deliver_message(root, D, L, &mail("c@d.test", "New", "y")).unwrap();
+        run_cycle(root, &cfg(), &only_labels);
+        assert_eq!(*chooser.label_calls.lock().unwrap(), 2);
+        assert!(inbox_flags(root, new).unwrap().iter().any(|f| f == "To_do"));
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        assert_eq!(store::label_counts(&conn).unwrap()["To do"], 2);
+        assert!(
+            !store::prefs(&conn).unwrap().enabled,
+            "folder suggestions stay off"
+        );
+    }
+
+    #[test]
+    fn labels_work_without_setup_and_the_model_can_add_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        let (_, uid) = imap_state::deliver_message(
+            root,
+            D,
+            L,
+            &mail("pta@school.test", "Parent evening", "Tuesday 18:00"),
+        )
+        .unwrap();
+        // Labels on, but the user defined none.
+        enable_labels(root, &[]);
+        let models = Models {
+            chooser: Some(Arc::new(fake::Fixed::proposing(
+                "School",
+                "The kids' school",
+            ))),
+            ..Models::default()
+        };
+        let report = run_cycle(root, &cfg(), &models);
+        assert_eq!(report.labeled, 1, "{report:?}");
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        let labels = store::labels(&conn).unwrap();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.name == "Receipts" && l.origin == store::ORIGIN_STARTER)
+        );
+        let school = labels
+            .iter()
+            .find(|l| l.name == "School")
+            .expect("AI label created");
+        assert_eq!(school.origin, store::ORIGIN_AI);
+        assert!(
+            inbox_flags(root, uid)
+                .unwrap()
+                .iter()
+                .any(|f| f == "School")
+        );
+    }
+
+    #[test]
+    fn label_discovery_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        imap_state::deliver_message(root, D, L, &mail("a@b.test", "Hi", "x")).unwrap();
+        enable_labels(root, &[]);
+        let models = Models {
+            chooser: Some(Arc::new(fake::Fixed::proposing("School", ""))),
+            ..Models::default()
+        };
+        let no_discovery = ClassifierConfig {
+            label_discovery: false,
+            ..cfg()
+        };
+        let report = run_cycle(root, &no_discovery, &models);
+        assert_eq!(report.labeled, 0, "{report:?}");
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        assert!(
+            !store::labels(&conn)
+                .unwrap()
+                .iter()
+                .any(|l| l.name == "School")
+        );
+    }
+
+    #[test]
+    fn cloud_labels_wait_for_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        imap_state::deliver_message(root, D, L, &mail("a@b.test", "Hi", "x")).unwrap();
+        enable_labels(root, &[("Urgent", "")]);
+        let chooser = Arc::new(fake::Fixed::labelling(&[("Urgent", 0.99)]));
+        let cloud = Models {
+            chooser: Some(chooser.clone()),
+            chat_info: hosted("typesafe"),
+            ..Models::default()
+        };
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!((report.accounts, report.awaiting_consent), (0, 1));
+        assert_eq!(*chooser.label_calls.lock().unwrap(), 0);
+
+        agree(root, &["typesafe"]);
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(report.labeled, 1, "{report:?}");
+    }
+
+    #[test]
+    fn autofiled_mail_keeps_its_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        seed(root);
+        opt_in(root, &["Receipts"]);
+        enable_labels(root, &[("Money", "")]);
+        let models = Models {
+            chooser: Some(Arc::new(fake::Fixed::labelling(&[("Money", 0.95)]))),
+            ..models()
+        };
+        run_cycle(root, &cfg(), &models);
+        // Known sender history makes this an auto-move into Receipts.
+        for _ in 0..3 {
+            let receipt = mail(
+                "orders@shop.test",
+                "Your receipt",
+                "order payment total invoice receipt",
+            );
+            imap_state::deliver_message(root, D, L, &receipt).unwrap();
+            run_cycle(root, &cfg(), &models);
+        }
+        let (_, receipts) = imap_state::load_folder(root, D, L, "Receipts").unwrap();
+        // Only flags in the failure message: message records carry mailbox paths.
+        let flags: Vec<&Vec<String>> = receipts.iter().map(|m| &m.flags).collect();
+        assert!(
+            flags.iter().any(|f| f.iter().any(|f| f == "Money")),
+            "flags in Receipts: {flags:?}"
+        );
     }
 
     #[test]
@@ -682,6 +1082,8 @@ mod tests {
                 enabled: true,
                 excluded_folders: vec!["Travel".into()],
                 autofile_folders: vec![],
+                cloud_consent: vec![],
+                labels_enabled: false,
             },
         )
         .unwrap();

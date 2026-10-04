@@ -17,7 +17,8 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
-use crate::engine::{Choice, Chooser, Embedder, FolderHint, l2_normalize};
+use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, Labeling, l2_normalize};
+use crate::prompt::{json_escape, label_prompt, parse_answer, parse_labels, system_prompt};
 use rmail_common::classifier_models;
 
 /// llama.cpp allows one backend per process.
@@ -153,6 +154,8 @@ pub struct LlamaChooser {
 
 const CHAT_CTX: u32 = 4096;
 const MAX_ANSWER_TOKENS: usize = 96;
+/// Room for a dozen `{"name", "confidence"}` items.
+const MAX_LABEL_TOKENS: usize = 320;
 
 impl LlamaChooser {
     pub fn load(models_dir: &Path, file: &str, threads: u32) -> Result<Self> {
@@ -162,8 +165,7 @@ impl LlamaChooser {
         })
     }
 
-    fn prompt(&self, message: &str, folders: &[FolderHint]) -> Result<String> {
-        let system = system_prompt(folders);
+    fn prompt(&self, system: String, message: &str) -> Result<String> {
         let user = format!("{message}\n\n/no_think");
         match self.model.chat_template(None) {
             Ok(template) => Ok(self.model.apply_chat_template(
@@ -177,23 +179,24 @@ impl LlamaChooser {
             Err(_) => Ok(format!("{system}\n\nMessage:\n{user}\n\nAnswer:\n")),
         }
     }
-}
 
-impl Chooser for LlamaChooser {
-    fn choose(&self, message: &str, folders: &[FolderHint]) -> Result<Choice> {
-        if folders.is_empty() {
-            return Ok(Choice {
-                folder: None,
-                confidence: 0.0,
-                raw: String::new(),
-            });
-        }
-        let prompt = self.prompt(message, folders)?;
+    /// Generate an answer to `system` + `message` that `grammar` admits,
+    /// stopping at end of generation, when `done` says the answer is
+    /// complete, or after `max_tokens`.
+    fn generate(
+        &self,
+        system: String,
+        message: &str,
+        grammar: &str,
+        max_tokens: usize,
+        done: impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        let prompt = self.prompt(system, message)?;
         let mut tokens = self
             .model
             .str_to_token(&prompt, AddBos::Always)
             .context("tokenizing prompt")?;
-        let budget = CHAT_CTX as usize - MAX_ANSWER_TOKENS - 8;
+        let budget = CHAT_CTX as usize - max_tokens - 8;
         if tokens.len() > budget {
             // Keep the start (instructions) and the end (the chat template's
             // assistant opening); drop the middle of the message.
@@ -217,16 +220,15 @@ impl Chooser for LlamaChooser {
         }
         ctx.decode(&mut batch).context("evaluating prompt")?;
 
-        let grammar = answer_grammar(folders);
         let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::grammar(&self.model, &grammar, "root")
+            LlamaSampler::grammar(&self.model, grammar, "root")
                 .map_err(|error| anyhow!("building grammar: {error:?}"))?,
             LlamaSampler::greedy(),
         ]);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut answer = String::new();
         let mut index = batch.n_tokens() - 1;
-        for pos in (tokens.len() as i32..).take(MAX_ANSWER_TOKENS) {
+        for pos in (tokens.len() as i32..).take(max_tokens) {
             let token: LlamaToken = sampler.sample(&ctx, index);
             if self.model.is_eog_token(token) {
                 break;
@@ -237,7 +239,7 @@ impl Chooser for LlamaChooser {
                     .token_to_piece(token, &mut decoder, true, None)
                     .unwrap_or_default(),
             );
-            if answer.ends_with('}') {
+            if done(&answer) {
                 break;
             }
             batch.clear();
@@ -245,32 +247,42 @@ impl Chooser for LlamaChooser {
             index = 0;
             ctx.decode(&mut batch).context("generating")?;
         }
-        Ok(parse_answer(&answer, folders))
+        Ok(answer)
     }
 }
 
-fn system_prompt(folders: &[FolderHint]) -> String {
-    let mut text = String::from(
-        "You sort email into the user's existing folders. Choose the single folder the \
-         message below belongs in, or null when none clearly fits. Answer with JSON: \
-         {\"folder\": <name or null>, \"confidence\": <0.0-1.0>}.\n\nFolders:\n",
-    );
-    for folder in folders {
-        text.push_str("- ");
-        text.push_str(&folder.name);
-        if !folder.examples.is_empty() {
-            text.push_str(" (for example: ");
-            let examples: Vec<String> = folder
-                .examples
-                .iter()
-                .map(|subject| format!("\"{}\"", subject.chars().take(80).collect::<String>()))
-                .collect();
-            text.push_str(&examples.join(", "));
-            text.push(')');
+impl Chooser for LlamaChooser {
+    fn choose(&self, message: &str, folders: &[FolderHint]) -> Result<Choice> {
+        if folders.is_empty() {
+            return Ok(Choice {
+                folder: None,
+                confidence: 0.0,
+                raw: String::new(),
+            });
         }
-        text.push('\n');
+        let answer = self.generate(
+            system_prompt(folders),
+            message,
+            &answer_grammar(folders),
+            MAX_ANSWER_TOKENS,
+            json_complete,
+        )?;
+        Ok(parse_answer(&answer, folders))
     }
-    text
+
+    fn label(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Result<Labeling> {
+        if labels.is_empty() && !may_propose {
+            return Ok(Labeling::default());
+        }
+        let answer = self.generate(
+            label_prompt(labels, may_propose),
+            message,
+            &label_grammar(labels, may_propose),
+            MAX_LABEL_TOKENS,
+            json_complete,
+        )?;
+        Ok(parse_labels(&answer, labels, may_propose))
+    }
 }
 
 /// GBNF that only admits `{"folder": "<one of the names>" | null,
@@ -288,10 +300,64 @@ pub fn answer_grammar(folders: &[FolderHint]) -> String {
     )
 }
 
-fn json_escape(text: &str) -> String {
-    serde_json::to_string(text)
-        .map(|quoted| quoted[1..quoted.len() - 1].to_string())
-        .unwrap_or_default()
+/// GBNF that only admits `{"labels": [{"name": "<label>", "confidence":
+/// d.d}, ...]}` with names from `labels`, plus, with `may_propose`,
+/// `"new_label": null` or a short `{"name", "description"}`.
+pub fn label_grammar(labels: &[LabelHint], may_propose: bool) -> String {
+    let names: Vec<String> = labels
+        .iter()
+        .map(|label| gbnf_literal(&format!("\"{}\"", json_escape(&label.name))))
+        .collect();
+    let list = if names.is_empty() {
+        String::new()
+    } else {
+        "(item (\", \" item)*)?".to_string()
+    };
+    let proposal = if may_propose {
+        "\", \\\"new_label\\\": \" (\"null\" | \"{\\\"name\\\": \\\"\" pname \"\\\", \\\"description\\\": \\\"\" pdesc \"\\\"}\")"
+    } else {
+        ""
+    };
+    let mut grammar = format!("root ::= \"{{\\\"labels\\\": [\" {list} \"]\" {proposal} \"}}\"\n");
+    if !names.is_empty() {
+        grammar.push_str(&format!(
+            "item ::= \"{{\\\"name\\\": \" name \", \\\"confidence\\\": \" conf \"}}\"\n\
+             name ::= {}\n\
+             conf ::= \"0.\" [0-9] | \"1.0\"\n",
+            names.join(" | ")
+        ));
+    }
+    if may_propose {
+        grammar.push_str("pname ::= [^\"\\\\\\n]{1,30}\npdesc ::= [^\"\\\\\\n]{0,120}\n");
+    }
+    grammar
+}
+
+/// Whether `answer` holds a complete JSON object: braces balance outside
+/// strings. Generation stops there.
+fn json_complete(answer: &str) -> bool {
+    let (mut depth, mut in_string, mut escaped, mut opened) = (0i32, false, false, false);
+    for c in answer.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                depth += 1;
+                opened = true;
+            }
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    opened && depth == 0
 }
 
 fn gbnf_literal(text: &str) -> String {
@@ -310,43 +376,32 @@ fn gbnf_literal(text: &str) -> String {
     out
 }
 
-/// Read the grammar-constrained answer. Names not in `folders` are ignored.
-pub fn parse_answer(raw: &str, folders: &[FolderHint]) -> Choice {
-    #[derive(serde::Deserialize)]
-    struct Answer {
-        folder: Option<String>,
-        confidence: f64,
-    }
-    let parsed = serde_json::from_str::<Answer>(raw.trim()).ok();
-    let folder = parsed
-        .as_ref()
-        .and_then(|answer| answer.folder.clone())
-        .filter(|name| folders.iter().any(|folder| &folder.name == name));
-    Choice {
-        confidence: if folder.is_some() {
-            parsed
-                .map(|answer| answer.confidence.clamp(0.0, 1.0))
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        },
-        folder,
-        raw: raw.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::hints;
 
-    fn hints(names: &[&str]) -> Vec<FolderHint> {
-        names
-            .iter()
-            .map(|name| FolderHint {
-                name: name.to_string(),
-                examples: vec![],
-            })
-            .collect()
+    #[test]
+    fn json_completion_ignores_braces_in_strings() {
+        assert!(!json_complete("{\"labels\": [{\"name\": \"A\"}"));
+        assert!(json_complete(
+            "{\"labels\": [], \"new_label\": {\"name\": \"x}\", \"description\": \"\"}}"
+        ));
+        assert!(!json_complete("{\"folder\": \"a{b\""));
+        assert!(!json_complete(""));
+    }
+
+    #[test]
+    fn label_grammar_only_allows_proposals_when_asked() {
+        let labels = crate::prompt::label_hints(&["Invoices"]);
+        assert!(!label_grammar(&labels, false).contains("new_label"));
+        let open = label_grammar(&labels, true);
+        assert!(
+            open.contains("new_label") && open.contains("pname ::="),
+            "{open}"
+        );
+        let empty = label_grammar(&[], true);
+        assert!(!empty.contains("item ::="), "{empty}");
     }
 
     #[test]
@@ -354,18 +409,6 @@ mod tests {
         let grammar = answer_grammar(&hints(&["Receipts", "Say \"hi\""]));
         assert!(grammar.contains(r#""\"Receipts\"""#), "{grammar}");
         assert!(grammar.contains(r#""\"Say \\\"hi\\\"\"""#), "{grammar}");
-    }
-
-    #[test]
-    fn answers_outside_the_folder_list_are_ignored() {
-        let folders = hints(&["Receipts", "Travel"]);
-        let choice = parse_answer(r#"{"folder": "Travel", "confidence": 0.8}"#, &folders);
-        assert_eq!(choice.folder.as_deref(), Some("Travel"));
-        assert_eq!(choice.confidence, 0.8);
-        let invented = parse_answer(r#"{"folder": "Taxes", "confidence": 0.9}"#, &folders);
-        assert_eq!(invented.folder, None);
-        assert_eq!(invented.confidence, 0.0);
-        assert_eq!(parse_answer("garbage", &folders).folder, None);
     }
 
     /// Compiles the answer grammar against a real vocabulary. Set
@@ -385,6 +428,53 @@ mod tests {
         ]));
         LlamaSampler::grammar(&model, &grammar, "root")
             .unwrap_or_else(|e| panic!("{e:?}\n{grammar}"));
+        for (names, propose) in [
+            (&["Invoices", "Say \"hi\""][..], false),
+            (&["Invoices"][..], true),
+            (&[][..], true),
+        ] {
+            let labels = label_grammar(&crate::prompt::label_hints(names), propose);
+            LlamaSampler::grammar(&model, &labels, "root")
+                .unwrap_or_else(|e| panic!("{e:?}\n{labels}"));
+        }
+    }
+
+    /// Grammar-constrained generation terminates with JSON the parsers
+    /// accept, whatever the model. Set `RMAIL_TEST_TINY_GGUF` to any small
+    /// chat-capable GGUF (even a toy model).
+    #[test]
+    fn constrained_answers_always_parse() {
+        let Ok(path) = std::env::var("RMAIL_TEST_TINY_GGUF") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let chooser = LlamaChooser::load(
+            path.parent().unwrap(),
+            path.file_name().unwrap().to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+        let folders = hints(&["Receipts", "Travel"]);
+        let choice = chooser.choose("Boarding pass for AB123", &folders).unwrap();
+        assert!(json_complete(&choice.raw), "{choice:?}");
+        let labels = crate::prompt::label_hints(&["Invoices", "Family"]);
+        for propose in [false, true] {
+            let answer = chooser
+                .generate(
+                    label_prompt(&labels, propose),
+                    "Invoice 42 is due Friday",
+                    &label_grammar(&labels, propose),
+                    MAX_LABEL_TOKENS,
+                    json_complete,
+                )
+                .unwrap();
+            assert!(json_complete(&answer), "unterminated: {answer}");
+            let value: serde_json::Value =
+                serde_json::from_str(&answer).unwrap_or_else(|e| panic!("{e}: {answer}"));
+            assert!(value["labels"].is_array(), "{answer}");
+            assert_eq!(value.get("new_label").is_some(), propose, "{answer}");
+            eprintln!("propose={propose}: {answer}");
+        }
     }
 
     /// End-to-end with real models. Set `RMAIL_TEST_MODEL_DIR` to a directory

@@ -770,6 +770,107 @@ pub struct ClassifierConfig {
     /// Folders with fewer learned messages than this defer to the chat model.
     #[serde(default = "default_classifier_min_examples")]
     pub min_examples: u32,
+    /// Minimum probability (percent) before a label is applied.
+    #[serde(default = "default_classifier_label_confidence")]
+    pub label_confidence: u32,
+    /// Let models that write text create a new label when none fits.
+    #[serde(default = "default_true")]
+    pub label_discovery: bool,
+    /// Where embeddings are computed. Cloud providers receive the text of
+    /// every message learned or classified, and only for accounts whose users
+    /// agreed to that provider in webmail.
+    #[serde(default)]
+    pub embed_provider: EmbedProvider,
+    /// Where the fallback for uncertain messages runs.
+    #[serde(default)]
+    pub chat_provider: ChatProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter_api_key: Option<SecretString>,
+    /// OpenAI-compatible API base; any compatible endpoint works.
+    #[serde(default = "default_openrouter_base_url")]
+    pub openrouter_base_url: String,
+    #[serde(default = "default_openrouter_embed_model")]
+    pub openrouter_embed_model: String,
+    /// Chat model id at the provider; empty disables the cloud fallback.
+    #[serde(default)]
+    pub openrouter_chat_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typesafe_api_key: Option<SecretString>,
+    #[serde(default = "default_jev_model")]
+    pub jev_model: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbedProvider {
+    /// A GGUF model run in-process (`embed_model`).
+    #[default]
+    Local,
+    OpenRouter,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatProvider {
+    /// A GGUF model run in-process (`chat_model`).
+    #[default]
+    Local,
+    OpenRouter,
+    /// TypeSafe's Jev decision model: picks one folder from the list with a
+    /// calibrated confidence instead of generating text.
+    Jev,
+}
+
+/// Third parties that receive message text, named as users see them when
+/// they consent in webmail.
+pub const CLOUD_OPENROUTER: &str = "openrouter";
+pub const CLOUD_TYPESAFE: &str = "typesafe";
+
+impl EmbedProvider {
+    pub fn cloud(self) -> Option<&'static str> {
+        match self {
+            EmbedProvider::Local => None,
+            EmbedProvider::OpenRouter => Some(CLOUD_OPENROUTER),
+        }
+    }
+}
+
+impl ChatProvider {
+    pub fn cloud(self) -> Option<&'static str> {
+        match self {
+            ChatProvider::Local => None,
+            ChatProvider::OpenRouter => Some(CLOUD_OPENROUTER),
+            ChatProvider::Jev => Some(CLOUD_TYPESAFE),
+        }
+    }
+}
+
+impl ClassifierConfig {
+    /// Every third party that may receive message text, sorted.
+    pub fn cloud_providers(&self) -> Vec<&'static str> {
+        cloud_providers(
+            self.embed_provider,
+            self.chat_provider,
+            &self.openrouter_chat_model,
+        )
+    }
+}
+
+/// Third parties that receive message text under these settings. An
+/// OpenRouter fallback without a model id is off and sends nothing.
+pub fn cloud_providers(
+    embed: EmbedProvider,
+    chat: ChatProvider,
+    openrouter_chat_model: &str,
+) -> Vec<&'static str> {
+    let chat = match chat {
+        ChatProvider::OpenRouter if openrouter_chat_model.trim().is_empty() => None,
+        chat => chat.cloud(),
+    };
+    let mut providers: Vec<&'static str> = [embed.cloud(), chat].into_iter().flatten().collect();
+    providers.sort_unstable();
+    providers.dedup();
+    providers
 }
 
 impl Default for ClassifierConfig {
@@ -785,10 +886,32 @@ impl Default for ClassifierConfig {
             knn_confidence: default_classifier_knn_confidence(),
             autofile_confidence: default_classifier_autofile_confidence(),
             min_examples: default_classifier_min_examples(),
+            label_confidence: default_classifier_label_confidence(),
+            label_discovery: true,
+            embed_provider: EmbedProvider::Local,
+            chat_provider: ChatProvider::Local,
+            openrouter_api_key: None,
+            openrouter_base_url: default_openrouter_base_url(),
+            openrouter_embed_model: default_openrouter_embed_model(),
+            openrouter_chat_model: String::new(),
+            typesafe_api_key: None,
+            jev_model: default_jev_model(),
         }
     }
 }
 
+fn default_classifier_label_confidence() -> u32 {
+    70
+}
+fn default_openrouter_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+fn default_openrouter_embed_model() -> String {
+    "openai/text-embedding-3-small".to_string()
+}
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
+}
 fn default_classifier_poll_interval_seconds() -> u64 {
     15
 }

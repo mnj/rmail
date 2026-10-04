@@ -377,6 +377,21 @@ struct DetailQuery {
 #[derive(Deserialize)]
 struct PatchMessage {
     seen: Option<bool>,
+    /// Keywords (labels) to add (`true`) or remove (`false`). System flags
+    /// and `$` keywords are not accepted.
+    #[serde(default)]
+    keywords: std::collections::BTreeMap<String, bool>,
+}
+
+/// A user keyword: a non-empty IMAP atom that is not a system flag or a
+/// reserved `$` keyword.
+fn is_user_keyword(keyword: &str) -> bool {
+    !keyword.is_empty()
+        && keyword.len() <= 100
+        && !keyword.starts_with(['\\', '$'])
+        && keyword
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !"(){%*\"\\]".contains(c))
 }
 
 #[derive(Deserialize)]
@@ -524,6 +539,9 @@ async fn patch_message(
     let Ok(input) = serde_json::from_slice::<PatchMessage>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
+    if input.keywords.len() > 50 || !input.keywords.keys().all(|k| is_user_keyword(k)) {
+        return (StatusCode::BAD_REQUEST, "invalid keyword").into_response();
+    }
     let result = blocking(move || {
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
@@ -537,6 +555,9 @@ async fn patch_message(
         let mut flags = message.flags;
         if let Some(seen) = input.seen {
             set_flag(&mut flags, "\\Seen", seen);
+        }
+        for (keyword, present) in &input.keywords {
+            set_flag(&mut flags, keyword, *present);
         }
         imap_state::set_uid_flags(
             &state.mail_root,
@@ -972,6 +993,178 @@ mod tests {
         )
         .await;
         assert_eq!(locked.status, 429);
+    }
+
+    #[tokio::test]
+    async fn labels_are_their_own_setting_and_suggest_folders() {
+        use rmail_common::classifier_store as store;
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (&state.mail_root, "example.test", "user");
+        imap_state::init_account(root, d, l).unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call = |method: &'static str, path: String, body: Vec<u8>| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move { route(req(method, &path, &body, cookie), &state).await }
+        };
+        let json = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap();
+
+        let saved = call(
+            "PUT",
+            "/api/organize".into(),
+            br#"{"enabled":false,"labels_enabled":true,"labels":[{"name":"To do","description":"Needs a reply"},{"name":"Invoices"}]}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(saved.status, 204);
+        let conn = store::open_existing(root, d, l).unwrap().unwrap();
+        let prefs = store::prefs(&conn).unwrap();
+        assert!(
+            prefs.labels_enabled && !prefs.enabled,
+            "labels do not need folder suggestions"
+        );
+
+        let overview = json(&call("GET", "/api/organize".into(), vec![]).await.body);
+        assert_eq!(overview["labels_enabled"], true);
+        assert_eq!(overview["labels"][0]["keyword"], "To_do");
+        assert_eq!(
+            overview["labels_available"], false,
+            "no fallback model is configured"
+        );
+        let listed = json(&call("GET", "/api/labels".into(), vec![]).await.body);
+        assert_eq!(listed[1]["name"], "Invoices");
+        assert_eq!(overview["labels"][0]["origin"], "user");
+        let starter = overview["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == "Receipts")
+            .expect("starter labels are seeded when labels are turned on");
+        assert_eq!(starter["origin"], "starter");
+
+        let duplicate = call(
+            "PUT",
+            "/api/organize".into(),
+            br#"{"enabled":false,"labels":[{"name":"A"},{"name":"a"}]}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(duplicate.status, 422);
+        // Saving folder preferences alone keeps labels on.
+        call(
+            "PUT",
+            "/api/organize".into(),
+            br#"{"enabled":false}"#.to_vec(),
+        )
+        .await;
+        assert!(store::prefs(&conn).unwrap().labels_enabled);
+
+        // A label on a message can be removed from webmail; system flags cannot be touched.
+        let (_, uid) = imap_state::deliver_message(root, d, l, b"Subject: x\r\n\r\ny").unwrap();
+        store::set_keyword(root, d, l, "INBOX", uid, "To_do", true).unwrap();
+        let path = format!("/api/folders/INBOX/messages/{uid}");
+        let removed = call(
+            "PATCH",
+            path.clone(),
+            br#"{"keywords":{"To_do":false}}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(removed.status, 204);
+        let (_, messages) = imap_state::load_folder(root, d, l, "INBOX").unwrap();
+        assert!(!messages[0].flags.iter().any(|f| f == "To_do"));
+        let system = call(
+            "PATCH",
+            path,
+            br#"{"keywords":{"\\Deleted":true}}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(system.status, 400);
+
+        // A label used often, with no folder of that name, is offered as a folder.
+        for uid in 0..10 {
+            store::record_labels(&conn, 1, 100 + uid, &[("Invoices".into(), 0.9)]).unwrap();
+        }
+        let overview = json(&call("GET", "/api/organize".into(), vec![]).await.body);
+        assert_eq!(overview["folder_ideas"][0]["label"], "Invoices");
+        assert_eq!(overview["folder_ideas"][0]["count"], 10);
+        let created = call(
+            "POST",
+            "/api/organize/folders".into(),
+            br#"{"name":"Invoices"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(created.status, 200);
+        let overview = json(&call("GET", "/api/organize".into(), vec![]).await.body);
+        assert_eq!(overview["folder_ideas"], serde_json::json!([]));
+        let inbox = call(
+            "POST",
+            "/api/organize/folders".into(),
+            br#"{"name":"inbox"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(inbox.status, 422);
+    }
+
+    #[tokio::test]
+    async fn organize_asks_for_cloud_consent_per_provider() {
+        use rmail_common::classifier_store as store;
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (&state.mail_root, "example.test", "user");
+        imap_state::init_account(root, d, l).unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let get = |state: Arc<AppState>, cookie: Option<String>| async move {
+            let response = route(req("GET", "/api/organize", b"", cookie), &state).await;
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+        };
+
+        // Everything local: nothing to consent to.
+        let local = get(state.clone(), cookie.clone()).await;
+        assert_eq!(local["cloud_providers"], serde_json::json!([]));
+        assert_eq!(local["cloud_consent"], false);
+
+        let mut conn = rmail_common::settings::open(&state.db_path).unwrap();
+        rmail_common::settings::write_raw(
+            &mut conn,
+            &[(
+                "classifier.embed_provider".to_string(),
+                Some(serde_json::Value::from("openrouter")),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let cloud = get(state.clone(), cookie.clone()).await;
+        assert_eq!(cloud["cloud_providers"], serde_json::json!(["openrouter"]));
+        assert_eq!(cloud["cloud_consent"], false);
+        assert_eq!(cloud["cloud_required"], true);
+
+        let put = |body: &'static [u8]| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move {
+                route(req("PUT", "/api/organize", body, cookie), &state)
+                    .await
+                    .status
+            }
+        };
+        assert_eq!(put(br#"{"enabled":true,"cloud_consent":true}"#).await, 204);
+        assert_eq!(
+            get(state.clone(), cookie.clone()).await["cloud_consent"],
+            true
+        );
+        let prefs = || store::prefs(&store::open_existing(root, d, l).unwrap().unwrap()).unwrap();
+        assert_eq!(prefs().cloud_consent, vec!["openrouter".to_string()]);
+
+        // Saving folders without the field keeps the decision.
+        assert_eq!(put(br#"{"enabled":true}"#).await, 204);
+        assert_eq!(prefs().cloud_consent, vec!["openrouter".to_string()]);
+
+        assert_eq!(put(br#"{"enabled":true,"cloud_consent":false}"#).await, 204);
+        assert!(prefs().cloud_consent.is_empty());
     }
 
     #[tokio::test]

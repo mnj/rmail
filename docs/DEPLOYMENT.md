@@ -14,7 +14,7 @@ The daemons are:
 - `rmail_web`: admin/status web UI
 - `rmail_webmail`: user-facing mailbox webmail UI
 - `rmail_outbound`: outbound queue worker
-- `rmail_classifier`: optional folder suggestions from local models (see [Mail organization](#mail-organization))
+- `rmail_classifier`: optional folder suggestions from local or hosted models (see [Mail organization](#mail-organization))
 
 Administrative tools:
 
@@ -407,9 +407,10 @@ journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u
 
 ## Mail organization
 
-`rmail_classifier` suggests folders for new INBOX mail. It learns from how each user files their mail
-and runs small GGUF models in-process with llama.cpp: no external model server, and mail never
-leaves the machine. It never runs in the SMTP path; mail always lands in INBOX first.
+`rmail_classifier` suggests folders for new INBOX mail. It learns from how each user files their mail.
+By default it runs small GGUF models in-process with llama.cpp: no external model server, and mail
+never leaves the machine. Hosted providers are optional (see [Hosted providers](#hosted-providers)).
+It never runs in the SMTP path; mail always lands in INBOX first.
 
 1. On the admin console **Organization** page, download an embedding model (required) and, if you want,
    a chat model (optional fallback for uncertain messages). Models are stored in `<mail_root>/models`.
@@ -434,11 +435,72 @@ How it decides:
   the confidence is at least `classifier.autofile_confidence`, and the vote came from the user's own
   filing (never from the chat model alone).
 
+### Labels
+
+Users can also have new INBOX mail labeled automatically. This is a separate switch in
+**Organize my mail**: it works without folder suggestions, and folder suggestions work without it.
+
+- Turning it on seeds common labels (Action needed, Receipts, Shipping, Travel, Finance, Events,
+  Security, Newsletters, Promotions, Notifications, Social, Work, Personal). The fallback model
+  (local chat model, OpenRouter or Jev) then decides which labels apply to each new message. A label
+  is applied when its probability reaches `classifier.label_confidence` (70% by default), with at
+  most three labels per message.
+- When no label fits, the local and OpenRouter chat models may create a new label: one to three
+  words, with a short description, applied to that message and offered for later mail. Set
+  `classifier.label_discovery` to `false` to turn this off. Jev only picks from existing labels; it
+  gets one yes/no question per label in a single request.
+- Each account has at most 30 labels, at most 15 of them created by the AI. A starter or AI label
+  the user removes is never created again. Users can add their own labels and reword descriptions
+  to steer the model; webmail marks the labels the AI created.
+- Labels are stored as IMAP keywords, so IMAP clients that show keywords (Thunderbird, for example)
+  see them too. Keywords must be ASCII atoms, so "Action needed" becomes `Action_needed` and
+  letters such as "Ø" become `_`. Webmail always shows the label's name. Removing a label in webmail
+  or any IMAP client removes the keyword.
+- Labels need a fallback model. With a cloud fallback, every new INBOX message of a user who turned
+  labels on goes to that provider, so the same per-user consent applies (see above).
+- When a label has been applied to 10 or more messages and the user has no folder with that name,
+  webmail suggests creating one.
+
 Resource notes: embedding models cost roughly 100–900 MB RAM and milliseconds per message on CPU.
 Chat models (1–2 GB) take seconds per uncertain message. The unit runs at `Nice=10` with a reduced
 CPU weight so inference yields to the mail daemons. Building `rmail_classifier` needs cmake and a C/C++
-compiler. Build with `--no-default-features` to leave out llama.cpp. For GPU inference, pass the
-`cuda`, `vulkan` or `metal` feature.
+compiler. Build with `--no-default-features` to leave out llama.cpp (and with it the libgomp and C++
+runtime dependencies); only hosted providers work then. For GPU inference, pass the `cuda`, `vulkan`
+or `metal` feature.
+
+### Hosted providers
+
+Each model role can use a hosted provider instead of a local model, under **Providers** on the
+Organization page (or the `classifier.*` settings):
+
+| Role | Setting | Options |
+| --- | --- | --- |
+| Embeddings (required) | `classifier.embed_provider` | `local`, `openrouter` |
+| Fallback for uncertain mail | `classifier.chat_provider` | `local`, `openrouter`, `jev` |
+
+- **OpenRouter** (`classifier.openrouter_api_key`, `openrouter_embed_model`, `openrouter_chat_model`)
+  uses the OpenAI-compatible `/embeddings` and `/chat/completions` APIs. `classifier.openrouter_base_url`
+  can point at any compatible endpoint, such as a self-hosted vLLM or Ollama. Chat answers are
+  constrained to the folder list with a JSON schema, and answers naming other folders are discarded.
+- **Jev** (`classifier.typesafe_api_key`, `classifier.jev_model`) is TypeSafe's decision model. It
+  gets one choice question whose options are the user's folders (described by example subjects) plus
+  "none", and returns the chosen option with a confidence instead of generated text.
+
+Hosted providers receive message text: the sender, subject and the first
+`classifier.max_input_bytes` of the body. A cloud embedder receives every message learned or
+classified, including the backfill when an account opts in. A cloud fallback receives only
+messages the vote is unsure about. So mail only goes to a provider whose name the user saw and
+agreed to in webmail's **Organize my mail** dialog:
+
+- Consent is per account and per provider, and is stored in `classifier.sqlite`. Accounts that
+  opted in before hosted providers were configured start without consent.
+- Without consent, a cloud embedder skips the account entirely. With a cloud fallback, the account
+  still gets sender and embedding suggestions from this server, without the fallback.
+- Adding or switching to another provider requires consent again. Users can withdraw at any time.
+- The Organization page shows how many opted-in mailboxes have agreed. API keys are never returned
+  to the browser.
+
+Suggestions from either fallback never move mail automatically, same as the local chat model.
 
 ## Notes On Privileged Ports
 

@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rmail_common::classifier_store::{self as store, Prefs};
 use rmail_common::imap_state;
+use rmail_common::settings::ClassifierModels;
 use serde::{Deserialize, Serialize};
 
 use super::{Session, Shared, blocking, internal_error};
@@ -20,6 +21,8 @@ const MAX_FOLDER_ENTRIES: usize = 500;
 pub(crate) fn routes() -> Router<Shared> {
     Router::new()
         .route("/api/organize", get(overview).put(save))
+        .route("/api/organize/folders", post(create_folder))
+        .route("/api/labels", get(labels))
         .route("/api/suggestions/accept-all", post(accept_all))
         .route("/api/suggestions/{uid}/accept", post(accept))
         .route("/api/suggestions/{uid}/dismiss", post(dismiss))
@@ -73,29 +76,77 @@ struct FolderView {
 }
 
 #[derive(Serialize)]
+struct LabelView {
+    name: String,
+    description: String,
+    keyword: String,
+    /// `user`, `starter` or `ai`.
+    origin: String,
+    /// Messages labeled with it so far.
+    count: u64,
+}
+
+/// A label used often enough that it might deserve its own folder.
+#[derive(Serialize)]
+struct FolderIdea {
+    label: String,
+    count: u64,
+}
+
+/// Labels applied to this many messages, with no folder of that name, are
+/// offered as new folders.
+const FOLDER_IDEA_MIN: u64 = 10;
+
+#[derive(Serialize)]
 struct Overview {
     /// Whether the administrator runs the classifier at all.
     server_enabled: bool,
     enabled: bool,
+    /// Third parties that would receive this mailbox's message text; empty
+    /// when everything runs on this server.
+    cloud_providers: Vec<&'static str>,
+    /// Whether the user agreed to all of `cloud_providers`.
+    cloud_consent: bool,
+    /// Whether learning itself runs in the cloud, so folder suggestions do
+    /// nothing for this mailbox without consent.
+    cloud_required: bool,
+    /// Whether labels (and the folder fallback) use a cloud provider.
+    labels_cloud: bool,
+    /// Whether the administrator configured a model that can apply labels.
+    labels_available: bool,
+    labels_enabled: bool,
+    labels: Vec<LabelView>,
+    folder_ideas: Vec<FolderIdea>,
     pending: usize,
     folders: Vec<FolderView>,
+}
+
+fn server_settings(db_path: &std::path::Path) -> (bool, ClassifierModels) {
+    let Ok(conn) = rmail_common::settings::open(db_path) else {
+        return (false, ClassifierModels::default());
+    };
+    let enabled = rmail_common::settings::get(&conn, "classifier.enabled")
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let models = rmail_common::settings::classifier_models(&conn).unwrap_or_default();
+    (enabled, models)
 }
 
 async fn overview(State(state): State<Shared>, session: Session) -> Response {
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
-        let server_enabled = rmail_common::settings::open(&state.db_path)
-            .and_then(|conn| rmail_common::settings::get(&conn, "classifier.enabled"))
-            .ok()
-            .flatten()
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let (server_enabled, models) = server_settings(&state.db_path);
+        let cloud_providers = models.cloud_providers();
         let conn = store::open_existing(root, domain, local)?;
-        let (prefs, learned, outcomes) = match &conn {
+        let (prefs, learned, outcomes, labels, label_counts) = match &conn {
             Some(conn) => (
                 store::prefs(conn)?,
                 store::example_counts(conn)?,
                 store::recent_outcomes(conn)?,
+                store::labels(conn)?,
+                store::label_counts(conn)?,
             ),
             None => Default::default(),
         };
@@ -106,7 +157,22 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
             }
             _ => 0,
         };
-        let folders = imap_state::list_folders(root, domain, local)?
+        let all_folders = imap_state::list_folders(root, domain, local)?;
+        let folder_ideas = labels
+            .iter()
+            .filter_map(|label| {
+                let count = label_counts.get(&label.name).copied().unwrap_or(0);
+                let exists = all_folders.iter().any(|folder| {
+                    let leaf = folder.name.rsplit('/').next().unwrap_or(&folder.name);
+                    leaf.eq_ignore_ascii_case(&label.name)
+                });
+                (count >= FOLDER_IDEA_MIN && !exists).then(|| FolderIdea {
+                    label: label.name.clone(),
+                    count,
+                })
+            })
+            .collect();
+        let folders = all_folders
             .into_iter()
             .filter(store::is_user_folder)
             .map(|folder| {
@@ -124,6 +190,23 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
         Ok(Overview {
             server_enabled,
             enabled: prefs.enabled,
+            cloud_consent: !cloud_providers.is_empty() && prefs.allows_cloud(&cloud_providers),
+            cloud_required: models.embed_cloud.is_some(),
+            labels_cloud: models.chat_cloud.is_some(),
+            labels_available: models.chat_configured,
+            cloud_providers,
+            labels_enabled: prefs.labels_enabled,
+            labels: labels
+                .into_iter()
+                .map(|label| LabelView {
+                    count: label_counts.get(&label.name).copied().unwrap_or(0),
+                    name: label.name,
+                    description: label.description,
+                    keyword: label.keyword,
+                    origin: label.origin,
+                })
+                .collect(),
+            folder_ideas,
             pending,
             folders,
         })
@@ -136,12 +219,32 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
 }
 
 #[derive(Deserialize)]
+struct LabelInput {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
 struct SaveRequest {
     enabled: bool,
     #[serde(default)]
     excluded_folders: Vec<String>,
     #[serde(default)]
     autofile_folders: Vec<String>,
+    /// Agree (or withdraw) for the providers currently configured; absent
+    /// keeps what the user decided before.
+    #[serde(default)]
+    cloud_consent: Option<bool>,
+    /// Absent keeps the current setting, as for `labels`.
+    #[serde(default)]
+    labels_enabled: Option<bool>,
+    #[serde(default)]
+    labels: Option<Vec<LabelInput>>,
+    /// Label names the editor showed, so labels the model added meanwhile
+    /// are not taken as removed.
+    #[serde(default)]
+    labels_seen: Option<Vec<String>>,
 }
 
 async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
@@ -155,17 +258,33 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
     }
     let address = session.address.clone();
     let enabled = input.enabled;
+    let cloud_consent = input.cloud_consent;
+    let labels_enabled = input.labels_enabled;
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
+        let existing = store::open_existing(root, domain, local)?;
+        let current = match &existing {
+            Some(conn) => store::prefs(conn)?,
+            None => Prefs::default(),
+        };
+        let labels_on = input.labels_enabled.unwrap_or(current.labels_enabled);
         // Opting out of an account that never opted in leaves no file behind.
-        let conn = if input.enabled {
-            Some(store::open_or_create(root, domain, local)?)
-        } else {
-            store::open_existing(root, domain, local)?
+        let conn = match existing {
+            Some(conn) => conn,
+            None if input.enabled || labels_on || input.labels.is_some() => {
+                store::open_or_create(root, domain, local)?
+            }
+            None => return Ok(Ok(())),
         };
-        let Some(conn) = conn else {
-            return Ok(());
-        };
+        if let Some(labels) = &input.labels {
+            let pairs: Vec<(String, String)> = labels
+                .iter()
+                .map(|label| (label.name.clone(), label.description.clone()))
+                .collect();
+            if let Err(error) = store::set_labels(&conn, &pairs, input.labels_seen.as_deref()) {
+                return Ok(Err(error.to_string()));
+            }
+        }
         let known: Vec<String> = imap_state::list_folders(root, domain, local)?
             .into_iter()
             .filter(store::is_user_folder)
@@ -180,24 +299,83 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
             names.dedup();
             names
         };
+        // Consent names the providers the user saw, so a provider added
+        // later needs a new agreement.
+        let cloud_consent = match input.cloud_consent {
+            Some(true) => server_settings(&state.db_path)
+                .1
+                .cloud_providers()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            Some(false) => Vec::new(),
+            None => current.cloud_consent,
+        };
         let prefs = Prefs {
             enabled: input.enabled,
             excluded_folders: keep(input.excluded_folders),
             autofile_folders: keep(input.autofile_folders),
+            cloud_consent,
+            labels_enabled: labels_on,
         };
         store::set_prefs(&conn, &prefs)?;
+        if prefs.labels_enabled {
+            // Common labels, so labeling works without setting anything up.
+            store::seed_starter_labels(&conn)?;
+        }
         if !prefs.enabled {
             clear_pending(root, domain, local, &conn)?;
         }
-        Ok(())
+        Ok(Ok(()))
     })
     .await;
     match result {
-        Ok(()) => {
-            webmail_log!("info", "organize_preferences_saved", { "address": address, "enabled": enabled });
+        Ok(Ok(())) => {
+            webmail_log!("info", "organize_preferences_saved", { "address": address, "enabled": enabled, "cloud_consent": cloud_consent, "labels_enabled": labels_enabled });
             StatusCode::NO_CONTENT.into_response()
         }
+        Ok(Err(message)) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
         Err(error) => internal_error(error),
+    }
+}
+
+/// The signed-in user's labels, for showing keywords as named chips.
+async fn labels(State(state): State<Shared>, session: Session) -> Response {
+    let result = blocking(move || {
+        match store::open_existing(&state.mail_root, &session.domain, &session.localpart)? {
+            Some(conn) => store::labels(&conn),
+            None => Ok(Vec::new()),
+        }
+    })
+    .await;
+    match result {
+        Ok(labels) => Json(labels).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewFolder {
+    name: String,
+}
+
+/// Create a folder, e.g. from a label used often.
+async fn create_folder(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+    let Ok(input) = serde_json::from_slice::<NewFolder>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let name = input.name.trim().trim_matches('/').to_string();
+    if name.is_empty() || name.eq_ignore_ascii_case("INBOX") || name.chars().count() > 200 {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "invalid folder name").into_response();
+    }
+    let created = name.clone();
+    let result = blocking(move || {
+        imap_state::create_folder(&state.mail_root, &session.domain, &session.localpart, &name)
+    })
+    .await;
+    match result {
+        Ok(()) => Json(serde_json::json!({ "folder": created })).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
 }
 
