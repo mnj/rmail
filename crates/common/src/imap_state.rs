@@ -1,4 +1,7 @@
-use crate::maildir::{STANDARD_FOLDERS, ensure_maildir, mailbox_dir, normalize_mailbox_name};
+pub use crate::maildir::account_maildir;
+use crate::maildir::{
+    STANDARD_FOLDERS, ensure_maildir, mailbox_dir, message_path, normalize_mailbox_name,
+};
 use crate::sqlite_pool::SqliteConnection;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -72,10 +75,6 @@ impl std::fmt::Display for StorageQuotaExceeded {
 }
 
 impl std::error::Error for StorageQuotaExceeded {}
-
-pub fn account_maildir(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
-    maildir_root.join(domain).join(localpart).join("Maildir")
-}
 
 pub fn state_db_path(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
     account_maildir(maildir_root, domain, localpart).join(STATE_DB_FILENAME)
@@ -1018,7 +1017,7 @@ fn expunge_uids_in_tx(
         else {
             continue;
         };
-        let path = dir.join(&subdir).join(&filename);
+        let path = message_path(&dir, &subdir, &filename)?;
         if path.exists() {
             let tombstone = dir.join("tmp").join(format!(
                 "{}.expunge.{}.{}",
@@ -1215,7 +1214,7 @@ pub fn transfer_messages_by_uid(
         else {
             continue;
         };
-        let source_path = source_dir.join(&subdir).join(&filename);
+        let source_path = message_path(&source_dir, &subdir, &filename)?;
         let operation = if move_messages { "moved" } else { "copy" };
         let destination_filename = format!(
             "{}.{}.{}.{}",
@@ -1224,7 +1223,7 @@ pub fn transfer_messages_by_uid(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
             rand::random::<u64>()
         );
-        let destination_path = destination_dir.join(&subdir).join(&destination_filename);
+        let destination_path = message_path(&destination_dir, &subdir, &destination_filename)?;
         if move_messages {
             fs::rename(&source_path, &destination_path).with_context(|| {
                 format!("moving message {uid} from {source_mailbox} to {destination_mailbox}")
@@ -1325,9 +1324,9 @@ pub fn move_message_by_uid(
     let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
     let destination_dir = mailbox_dir(maildir_root, domain, localpart, &destination)?;
     ensure_maildir(&destination_dir)?;
-    let source_path = source_dir.join(&subdir).join(&filename);
+    let source_path = message_path(&source_dir, &subdir, &filename)?;
     let mut destination_filename = filename.clone();
-    let mut destination_path = destination_dir.join(&subdir).join(&destination_filename);
+    let mut destination_path = message_path(&destination_dir, &subdir, &destination_filename)?;
     if destination_path.exists() {
         destination_filename = format!(
             "{}.moved.{}.{}",
@@ -1335,7 +1334,7 @@ pub fn move_message_by_uid(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
             rand::random::<u64>()
         );
-        destination_path = destination_dir.join(&subdir).join(&destination_filename);
+        destination_path = message_path(&destination_dir, &subdir, &destination_filename)?;
     }
     fs::rename(&source_path, &destination_path).with_context(|| {
         format!(
@@ -1432,7 +1431,7 @@ pub fn copy_message_by_uid(
     let source_dir = mailbox_dir(maildir_root, domain, localpart, &source)?;
     let destination_dir = mailbox_dir(maildir_root, domain, localpart, &destination)?;
     ensure_maildir(&destination_dir)?;
-    let source_path = source_dir.join(&subdir).join(&filename);
+    let source_path = message_path(&source_dir, &subdir, &filename)?;
     let uidnext: i64 = tx.query_row(
         "SELECT uidnext FROM folders WHERE id = ?1",
         params![destination_id],
@@ -1445,7 +1444,7 @@ pub fn copy_message_by_uid(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
         rand::random::<u64>()
     );
-    let destination_path = destination_dir.join(&subdir).join(&destination_filename);
+    let destination_path = message_path(&destination_dir, &subdir, &destination_filename)?;
     fs::copy(&source_path, &destination_path).with_context(|| {
         format!(
             "copying message {} from {} to {}",
@@ -2298,7 +2297,7 @@ fn list_messages_for_folder(
         ) = row?;
         messages.push(Message {
             uid,
-            path: dir.join(subdir).join(filename),
+            path: message_path(&dir, &subdir, &filename)?,
             flags: flags_from_text(&flags_text)?,
             size,
             internaldate,

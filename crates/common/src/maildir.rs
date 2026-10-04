@@ -127,8 +127,43 @@ pub const STANDARD_FOLDERS: &[(&str, &str)] = &[
     ("Archive", "\\Archive"),
 ];
 
-fn account_maildir(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
-    maildir_root.join(domain).join(localpart).join("Maildir")
+/// Whether `s` is safe to use as a single path component.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && !s.contains("..")
+}
+
+/// Placeholder component that never matches a real account, so an invalid
+/// domain or localpart cannot escape the mail root.
+const INVALID_COMPONENT: &str = ".invalid";
+
+/// The account's Maildir root. Components that are not a single safe path
+/// segment resolve to a placeholder directory instead of leaving `maildir_root`.
+pub fn account_maildir(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
+    let pick = |s: &str| -> String {
+        if is_safe_component(s) {
+            s.to_string()
+        } else {
+            INVALID_COMPONENT.to_string()
+        }
+    };
+    maildir_root
+        .join(pick(domain))
+        .join(pick(localpart))
+        .join("Maildir")
+}
+
+/// Path of a message file inside a Maildir, rejecting `subdir`/`filename`
+/// values (which come from the state database) that could escape it.
+pub fn message_path(dir: &Path, subdir: &str, filename: &str) -> anyhow::Result<PathBuf> {
+    if !matches!(subdir, "new" | "cur" | "tmp") || !is_safe_component(filename) {
+        return Err(anyhow::anyhow!("invalid message location"));
+    }
+    Ok(dir.join(subdir).join(filename))
 }
 
 pub fn mailbox_dir(
