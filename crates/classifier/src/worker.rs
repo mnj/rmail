@@ -905,11 +905,12 @@ mod tests {
             run_cycle(root, &cfg(), &models);
         }
         let (_, receipts) = imap_state::load_folder(root, D, L, "Receipts").unwrap();
-        let moved: Vec<_> = receipts
-            .iter()
-            .filter(|m| m.flags.iter().any(|f| f == "Money"))
-            .collect();
-        assert!(!moved.is_empty(), "{receipts:?}");
+        // Only flags in the failure message: message records carry mailbox paths.
+        let flags: Vec<&Vec<String>> = receipts.iter().map(|m| &m.flags).collect();
+        assert!(
+            flags.iter().any(|f| f.iter().any(|f| f == "Money")),
+            "flags in Receipts: {flags:?}"
+        );
     }
 
     #[test]
