@@ -83,11 +83,12 @@ pub async fn check(ip: IpAddr, zones: &[String], timeout: Duration) -> Option<Li
     for zone in zones.iter().filter(|zone| !zone.trim().is_empty()) {
         let zone = zone.trim().trim_matches('.').to_ascii_lowercase();
         lookups.spawn(async move {
+            // Failures are not cached (try_get_with only stores Ok), so the
+            // next attempt retries; the failed attempt itself fails open.
             cache()
-                .get_with((ip, zone.clone()), async {
-                    lookup_zone(ip, &zone, timeout).await
-                })
+                .try_get_with((ip, zone.clone()), lookup_zone(ip, &zone, timeout))
                 .await
+                .unwrap_or(None)
         });
     }
     while let Some(result) = lookups.join_next().await {
@@ -99,16 +100,26 @@ pub async fn check(ip: IpAddr, zones: &[String], timeout: Duration) -> Option<Li
     None
 }
 
-async fn lookup_zone(ip: IpAddr, zone: &str, timeout: Duration) -> Option<Listing> {
+fn is_no_records(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<mail_auth::hickory_resolver::net::NetError>()
+        .is_some_and(|error| error.is_no_records_found())
+}
+
+/// `Err` means the lookup failed (timeout or resolver error) and must not be
+/// cached; NXDOMAIN-style "no records" is a clean `Ok(None)`.
+async fn lookup_zone(ip: IpAddr, zone: &str, timeout: Duration) -> Result<Option<Listing>, ()> {
     let name = query_name(ip, zone);
-    let answers = tokio::time::timeout(timeout, crate::mail_auth::lookup_ip_addrs(&name))
-        .await
-        .ok()?
-        .ok()?; // NXDOMAIN and resolver errors alike: not listed
-    listed_code(&answers).map(|code| Listing {
+    let answers =
+        match tokio::time::timeout(timeout, crate::mail_auth::lookup_ip_addrs(&name)).await {
+            Ok(Ok(answers)) => answers,
+            Ok(Err(error)) if is_no_records(&error) => return Ok(None),
+            _ => return Err(()),
+        };
+    Ok(listed_code(&answers).map(|code| Listing {
         zone: zone.to_string(),
         code,
-    })
+    }))
 }
 
 #[cfg(test)]

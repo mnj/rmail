@@ -93,8 +93,9 @@ impl Greylist {
         });
         if created {
             self.dirty.store(true, Ordering::Release);
-        } else if entry.last_seen.fetch_max(now, Ordering::AcqRel) < now {
-            // Only the persisted last_seen moved; coalesced into the next snapshot.
+        } else if now.saturating_sub(entry.last_seen.fetch_max(now, Ordering::AcqRel)) >= 3600 {
+            // Only the persisted last_seen moved, and by a coarse step (the
+            // multi-week TTL tolerates it); coalesced into the next snapshot.
             self.dirty.store(true, Ordering::Release);
         }
         let elapsed = now.saturating_sub(entry.first_seen);
@@ -309,7 +310,7 @@ mod tests {
         grey.check_at(ip("192.0.2.1"), "a@x.test", "b@y.test", Duration::ZERO, T);
         assert!(grey.take_dirty());
         assert!(!grey.take_dirty());
-        // A repeat within the same second changes nothing worth writing.
+        // A repeat shortly after changes nothing worth writing.
         grey.check_at(ip("192.0.2.1"), "a@x.test", "b@y.test", Duration::ZERO, T);
         assert!(!grey.take_dirty());
         grey.check_at(
@@ -318,6 +319,15 @@ mod tests {
             "b@y.test",
             Duration::ZERO,
             T + 5,
+        );
+        assert!(!grey.take_dirty());
+        // A coarse (hour-scale) last_seen advance is worth persisting.
+        grey.check_at(
+            ip("192.0.2.1"),
+            "a@x.test",
+            "b@y.test",
+            Duration::ZERO,
+            T + 5 + 3600,
         );
         assert!(grey.take_dirty());
     }

@@ -124,6 +124,9 @@ pub fn save_greylist<P: AsRef<Path>>(
     records: &[crate::greylist::GreylistRecord],
 ) -> Result<()> {
     let mut conn = Connection::open(path)?;
+    // Wait out a concurrent save (e.g. the shutdown flush overlapping a
+    // periodic one) instead of failing with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM greylist", [])?;
     {

@@ -518,7 +518,7 @@ fn submission_message_quota_is_account_keyed() {
     let first = "quota-first@example.test";
     let second = "quota-second@example.test";
     assert!(super::submission_quota_available(first, 1));
-    super::record_submission_message(first);
+    super::record_submission_message(first, 0, 0);
     assert!(!super::submission_quota_available(first, 1));
     assert!(super::submission_quota_available(second, 1));
 }
@@ -2304,7 +2304,7 @@ async fn greylisting_defers_unknown_triples_but_not_submission_or_loopback() {
         ..SecurityConfig::default()
     };
     let script =
-        b"EHLO localhost\r\nMAIL FROM:<grey@sender.test>\r\nRCPT TO:<user@example.test>\r\nQUIT\r\n"
+        b"EHLO localhost\r\nMAIL FROM:<grey-defers-unknown@sender.test>\r\nRCPT TO:<user@example.test>\r\nQUIT\r\n"
             .to_vec();
     let peer: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
 
