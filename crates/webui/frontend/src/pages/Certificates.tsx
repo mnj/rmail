@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { AlertTriangle, FlaskConical, RefreshCw, Save, ServerCog, ShieldCheck } from 'lucide-react';
 import { api, Certificates, Setting, SettingsView } from '../api';
 import { Empty, ErrorBanner, formatDate, formatRelative, Panel, useFeedback, useResource } from '../ui';
-import { SettingControl } from './Settings';
+import { RestartNotice, SettingControl } from './Settings';
 
 type Drafts = Record<string, unknown>;
 
@@ -102,11 +102,15 @@ export function CertificatesPage() {
   const view = overview.data;
   const running = Boolean(view?.running);
 
-  // Follow a run while it is in progress.
+  // Follow a run while it is in progress; when it ends, a first certificate
+  // may have pointed the TLS settings at new files, which needs a restart.
   useEffect(() => {
     if (!running) return;
     const id = window.setInterval(() => overview.reload(), 2000);
-    return () => window.clearInterval(id);
+    return () => {
+      window.clearInterval(id);
+      settingsView.reload();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running]);
 
@@ -193,6 +197,7 @@ export function CertificatesPage() {
         </div>
       </div>
 
+      {settingsView.data && <RestartNotice view={settingsView.data} onRestarted={settingsView.reload} />}
       {view.names_error && view.enabled && <div className="banner"><AlertTriangle size={16} /> {view.names_error}</div>}
       {view.warnings.map((warning) => (
         <div className="notice warn" key={warning}><AlertTriangle size={18} /><p>{warning}</p></div>

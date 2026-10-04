@@ -578,7 +578,7 @@ async fn run_acme(action: AcmeAction, cfg: &Config) -> Result<()> {
             )
             .await?;
             if outcome.settings_updated {
-                println!("Restart the services once to enable TLS: rmail_ctl service restart");
+                restart_for_tls()?;
             }
         }
         AcmeAction::Renew => match acme::renew_if_due(cfg, "cli").await? {
@@ -707,6 +707,33 @@ fn apply_restart_request(file: &str) -> Result<()> {
         run_systemctl("restart", unit, false)?;
     }
     Ok(())
+}
+
+/// A first certificate needs one restart of the TLS services; offer it
+/// (or print the command when there is nobody to ask).
+fn restart_for_tls() -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    let command = "rmail_ctl service restart";
+    if !std::io::stdin().is_terminal() {
+        println!("Restart the services once to enable TLS: {command}");
+        return Ok(());
+    }
+    print!("Restart the rMail services now to enable TLS? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        run_service_action(
+            "restart",
+            ServiceCommandOptions {
+                units: Vec::new(),
+                dry_run: false,
+            },
+        )
+    } else {
+        println!("Restart later with: {command}");
+        Ok(())
+    }
 }
 
 fn run_service_action(action: &str, opts: ServiceCommandOptions) -> Result<()> {
