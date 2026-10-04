@@ -738,6 +738,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.tls_rpt_enabled",
+        "tls",
+        "SMTP TLS reports",
+        "Send daily TLS reports (RFC 8460) to domains that publish a _smtp._tls record, covering sessions checked against their MTA-STS policy.",
+        SettingKind::Bool,
+        SMTP,
+    ),
+    spec(
         "security.scanner_failure_action",
         "filtering",
         "When a scanner fails",

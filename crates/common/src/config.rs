@@ -474,6 +474,10 @@ pub struct SecurityConfig {
     pub mta_sts_mode: crate::discovery::MtaStsMode,
     #[serde(default = "default_mta_sts_max_age_secs")]
     pub mta_sts_max_age_secs: u64,
+    /// Send daily SMTP TLS reports (RFC 8460) to domains that publish a
+    /// `_smtp._tls` record.
+    #[serde(default = "default_true")]
+    pub tls_rpt_enabled: bool,
 }
 
 impl Default for SecurityConfig {
@@ -504,6 +508,7 @@ impl Default for SecurityConfig {
             rspamd_reject_actions: Vec::new(),
             mta_sts_mode: crate::discovery::MtaStsMode::None,
             mta_sts_max_age_secs: default_mta_sts_max_age_secs(),
+            tls_rpt_enabled: true,
         }
     }
 }

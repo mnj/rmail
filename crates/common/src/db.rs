@@ -104,6 +104,18 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             created_at INTEGER,
             reported INTEGER DEFAULT 0
         );
+
+        -- tlsrpt_counts aggregates outbound TLS outcomes per UTC day (see tlsrpt.rs).
+        CREATE TABLE IF NOT EXISTS tlsrpt_counts (
+            day TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            policy_type TEXT NOT NULL,
+            mx_host TEXT NOT NULL,
+            result TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            info TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (day, domain, policy_type, mx_host, result)
+        ) WITHOUT ROWID;
         "#,
     )?;
     ensure_outbound_columns(path)?;
@@ -250,6 +262,81 @@ pub fn set_mailbox_quota<P: AsRef<Path>>(
     if changed == 0 {
         anyhow::bail!("mailbox does not exist");
     }
+    Ok(())
+}
+
+/// Add `rows` to the persisted TLS-RPT counters in one transaction.
+pub fn add_tlsrpt_counts<P: AsRef<Path>>(
+    path: P,
+    rows: &[crate::tlsrpt::CounterRow],
+) -> Result<()> {
+    let mut conn = Connection::open(path)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO tlsrpt_counts (day, domain, policy_type, mx_host, result, count, info)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(day, domain, policy_type, mx_host, result)
+             DO UPDATE SET count = count + excluded.count,
+                           info = CASE WHEN excluded.info = '' THEN info ELSE excluded.info END",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                row.day,
+                row.domain,
+                row.policy_type,
+                row.mx_host,
+                row.result,
+                row.count as i64,
+                row.info
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Counters for one day and policy domain.
+pub fn tlsrpt_rows<P: AsRef<Path>>(
+    path: P,
+    day: &str,
+    domain: &str,
+) -> Result<Vec<crate::tlsrpt::CounterRow>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT day, domain, policy_type, mx_host, result, count, info FROM tlsrpt_counts
+         WHERE day = ?1 AND domain = ?2 ORDER BY policy_type, mx_host, result",
+    )?;
+    let rows = stmt.query_map(params![day, domain], |row| {
+        Ok(crate::tlsrpt::CounterRow {
+            day: row.get(0)?,
+            domain: row.get(1)?,
+            policy_type: row.get(2)?,
+            mx_host: row.get(3)?,
+            result: row.get(4)?,
+            count: row.get::<_, i64>(5)? as u64,
+            info: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (day, domain) pairs from days before `today` that still need a report.
+pub fn tlsrpt_due<P: AsRef<Path>>(path: P, today: &str) -> Result<Vec<(String, String)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT day, domain FROM tlsrpt_counts WHERE day < ?1 ORDER BY day, domain",
+    )?;
+    let rows = stmt.query_map(params![today], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn tlsrpt_delete<P: AsRef<Path>>(path: P, day: &str, domain: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "DELETE FROM tlsrpt_counts WHERE day = ?1 AND domain = ?2",
+        params![day, domain],
+    )?;
     Ok(())
 }
 

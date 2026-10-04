@@ -3276,6 +3276,7 @@ dependencies = [
  "chrono",
  "criterion",
  "encoding_rs",
+ "flate2",
  "hmac",
  "hyper",
  "hyper-util",

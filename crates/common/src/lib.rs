@@ -32,6 +32,7 @@ pub mod sqlite_pool;
 pub mod test_support;
 pub mod throttle;
 pub mod tls;
+pub mod tlsrpt;
 pub mod tracking;
 pub mod transport;
 pub mod websession;
