@@ -3420,6 +3420,7 @@ dependencies = [
  "pbkdf2 0.12.2",
  "rand 0.8.8",
  "rmail_common",
+ "rmail_sieve",
  "rustls 0.21.12",
  "rustls-pemfile",
  "sha2 0.10.9",
