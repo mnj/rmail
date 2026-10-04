@@ -149,13 +149,21 @@ async fn main() -> Result<()> {
     };
 
     let security = Arc::new(cfg.security.clone());
+    let greylist_task = if security.greylist_enabled {
+        Some(rmail_common::greylist::spawn_persistence(
+            std::path::PathBuf::from(&db_path),
+            Duration::from_secs(security.greylist_persist_interval_secs.max(1)),
+        )?)
+    } else {
+        None
+    };
     protocol::validate_sasl_mechanisms(&security.smtp_sasl_mechanisms, security.oauth.is_some())
         .context("validating security.smtp_sasl_mechanisms")?;
     let shutdown = GracefulShutdown::new();
     let template = ListenerContext {
         mail_root,
         tls: tls_receiver,
-        db_path: Some(db_path),
+        db_path: Some(db_path.clone()),
         enforce_dmarc: cfg.global.enforce_dmarc.unwrap_or(false),
         security: security.clone(),
         session_limit: Arc::new(Semaphore::new(security.smtp_max_concurrent_sessions.max(1))),
@@ -225,6 +233,12 @@ async fn main() -> Result<()> {
     }
     if !shutdown.wait_for_sessions(Duration::from_secs(30)).await {
         smtp_log!("warn", "shutdown_drain_timed_out", { "active_sessions": shutdown.active_sessions() });
+    }
+    if let Some(task) = greylist_task {
+        task.abort();
+        if let Err(error) = rmail_common::greylist::flush(std::path::Path::new(&db_path)) {
+            smtp_log!("error", "greylist_flush_failed", { "error": error.to_string() });
+        }
     }
     Ok(())
 }

@@ -736,6 +736,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.greylist_persist_interval_secs",
+        "filtering",
+        "Greylist save interval (s)",
+        "How often changed greylist state is written to disk. Changes are batched; nothing is written while idle.",
+        int(10, 86_400),
+        SMTP,
+    ),
+    spec(
         "security.scanner_failure_action",
         "filtering",
         "When a scanner fails",

@@ -474,6 +474,9 @@ pub struct SecurityConfig {
     pub greylist_enabled: bool,
     #[serde(default = "default_greylist_delay_secs")]
     pub greylist_delay_secs: u64,
+    /// How often changed greylist state is written to SQLite.
+    #[serde(default = "default_greylist_persist_interval_secs")]
+    pub greylist_persist_interval_secs: u64,
 }
 
 impl Default for SecurityConfig {
@@ -504,6 +507,7 @@ impl Default for SecurityConfig {
             rspamd_reject_actions: Vec::new(),
             greylist_enabled: false,
             greylist_delay_secs: default_greylist_delay_secs(),
+            greylist_persist_interval_secs: default_greylist_persist_interval_secs(),
         }
     }
 }
@@ -731,6 +735,10 @@ fn default_clamav_endpoint() -> String {
 }
 
 fn default_greylist_delay_secs() -> u64 {
+    300
+}
+
+fn default_greylist_persist_interval_secs() -> u64 {
     300
 }
 
