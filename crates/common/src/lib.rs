@@ -25,6 +25,7 @@ pub mod outbound;
 pub mod restart;
 pub mod runtime;
 pub mod scanner;
+pub mod search_index;
 pub mod settings;
 pub mod sqlite_pool;
 #[cfg(any(test, feature = "test-support"))]

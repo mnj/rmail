@@ -299,6 +299,7 @@ impl UpdateContext {
                     size: view.sizes.get(uid).copied().unwrap_or(0) as usize,
                     email_id: view.email_ids.get(uid).map_or("", String::as_str),
                     data: data.as_deref().unwrap_or_default(),
+                    fts: None,
                 };
                 parser::search_matches(&self.criterion, &message, view.msgs.len())
             };

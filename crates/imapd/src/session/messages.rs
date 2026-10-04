@@ -134,6 +134,7 @@ impl Session {
         let outcome = commands::search::handle(
             tag,
             args,
+            Some(std::path::Path::new(&self.mail_root)),
             self.selected(),
             self.state.saved_search_uids(),
             uid,
