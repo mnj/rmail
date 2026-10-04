@@ -720,6 +720,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.greylist_enabled",
+        "filtering",
+        "Greylisting",
+        "Defer the first delivery from unknown sender/recipient/network triples on inbound SMTP.",
+        SettingKind::Bool,
+        SMTP,
+    ),
+    spec(
+        "security.greylist_delay_secs",
+        "filtering",
+        "Greylist delay (s)",
+        "Minimum wait before a deferred triple is accepted.",
+        int(1, 86_400),
+        SMTP,
+    ),
+    spec(
         "security.scanner_failure_action",
         "filtering",
         "When a scanner fails",

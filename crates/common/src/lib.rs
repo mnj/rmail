@@ -13,6 +13,7 @@ pub mod compose;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod greylist;
 pub mod http;
 pub mod imap_state;
 pub mod mail_auth;

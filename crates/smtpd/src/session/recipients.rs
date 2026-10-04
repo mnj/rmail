@@ -47,6 +47,10 @@ impl Session {
             Decision::Reject(rejection) => return reply(reader, rejection).await,
             Decision::Accept { targets, forwarded } => (targets, forwarded),
         };
+        if let Some(retry) = self.greylist_defer(&address) {
+            session_log!(self, "info", "rcpt_greylisted", { "rcpt": address, "retry_after_secs": retry });
+            return reply(reader, b"451 4.7.1 Greylisted, please try again later\r\n").await;
+        }
         if self.service == SmtpService::Lmtp {
             self.lmtp_recipient_groups
                 .push((self.generation, address.clone(), targets.clone()));
@@ -62,6 +66,33 @@ impl Session {
         }
         session_log!(self, "info", "rcpt_accepted", { "rcpt": address, "recipient_count": self.tx.rcpts.len() });
         reply(reader, b"250 2.1.5 Recipient OK\r\n").await
+    }
+
+    /// Greylisting applies only to unauthenticated inbound SMTP from a known
+    /// peer; authenticated submission and LMTP are never delayed.
+    fn greylist_defer(&self, address: &str) -> Option<u64> {
+        if !self.security.greylist_enabled
+            || self.service != SmtpService::Mta
+            || self.authenticated_user.is_some()
+        {
+            return None;
+        }
+        let ip = self.peer?.ip();
+        if ip.is_loopback() {
+            return None;
+        }
+        let from = self.tx.mail_from.as_deref().unwrap_or("");
+        match rmail_common::greylist::global().check(
+            ip,
+            from,
+            address,
+            std::time::Duration::from_secs(self.security.greylist_delay_secs),
+        ) {
+            rmail_common::greylist::GreylistDecision::Accept => None,
+            rmail_common::greylist::GreylistDecision::Defer { retry_after_secs } => {
+                Some(retry_after_secs)
+            }
+        }
     }
 
     /// Mailbox first, then alias, then the domain catchall; anything else is

@@ -468,6 +468,12 @@ pub struct SecurityConfig {
     pub rspamd_quarantine_actions: Vec<String>,
     #[serde(default)]
     pub rspamd_reject_actions: Vec<String>,
+    /// Defer the first delivery attempt from unknown (network, sender,
+    /// recipient) triples on unauthenticated SMTP sessions.
+    #[serde(default)]
+    pub greylist_enabled: bool,
+    #[serde(default = "default_greylist_delay_secs")]
+    pub greylist_delay_secs: u64,
 }
 
 impl Default for SecurityConfig {
@@ -496,6 +502,8 @@ impl Default for SecurityConfig {
             rspamd_url: default_rspamd_url(),
             rspamd_quarantine_actions: default_rspamd_quarantine_actions(),
             rspamd_reject_actions: Vec::new(),
+            greylist_enabled: false,
+            greylist_delay_secs: default_greylist_delay_secs(),
         }
     }
 }
@@ -720,6 +728,10 @@ fn default_scanner_max_message_bytes() -> usize {
 
 fn default_clamav_endpoint() -> String {
     "unix:/run/clamav/clamd.ctl".to_string()
+}
+
+fn default_greylist_delay_secs() -> u64 {
+    300
 }
 
 fn default_rspamd_url() -> String {

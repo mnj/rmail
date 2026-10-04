@@ -232,6 +232,10 @@ impl Session {
                 ScanAction::Quarantine => Scan::Quarantine(
                     rmail_common::scanner::prepend_scan_headers(data, &verdict.headers),
                 ),
+                ScanAction::Defer => {
+                    session_log!(self, "info", "message_deferred_by_scanner", { "message_id": self.message_id, "reason": verdict.reason });
+                    Scan::Reject("451 4.7.1 Greylisted, please try again later")
+                }
                 ScanAction::Reject => {
                     session_log!(self, "warn", "message_rejected_by_scanner", { "message_id": self.message_id, "reason": verdict.reason });
                     Scan::Reject("554 5.7.1 Message rejected: malware detected")
