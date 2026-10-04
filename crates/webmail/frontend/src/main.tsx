@@ -5,7 +5,7 @@ import './style.css';
 
 type Folder = { name: string; special_use: string | null; messages: number; unread: number };
 type Suggestion = { folder: string; score: number; method: 'sender' | 'knn' | 'llm' };
-type Message = { uid: number; flags: string[]; size: number; internal_date: number; from: string; to: string; subject: string; snippet: string; suggestion?: Suggestion };
+type Message = { uid: number; flags: string[]; size: number; internal_date: number; from: string; to: string; subject: string; snippet: string; suggestion?: Suggestion; labels?: Label[] };
 type MessageDetail = Message & { date: string; text_body: string; html_body: string | null; has_remote_content: boolean };
 type OrganizeFolder = { name: string; learned: number; accepted: number; dismissed: number; excluded: boolean; autofile: boolean };
 type Label = { name: string; keyword: string; description: string };
@@ -51,6 +51,7 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
   // Labels the editor showed; ones the AI adds meanwhile are not removed on save.
   const [seen, setSeen] = useState<string[]>([]);
   const [editingLabels, setEditingLabels] = useState(false);
+  const [ideaParent, setIdeaParent] = useState('');
 
   useEffect(() => {
     api<Organize>('/api/organize').then((loaded) => {
@@ -64,13 +65,11 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
     setData({ ...data, labels: data.labels.map((l, i) => (i === index ? { ...l, ...change } : l)) });
   }
 
-  async function createFolder(name: string) {
+  async function createFolder(label: string) {
     if (!data) return;
-    const wanted = window.prompt('New folder name. Use a / for a subfolder, e.g. Projects/Invoices.', name);
-    if (!wanted?.trim()) return;
     try {
-      await api('/api/organize/folders', { method: 'POST', body: JSON.stringify({ name: wanted.trim() }) });
-      setData({ ...data, folder_ideas: data.folder_ideas.filter((idea) => idea.label !== name) });
+      await api('/api/organize/folders', { method: 'POST', body: JSON.stringify({ label, ...(ideaParent ? { parent: ideaParent } : {}) }) });
+      setData({ ...data, folder_ideas: data.folder_ideas.filter((idea) => idea.label !== label) });
       onSaved();
     } catch (err) {
       setError((err as Error).message);
@@ -168,6 +167,7 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
             {data.folder_ideas.length > 0 && (
               <div className="folder-ideas">
                 <p className="dialog-hint">You use these labels a lot. They might deserve a folder:</p>
+                <label className="idea-parent">Create in <select value={ideaParent} onChange={(e) => setIdeaParent(e.target.value)}><option value="">Top level</option>{data.folders.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</select></label>
                 {data.folder_ideas.map((idea) => (
                   <button key={idea.label} onClick={() => createFolder(idea.label)}><FolderPlus size={14} />{idea.label} <small>{idea.count} messages</small></button>
                 ))}
@@ -203,7 +203,6 @@ function App() {
   const [mobileView, setMobileView] = useState<'folders' | 'list' | 'message'>('list');
   const [error, setError] = useState('');
   const [organizing, setOrganizing] = useState(false);
-  const [labels, setLabels] = useState<Label[]>([]);
 
   async function api<T>(url: string, options?: RequestInit): Promise<T> {
     // X-Rmail-Webmail marks the request as same-origin (CSRF protection).
@@ -215,12 +214,10 @@ function App() {
 
   async function refresh(nextFolder = folder) {
     const q = query ? `&q=${encodeURIComponent(query)}` : '';
-    const [folderData, messageData, labelData] = await Promise.all([
+    const [folderData, messageData] = await Promise.all([
       api<Folder[]>('/api/folders'),
       api<Message[]>(`/api/folders/${encodeURIComponent(nextFolder)}/messages?limit=100${q}`),
-      api<Label[]>('/api/labels').catch(() => [] as Label[]),
     ]);
-    setLabels(labelData);
     setFolders(folderData);
     setMessages(messageData);
     setChecked([]);
@@ -303,9 +300,9 @@ function App() {
     await refresh();
   }
 
-  /** The user's labels present on a message, as removable chips. */
+  /** The user's labels on a message (as the list reports them), as removable chips. */
   function labelChips(message: Message) {
-    const present = labels.filter((label) => message.flags.some((flag) => flag.toLowerCase() === label.keyword.toLowerCase()));
+    const present = (messages.find((m) => m.uid === message.uid) || message).labels || [];
     if (!present.length) return null;
     return (
       <div className="label-chips">
