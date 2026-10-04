@@ -22,11 +22,13 @@ use rmail_common::mime::{
     Attachment, attachment_data, has_remote_content, parse_message, sanitize_email_html, snippet,
 };
 
+mod compose;
 mod organize;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Room for a 10 MiB message as base64 attachments in JSON.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// State-changing requests must carry this header; browsers cannot add it to
 /// cross-site form posts.
 pub(crate) const CSRF_HEADER: &str = "x-rmail-webmail";
@@ -42,6 +44,9 @@ pub(crate) struct AppState {
     pub secure_cookies: bool,
     pub throttle: AuthThrottle,
     pub revoked: websession::RevocationList,
+    /// Loopback address of this server's submission service; `None` when
+    /// no usable submission listener is configured (sending is off).
+    pub submission: Option<std::net::SocketAddr>,
 }
 
 type Shared = Arc<AppState>;
@@ -72,6 +77,7 @@ pub(crate) fn router(state: Shared) -> Router {
         )
         .route("/api/folders/{folder}/messages/bulk", post(bulk))
         .merge(organize::routes())
+        .merge(compose::routes())
         .fallback(fallback)
         .layer(middleware::from_fn(reject_cross_site))
         .layer(middleware::from_fn(security_headers))
@@ -235,6 +241,8 @@ struct LoginRequest {
 #[derive(Serialize)]
 struct SessionResponse {
     address: String,
+    /// Whether this server can send mail from webmail.
+    can_send: bool,
 }
 
 async fn login(
@@ -298,7 +306,10 @@ async fn login(
     let binding = websession::credential_binding(&state.session_secret, &hash);
     let token = websession::sign(&state.session_secret, &address, &binding, SESSION_TTL_SECS);
     with_cookie(
-        Json(SessionResponse { address }),
+        Json(SessionResponse {
+            address,
+            can_send: state.submission.is_some(),
+        }),
         websession::set_cookie(
             SESSION_COOKIE,
             &token,
@@ -321,9 +332,10 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
     )
 }
 
-async fn session_info(session: Session) -> Json<SessionResponse> {
+async fn session_info(State(state): State<Shared>, session: Session) -> Json<SessionResponse> {
     Json(SessionResponse {
         address: session.address,
+        can_send: state.submission.is_some(),
     })
 }
 
@@ -374,8 +386,11 @@ struct MessageDetail {
     from: String,
     to: String,
     cc: String,
+    bcc: String,
     reply_to: String,
     message_id: String,
+    in_reply_to: String,
+    references: String,
     subject: String,
     date: String,
     attachments: Vec<Attachment>,
@@ -609,8 +624,11 @@ async fn message_detail(
             from: parsed.from,
             to: parsed.to,
             cc: parsed.cc,
+            bcc: parsed.bcc,
             reply_to: parsed.reply_to,
             message_id: parsed.message_id,
+            in_reply_to: parsed.in_reply_to,
+            references: parsed.references,
             subject: parsed.subject,
             date: parsed.date,
             attachments: parsed.attachments,
@@ -1049,6 +1067,7 @@ mod tests {
             secure_cookies: false,
             throttle: AuthThrottle::default(),
             revoked: websession::RevocationList::default(),
+            submission: None,
         })
     }
 
@@ -1388,6 +1407,197 @@ mod tests {
         )
         .await;
         assert_eq!(locked.status, 429);
+    }
+
+    /// A submission service stand-in: checks webmail's credential against
+    /// the real key, refuses one recipient, and records what it receives.
+    async fn fake_submission(
+        mail_root: std::path::PathBuf,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<(Vec<String>, String)>,
+    ) {
+        use base64::Engine;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(read).lines();
+                write.write_all(b"220 test ESMTP\r\n").await.unwrap();
+                let mut envelope = Vec::new();
+                let mut data = String::new();
+                let mut in_data = false;
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if in_data {
+                        if line == "." {
+                            in_data = false;
+                            write.write_all(b"250 2.0.0 queued\r\n").await.unwrap();
+                        } else {
+                            data.push_str(&line);
+                            data.push('\n');
+                        }
+                        continue;
+                    }
+                    let reply: &[u8] = if line.starts_with("EHLO") {
+                        b"250-test\r\n250 8BITMIME\r\n"
+                    } else if let Some(token) = line.strip_prefix("AUTH X-RMAIL-WEBMAIL ") {
+                        let decoded = String::from_utf8(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(token)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let key =
+                            rmail_common::runtime::webmail_submission_key(&mail_root).unwrap();
+                        if decoded == format!("user@example.test\0{key}") {
+                            b"235 ok\r\n"
+                        } else {
+                            b"535 no\r\n"
+                        }
+                    } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                        envelope.push(line.clone());
+                        if line.contains("blocked@") {
+                            b"550 5.1.1 Recipient rejected\r\n"
+                        } else {
+                            b"250 ok\r\n"
+                        }
+                    } else if line == "DATA" {
+                        in_data = true;
+                        b"354 go\r\n"
+                    } else if line == "QUIT" {
+                        write.write_all(b"221 bye\r\n").await.unwrap();
+                        break;
+                    } else {
+                        b"250 ok\r\n"
+                    };
+                    write.write_all(reply).await.unwrap();
+                }
+                if !data.is_empty() {
+                    tx.send((envelope, data)).unwrap();
+                }
+            }
+        });
+        (address, rx)
+    }
+
+    #[tokio::test]
+    async fn sending_goes_through_submission_and_keeps_a_copy() {
+        use base64::Engine;
+        let td = tempfile::tempdir().unwrap();
+        let base = state(&td);
+        let (root, d, l) = (base.mail_root.clone(), "example.test", "user");
+        imap_state::init_account(&root, d, l).unwrap();
+        let (address, mut received) = fake_submission(root.clone()).await;
+        let state = Arc::new(AppState {
+            mail_root: base.mail_root.clone(),
+            db_path: base.db_path.clone(),
+            static_dir: base.static_dir.clone(),
+            session_secret: base.session_secret.clone(),
+            secure_cookies: false,
+            throttle: AuthThrottle::default(),
+            revoked: websession::RevocationList::default(),
+            submission: Some(address),
+        });
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call = |method: &'static str, path: &'static str, body: Vec<u8>| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move { route(req(method, path, &body, cookie), &state).await }
+        };
+        let session: serde_json::Value =
+            serde_json::from_slice(&call("GET", "/api/session", vec![]).await.body).unwrap();
+        assert_eq!(session["can_send"], true);
+
+        let (_, original) = imap_state::deliver_message(
+            &root,
+            d,
+            l,
+            b"From: a@b.test\r\nMessage-ID: <o1@b.test>\r\nSubject: Hi\r\n\r\nhello",
+        )
+        .unwrap();
+        let draft: serde_json::Value = serde_json::from_slice(
+            &call(
+                "POST",
+                "/api/drafts",
+                br#"{"to":["a@b.test"],"subject":"Re: Hi","text":"draft"}"#.to_vec(),
+            )
+            .await
+            .body,
+        )
+        .unwrap();
+        assert_eq!(draft["folder"], "Drafts");
+        let draft_uid = draft["uid"].as_u64().unwrap();
+        let drafts = imap_state::load_folder(&root, d, l, "Drafts").unwrap().1;
+        assert!(drafts[0].flags.iter().any(|f| f == "\\Draft"));
+
+        let file = base64::engine::general_purpose::STANDARD.encode(b"report");
+        let body = serde_json::json!({
+            "to": ["Ann <a@b.test>"], "bcc": ["hidden@c.test"], "subject": "Re: Hi", "text": ".leading dot\nthanks",
+            "in_reply_to": "<o1@b.test>", "references": "<o1@b.test>",
+            "attachments": [{"filename": "r.txt", "content_type": "text/plain", "data": file}],
+            "source": {"folder": "INBOX", "uid": original, "kind": "reply"},
+            "draft_uid": draft_uid,
+        });
+        let sent = call("POST", "/api/send", body.to_string().into_bytes()).await;
+        assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+        let (envelope, data) = received.recv().await.unwrap();
+        assert_eq!(
+            envelope,
+            vec![
+                "MAIL FROM:<user@example.test>",
+                "RCPT TO:<a@b.test>",
+                "RCPT TO:<hidden@c.test>"
+            ]
+        );
+        assert!(!data.contains("hidden@c.test"), "Bcc stays off the wire");
+        assert!(data.contains("..leading dot"), "dot-stuffed");
+        assert!(data.contains("In-Reply-To: <o1@b.test>"));
+
+        let sent_folder = imap_state::load_folder(&root, d, l, "Sent").unwrap().1;
+        assert_eq!(sent_folder.len(), 1);
+        let copy = std::fs::read_to_string(&sent_folder[0].path).unwrap();
+        assert!(
+            copy.contains("Bcc: hidden@c.test"),
+            "the Sent copy keeps Bcc"
+        );
+        assert!(
+            imap_state::load_folder(&root, d, l, "Drafts")
+                .unwrap()
+                .1
+                .is_empty(),
+            "draft removed"
+        );
+        let inbox = imap_state::load_folder(&root, d, l, "INBOX").unwrap().1;
+        assert!(inbox[0].flags.iter().any(|f| f == "\\Answered"));
+
+        let refused = call(
+            "POST",
+            "/api/send",
+            br#"{"to":["blocked@b.test"],"subject":"x","text":"y"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(refused.status, 422);
+        assert!(String::from_utf8_lossy(&refused.body).contains("550 5.1.1 Recipient rejected"));
+        let empty = call(
+            "POST",
+            "/api/send",
+            br#"{"to":[],"subject":"x","text":"y"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(empty.status, 422);
+        let injected = call(
+            "POST",
+            "/api/send",
+            b"{\"to\":[\"a@b.test\\r\\nRCPT TO:<x@y.test>\"],\"text\":\"y\"}".to_vec(),
+        )
+        .await;
+        assert_eq!(injected.status, 422);
     }
 
     #[tokio::test]

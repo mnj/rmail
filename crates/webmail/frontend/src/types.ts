@@ -12,7 +12,8 @@ export type MessagePage = { total: number; messages: Message[] };
 export type Attachment = { index: number; filename: string; content_type: string; size: number; inline: boolean };
 export type MessageDetail = {
   uid: number; flags: string[]; size: number; internal_date: number;
-  from: string; to: string; cc: string; reply_to: string; message_id: string;
+  from: string; to: string; cc: string; bcc: string; reply_to: string; message_id: string;
+  in_reply_to: string; references: string;
   subject: string; date: string; text_body: string; html_body: string | null;
   has_remote_content: boolean; attachments: Attachment[]; labels: Label[];
 };

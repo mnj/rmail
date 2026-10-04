@@ -2,10 +2,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
-  Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, RefreshCw, Search, Send, Sparkles,
-  Star, Sun, Tag, Trash2, X,
+  Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
+  ReplyAll, Search, Send, Sparkles, Star, Sun, Tag, Trash2, X,
 } from 'lucide-react';
 import { OrganizeDialog } from './organize';
+import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import {
   Api, ApiError, Attachment, Folder, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
   formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sortFolders, splitAddress,
@@ -274,7 +275,7 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
 // ---------------------------------------------------------------------------
 // Mailbox
 
-function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogout: () => void }) {
+function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: string; canSend: boolean; onLogout: () => void }) {
   const [folders, setFolders] = useState<Folder[]>([]);
   const [folder, setFolder] = useState('INBOX');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -292,6 +293,7 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
   const [moveOpen, setMoveOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [notice, setNotice] = useState('');
+  const [compose, setCompose] = useState<ComposeSeed | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const flash = (text: string) => {
@@ -473,7 +475,7 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
-      if (target.closest('input, textarea, select, [contenteditable], .dialog') || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
       const move = (delta: number) => {
         const index = selectedIndex < 0 ? (delta > 0 ? 0 : messages.length - 1) : selectedIndex + delta;
         const message = messages[index];
@@ -488,6 +490,10 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
         case '!': act('junk', uids); break;
         case 's': if (selected) act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid]); break;
         case 'u': if (selected) { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); } break;
+        case 'c': if (canSend) { event.preventDefault(); setCompose({}); } break;
+        case 'r': if (canSend && selected) { event.preventDefault(); setCompose(replySeed(selected, folder, address, false)); } break;
+        case 'a': if (canSend && selected) { event.preventDefault(); setCompose(replySeed(selected, folder, address, true)); } break;
+        case 'f': if (canSend && selected) { event.preventDefault(); setCompose(forwardSeed(selected, folder)); } break;
         case '/': event.preventDefault(); searchRef.current?.focus(); break;
         case 'Escape':
           // Close an open menu first; only then the message.
@@ -519,6 +525,7 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
     <main className={`app view-${view}`}>
       <aside className="sidebar">
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span title={address}>{address}</span></div></div>
+        {canSend && <button className="compose-button" onClick={() => { setCompose({}); setView('list'); }}><PenSquare size={16} />Compose</button>}
         <nav aria-label="Folders">
           {folders.map((f) => {
             const Icon = folderIcon(f);
@@ -611,6 +618,14 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
           <>
             <div className="reader-actions">
               <IconButton label="Back" className="mobile-only" onClick={() => setView('list')}><ChevronLeft size={18} /></IconButton>
+              {canSend && (current?.special_use === '\\Drafts' || hasFlag(selected.flags, '\\Draft')
+                ? <button className="secondary small-button" onClick={() => setCompose(draftSeed(selected, folder))}><Pencil size={14} />Edit draft</button>
+                : <>
+                  <IconButton label="Reply (r)" onClick={() => setCompose(replySeed(selected, folder, address, false))}><Reply size={16} /></IconButton>
+                  <IconButton label="Reply all (a)" onClick={() => setCompose(replySeed(selected, folder, address, true))}><ReplyAll size={16} /></IconButton>
+                  <IconButton label="Forward (f)" onClick={() => setCompose(forwardSeed(selected, folder))}><Forward size={16} /></IconButton>
+                  <span className="divider" />
+                </>)}
               <IconButton label="Archive (e)" onClick={() => act('archive', [selected.uid])}><Archive size={16} /></IconButton>
               <IconButton label="Delete (#)" onClick={() => act('delete', [selected.uid])}><Trash2 size={16} /></IconButton>
               <IconButton label="Junk (!)" onClick={() => act('junk', [selected.uid])}><AlertOctagon size={16} /></IconButton>
@@ -655,10 +670,20 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
             </div>
           </>
         ) : (
-          <div className="empty"><Mail size={32} /><p>Select a message</p><small>Shortcuts: j/k next and previous · e archive · # delete · s star · / search</small></div>
+          <div className="empty"><Mail size={32} /><p>Select a message</p><small>Shortcuts: j/k next and previous · e archive · # delete · s star · / search{canSend ? ' · c compose · r reply · a reply all · f forward' : ''}</small></div>
         )}
       </article>
 
+      {compose && (
+        <ComposeWindow
+          key={JSON.stringify(compose.source ?? compose.draft_uid ?? 'new')}
+          api={api}
+          from={address}
+          seed={compose}
+          onClose={(note) => { setCompose(null); if (note) flash(note); }}
+          onSent={() => { loadFolders().catch(() => undefined); if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery).catch(() => undefined); }}
+        />
+      )}
       {notice && <div className="toast" role="status">{notice}</div>}
       {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} />}
       {prompt && <PromptDialog {...prompt} />}
@@ -672,6 +697,7 @@ function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogo
 
 function App() {
   const [address, setAddress] = useState<string | null | undefined>(undefined);
+  const [canSend, setCanSend] = useState(false);
   const [loginAddress, setLoginAddress] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -679,7 +705,7 @@ function App() {
   const api = useApi(useCallback(() => setAddress(null), []));
 
   useEffect(() => {
-    api<{ address: string }>('/api/session').then((s) => setAddress(s.address)).catch(() => setAddress(null));
+    api<{ address: string; can_send: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setAddress(s.address); }).catch(() => setAddress(null));
   }, [api]);
 
   async function login(event: React.FormEvent) {
@@ -687,8 +713,9 @@ function App() {
     setError('');
     setBusy(true);
     try {
-      const session = await api<{ address: string }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password }) });
+      const session = await api<{ address: string; can_send: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password }) });
       setPassword('');
+      setCanSend(session.can_send);
       setAddress(session.address);
     } catch (err) {
       setError(err instanceof ApiError && err.status === 429 ? err.message : 'Invalid mailbox or password');
@@ -716,7 +743,7 @@ function App() {
       </main>
     );
   }
-  return <Mailbox api={api} address={address} onLogout={logout} />;
+  return <Mailbox api={api} address={address} canSend={canSend} onLogout={logout} />;
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

@@ -15,6 +15,8 @@ pub struct ParsedMessage {
     pub from: String,
     pub to: String,
     pub cc: String,
+    /// Only present in copies the sender kept (Sent, Drafts).
+    pub bcc: String,
     pub reply_to: String,
     pub subject: String,
     pub date: String,
@@ -88,11 +90,13 @@ impl Leaf<'_> {
         decode_transfer_bytes(self.body, &encoding)
     }
 
+    /// The part as text, with LF line ends.
     fn text(&self) -> String {
         decode_charset(
             &self.decoded(),
             self.param("content-type", "charset").as_deref(),
         )
+        .replace("\r\n", "\n")
     }
 }
 
@@ -104,6 +108,7 @@ pub fn parse_message(bytes: &[u8]) -> ParsedMessage {
     parsed.from = get("from");
     parsed.to = get("to");
     parsed.cc = get("cc");
+    parsed.bcc = get("bcc");
     parsed.reply_to = get("reply-to");
     parsed.subject = get("subject");
     parsed.date = get("date");

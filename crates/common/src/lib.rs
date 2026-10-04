@@ -9,6 +9,7 @@ pub mod auth;
 pub mod classifier_control;
 pub mod classifier_models;
 pub mod classifier_store;
+pub mod compose;
 pub mod config;
 pub mod db;
 pub mod domain;

@@ -262,6 +262,29 @@ time { white-space: nowrap; }
 .attachment-meta small { color: var(--muted); font-size: 12px; }
 .attachment-download { color: var(--muted); }
 
+/* ---- Compose -------------------------------------------------------------------- */
+.compose-button { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 0 4px; padding: 9px 12px; border: 0; border-radius: 9px; background: var(--accent); color: #fff; font-weight: 600; }
+.compose-button:hover { background: var(--accent-hover); }
+.divider { width: 1px; height: 20px; background: var(--border); margin: 0 6px; }
+.small-button { padding: 5px 10px; font-size: 13px; }
+.compose { position: fixed; right: 24px; bottom: 0; z-index: 25; width: min(640px, calc(100vw - 32px)); height: min(620px, calc(100vh - 40px)); display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border); border-bottom: 0; border-radius: 12px 12px 0 0; box-shadow: var(--shadow); }
+.compose header { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 8px 16px; background: var(--sidebar); color: #fff; border-radius: 12px 12px 0 0; }
+.compose header .icon { color: #fff; }
+.compose header .icon:hover { background: var(--sidebar-active); border-color: transparent; }
+.compose-fields { display: grid; border-bottom: 1px solid var(--border); }
+.compose-fields label, .compose-from { display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--border); min-height: 38px; }
+.compose-fields label:last-child { border-bottom: 0; }
+.compose-fields span, .compose-from span { width: 56px; color: var(--muted); font-size: 13px; flex: none; }
+.compose-from { color: var(--text-2); font-size: 13px; }
+.compose-fields input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; padding: 9px 0; }
+.compose-body { flex: 1; min-height: 120px; border: 0; outline: none; resize: none; padding: 12px 14px; background: var(--surface); color: var(--text); font: 14px/1.55 inherit; font-family: inherit; }
+.compose-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px; border-top: 1px solid var(--border); }
+.file-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px 3px 9px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; background: var(--surface-2); }
+.file-chip small { color: var(--muted); }
+.file-chip button { border: 0; background: none; color: var(--muted); display: grid; padding: 2px; border-radius: 50%; }
+.compose-error { padding: 0 14px 6px; }
+.compose footer { display: flex; align-items: center; gap: 6px; padding: 10px 12px; border-top: 1px solid var(--border); }
+
 /* ---- Small screens: one pane at a time ------------------------------------------ */
 @media (max-width: 1100px) {
   .app { grid-template-columns: 210px minmax(300px, 1fr) minmax(360px, 1.2fr); }
@@ -280,4 +303,6 @@ time { white-space: nowrap; }
   .label-row input:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
   .label-row small { display: none; }
   .organize-table th:nth-child(4), .organize-table td:nth-child(4) { display: none; }
+  .compose { inset: 0; width: auto; height: auto; border-radius: 0; }
+  .compose header { border-radius: 0; }
 }

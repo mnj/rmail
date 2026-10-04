@@ -21,6 +21,7 @@ macro_rules! webmail_log {
 
 mod api;
 mod assets;
+mod submit;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
         secure_cookies,
         throttle: AuthThrottle::default(),
         revoked: websession::RevocationList::default(),
+        submission: submit::local_submission_address(&cfg.global.submission_listeners()),
     });
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),

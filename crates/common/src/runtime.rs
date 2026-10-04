@@ -174,6 +174,56 @@ pub fn prometheus_snapshot_path(mail_root: &Path, component: &str) -> PathBuf {
         .join(format!("{}.prom", component))
 }
 
+/// The secret webmail presents to the local submission service to send as
+/// its signed-in user (SASL `X-RMAIL-WEBMAIL`, loopback only).
+pub fn webmail_submission_key_path(mail_root: &Path) -> PathBuf {
+    mail_root.join("run").join("webmail-submission.key")
+}
+
+/// The webmail submission secret, created (owner-only, 0600) when missing.
+pub fn webmail_submission_key(mail_root: &Path) -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = webmail_submission_key_path(mail_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            let key: String = (0..32)
+                .map(|_| format!("{:02x}", rand::random::<u8>()))
+                .collect();
+            file.write_all(key.as_bytes())?;
+            file.sync_all()?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let key = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let key = key.trim().to_string();
+            if key.len() < 32 {
+                anyhow::bail!("{} is too short", path.display());
+            }
+            Ok(key)
+        }
+        Err(error) => Err(error).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
+/// Byte-wise comparison whose time does not depend on where inputs differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub fn log_path(mail_root: &Path, component: &str) -> PathBuf {
     mail_root.join("logs").join(format!("{}.log", component))
 }

@@ -2143,3 +2143,137 @@ async fn declared_mail_size_over_limit_is_rejected_before_data() {
     assert!(responses.iter().any(|r| r.starts_with("552 5.3.4")));
     assert!(responses.iter().any(|r| r.starts_with("221 2.0.0 Bye")));
 }
+
+/// One session from `peer` to the given service, plaintext, against the
+/// standard test mailboxes; returns the replies and the mail root.
+async fn run_session_from(
+    input: Vec<u8>,
+    service: SmtpService,
+    peer: &str,
+    prepare: impl FnOnce(&std::path::Path) -> Vec<u8>,
+) -> (Vec<String>, tempfile::TempDir) {
+    let (td, mail_root, db_path) = setup_mailbox();
+    let mut input = input;
+    let prefix = prepare(&mail_root);
+    input.splice(0..0, prefix);
+    let (client, server) = duplex(65536);
+    let peer: std::net::SocketAddr = peer.parse().unwrap();
+    let server_task = tokio::spawn(async move {
+        process_stream(
+            Box::new(server),
+            mail_root.to_string_lossy().to_string(),
+            None,
+            Some(db_path.to_string_lossy().to_string()),
+            Some(peer),
+            false,
+            false,
+            true,
+            Arc::new(SecurityConfig::default()),
+            service,
+            None,
+        )
+        .await
+    });
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("greeting");
+    reader.get_mut().write_all(&input).await.expect("write");
+    reader.get_mut().flush().await.expect("flush");
+    let mut responses = Vec::new();
+    loop {
+        let mut resp = String::new();
+        reader.read_line(&mut resp).await.expect("read response");
+        if resp.is_empty() {
+            break;
+        }
+        let bye = resp.starts_with("221 2.0.0 Bye");
+        responses.push(resp);
+        if bye {
+            break;
+        }
+    }
+    server_task.await.expect("join").expect("server");
+    (responses, td)
+}
+
+fn webmail_auth(mail_root: &std::path::Path, user: &str, wrong: bool) -> Vec<u8> {
+    let key = rmail_common::runtime::webmail_submission_key(mail_root).unwrap();
+    let secret = if wrong { "0".repeat(key.len()) } else { key };
+    let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}\0{secret}"));
+    format!("EHLO localhost\r\nAUTH X-RMAIL-WEBMAIL {token}\r\n").into_bytes()
+}
+
+#[tokio::test]
+async fn local_webmail_submits_as_its_user_over_loopback_only() {
+    let message = b"MAIL FROM:<user@example.test>\r\nRCPT TO:<postmaster@example.test>\r\nDATA\r\nFrom: user@example.test\r\nTo: postmaster@example.test\r\nSubject: hi\r\n\r\nhello\r\n.\r\nQUIT\r\n".to_vec();
+    let (sent, td) = run_session_from(
+        message.clone(),
+        SmtpService::Submission,
+        "127.0.0.1:40000",
+        |root| webmail_auth(root, "user@example.test", false),
+    )
+    .await;
+    assert!(sent.iter().any(|l| l.starts_with("235 2.7.0")), "{sent:?}");
+    assert!(
+        !sent.iter().any(|l| l.contains("X-RMAIL-WEBMAIL")),
+        "never advertised: {sent:?}"
+    );
+    assert!(sent.iter().any(|l| l.starts_with("354")), "{sent:?}");
+    let last = sent.iter().rev().find(|l| l.starts_with("250")).unwrap();
+    assert!(last.contains("2.0.0"), "message accepted: {sent:?}");
+    let key = rmail_common::runtime::webmail_submission_key_path(&td.path().join("mail"));
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&key).unwrap().permissions())
+            & 0o777,
+        0o600
+    );
+
+    // The session is the user's: sending as someone else is still refused.
+    let (spoof, _) = run_session_from(
+        b"MAIL FROM:<postmaster@example.test>\r\nQUIT\r\n".to_vec(),
+        SmtpService::Submission,
+        "[::1]:40000",
+        |root| webmail_auth(root, "user@example.test", false),
+    )
+    .await;
+    assert!(
+        spoof.iter().any(|l| l.starts_with("553 5.7.1")),
+        "{spoof:?}"
+    );
+
+    let (wrong, _) = run_session_from(
+        b"QUIT\r\n".to_vec(),
+        SmtpService::Submission,
+        "127.0.0.1:40000",
+        |root| webmail_auth(root, "user@example.test", true),
+    )
+    .await;
+    assert!(
+        wrong.iter().any(|l| l.starts_with("535 5.7.8")),
+        "{wrong:?}"
+    );
+
+    let (remote, _) = run_session_from(
+        message.clone(),
+        SmtpService::Submission,
+        "192.0.2.10:40000",
+        |root| webmail_auth(root, "user@example.test", false),
+    )
+    .await;
+    assert!(!remote.iter().any(|l| l.starts_with("235")), "{remote:?}");
+    assert!(
+        remote
+            .iter()
+            .any(|l| l.starts_with("530 5.7.0 Must issue STARTTLS")),
+        "{remote:?}"
+    );
+
+    let (mta, _) = run_session_from(
+        b"QUIT\r\n".to_vec(),
+        SmtpService::Mta,
+        "127.0.0.1:40000",
+        |root| webmail_auth(root, "user@example.test", false),
+    )
+    .await;
+    assert!(!mta.iter().any(|l| l.starts_with("235")), "{mta:?}");
+}
