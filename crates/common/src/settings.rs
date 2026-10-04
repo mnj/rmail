@@ -672,6 +672,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.submission_max_messages_per_user_per_day",
+        "limits",
+        "Messages per account per day",
+        "Caps steady sending from one account, e.g. a compromised one. 0 means unlimited.",
+        int(0, 10_000_000),
+        SMTP,
+    ),
+    spec(
+        "security.submission_max_messages_per_domain_per_hour",
+        "limits",
+        "Messages per domain per hour",
+        "Caps all accounts of one sending domain together. 0 means unlimited.",
+        int(0, 10_000_000),
+        SMTP,
+    ),
+    spec(
         "security.clamav_enabled",
         "filtering",
         "ClamAV",

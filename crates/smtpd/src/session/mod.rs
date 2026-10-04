@@ -25,7 +25,9 @@ use rmail_common::tracking::new_tracking_id;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use crate::limits::{auth_block_remaining, submission_quota_available};
+use crate::limits::{
+    SenderLimit, auth_block_remaining, sender_limit_reached, submission_quota_available,
+};
 use crate::protocol::{self, Command as SmtpCommand, parse_command, parse_mail_from_args};
 use crate::trace::{ConnectionTrace, ReplyTrackingStream, emit_tracking};
 use crate::{
@@ -855,6 +857,25 @@ impl Session {
                     b"452 4.7.0 Submission message rate limit exceeded\r\n",
                 )
                 .await;
+            }
+            if let Some(limit) = user.and_then(|user| {
+                sender_limit_reached(
+                    user,
+                    self.security.submission_max_messages_per_user_per_day,
+                    self.security.submission_max_messages_per_domain_per_hour,
+                )
+            }) {
+                self.tx.mail_from = None;
+                self.tx.active = false;
+                let line: &[u8] = match limit {
+                    SenderLimit::UserDaily => {
+                        b"452 4.7.0 Daily submission limit exceeded for this account\r\n"
+                    }
+                    SenderLimit::DomainHourly => {
+                        b"452 4.7.0 Hourly submission limit exceeded for this domain\r\n"
+                    }
+                };
+                return reply(reader, line).await;
             }
         }
         self.tx.active = true;

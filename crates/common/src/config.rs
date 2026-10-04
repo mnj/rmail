@@ -436,6 +436,12 @@ pub struct SecurityConfig {
     pub submission_max_recipients: usize,
     #[serde(default = "default_submission_max_messages_per_minute")]
     pub submission_max_messages_per_minute: usize,
+    /// Messages one account may submit per rolling 24 hours (0 = unlimited).
+    #[serde(default)]
+    pub submission_max_messages_per_user_per_day: usize,
+    /// Messages all accounts of one sending domain may submit per rolling hour (0 = unlimited).
+    #[serde(default)]
+    pub submission_max_messages_per_domain_per_hour: usize,
     /// Require every RFC 5322 From mailbox on authenticated submission to match the login.
     #[serde(default)]
     pub submission_require_from_alignment: bool,
@@ -497,6 +503,8 @@ impl Default for SecurityConfig {
             smtp_max_recipients: default_smtp_max_recipients(),
             submission_max_recipients: default_submission_max_recipients(),
             submission_max_messages_per_minute: default_submission_max_messages_per_minute(),
+            submission_max_messages_per_user_per_day: 0,
+            submission_max_messages_per_domain_per_hour: 0,
             submission_require_from_alignment: false,
             imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             smtp_sasl_mechanisms: default_smtp_sasl_mechanisms(),
