@@ -76,7 +76,6 @@ impl std::fmt::Display for StorageQuotaExceeded {
 
 impl std::error::Error for StorageQuotaExceeded {}
 
-
 pub fn state_db_path(maildir_root: &Path, domain: &str, localpart: &str) -> PathBuf {
     account_maildir(maildir_root, domain, localpart).join(STATE_DB_FILENAME)
 }
