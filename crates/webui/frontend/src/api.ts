@@ -181,7 +181,7 @@ export type ClassifierStatus = {
   accounts: { opted_in?: number; opted_out?: number; cloud_consented?: number };
   cloud_providers?: string[];
   loaded_at: number;
-  last_cycle: { finished_at: number; duration_ms: number; report: { accounts: number; learned: number; classified: number; suggested: number; moved: number; awaiting_consent?: number; errors: string[] } } | null;
+  last_cycle: { finished_at: number; duration_ms: number; report: { accounts: number; learned: number; classified: number; suggested: number; moved: number; labeled?: number; awaiting_consent?: number; errors: string[] } } | null;
 };
 export type Organization = {
   managed: boolean;

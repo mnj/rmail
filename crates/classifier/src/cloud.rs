@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::engine::{Choice, Chooser, Embedder, FolderHint, l2_normalize};
-use crate::prompt::{parse_answer, quoted_examples, system_prompt};
+use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, l2_normalize};
+use crate::prompt::{label_prompt, parse_answer, parse_labels, quoted_examples, system_prompt};
 
 pub const TYPESAFE_API: &str = "https://api.typesafe.ai/v1";
 
@@ -231,11 +231,60 @@ impl Chooser for OpenAiChooser {
                 },
             },
         });
+        Ok(parse_answer(&self.complete(body)?, folders))
+    }
+
+    fn label(&self, message: &str, labels: &[LabelHint]) -> Result<Vec<(String, f64)>> {
+        if labels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names: Vec<&str> = labels.iter().map(|label| label.name.as_str()).collect();
+        let body = json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 400,
+            "messages": [
+                { "role": "system", "content": label_prompt(labels) },
+                { "role": "user", "content": message },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "labels",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "labels": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string", "enum": names },
+                                        "confidence": { "type": "number" },
+                                    },
+                                    "required": ["name", "confidence"],
+                                    "additionalProperties": false,
+                                },
+                            },
+                        },
+                        "required": ["labels"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        });
+        Ok(parse_labels(&self.complete(body)?, labels))
+    }
+}
+
+impl OpenAiChooser {
+    fn complete(&self, body: Value) -> Result<String> {
         let response = self.api.post("/chat/completions", &body)?;
-        let content = response["choices"][0]["message"]["content"]
+        Ok(response["choices"][0]["message"]["content"]
             .as_str()
-            .context("chat response has no message content")?;
-        Ok(parse_answer(content, folders))
+            .context("chat response has no message content")?
+            .to_string())
     }
 }
 
@@ -317,6 +366,43 @@ impl Chooser for JevChooser {
             folder,
             raw: answer.to_string(),
         })
+    }
+
+    /// One yes/no ("noul") question per label; Jev answers each with a
+    /// probability and evaluates them in parallel.
+    fn label(&self, message: &str, labels: &[LabelHint]) -> Result<Vec<(String, f64)>> {
+        if labels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let questions: serde_json::Map<String, Value> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let mut instructions =
+                    format!("Does the label \"{}\" apply to this email?", label.name);
+                if !label.description.is_empty() {
+                    instructions.push_str(" The label means: ");
+                    instructions.push_str(&label.description);
+                }
+                (
+                    format!("l{}", index + 1),
+                    json!({ "type": "noul", "instructions": instructions }),
+                )
+            })
+            .collect();
+        let response = self.api.post(
+            "/systemone",
+            &json!({ "model": self.model, "state": message, "questions": questions }),
+        )?;
+        Ok(labels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, label)| {
+                let probability =
+                    response["answers"][format!("l{}", index + 1)]["noul"].as_f64()?;
+                Some((label.name.clone(), probability.clamp(0.0, 1.0)))
+            })
+            .collect())
     }
 }
 
@@ -459,6 +545,49 @@ mod tests {
         let declined = chooser.choose("Hello", &folders).unwrap();
         assert_eq!(declined.folder, None);
         assert_eq!(declined.confidence, 0.0);
+    }
+
+    #[test]
+    fn jev_labels_are_one_yes_no_question_each() {
+        let reply = json!({"answers": {
+            "l1": {"type": "noul", "noul": 0.93},
+            "l2": {"type": "noul", "noul": 0.04},
+        }});
+        let (base, requests) = serve(vec![(200, reply.to_string())]);
+        let chooser = JevChooser::load(&base, "k", "").unwrap();
+        let labels = crate::prompt::label_hints(&["Invoices", "Family"]);
+        let result = chooser.label("Invoice 42 is due", &labels).unwrap();
+        assert_eq!(
+            result,
+            vec![("Invoices".to_string(), 0.93), ("Family".to_string(), 0.04)]
+        );
+        let (_, request) = requests.recv().unwrap();
+        assert_eq!(request["questions"]["l1"]["type"], "noul");
+        assert!(
+            request["questions"]["l2"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("\"Family\" apply to this email? The label means: about Family")
+        );
+    }
+
+    #[test]
+    fn chat_labels_use_a_schema_of_known_names() {
+        let reply = json!({"choices": [{"message": {"content":
+            "{\"labels\": [{\"name\": \"Family\", \"confidence\": 0.8}, {\"name\": \"Made up\", \"confidence\": 1}]}"}}]});
+        let (base, requests) = serve(vec![(200, reply.to_string())]);
+        let chooser = OpenAiChooser::load(&base, "k", "m").unwrap();
+        let labels = crate::prompt::label_hints(&["Invoices", "Family"]);
+        assert_eq!(
+            chooser.label("Dinner on Sunday?", &labels).unwrap(),
+            vec![("Family".to_string(), 0.8)]
+        );
+        let (_, request) = requests.recv().unwrap();
+        assert_eq!(
+            request["response_format"]["json_schema"]["schema"]["properties"]["labels"]["items"]["properties"]
+                ["name"]["enum"],
+            json!(["Invoices", "Family"])
+        );
     }
 
     #[test]

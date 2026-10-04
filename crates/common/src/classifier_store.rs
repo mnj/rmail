@@ -103,17 +103,49 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             PRIMARY KEY (sender, folder)
         );
+        CREATE TABLE IF NOT EXISTS labels(
+            name TEXT PRIMARY KEY,
+            keyword TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS label_marks(
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            uidvalidity INTEGER NOT NULL,
+            last_uid INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS labeled(
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            score REAL NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (uidvalidity, uid, label)
+        );
         ",
     )?;
-    // Added after the first release: stores opted in before it start with no
-    // cloud consent.
-    let has_consent = conn
-        .prepare("SELECT 1 FROM pragma_table_info('prefs') WHERE name = 'cloud_consent'")?
-        .exists([])?;
-    if !has_consent {
-        conn.execute_batch(
-            "ALTER TABLE prefs ADD COLUMN cloud_consent TEXT NOT NULL DEFAULT '[]'",
-        )?;
+    // Added after the first release: stores opted in before them start with
+    // no cloud consent and labeling off.
+    add_column(conn, "prefs", "cloud_consent", "TEXT NOT NULL DEFAULT '[]'")?;
+    add_column(
+        conn,
+        "prefs",
+        "labels_enabled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let exists = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))?
+        .exists([column])?;
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
     }
     Ok(())
 }
@@ -138,9 +170,18 @@ pub struct Prefs {
     /// Cloud providers the user agreed may receive their mail's text.
     #[serde(default)]
     pub cloud_consent: Vec<String>,
+    /// Label new INBOX mail with the user's labels. Independent of folder
+    /// suggestions (`enabled`).
+    #[serde(default)]
+    pub labels_enabled: bool,
 }
 
 impl Prefs {
+    /// Whether the daemon has anything to do for this account.
+    pub fn any_enabled(&self) -> bool {
+        self.enabled || self.labels_enabled
+    }
+
     /// Whether the user agreed to every provider in `providers`.
     pub fn allows_cloud(&self, providers: &[&str]) -> bool {
         providers
@@ -150,8 +191,9 @@ impl Prefs {
 }
 
 pub fn prefs(conn: &Connection) -> Result<Prefs> {
-    let (enabled, excluded, autofile, consent) = conn.query_row(
-        "SELECT enabled, excluded_folders, autofile_folders, cloud_consent FROM prefs WHERE id = 1",
+    let (enabled, excluded, autofile, consent, labels_enabled) = conn.query_row(
+        "SELECT enabled, excluded_folders, autofile_folders, cloud_consent, labels_enabled
+         FROM prefs WHERE id = 1",
         [],
         |row| {
             Ok((
@@ -159,6 +201,7 @@ pub fn prefs(conn: &Connection) -> Result<Prefs> {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         },
     )?;
@@ -167,22 +210,180 @@ pub fn prefs(conn: &Connection) -> Result<Prefs> {
         excluded_folders: serde_json::from_str(&excluded).unwrap_or_default(),
         autofile_folders: serde_json::from_str(&autofile).unwrap_or_default(),
         cloud_consent: serde_json::from_str(&consent).unwrap_or_default(),
+        labels_enabled,
     })
 }
 
 pub fn set_prefs(conn: &Connection, prefs: &Prefs) -> Result<()> {
     conn.execute(
         "UPDATE prefs SET enabled = ?1, excluded_folders = ?2, autofile_folders = ?3,
-             cloud_consent = ?4, updated_at = ?5 WHERE id = 1",
+             cloud_consent = ?4, labels_enabled = ?5, updated_at = ?6 WHERE id = 1",
         params![
             prefs.enabled,
             serde_json::to_string(&prefs.excluded_folders)?,
             serde_json::to_string(&prefs.autofile_folders)?,
             serde_json::to_string(&prefs.cloud_consent)?,
+            prefs.labels_enabled,
             now()
         ],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Labels
+
+/// Most labels one account may define; each costs a question per message.
+pub const MAX_LABELS: usize = 30;
+pub const MAX_LABEL_NAME: usize = 40;
+pub const MAX_LABEL_DESCRIPTION: usize = 300;
+
+/// A user-defined label, applied to messages as an IMAP keyword.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Label {
+    pub name: String,
+    /// The IMAP keyword (RFC 3501 flag-keyword atom) clients see.
+    pub keyword: String,
+    pub description: String,
+}
+
+/// An IMAP keyword for a label name: atom characters only, spaces become
+/// `_`, and never a system flag (`\`) or a reserved `$` keyword.
+pub fn keyword_for(name: &str) -> String {
+    // Atom characters (RFC 3501): printable ASCII except atom-specials.
+    let atom = |c: char| c.is_ascii_graphic() && !"(){%*\"\\]".contains(c);
+    let mut keyword: String = name
+        .trim()
+        .chars()
+        .map(|c| if atom(c) { c } else { '_' })
+        .collect();
+    let trimmed = keyword.trim_start_matches(['$', '\\']).to_string();
+    keyword = trimmed;
+    if keyword.trim_matches('_').is_empty() {
+        keyword = "label".to_string();
+    }
+    keyword
+}
+
+pub fn labels(conn: &Connection) -> Result<Vec<Label>> {
+    let mut statement =
+        conn.prepare("SELECT name, keyword, description FROM labels ORDER BY position, name")?;
+    let rows = statement.query_map([], |row| {
+        Ok(Label {
+            name: row.get(0)?,
+            keyword: row.get(1)?,
+            description: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Replace the account's labels with `wanted` (name, description) pairs.
+/// Existing labels keep their keyword so messages already labeled stay
+/// labeled; new ones get a keyword unique within the account.
+pub fn set_labels(conn: &Connection, wanted: &[(String, String)]) -> Result<Vec<Label>> {
+    if wanted.len() > MAX_LABELS {
+        bail!("at most {MAX_LABELS} labels");
+    }
+    let existing: BTreeMap<String, String> = labels(conn)?
+        .into_iter()
+        .map(|label| (label.name.to_lowercase(), label.keyword))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut keywords = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (name, description) in wanted {
+        let name = name.trim().to_string();
+        let description = description.trim().to_string();
+        if name.is_empty() || name.chars().count() > MAX_LABEL_NAME {
+            bail!("label names must be 1-{MAX_LABEL_NAME} characters");
+        }
+        if description.chars().count() > MAX_LABEL_DESCRIPTION {
+            bail!("label descriptions must be at most {MAX_LABEL_DESCRIPTION} characters");
+        }
+        if !seen.insert(name.to_lowercase()) {
+            bail!("duplicate label {name}");
+        }
+        let mut keyword = existing
+            .get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| keyword_for(&name));
+        let base = keyword.clone();
+        let mut n = 2;
+        while !keywords.insert(keyword.to_lowercase()) {
+            keyword = format!("{base}_{n}");
+            n += 1;
+        }
+        out.push(Label {
+            name,
+            keyword,
+            description,
+        });
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM labels", [])?;
+    for (position, label) in out.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO labels(name, keyword, description, position) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                label.name,
+                label.keyword,
+                label.description,
+                position as i64
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
+pub fn label_mark(conn: &Connection) -> Result<Option<Watermark>> {
+    Ok(conn
+        .query_row(
+            "SELECT uidvalidity, last_uid FROM label_marks WHERE id = 1",
+            [],
+            |row| {
+                Ok(Watermark {
+                    uidvalidity: row.get::<_, i64>(0)? as u64,
+                    last_uid: row.get::<_, i64>(1)? as u64,
+                })
+            },
+        )
+        .optional()?)
+}
+
+pub fn set_label_mark(conn: &Connection, mark: Watermark) -> Result<()> {
+    conn.execute(
+        "INSERT INTO label_marks(id, uidvalidity, last_uid) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET uidvalidity = ?1, last_uid = ?2",
+        params![mark.uidvalidity as i64, mark.last_uid as i64],
+    )?;
+    Ok(())
+}
+
+pub fn record_labels(
+    conn: &Connection,
+    uidvalidity: u64,
+    uid: u64,
+    labels: &[(String, f64)],
+) -> Result<()> {
+    for (label, score) in labels {
+        conn.execute(
+            "INSERT OR REPLACE INTO labeled(uidvalidity, uid, label, score, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![uidvalidity as i64, uid as i64, label, score, now()],
+        )?;
+    }
+    Ok(())
+}
+
+/// Messages labeled per label name, ever.
+pub fn label_counts(conn: &Connection) -> Result<BTreeMap<String, u64>> {
+    let mut statement = conn.prepare("SELECT label, COUNT(*) FROM labeled GROUP BY label")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +768,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn label_keywords_are_imap_atoms_and_stay_stable() {
+        assert_eq!(keyword_for("To do"), "To_do");
+        assert_eq!(keyword_for("$Junk"), "Junk");
+        assert_eq!(keyword_for("\\Seen"), "_Seen");
+        assert_eq!(keyword_for("a(b)*\"c\""), "a_b___c_");
+        assert_eq!(keyword_for("Økonomi"), "_konomi");
+        assert_eq!(keyword_for("   "), "label");
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_or_create(dir.path(), "example.test", "alice").unwrap();
+        let pair = |name: &str, description: &str| (name.to_string(), description.to_string());
+        let first = set_labels(&conn, &[pair("To do", "Needs action"), pair("To_do", "")]).unwrap();
+        assert_eq!(first[0].keyword, "To_do");
+        assert_eq!(
+            first[1].keyword, "To_do_2",
+            "keywords are unique per account"
+        );
+        assert_eq!(labels(&conn).unwrap(), first);
+
+        // Renaming one label keeps the other's keyword, so labeled mail stays labeled.
+        let second = set_labels(&conn, &[pair("Invoices", ""), pair("To_do", "x")]).unwrap();
+        assert_eq!(second[1].keyword, "To_do_2");
+        assert!(set_labels(&conn, &[pair("A", ""), pair("a", "")]).is_err());
+        assert!(set_labels(&conn, &[pair("", "")]).is_err());
+
+        assert_eq!(label_mark(&conn).unwrap(), None);
+        set_label_mark(
+            &conn,
+            Watermark {
+                uidvalidity: 3,
+                last_uid: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(label_mark(&conn).unwrap().unwrap().last_uid, 9);
+        record_labels(&conn, 3, 9, &[("Invoices".into(), 0.9)]).unwrap();
+        record_labels(&conn, 3, 10, &[("Invoices".into(), 0.8)]).unwrap();
+        assert_eq!(label_counts(&conn).unwrap()["Invoices"], 2);
+    }
+
+    #[test]
     fn stores_from_before_cloud_consent_are_migrated_without_consent() {
         let dir = tempfile::tempdir().unwrap();
         let path = store_path(dir.path(), "example.test", "bob");
@@ -588,6 +830,7 @@ mod tests {
             .unwrap();
         let migrated = prefs(&conn).unwrap();
         assert!(migrated.enabled);
+        assert!(!migrated.labels_enabled);
         assert!(migrated.cloud_consent.is_empty());
         assert!(!migrated.allows_cloud(&["openrouter"]));
     }
@@ -609,6 +852,7 @@ mod tests {
             excluded_folders: vec!["Private".into()],
             autofile_folders: vec!["Receipts".into()],
             cloud_consent: vec!["openrouter".into()],
+            labels_enabled: true,
         };
         set_prefs(&conn, &wanted).unwrap();
         assert_eq!(prefs(&conn).unwrap(), wanted);

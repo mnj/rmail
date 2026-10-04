@@ -24,10 +24,21 @@ pub struct Choice {
     pub raw: String,
 }
 
+/// The fallback model: picks folders for uncertain mail and applies labels.
 pub trait Chooser: Send + Sync {
     /// Pick one of `folders` for `message`, or none. `hints` are example
     /// subjects per folder.
     fn choose(&self, message: &str, folders: &[FolderHint]) -> Result<Choice>;
+    /// The probability that each of `labels` applies to `message`. Labels
+    /// the model leaves out have probability zero.
+    fn label(&self, message: &str, labels: &[LabelHint]) -> Result<Vec<(String, f64)>>;
+}
+
+/// A user's label as the model sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelHint {
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -316,6 +327,9 @@ pub mod fake {
     pub struct Fixed {
         pub answer: Choice,
         pub calls: Mutex<usize>,
+        /// Answer for every `label` call.
+        pub labels: Vec<(String, f64)>,
+        pub label_calls: Mutex<usize>,
     }
 
     impl Fixed {
@@ -327,6 +341,18 @@ pub mod fake {
                     raw: String::new(),
                 },
                 calls: Mutex::new(0),
+                labels: Vec::new(),
+                label_calls: Mutex::new(0),
+            }
+        }
+
+        pub fn labelling(labels: &[(&str, f64)]) -> Self {
+            Self {
+                labels: labels
+                    .iter()
+                    .map(|(name, p)| (name.to_string(), *p))
+                    .collect(),
+                ..Self::new(None, 0.0)
             }
         }
     }
@@ -335,6 +361,11 @@ pub mod fake {
         fn choose(&self, _message: &str, _folders: &[FolderHint]) -> Result<Choice> {
             *self.calls.lock().unwrap() += 1;
             Ok(self.answer.clone())
+        }
+
+        fn label(&self, _message: &str, _labels: &[LabelHint]) -> Result<Vec<(String, f64)>> {
+            *self.label_calls.lock().unwrap() += 1;
+            Ok(self.labels.clone())
         }
     }
 }

@@ -770,6 +770,9 @@ pub struct ClassifierConfig {
     /// Folders with fewer learned messages than this defer to the chat model.
     #[serde(default = "default_classifier_min_examples")]
     pub min_examples: u32,
+    /// Minimum probability (percent) before a user's label is applied.
+    #[serde(default = "default_classifier_label_confidence")]
+    pub label_confidence: u32,
     /// Where embeddings are computed. Cloud providers receive the text of
     /// every message learned or classified, and only for accounts whose users
     /// agreed to that provider in webmail.
@@ -880,6 +883,7 @@ impl Default for ClassifierConfig {
             knn_confidence: default_classifier_knn_confidence(),
             autofile_confidence: default_classifier_autofile_confidence(),
             min_examples: default_classifier_min_examples(),
+            label_confidence: default_classifier_label_confidence(),
             embed_provider: EmbedProvider::Local,
             chat_provider: ChatProvider::Local,
             openrouter_api_key: None,
@@ -892,6 +896,9 @@ impl Default for ClassifierConfig {
     }
 }
 
+fn default_classifier_label_confidence() -> u32 {
+    70
+}
 fn default_openrouter_base_url() -> String {
     "https://openrouter.ai/api/v1".to_string()
 }

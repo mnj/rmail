@@ -836,6 +836,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         CLASSIFIER,
     ),
     spec(
+        "classifier.label_confidence",
+        "classifier",
+        "Label confidence (%)",
+        "Minimum probability before one of a user's labels is applied. Labels use the fallback model.",
+        int(1, 100),
+        CLASSIFIER,
+    ),
+    spec(
         "classifier.embed_provider",
         "classifier",
         "Embedding provider",
@@ -1117,18 +1125,51 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Value>> {
 }
 
 /// The admin password policy stored in the settings database.
-/// Cloud providers the classifier sends message text to under the stored
-/// settings, for webmail's consent prompt (see `config::cloud_providers`).
-pub fn classifier_cloud_providers(conn: &Connection) -> Result<Vec<&'static str>> {
+/// Where the classifier's models run under the stored settings, for
+/// webmail's consent prompt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassifierModels {
+    /// The cloud provider computing embeddings, if any.
+    pub embed_cloud: Option<&'static str>,
+    /// The cloud provider behind the fallback model (folders and labels).
+    pub chat_cloud: Option<&'static str>,
+    /// Whether a fallback model is configured at all; labels need one.
+    pub chat_configured: bool,
+}
+
+impl ClassifierModels {
+    /// Every provider that may receive message text, sorted.
+    pub fn cloud_providers(&self) -> Vec<&'static str> {
+        let mut providers: Vec<&'static str> = [self.embed_cloud, self.chat_cloud]
+            .into_iter()
+            .flatten()
+            .collect();
+        providers.sort_unstable();
+        providers.dedup();
+        providers
+    }
+}
+
+pub fn classifier_models(conn: &Connection) -> Result<ClassifierModels> {
+    use crate::config::ChatProvider;
     let value = |key: &str| get(conn, key).map(|value| value.unwrap_or(Value::Null));
-    let embed = serde_json::from_value(value("classifier.embed_provider")?).unwrap_or_default();
-    let chat = serde_json::from_value(value("classifier.chat_provider")?).unwrap_or_default();
-    let chat_model = value("classifier.openrouter_chat_model")?;
-    Ok(crate::config::cloud_providers(
-        embed,
-        chat,
-        chat_model.as_str().unwrap_or_default(),
-    ))
+    let text = |key: &str| -> Result<String> {
+        Ok(value(key)?.as_str().unwrap_or_default().trim().to_string())
+    };
+    let embed: crate::config::EmbedProvider =
+        serde_json::from_value(value("classifier.embed_provider")?).unwrap_or_default();
+    let chat: ChatProvider =
+        serde_json::from_value(value("classifier.chat_provider")?).unwrap_or_default();
+    let chat_configured = match chat {
+        ChatProvider::Local => !text("classifier.chat_model")?.is_empty(),
+        ChatProvider::OpenRouter => !text("classifier.openrouter_chat_model")?.is_empty(),
+        ChatProvider::Jev => true,
+    };
+    Ok(ClassifierModels {
+        embed_cloud: embed.cloud(),
+        chat_cloud: chat.cloud().filter(|_| chat_configured),
+        chat_configured,
+    })
 }
 
 pub fn admin_password_policy(conn: &Connection) -> Result<crate::config::AdminPasswordPolicy> {

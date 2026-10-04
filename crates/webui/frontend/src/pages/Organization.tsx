@@ -126,7 +126,7 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
               <option value="openrouter">OpenRouter</option>
             </select>
           </Field>
-          <Field label="Fallback for uncertain mail" hint={form.chat_provider === 'jev' ? 'Jev picks one folder with a confidence instead of generating text.' : form.chat_provider === 'local' ? 'Pick the chat model in the table below.' : 'Only messages the vote is unsure about are sent.'}>
+          <Field label="Fallback and labels" hint={<>{form.chat_provider === 'jev' ? 'Jev answers with calibrated probabilities instead of generated text.' : form.chat_provider === 'local' ? 'Pick the chat model in the table below.' : 'Messages the vote is unsure about are sent.'} It also applies users' labels{form.chat_provider === 'local' ? '.' : ', so every new message of users with labels on is sent.'}</>}>
             <select value={form.chat_provider} onChange={(event) => set({ chat_provider: event.target.value as ChatProvider })}>
               <option value="local">On this server</option>
               <option value="openrouter">OpenRouter</option>
@@ -273,7 +273,7 @@ export function OrganizationPage() {
           <strong>{!status ? 'Classifier daemon not running' : !enabled ? 'Mail organization is off' : status.embed_model ? 'Suggesting folders for opted-in mailboxes' : activeFile(data, 'embedding') || data.settings.embed_provider === 'openrouter' ? 'The embedding model did not load' : 'Choose an embedding model'}</strong>
           <p>
             {status
-              ? <>{status.accounts.opted_in || 0} mailbox{status.accounts.opted_in === 1 ? '' : 'es'} opted in from webmail.{status.last_cycle && <> Last check {formatRelative(status.last_cycle.finished_at)}: {status.last_cycle.report.learned} learned, {status.last_cycle.report.suggested} suggested, {status.last_cycle.report.moved} moved.</>}</>
+              ? <>{status.accounts.opted_in || 0} mailbox{status.accounts.opted_in === 1 ? '' : 'es'} opted in from webmail.{status.last_cycle && <> Last check {formatRelative(status.last_cycle.finished_at)}: {status.last_cycle.report.learned} learned, {status.last_cycle.report.suggested} suggested, {status.last_cycle.report.moved} moved, {status.last_cycle.report.labeled ?? 0} labeled.</>}</>
               : <>Start <code>rmail_classifier</code> to classify mail. {data.daemon.running ? '' : data.daemon.error}</>}
           </p>
         </div>

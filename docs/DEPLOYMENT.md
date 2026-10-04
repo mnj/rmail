@@ -435,6 +435,25 @@ How it decides:
   the confidence is at least `classifier.autofile_confidence`, and the vote came from the user's own
   filing (never from the chat model alone).
 
+### Labels
+
+Users can also have new INBOX mail labeled. This is a separate switch in **Organize my mail**: it
+works without folder suggestions, and folder suggestions work without it.
+
+- Each user defines up to 30 labels, each a name plus a sentence describing it (for example
+  "Invoices: bills I need to pay"). The fallback model (local chat model, OpenRouter or Jev) decides
+  which labels apply to each new message. A label is applied when its probability reaches
+  `classifier.label_confidence` (70% by default). Jev gets one yes/no question per label in a single
+  request. Chat models answer with a JSON list limited to the user's label names.
+- Labels are stored as IMAP keywords, so IMAP clients that show keywords (Thunderbird, for example)
+  see them too. Keywords must be ASCII atoms, so "To do" becomes `To_do` and letters such as "Ø"
+  become `_`. Webmail always shows the label's name. Removing a label in webmail or any IMAP client
+  removes the keyword.
+- Labels need a fallback model. With a cloud fallback, every new INBOX message of a user who turned
+  labels on goes to that provider, so the same per-user consent applies (see above).
+- When a label has been applied to 10 or more messages and the user has no folder with that name,
+  webmail suggests creating one.
+
 Resource notes: embedding models cost roughly 100–900 MB RAM and milliseconds per message on CPU.
 Chat models (1–2 GB) take seconds per uncertain message. The unit runs at `Nice=10` with a reduced
 CPU weight so inference yields to the mail daemons. Building `rmail_classifier` needs cmake and a C/C++

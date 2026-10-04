@@ -17,8 +17,8 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
-use crate::engine::{Choice, Chooser, Embedder, FolderHint, l2_normalize};
-use crate::prompt::{json_escape, parse_answer, system_prompt};
+use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, l2_normalize};
+use crate::prompt::{json_escape, label_prompt, parse_answer, parse_labels, system_prompt};
 use rmail_common::classifier_models;
 
 /// llama.cpp allows one backend per process.
@@ -154,6 +154,8 @@ pub struct LlamaChooser {
 
 const CHAT_CTX: u32 = 4096;
 const MAX_ANSWER_TOKENS: usize = 96;
+/// Room for a dozen `{"name", "confidence"}` items.
+const MAX_LABEL_TOKENS: usize = 320;
 
 impl LlamaChooser {
     pub fn load(models_dir: &Path, file: &str, threads: u32) -> Result<Self> {
@@ -163,8 +165,7 @@ impl LlamaChooser {
         })
     }
 
-    fn prompt(&self, message: &str, folders: &[FolderHint]) -> Result<String> {
-        let system = system_prompt(folders);
+    fn prompt(&self, system: String, message: &str) -> Result<String> {
         let user = format!("{message}\n\n/no_think");
         match self.model.chat_template(None) {
             Ok(template) => Ok(self.model.apply_chat_template(
@@ -178,23 +179,24 @@ impl LlamaChooser {
             Err(_) => Ok(format!("{system}\n\nMessage:\n{user}\n\nAnswer:\n")),
         }
     }
-}
 
-impl Chooser for LlamaChooser {
-    fn choose(&self, message: &str, folders: &[FolderHint]) -> Result<Choice> {
-        if folders.is_empty() {
-            return Ok(Choice {
-                folder: None,
-                confidence: 0.0,
-                raw: String::new(),
-            });
-        }
-        let prompt = self.prompt(message, folders)?;
+    /// Generate an answer to `system` + `message` that `grammar` admits,
+    /// stopping at end of generation, when `done` says the answer is
+    /// complete, or after `max_tokens`.
+    fn generate(
+        &self,
+        system: String,
+        message: &str,
+        grammar: &str,
+        max_tokens: usize,
+        done: impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        let prompt = self.prompt(system, message)?;
         let mut tokens = self
             .model
             .str_to_token(&prompt, AddBos::Always)
             .context("tokenizing prompt")?;
-        let budget = CHAT_CTX as usize - MAX_ANSWER_TOKENS - 8;
+        let budget = CHAT_CTX as usize - max_tokens - 8;
         if tokens.len() > budget {
             // Keep the start (instructions) and the end (the chat template's
             // assistant opening); drop the middle of the message.
@@ -218,16 +220,15 @@ impl Chooser for LlamaChooser {
         }
         ctx.decode(&mut batch).context("evaluating prompt")?;
 
-        let grammar = answer_grammar(folders);
         let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::grammar(&self.model, &grammar, "root")
+            LlamaSampler::grammar(&self.model, grammar, "root")
                 .map_err(|error| anyhow!("building grammar: {error:?}"))?,
             LlamaSampler::greedy(),
         ]);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut answer = String::new();
         let mut index = batch.n_tokens() - 1;
-        for pos in (tokens.len() as i32..).take(MAX_ANSWER_TOKENS) {
+        for pos in (tokens.len() as i32..).take(max_tokens) {
             let token: LlamaToken = sampler.sample(&ctx, index);
             if self.model.is_eog_token(token) {
                 break;
@@ -238,7 +239,7 @@ impl Chooser for LlamaChooser {
                     .token_to_piece(token, &mut decoder, true, None)
                     .unwrap_or_default(),
             );
-            if answer.ends_with('}') {
+            if done(&answer) {
                 break;
             }
             batch.clear();
@@ -246,7 +247,41 @@ impl Chooser for LlamaChooser {
             index = 0;
             ctx.decode(&mut batch).context("generating")?;
         }
+        Ok(answer)
+    }
+}
+
+impl Chooser for LlamaChooser {
+    fn choose(&self, message: &str, folders: &[FolderHint]) -> Result<Choice> {
+        if folders.is_empty() {
+            return Ok(Choice {
+                folder: None,
+                confidence: 0.0,
+                raw: String::new(),
+            });
+        }
+        let answer = self.generate(
+            system_prompt(folders),
+            message,
+            &answer_grammar(folders),
+            MAX_ANSWER_TOKENS,
+            |answer| answer.ends_with('}'),
+        )?;
         Ok(parse_answer(&answer, folders))
+    }
+
+    fn label(&self, message: &str, labels: &[LabelHint]) -> Result<Vec<(String, f64)>> {
+        if labels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let answer = self.generate(
+            label_prompt(labels),
+            message,
+            &label_grammar(labels),
+            MAX_LABEL_TOKENS,
+            |answer| answer.ends_with("]}"),
+        )?;
+        Ok(parse_labels(&answer, labels))
     }
 }
 
@@ -260,6 +295,22 @@ pub fn answer_grammar(folders: &[FolderHint]) -> String {
     format!(
         "root ::= \"{{\\\"folder\\\": \" folder \", \\\"confidence\\\": \" conf \"}}\"\n\
          folder ::= \"null\" | {}\n\
+         conf ::= \"0.\" [0-9] | \"1.0\"\n",
+        names.join(" | ")
+    )
+}
+
+/// GBNF that only admits `{"labels": [{"name": "<label>", "confidence":
+/// d.d}, ...]}` with names from `labels`.
+pub fn label_grammar(labels: &[LabelHint]) -> String {
+    let names: Vec<String> = labels
+        .iter()
+        .map(|label| gbnf_literal(&format!("\"{}\"", json_escape(&label.name))))
+        .collect();
+    format!(
+        "root ::= \"{{\\\"labels\\\": [\" (item (\", \" item)*)? \"]}}\"\n\
+         item ::= \"{{\\\"name\\\": \" name \", \\\"confidence\\\": \" conf \"}}\"\n\
+         name ::= {}\n\
          conf ::= \"0.\" [0-9] | \"1.0\"\n",
         names.join(" | ")
     )
@@ -310,6 +361,9 @@ mod tests {
         ]));
         LlamaSampler::grammar(&model, &grammar, "root")
             .unwrap_or_else(|e| panic!("{e:?}\n{grammar}"));
+        let labels = label_grammar(&crate::prompt::label_hints(&["Invoices", "Say \"hi\""]));
+        LlamaSampler::grammar(&model, &labels, "root")
+            .unwrap_or_else(|e| panic!("{e:?}\n{labels}"));
     }
 
     /// End-to-end with real models. Set `RMAIL_TEST_MODEL_DIR` to a directory

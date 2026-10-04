@@ -200,11 +200,11 @@ async fn poll_loop(shared: Arc<Shared>) {
             ..CycleReport::default()
         });
         let elapsed = started.elapsed().as_millis() as u64;
-        if report.learned + report.classified > 0 || !report.errors.is_empty() {
+        if report.learned + report.classified + report.labeled > 0 || !report.errors.is_empty() {
             classifier_log!("info", "cycle_finished", {
                 "duration_ms": elapsed, "accounts": report.accounts, "learned": report.learned,
                 "classified": report.classified, "suggested": report.suggested,
-                "moved": report.moved, "errors": report.errors.len()
+                "moved": report.moved, "labeled": report.labeled, "errors": report.errors.len()
             });
         }
         let busy = report.learned > 0;

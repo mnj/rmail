@@ -1,7 +1,7 @@
 //! The folder-choice prompt and answer format shared by the generative
 //! choosers (llama.cpp and OpenAI-compatible APIs).
 
-use crate::engine::{Choice, FolderHint};
+use crate::engine::{Choice, FolderHint, LabelHint};
 
 pub fn system_prompt(folders: &[FolderHint]) -> String {
     let mut text = String::from(
@@ -65,11 +65,69 @@ pub fn parse_answer(raw: &str, folders: &[FolderHint]) -> Choice {
     }
 }
 
+pub fn label_prompt(labels: &[LabelHint]) -> String {
+    let mut text = String::from(
+        "You tag email with the user's labels. List every label below that applies to the \
+         message, each with how sure you are, and leave out labels that do not apply. Answer \
+         with JSON: {\"labels\": [{\"name\": <label>, \"confidence\": <0.0-1.0>}, ...]}.\n\n\
+         Labels:\n",
+    );
+    for label in labels {
+        text.push_str("- ");
+        text.push_str(&label.name);
+        if !label.description.is_empty() {
+            text.push_str(": ");
+            text.push_str(&label.description);
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// Read a `{"labels": [{"name", "confidence"}]}` answer. Names not in
+/// `labels` are ignored, as are repeats.
+pub fn parse_labels(raw: &str, labels: &[LabelHint]) -> Vec<(String, f64)> {
+    #[derive(serde::Deserialize)]
+    struct Item {
+        name: String,
+        #[serde(default)]
+        confidence: Option<f64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        labels: Vec<Item>,
+    }
+    let Some(answer) = json_object(raw).and_then(|json| serde_json::from_str::<Answer>(json).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, f64)> = Vec::new();
+    for item in answer.labels {
+        if labels.iter().any(|label| label.name == item.name)
+            && !out.iter().any(|(name, _)| name == &item.name)
+        {
+            out.push((item.name, item.confidence.unwrap_or(1.0).clamp(0.0, 1.0)));
+        }
+    }
+    out
+}
+
 /// The outermost `{...}` in `raw`, for models that wrap JSON in prose.
 fn json_object(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
     (start < end).then(|| &raw[start..=end])
+}
+
+#[cfg(test)]
+pub(crate) fn label_hints(names: &[&str]) -> Vec<LabelHint> {
+    names
+        .iter()
+        .map(|name| LabelHint {
+            name: name.to_string(),
+            description: format!("about {name}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -97,6 +155,21 @@ mod tests {
         assert_eq!(invented.folder, None);
         assert_eq!(invented.confidence, 0.0);
         assert_eq!(parse_answer("garbage", &folders).folder, None);
+    }
+
+    #[test]
+    fn label_answers_keep_only_known_labels_once() {
+        let labels = label_hints(&["Invoices", "Urgent"]);
+        let parsed = parse_labels(
+            r#"{"labels": [{"name": "Urgent", "confidence": 0.9}, {"name": "Spam", "confidence": 1}, {"name": "Urgent", "confidence": 0.1}, {"name": "Invoices"}]}"#,
+            &labels,
+        );
+        assert_eq!(
+            parsed,
+            vec![("Urgent".to_string(), 0.9), ("Invoices".to_string(), 1.0)]
+        );
+        assert!(parse_labels("nope", &labels).is_empty());
+        assert!(label_prompt(&labels).contains("- Invoices: about Invoices"));
     }
 
     #[test]
