@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { CheckCircle2, Download, FlaskConical, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { api, CatalogModel, ModelKind, Organization } from '../api';
-import { Empty, ErrorBanner, Field, formatBytes, formatRelative, Modal, Panel, Toggle, useFeedback, useResource } from '../ui';
+import { Empty, ErrorBanner, Field, formatBytes, formatRelative, IconButton, Modal, Panel, Toggle, useFeedback, useResource } from '../ui';
 
 const kindLabel: Record<ModelKind, string> = { embedding: 'Embedding', chat: 'Chat' };
 
@@ -151,7 +151,7 @@ export function OrganizationPage() {
           {!have && !running && model.catalog && <button className="button" onClick={() => run(() => api('/api/organization/download', 'POST', { catalog_id: model.catalog!.id }), `Downloading ${model.name}`).then(() => org.reload())}><Download size={15} />Download</button>}
           {have && !active && <button className="button" onClick={() => activate(model.kind === 'embedding' ? { embed_model: model.file } : { chat_model: model.file }, `${model.name} is now active`)}>Use</button>}
           {have && active && model.kind === 'chat' && <button className="button" onClick={() => activate({ chat_model: '' }, 'Chat fallback turned off')}>Stop using</button>}
-          {have && !active && <button className="iconButton danger" title="Delete model" onClick={() => remove(model.file)}><Trash2 size={15} /></button>}
+          {have && !active && <IconButton danger label={`Delete ${model.file}`} onClick={() => remove(model.file)}><Trash2 size={15} /></IconButton>}
         </td>
       </tr>
     );
@@ -183,13 +183,15 @@ export function OrganizationPage() {
         subtitle={<>Stored in <code>{data.models_dir}</code>. An embedding model is required. A chat model is an optional fallback for messages the embedding vote is unsure about.</>}
         actions={<button className="button" onClick={() => setCustom(true)}><Plus size={16} />Add by URL</button>}
       >
+        <div className="tableScroll">
         <table>
-          <thead><tr><th>Model</th><th>Kind</th><th>Size</th><th>License</th><th>Status</th><th /></tr></thead>
+          <thead><tr><th>Model</th><th>Kind</th><th>Size</th><th>License</th><th>Status</th><th><span className="visuallyHidden">Actions</span></th></tr></thead>
           <tbody>
             {data.catalog.map((model) => row({ ...model, catalog: model }))}
             {extra.map((model) => row({ file: model.file, name: model.file, kind: model.meta?.kind || (activeFile(data, 'chat') === model.file ? 'chat' : 'embedding'), notes: model.meta ? new URL(model.meta.url).host : 'added manually' }))}
           </tbody>
         </table>
+        </div>
         <p className="panelNote">Catalog checksums are not pinned yet. Each download records the SHA-256 it received, and a model added by URL can require a specific checksum.</p>
       </Panel>
       <TestPanel org={data} />

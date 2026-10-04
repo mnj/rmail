@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { ArrowUpToLine, RotateCcw, Trash2, Wand2 } from 'lucide-react';
 import { api, DmarcRow, QueueItem, QueueSummary, Spool } from '../api';
-import { Empty, ErrorBanner, formatRelative, numberFmt, Panel, useFeedback, useResource } from '../ui';
+import { Empty, ErrorBanner, formatRelative, IconButton, invalidate, numberFmt, Panel, SkeletonRows, useFeedback, useResource } from '../ui';
 
 const spools: { id: Spool; label: string; help: string }[] = [
   { id: 'queue', label: 'Queued', help: 'Waiting for the next delivery attempt' },
@@ -23,6 +23,7 @@ export function DeliveryPage() {
   const refresh = () => {
     summary.reload();
     listing.reload();
+    invalidate('queue');
   };
 
   async function act(action: Action, target: { name: string } | { pattern: string }) {
@@ -51,33 +52,35 @@ export function DeliveryPage() {
         <div className="tableScroll">
           <table className="queueTable">
             <colgroup><col className="queueName" /><col className="queueNum" /><col className="queueNum" /><col className="queueNext" /><col className="queueError" /><col className="queueActions" /></colgroup>
-            <thead><tr><th>Message</th><th>Attempts</th><th>Priority</th><th>Next attempt</th><th>Last error</th><th /></tr></thead>
+            <thead><tr><th>Message</th><th className="num">Attempts</th><th className="num">Priority</th><th>Next attempt</th><th>Last error</th><th><span className="visuallyHidden">Actions</span></th></tr></thead>
             <tbody>
+              {listing.data === null && !listing.error && <SkeletonRows cols={6} />}
               {entries.map((item) => (
                 <tr key={item.name}>
                   <td className="queueNameCell"><code title={item.name}>{item.name}</code></td>
-                  <td>{item.control?.attempts ?? 0}{item.control?.max_attempts ? ` / ${item.control.max_attempts}` : ''}</td>
-                  <td>{item.control?.priority ?? 0}</td>
-                  <td title={item.control?.next_try ? new Date(item.control.next_try * 1000).toLocaleString() : ''}>{item.control?.next_try ? formatRelative(item.control.next_try) : 'now'}</td>
+                  <td className="num">{item.control?.attempts ?? 0}{item.control?.max_attempts ? ` / ${item.control.max_attempts}` : ''}</td>
+                  <td className="num">{item.control?.priority ?? 0}</td>
+                  <td className="nowrap" title={item.control?.next_try ? new Date(item.control.next_try * 1000).toLocaleString() : ''}>{item.control?.next_try ? formatRelative(item.control.next_try) : 'now'}</td>
                   <td className="muted"><span className="clampText" title={item.control?.last_error || undefined}>{item.control?.last_error || '—'}</span></td>
                   <td className="rowActions">
-                    {spool !== 'inflight' && <button className="iconButton" title="Requeue now (resets attempts)" onClick={() => act('requeue', { name: item.name })}><RotateCcw size={15} /></button>}
-                    {spool === 'queue' && <button className="iconButton" title="Promote (deliver first)" onClick={() => act('promote', { name: item.name })}><ArrowUpToLine size={15} /></button>}
-                    {spool !== 'inflight' && <button className="iconButton danger" title="Delete" onClick={() => act('delete', { name: item.name })}><Trash2 size={15} /></button>}
+                    {spool !== 'inflight' && <IconButton label="Requeue now (resets attempts)" onClick={() => act('requeue', { name: item.name })}><RotateCcw size={15} /></IconButton>}
+                    {spool === 'queue' && <IconButton label="Promote (deliver first)" onClick={() => act('promote', { name: item.name })}><ArrowUpToLine size={15} /></IconButton>}
+                    {spool !== 'inflight' && <IconButton danger label="Delete" onClick={() => act('delete', { name: item.name })}><Trash2 size={15} /></IconButton>}
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-        {!listing.loading && entries.length === 0 && <Empty>No messages in this spool.</Empty>}
+        {listing.data !== null && entries.length === 0 && <Empty>No messages in this spool.</Empty>}
       </Panel>
 
       <section className="grid">
         <Panel title="Bulk actions" subtitle="Apply an action to every spool entry whose name matches a pattern (* wildcards).">
-          <form className="queueTools" onSubmit={(event) => { event.preventDefault(); }}>
-            <input value={pattern} onChange={(event) => setPattern(event.target.value)} placeholder="e.g. 1714*" />
-            <button type="button" className="button" disabled={!pattern.trim()} onClick={() => act('requeue', { pattern: pattern.trim() })}><RotateCcw size={16} />Requeue</button>
+          {/* Enter requeues: the one bulk action that never loses mail. It still asks first. */}
+          <form className="queueTools" onSubmit={(event) => { event.preventDefault(); if (pattern.trim()) act('requeue', { pattern: pattern.trim() }); }}>
+            <input value={pattern} onChange={(event) => setPattern(event.target.value)} placeholder="e.g. 1714*" aria-label="Spool entry name pattern" />
+            <button type="submit" className="button" disabled={!pattern.trim()}><RotateCcw size={16} />Requeue</button>
             <button type="button" className="button" disabled={!pattern.trim()} onClick={() => act('promote', { pattern: pattern.trim() })}><Wand2 size={16} />Promote</button>
             <button type="button" className="button danger" disabled={!pattern.trim()} onClick={() => act('delete', { pattern: pattern.trim() })}><Trash2 size={16} />Delete</button>
           </form>

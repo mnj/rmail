@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { RefreshCw, RotateCcw, Save, Search, ServerCog, Trash2 } from 'lucide-react';
 import { api, Setting, SettingsView } from '../api';
-import { Empty, ErrorBanner, Toggle, useFeedback, useResource } from '../ui';
+import { Empty, ErrorBanner, IconButton, invalidate, Toggle, useFeedback, useResource, useUnsavedChanges } from '../ui';
 
 /** Draft edits keyed by setting key. `null` means "reset to default". */
 type Drafts = Record<string, unknown>;
@@ -112,6 +112,7 @@ export function RestartNotice({ view, onRestarted }: { view: SettingsView; onRes
   const names = restartNeeded.map((service) => service.service);
 
   async function restart() {
+    const pending = (current: SettingsView) => current.managed && current.services.some((service) => names.includes(service.service) && service.restart_required);
     const ok = await confirm({
       title: `Restart ${names.join(', ')}?`,
       message: names.includes('web')
@@ -121,10 +122,23 @@ export function RestartNotice({ view, onRestarted }: { view: SettingsView; onRes
     });
     if (!ok) return;
     setRestarting(true);
-    const queued = await run(() => api('/api/services/restart', 'POST'), 'Restart requested');
-    // Services record their new revision as they come back up.
-    if (queued) for (const delay of [3000, 8000, 15000]) window.setTimeout(onRestarted, delay);
-    window.setTimeout(() => setRestarting(false), 15000);
+    if (await run(() => api('/api/services/restart', 'POST'), 'Restart requested')) {
+      // Services record their new revision as they come back up. Poll until
+      // they all have (the console itself may be down for a moment), then
+      // refresh every view that shows restart state.
+      const deadline = Date.now() + 45000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2500));
+        try {
+          if (!pending(await api<SettingsView>('/api/settings'))) break;
+        } catch {
+          // restarting; try again
+        }
+      }
+      onRestarted();
+      invalidate('settings');
+    }
+    setRestarting(false);
   }
 
   return (
@@ -145,7 +159,7 @@ export function RestartNotice({ view, onRestarted }: { view: SettingsView; onRes
 
 export function SettingsPage() {
   const { run, confirm, notify } = useFeedback();
-  const resource = useResource(() => api<SettingsView>('/api/settings'), []);
+  const resource = useResource(() => api<SettingsView>('/api/settings'), [], undefined, 'settings');
   const [drafts, setDrafts] = useState<Drafts>({});
   const [filter, setFilter] = useState('');
   const [group, setGroup] = useState<string>('all');
@@ -155,6 +169,7 @@ export function SettingsPage() {
   // Certificate settings have their own page.
   const settings = view && view.managed ? view.settings.filter((setting) => setting.group !== 'acme') : [];
   const dirtyKeys = Object.keys(drafts);
+  useUnsavedChanges(dirtyKeys.length);
 
   const visible = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -192,13 +207,17 @@ export function SettingsPage() {
   async function save() {
     setSaving(true);
     const changes = Object.fromEntries(dirtyKeys.map((key) => [key, drafts[key]]));
+    const needsRestart = settings.some((setting) => setting.key in drafts && setting.services.length > 0);
     const ok = await run(async () => {
       const updated = await api<SettingsView>('/api/settings', 'PUT', { changes });
       resource.setData(updated);
       setDrafts({});
     }, `Saved ${dirtyKeys.length} setting${dirtyKeys.length === 1 ? '' : 's'}`);
     setSaving(false);
-    if (ok) notify('info', 'Restart the affected services to apply the changes.');
+    if (ok) {
+      invalidate('settings');
+      if (needsRestart) notify('info', 'Restart the affected services to apply the changes.');
+    }
   }
 
   async function reset(setting: Setting) {
@@ -215,6 +234,7 @@ export function SettingsPage() {
     if (!ok) return;
     await run(async () => {
       resource.setData(await api<SettingsView>('/api/settings', 'PUT', { changes: { [key]: null } }));
+      invalidate('settings');
     }, `Removed ${key}`);
   }
 
@@ -240,7 +260,7 @@ export function SettingsPage() {
 
         <div className="settingsMain">
           <div className="settingsToolbar">
-            <div className="searchBox"><Search size={16} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Search settings" /></div>
+            <div className="searchBox"><Search size={16} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Search settings" aria-label="Search settings" /></div>
             <span className="muted">Revision {view.revision}{view.imported_from ? ` · imported from ${view.imported_from}` : ''}</span>
           </div>
 
@@ -251,7 +271,7 @@ export function SettingsPage() {
                 <thead><tr><th>Key</th><th>Value</th><th /></tr></thead>
                 <tbody>
                   {view.other.map((item) => (
-                    <tr key={item.key}><td><code>{item.key}</code></td><td><code>{JSON.stringify(item.value)}</code></td><td className="rowActions"><button className="iconButton danger" title="Remove" onClick={() => removeOther(item.key)}><Trash2 size={15} /></button></td></tr>
+                    <tr key={item.key}><td><code>{item.key}</code></td><td><code>{JSON.stringify(item.value)}</code></td><td className="rowActions"><IconButton danger label={`Remove ${item.key}`} onClick={() => removeOther(item.key)}><Trash2 size={15} /></IconButton></td></tr>
                   ))}
                 </tbody>
               </table>
@@ -288,12 +308,12 @@ export function SettingsPage() {
               );
             })
           )}
-          {group !== 'other' && visible.length === 0 && <Empty>No settings match “{filter}”.</Empty>}
+          {group !== 'other' && visible.length === 0 && <Empty>No settings match “{filter}”{group !== 'all' && <> in this group. <button className="linkButton" onClick={() => setGroup('all')}>Search all settings</button></>}.</Empty>}
         </div>
       </div>
 
       {dirtyKeys.length > 0 && (
-        <div className="saveBar">
+        <div className="saveBar" role="region" aria-label="Unsaved changes">
           <span><strong>{dirtyKeys.length}</strong> unsaved change{dirtyKeys.length === 1 ? '' : 's'}</span>
           <button className="button" onClick={() => setDrafts({})} disabled={saving}>Discard</button>
           <button className="button primary" onClick={save} disabled={saving}><Save size={16} />{saving ? 'Saving…' : 'Save changes'}</button>

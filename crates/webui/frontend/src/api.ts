@@ -59,7 +59,16 @@ export function errorMessage(err: unknown): string {
 // ---------------------------------------------------------------------------
 // Types returned by the server
 
-export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; settings_managed: boolean };
+export type PasswordPolicy = {
+  min_length: number;
+  max_length: number;
+  require_lowercase: boolean;
+  require_uppercase: boolean;
+  require_digit: boolean;
+  require_symbol: boolean;
+  forbid_username: boolean;
+};
+export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; settings_managed: boolean; password_policy?: PasswordPolicy };
 export type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
 export type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null };
 export type QueueSummary = { queued: number; inflight: number; sent: number; failed: number };
@@ -73,6 +82,8 @@ export type Overview = {
   domains: { domain: string; accounts: number; messages: number; unseen: number }[];
   top_mailboxes: { address: string; messages: number; unseen: number; folders: number }[];
   queue: QueueSummary;
+  used_bytes: number;
+  near_quota: { address: string; used_bytes: number; quota_bytes: number }[];
 };
 export type QueueControl = { attempts?: number; max_attempts?: number; priority?: number; next_try?: number | null; last_error?: string | null };
 export type QueueItem = { name: string; control?: QueueControl | null };
@@ -154,7 +165,7 @@ export type Certificates = {
   warnings: string[];
 };
 
-export type ModelKind ='embedding' | 'chat';
+export type ModelKind = 'embedding' | 'chat';
 export type CatalogModel = { id: string; name: string; kind: ModelKind; file: string; url: string; sha256: string | null; size_mb: number; ram_mb: number; license: string; prefix: string; notes: string };
 export type InstalledModel = { file: string; size: number; meta: { kind: ModelKind; url: string; sha256: string; size: number; downloaded_at: number } | null };
 export type ModelDownload = { file: string; received: number; total: number; status: { state: 'running' } | { state: 'done'; sha256: string } | { state: 'failed'; error: string } };

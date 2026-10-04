@@ -91,6 +91,8 @@ struct OverviewSummary {
     domains: Vec<DomainSummary>,
     top_mailboxes: Vec<MailboxLoadSummary>,
     queue: QueueSummary,
+    used_bytes: u64,
+    near_quota: Vec<QuotaPressure>,
 }
 
 #[derive(Clone, Default)]
@@ -302,6 +304,16 @@ struct MailboxLoadSummary {
     unseen: usize,
     folders: usize,
 }
+
+#[derive(Serialize)]
+struct QuotaPressure {
+    address: String,
+    used_bytes: u64,
+    quota_bytes: u64,
+}
+
+/// Share of its quota at which a mailbox is reported on the overview.
+const QUOTA_WARNING_PERCENT: u64 = 90;
 
 #[derive(Deserialize)]
 struct AccountRequest {
@@ -747,7 +759,27 @@ fn overview_summary_sync(
     });
     top_mailboxes.truncate(8);
 
+    let mut near_quota = accounts
+        .iter()
+        .filter_map(|account| {
+            let quota = account.quota_bytes.filter(|quota| *quota > 0)?;
+            (account.used_bytes.saturating_mul(100) >= quota.saturating_mul(QUOTA_WARNING_PERCENT))
+                .then(|| QuotaPressure {
+                    address: account.address.clone(),
+                    used_bytes: account.used_bytes,
+                    quota_bytes: quota,
+                })
+        })
+        .collect::<Vec<_>>();
+    near_quota.sort_by(|a, b| {
+        (b.used_bytes as f64 / b.quota_bytes as f64)
+            .total_cmp(&(a.used_bytes as f64 / a.quota_bytes as f64))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+
     Ok(OverviewSummary {
+        used_bytes: accounts.iter().map(|account| account.used_bytes).sum(),
+        near_quota,
         accounts: accounts.len(),
         folders: accounts.iter().map(|account| account.folders).sum(),
         total_messages: accounts.iter().map(|account| account.messages).sum(),
@@ -1620,6 +1652,9 @@ mod tests {
         .expect("add alias");
         rmail_common::db::set_catchall(&db_path, "example.test", "alice@example.test")
             .expect("set catchall");
+        // A quota smaller than one message puts alice over the warning line.
+        rmail_common::db::set_mailbox_quota(&db_path, "alice@example.test", Some(16))
+            .expect("set quota");
         rmail_common::maildir::deliver(
             &mail_root,
             "example.test",
@@ -1652,6 +1687,13 @@ mod tests {
         assert!(response.contains("\"unseen_messages\":2"), "{response}");
         assert!(response.contains("\"aliases\":1"), "{response}");
         assert!(response.contains("\"catchalls\":1"), "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(body["used_bytes"].as_u64().unwrap() > 0, "{response}");
+        let near_quota = body["near_quota"].as_array().unwrap();
+        assert_eq!(near_quota.len(), 1, "{response}");
+        assert_eq!(near_quota[0]["address"], "alice@example.test");
+        assert_eq!(near_quota[0]["quota_bytes"], 16);
         assert!(
             response.contains("\"domain\":\"example.test\""),
             "{response}"
@@ -2168,6 +2210,14 @@ mod tests {
         )
         .await;
         assert!(session.contains("\"setup_required\":true"), "{session}");
+        // The setup screen checks passwords against the policy before submitting.
+        let policy: serde_json::Value =
+            serde_json::from_str(session.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(policy["password_policy"]["min_length"], 10, "{session}");
+        assert_eq!(
+            policy["password_policy"]["forbid_username"], true,
+            "{session}"
+        );
 
         let short = send_to_state(
             state.clone(),
