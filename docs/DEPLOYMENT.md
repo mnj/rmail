@@ -96,6 +96,7 @@ Mail-protocol resource limits are configured in the `[security]` section:
 - `submission_max_recipients` — recipients per authenticated submission transaction (default: `50`)
 - `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
 - `submission_require_from_alignment` — when `true`, every parsed RFC 5322 `From` mailbox on authenticated submission must equal the authenticated mailbox; missing, malformed, or mismatched author fields are rejected (default: `false`)
+- `admin_password_policy` — rules for the admin console password, applied when it is set or changed: `min_length` (default `10`), `max_length` (`128`), `require_lowercase`, `require_uppercase`, `require_digit`, `require_symbol` (all `false`) and `forbid_username` (`true`). Also editable in the console under Settings → Authentication.
 
 OAuth bearer authentication uses an RFC 7662 token-introspection authority configured under
 `[security.oauth]`. The endpoint must use HTTPS unless `allow_insecure_http = true` is explicitly

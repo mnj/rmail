@@ -142,3 +142,14 @@ rspamd_reject_actions = []
 
 # Experimental: enable DANE/TLSA verification for outbound deliveries via environment variable
 # RMAIL_ENABLE_DANE=1  (set to 0 or false to disable)
+
+# Rules applied when the admin console password is set or changed (console
+# or `rmail_ctl admin-password`). Existing passwords are not re-checked.
+[security.admin_password_policy]
+min_length = 10
+max_length = 128
+require_lowercase = false
+require_uppercase = false
+require_digit = false
+require_symbol = false
+forbid_username = true

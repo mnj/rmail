@@ -36,7 +36,6 @@ const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 /// Basic authentication.
 pub(crate) const CSRF_HEADER: &str = "x-rmail-admin";
 const BASIC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-const MIN_ADMIN_PASSWORD_CHARS: usize = 10;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
@@ -974,11 +973,17 @@ async fn change_credentials(
             "username must be non-empty and must not contain ':'",
         );
     }
-    if input.new_password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
-        return error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("password must be at least {MIN_ADMIN_PASSWORD_CHARS} characters"),
-        );
+    let policy_db = db.clone();
+    let policy = match blocking(move || {
+        rmail_common::settings::admin_password_policy(&rmail_common::settings::open(&policy_db)?)
+    })
+    .await
+    {
+        Ok(policy) => policy,
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    if let Err(message) = policy.check(&username, &input.new_password) {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, message);
     }
     // Setup mode (no credentials yet) needs no current password.
     if let Principal::Admin(_) = principal {

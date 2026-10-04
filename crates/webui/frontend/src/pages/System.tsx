@@ -38,7 +38,7 @@ export function AdminCredentialsForm({ session, onChanged, setup }: { session: S
     <form className="formStack padded" onSubmit={submit}>
       <Field label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></Field>
       {!setup && <Field label="Current password"><input type="password" value={current} onChange={(event) => setCurrent(event.target.value)} autoComplete="current-password" required /></Field>}
-      <Field label="New password" hint="At least 10 characters. Changing it signs out other admin sessions."><input type="password" value={next} onChange={(event) => setNext(event.target.value)} autoComplete="new-password" minLength={10} required /></Field>
+      <Field label="New password" hint="Must satisfy the admin password policy (Settings → Authentication). Changing it signs out other admin sessions."><input type="password" value={next} onChange={(event) => setNext(event.target.value)} autoComplete="new-password" required /></Field>
       <Field label="Repeat new password" hint={mismatch ? <span className="errorText">Passwords do not match</span> : undefined}><input type="password" value={confirmNext} onChange={(event) => setConfirmNext(event.target.value)} autoComplete="new-password" required /></Field>
       <button className="button primary" disabled={mismatch || next.length < 10}><KeyRound size={16} />{setup ? 'Create admin account' : 'Update credentials'}</button>
     </form>

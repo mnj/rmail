@@ -544,6 +544,62 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.admin_password_policy.min_length",
+        "auth",
+        "Admin password: minimum length",
+        "Applies when the admin password is set or changed.",
+        int(1, 1_024),
+        LIVE,
+    ),
+    spec(
+        "security.admin_password_policy.max_length",
+        "auth",
+        "Admin password: maximum length",
+        "Upper bound in characters.",
+        int(1, 1_024),
+        LIVE,
+    ),
+    spec(
+        "security.admin_password_policy.require_lowercase",
+        "auth",
+        "Admin password: require lowercase",
+        "",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "security.admin_password_policy.require_uppercase",
+        "auth",
+        "Admin password: require uppercase",
+        "",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "security.admin_password_policy.require_digit",
+        "auth",
+        "Admin password: require digit",
+        "",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "security.admin_password_policy.require_symbol",
+        "auth",
+        "Admin password: require symbol",
+        "",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "security.admin_password_policy.forbid_username",
+        "auth",
+        "Admin password: forbid username",
+        "Reject passwords that contain the admin username.",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
         "security.imap_max_concurrent_sessions",
         "limits",
         "IMAP concurrent sessions",
@@ -992,6 +1048,18 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Value>> {
         .transpose()
 }
 
+/// The admin password policy stored in the settings database.
+pub fn admin_password_policy(conn: &Connection) -> Result<crate::config::AdminPasswordPolicy> {
+    let stored = load_all(conn)?;
+    let prefix = "security.admin_password_policy.";
+    let tree = unflatten(stored.iter().filter(|(key, _)| key.starts_with(prefix)));
+    let policy = tree
+        .pointer("/security/admin_password_policy")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    serde_json::from_value(policy).context("invalid admin password policy")
+}
+
 pub fn get_string(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(get(conn, key)?.and_then(|value| value.as_str().map(str::to_string)))
 }
@@ -1320,6 +1388,14 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
         crate::domain::canonicalize_domain(hostname.trim()).map_err(|error| {
             anyhow!("global.hostname: {hostname:?} is not a valid domain name ({error})")
         })?;
+    }
+    let policy = &config.security.admin_password_policy;
+    if policy.min_length > policy.max_length {
+        bail!(
+            "security.admin_password_policy: min_length ({}) exceeds max_length ({})",
+            policy.min_length,
+            policy.max_length
+        );
     }
     let oauth = config.security.oauth.is_some();
     for (key, mechanisms) in [

@@ -447,6 +447,9 @@ pub struct SecurityConfig {
     /// mechanism can be enabled.
     #[serde(default)]
     pub oauth: Option<OAuthConfig>,
+    /// Rules applied when the admin console password is set or changed.
+    #[serde(default)]
+    pub admin_password_policy: AdminPasswordPolicy,
     #[serde(default = "default_scanner_failure_action")]
     pub scanner_failure_action: ScannerFailureAction,
     #[serde(default = "default_scanner_timeout_ms")]
@@ -483,6 +486,7 @@ impl Default for SecurityConfig {
             imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             smtp_sasl_mechanisms: default_smtp_sasl_mechanisms(),
             oauth: None,
+            admin_password_policy: AdminPasswordPolicy::default(),
             scanner_failure_action: default_scanner_failure_action(),
             scanner_timeout_ms: default_scanner_timeout_ms(),
             scanner_max_message_bytes: default_scanner_max_message_bytes(),
@@ -493,6 +497,103 @@ impl Default for SecurityConfig {
             rspamd_quarantine_actions: default_rspamd_quarantine_actions(),
             rspamd_reject_actions: Vec::new(),
         }
+    }
+}
+
+/// Rules for the admin console password. Existing passwords are not
+/// re-checked; the policy applies when one is set or changed.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct AdminPasswordPolicy {
+    #[serde(default = "default_admin_password_min_length")]
+    pub min_length: usize,
+    /// Upper bound in characters; keeps password hashing work bounded.
+    #[serde(default = "default_admin_password_max_length")]
+    pub max_length: usize,
+    #[serde(default)]
+    pub require_lowercase: bool,
+    #[serde(default)]
+    pub require_uppercase: bool,
+    #[serde(default)]
+    pub require_digit: bool,
+    #[serde(default)]
+    pub require_symbol: bool,
+    /// Reject passwords that contain the admin username.
+    #[serde(default = "default_true")]
+    pub forbid_username: bool,
+}
+
+fn default_admin_password_min_length() -> usize {
+    10
+}
+
+fn default_admin_password_max_length() -> usize {
+    128
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AdminPasswordPolicy {
+    fn default() -> Self {
+        Self {
+            min_length: default_admin_password_min_length(),
+            max_length: default_admin_password_max_length(),
+            require_lowercase: false,
+            require_uppercase: false,
+            require_digit: false,
+            require_symbol: false,
+            forbid_username: true,
+        }
+    }
+}
+
+impl AdminPasswordPolicy {
+    /// Describes the first rule `password` breaks, if any.
+    pub fn check(&self, username: &str, password: &str) -> Result<(), String> {
+        let length = password.chars().count();
+        if length < self.min_length {
+            return Err(format!(
+                "password must be at least {} characters",
+                self.min_length
+            ));
+        }
+        if length > self.max_length {
+            return Err(format!(
+                "password must be at most {} characters",
+                self.max_length
+            ));
+        }
+        let rules: [(bool, fn(char) -> bool, &str); 4] = [
+            (
+                self.require_lowercase,
+                char::is_lowercase,
+                "a lowercase letter",
+            ),
+            (
+                self.require_uppercase,
+                char::is_uppercase,
+                "an uppercase letter",
+            ),
+            (self.require_digit, |c| c.is_ascii_digit(), "a digit"),
+            (
+                self.require_symbol,
+                |c| !c.is_alphanumeric() && !c.is_whitespace(),
+                "a symbol",
+            ),
+        ];
+        for (required, test, label) in rules {
+            if required && !password.chars().any(test) {
+                return Err(format!("password must contain {label}"));
+            }
+        }
+        if self.forbid_username
+            && !username.is_empty()
+            && password.to_lowercase().contains(&username.to_lowercase())
+        {
+            return Err("password must not contain the username".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -949,5 +1050,38 @@ imap_port = 1143
         assert_eq!(example.global.imap_listeners(), ["[::]:143"]);
         assert_eq!(test.global.smtp_listeners().len(), 2);
         assert_eq!(test.global.tcp_listener.backlog, 128);
+    }
+}
+
+#[cfg(test)]
+mod admin_password_policy_tests {
+    use super::AdminPasswordPolicy;
+
+    #[test]
+    fn default_policy_keeps_the_legacy_minimum() {
+        let policy = AdminPasswordPolicy::default();
+        assert!(policy.check("admin", "short").is_err());
+        assert!(policy.check("admin", "long enough pw").is_ok());
+    }
+
+    #[test]
+    fn enforces_length_bounds_and_character_classes() {
+        let policy = AdminPasswordPolicy {
+            min_length: 8,
+            max_length: 12,
+            require_lowercase: true,
+            require_uppercase: true,
+            require_digit: true,
+            require_symbol: true,
+            forbid_username: true,
+        };
+        assert!(policy.check("admin", "Abcdef1!").is_ok());
+        assert!(policy.check("admin", "Abc1!").is_err());
+        assert!(policy.check("admin", "Abcdefgh1!xyz").is_err());
+        assert!(policy.check("admin", "ABCDEF1!").is_err());
+        assert!(policy.check("admin", "abcdef1!").is_err());
+        assert!(policy.check("admin", "Abcdefg!").is_err());
+        assert!(policy.check("admin", "Abcdefg1").is_err());
+        assert!(policy.check("admin", "ADMIN-Pw1!").is_err());
     }
 }
