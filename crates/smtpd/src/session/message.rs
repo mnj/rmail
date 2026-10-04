@@ -232,6 +232,10 @@ impl Session {
                 ScanAction::Quarantine => Scan::Quarantine(
                     rmail_common::scanner::prepend_scan_headers(data, &verdict.headers),
                 ),
+                ScanAction::Defer => {
+                    session_log!(self, "info", "message_deferred_by_scanner", { "message_id": self.message_id, "reason": verdict.reason });
+                    Scan::Reject("451 4.7.1 Greylisted, please try again later")
+                }
                 ScanAction::Reject => {
                     session_log!(self, "warn", "message_rejected_by_scanner", { "message_id": self.message_id, "reason": verdict.reason });
                     Scan::Reject("554 5.7.1 Message rejected: malware detected")
@@ -357,7 +361,11 @@ impl Session {
             if self.service == SmtpService::Submission
                 && let Some(user) = self.authenticated_user.as_deref()
             {
-                record_submission_message(user);
+                record_submission_message(
+                    user,
+                    self.security.submission_max_messages_per_user_per_day,
+                    self.security.submission_max_messages_per_domain_per_hour,
+                );
             }
             session_log!(self, "info", "data_completed", { "message_id": self.message_id, "result": if report.any_rejected { "partially_accepted" } else { "accepted" } });
             writer.write_all(b"250 2.0.0 Message accepted\r\n").await?;

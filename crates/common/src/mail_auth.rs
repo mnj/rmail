@@ -35,6 +35,20 @@ pub async fn dns_health_check() -> Result<()> {
     Ok(())
 }
 
+/// Resolve `name` to its A/AAAA addresses with the shared resolver. NXDOMAIN
+/// and other failures are errors.
+pub async fn lookup_ip_addrs(name: &str) -> Result<Vec<IpAddr>> {
+    let name = if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
+    };
+    let started = std::time::Instant::now();
+    let result = authenticator()?.resolver().lookup_ip(name).await;
+    crate::metrics::observe_dns_duration(started.elapsed());
+    Ok(result?.iter().collect())
+}
+
 /// Return true when a message has at least one RFC 5322 From mailbox and all
 /// parsed From mailboxes match the authenticated submission identity.
 pub fn submission_from_matches(data: &[u8], authenticated_user: &str) -> bool {
