@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle, FlaskConical, RefreshCw, Save, ServerCog, ShieldCheck } from 'lucide-react';
 import { api, Certificates, Setting, SettingsView } from '../api';
-import { Empty, ErrorBanner, formatDate, formatRelative, Panel, useFeedback, useResource } from '../ui';
+import { Empty, ErrorBanner, formatDate, formatRelative, invalidate, Panel, useFeedback, useResource, useUnsavedChanges } from '../ui';
 import { RestartNotice, SettingControl } from './Settings';
 
 type Drafts = Record<string, unknown>;
@@ -96,8 +96,9 @@ function RunLog({ view }: { view: Certificates }) {
 export function CertificatesPage() {
   const { run, confirm, notify } = useFeedback();
   const overview = useResource(() => api<Certificates>('/api/certificates'), [], 30000);
-  const settingsView = useResource(() => api<SettingsView>('/api/settings'), []);
+  const settingsView = useResource(() => api<SettingsView>('/api/settings'), [], undefined, 'settings');
   const [drafts, setDrafts] = useState<Drafts>({});
+  useUnsavedChanges(Object.keys(drafts).length);
   const [saving, setSaving] = useState(false);
   const view = overview.data;
   const running = Boolean(view?.running);
@@ -109,7 +110,7 @@ export function CertificatesPage() {
     const id = window.setInterval(() => overview.reload(), 2000);
     return () => {
       window.clearInterval(id);
-      settingsView.reload();
+      invalidate('settings');
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running]);
@@ -157,7 +158,10 @@ export function CertificatesPage() {
       setDrafts({});
     }, 'Certificate settings saved');
     setSaving(false);
-    if (ok) overview.reload();
+    if (ok) {
+      overview.reload();
+      invalidate('settings');
+    }
   }
 
   async function issue(dryRun: boolean) {
@@ -244,7 +248,7 @@ export function CertificatesPage() {
       </Panel>
 
       {dirtyKeys.length > 0 && (
-        <div className="saveBar">
+        <div className="saveBar" role="region" aria-label="Unsaved changes">
           <span><strong>{dirtyKeys.length}</strong> unsaved change{dirtyKeys.length === 1 ? '' : 's'}</span>
           <button className="button" onClick={() => setDrafts({})} disabled={saving}>Discard</button>
           <button className="button primary" onClick={save} disabled={saving}><Save size={16} />{saving ? 'Saving…' : 'Save changes'}</button>

@@ -1,7 +1,14 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
 import { Account, api } from '../api';
-import { Empty, ErrorBanner, Field, formatBytes, generatePassword, Modal, Panel, useFeedback, useResource } from '../ui';
+import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
+
+type Column = 'address' | 'storage' | 'folders' | 'messages';
+
+/** Share of the quota in use, or null without a quota. */
+function quotaPercent(account: Account): number | null {
+  return account.quota_bytes ? Math.round((account.used_bytes / account.quota_bytes) * 100) : null;
+}
 
 type Editing = { mode: 'create' } | { mode: 'edit'; account: Account };
 
@@ -42,7 +49,7 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
         <Field label={existing ? 'New password' : 'Password'} hint={existing ? 'Leave empty to keep the current password. Changing it signs the user out of webmail.' : 'Stored as Argon2id plus a SCRAM-SHA-256 verifier.'}>
           <div className="inputRow">
             <input aria-label={existing ? 'New password' : 'Password'} type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" autoFocus={!!existing} />
-            <button type="button" className="iconButton" title="Generate a password" onClick={() => { setPassword(generatePassword()); setShowPassword(true); }}><Dices size={15} /></button>
+            <IconButton label="Generate a password" onClick={() => { setPassword(generatePassword()); setShowPassword(true); }}><Dices size={15} /></IconButton>
           </div>
         </Field>
         <Field label="Storage quota (MiB)" hint="Empty or 0 means unlimited.">
@@ -55,14 +62,19 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
 
 export function AccountsPage() {
   const { run, confirm } = useFeedback();
-  const accounts = useResource(() => api<Account[]>('/api/accounts'), []);
+  const accounts = useResource(() => api<Account[]>('/api/accounts'), [], undefined, 'accounts');
   const [editing, setEditing] = useState<Editing | null>(null);
   const [filter, setFilter] = useState('');
 
   const rows = useMemo(() => {
     const needle = filter.trim().toLowerCase();
-    return (accounts.data || []).filter((account) => !needle || account.address.includes(needle));
+    return (accounts.data || []).filter((account) => !needle || account.address.toLowerCase().includes(needle));
   }, [accounts.data, filter]);
+  const { sorted, sort, toggle } = useSort<Account, Column>(rows, { key: 'address', dir: 'asc' }, (account, key) => {
+    if (key === 'address') return account.address;
+    if (key === 'storage') return account.used_bytes;
+    return account[key];
+  });
 
   async function remove(account: Account) {
     const ok = await confirm({
@@ -83,35 +95,47 @@ export function AccountsPage() {
         title="Mailboxes"
         subtitle={`${rows.length} of ${accounts.data?.length ?? 0} · ${formatBytes(totalUsed)} stored`}
         actions={<>
-          <div className="searchBox"><Search size={16} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter mailboxes" /></div>
+          <div className="searchBox"><Search size={16} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter mailboxes" aria-label="Filter mailboxes" /></div>
           <button className="button primary" onClick={() => setEditing({ mode: 'create' })}><Plus size={16} />New mailbox</button>
         </>}
       >
+        <div className="tableScroll">
         <table>
-          <thead><tr><th>Mailbox</th><th>Sign-in</th><th>Storage</th><th>Folders</th><th>Messages</th><th /></tr></thead>
+          <thead><tr>
+            <SortHeader label="Mailbox" column="address" sort={sort} onSort={toggle} />
+            <th>Sign-in</th>
+            <SortHeader label="Storage" column="storage" sort={sort} onSort={toggle} numeric />
+            <SortHeader label="Folders" column="folders" sort={sort} onSort={toggle} numeric />
+            <SortHeader label="Messages" column="messages" sort={sort} onSort={toggle} numeric />
+            <th><span className="visuallyHidden">Actions</span></th>
+          </tr></thead>
           <tbody>
-            {rows.map((account) => {
-              const percent = account.quota_bytes ? Math.min(100, Math.round((account.used_bytes / account.quota_bytes) * 100)) : null;
+            {accounts.data === null && !accounts.error && <SkeletonRows cols={6} />}
+            {sorted.map((account) => {
+              const percent = quotaPercent(account);
+              const level = percent === null ? '' : percent >= 90 ? 'high' : percent >= 75 ? 'warn' : '';
               return (
                 <tr key={account.address}>
                   <td><strong>{account.address}</strong><small>{account.unseen ? `${account.unseen} unread` : 'No unread mail'}</small></td>
                   <td><span className={`pill ${account.auth === 'Unset' ? 'warn' : ''}`}>{account.auth === 'Unset' ? 'No password' : account.auth}</span></td>
-                  <td className="usage">
+                  <td className="usage num">
                     <span>{formatBytes(account.used_bytes)} / {account.quota_bytes == null ? 'unlimited' : formatBytes(account.quota_bytes)}</span>
-                    {percent !== null && <div className={`usageBar ${percent > 90 ? 'high' : ''}`}><i style={{ width: `${percent}%` }} /></div>}
+                    {percent !== null && <div className={`usageBar ${level}`} style={{ marginLeft: 'auto' }} title={`${percent}% of quota`}><i style={{ width: `${Math.min(100, percent)}%` }} /></div>}
+                    {level === 'high' && <small className="errorText">{percent}% of quota</small>}
                   </td>
-                  <td>{account.folders}</td>
-                  <td>{account.messages}</td>
+                  <td className="num">{account.folders}</td>
+                  <td className="num">{account.messages}</td>
                   <td className="rowActions">
-                    <button className="iconButton" title="Edit mailbox" onClick={() => setEditing({ mode: 'edit', account })}>{account.auth === 'Unset' ? <KeyRound size={15} /> : <Pencil size={15} />}</button>
-                    <button className="iconButton danger" title="Delete mailbox" onClick={() => remove(account)}><Trash2 size={15} /></button>
+                    <IconButton label={account.auth === 'Unset' ? `Set a password for ${account.address}` : `Edit ${account.address}`} onClick={() => setEditing({ mode: 'edit', account })}>{account.auth === 'Unset' ? <KeyRound size={15} /> : <Pencil size={15} />}</IconButton>
+                    <IconButton danger label={`Delete ${account.address}`} onClick={() => remove(account)}><Trash2 size={15} /></IconButton>
                   </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
-        {!accounts.loading && rows.length === 0 && <Empty>{filter ? 'No mailboxes match the filter.' : 'No mailboxes yet. Create the first one to start receiving mail.'}</Empty>}
+        </div>
+        {accounts.data !== null && rows.length === 0 && <Empty>{filter ? 'No mailboxes match the filter.' : 'No mailboxes yet. Create the first one to start receiving mail.'}</Empty>}
       </Panel>
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={accounts.reload} />}
     </>

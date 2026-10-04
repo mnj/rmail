@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, ChevronRight, FolderTree, Gauge, LockKeyhole, LogOut, Menu, Network, Send, Server, SlidersHorizontal, Users, X } from 'lucide-react';
-import { api, errorMessage, onUnauthorized, Session } from './api';
-import { FeedbackProvider, Field } from './ui';
+import { Activity, FolderTree, Gauge, LockKeyhole, LogOut, Menu, Monitor, Moon, Network, Send, Server, SlidersHorizontal, Sun, Users, X } from 'lucide-react';
+import { api, errorMessage, onUnauthorized, QueueSummary, Session, SettingsView } from './api';
+import { confirmLeave, FeedbackProvider, Field, useResource } from './ui';
 import { OverviewPage } from './pages/Overview';
 import { AccountsPage } from './pages/Accounts';
 import { RoutingPage } from './pages/Routing';
@@ -16,16 +16,16 @@ import './style.css';
 
 export type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'organization' | 'settings' | 'certificates' | 'observability' | 'system';
 
-const pageMeta: Record<Page, { path: string; label: string; eyebrow: string; description: string; icon: React.ElementType }> = {
-  overview: { path: '/', label: 'Overview', eyebrow: 'Command center', description: 'Health, storage and delivery at a glance.', icon: Gauge },
-  accounts: { path: '/accounts', label: 'Mailboxes', eyebrow: 'Identity & storage', description: 'Create mailboxes, reset passwords and manage quotas.', icon: Users },
-  routing: { path: '/routing', label: 'Routing', eyebrow: 'Mail flow', description: 'Aliases and per-domain catchalls.', icon: Network },
-  delivery: { path: '/delivery', label: 'Delivery', eyebrow: 'Outbound operations', description: 'Inspect and recover the outbound queue.', icon: Send },
-  organization: { path: '/organization', label: 'Organization', eyebrow: 'Local AI', description: 'Download, choose and test the local models that suggest folders for new mail.', icon: FolderTree },
-  settings: { path: '/settings', label: 'Settings', eyebrow: 'Configuration', description: 'Listeners, TLS, authentication, limits and filtering. Stored in the database.', icon: SlidersHorizontal },
-  certificates: { path: '/certificates', label: 'Certificates', eyebrow: 'TLS', description: 'Automatic certificates from Let\'s Encrypt or another ACME CA, renewed and reloaded without restarts.', icon: LockKeyhole },
-  observability: { path: '/observability', label: 'Logs & metrics', eyebrow: 'Diagnostics', description: 'Daemon logs and Prometheus telemetry.', icon: Activity },
-  system: { path: '/system', label: 'System', eyebrow: 'Services & access', description: 'Dependency readiness, running services and the admin account.', icon: Server },
+const pageMeta: Record<Page, { path: string; label: string; description: string; icon: React.ElementType }> = {
+  overview: { path: '/', label: 'Overview', description: 'Health, storage and delivery at a glance.', icon: Gauge },
+  accounts: { path: '/accounts', label: 'Mailboxes', description: 'Create mailboxes, reset passwords and manage quotas.', icon: Users },
+  routing: { path: '/routing', label: 'Routing', description: 'Aliases and per-domain catchalls.', icon: Network },
+  delivery: { path: '/delivery', label: 'Delivery', description: 'Inspect and recover the outbound queue.', icon: Send },
+  organization: { path: '/organization', label: 'Organization', description: 'Download, choose and test the local models that suggest folders for new mail.', icon: FolderTree },
+  settings: { path: '/settings', label: 'Settings', description: 'Listeners, TLS, authentication, limits and filtering. Stored in the database.', icon: SlidersHorizontal },
+  certificates: { path: '/certificates', label: 'Certificates', description: 'Automatic certificates from Let\'s Encrypt or another ACME CA, renewed and reloaded without restarts.', icon: LockKeyhole },
+  observability: { path: '/observability', label: 'Logs & metrics', description: 'Daemon logs and Prometheus telemetry.', icon: Activity },
+  system: { path: '/system', label: 'System', description: 'Dependency readiness, running services and the admin account.', icon: Server },
 };
 
 const navGroups: { label: string; pages: Page[] }[] = [
@@ -36,6 +36,66 @@ const navGroups: { label: string; pages: Page[] }[] = [
 
 function pageFromPath(path: string): Page {
   return (Object.entries(pageMeta).find(([, value]) => value.path === path)?.[0] as Page | undefined) || 'overview';
+}
+
+// ---------------------------------------------------------------------------
+// Theme: follows the OS unless the viewer picks one; the choice is per browser.
+
+type Theme = 'system' | 'light' | 'dark';
+const themeKey = 'rmail-admin-theme';
+
+function storedTheme(): Theme {
+  try {
+    const value = localStorage.getItem(themeKey);
+    return value === 'light' || value === 'dark' ? value : 'system';
+  } catch {
+    return 'system';
+  }
+}
+
+function applyTheme(theme: Theme) {
+  if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', theme);
+}
+
+applyTheme(storedTheme());
+
+function ThemeSwitch() {
+  const [theme, setTheme] = useState<Theme>(storedTheme);
+  const choose = (next: Theme) => {
+    setTheme(next);
+    applyTheme(next);
+    try {
+      if (next === 'system') localStorage.removeItem(themeKey);
+      else localStorage.setItem(themeKey, next);
+    } catch {
+      // storage unavailable: the choice lasts for this page load
+    }
+  };
+  const options: { id: Theme; label: string; icon: React.ElementType }[] = [
+    { id: 'light', label: 'Light theme', icon: Sun },
+    { id: 'system', label: 'Match system theme', icon: Monitor },
+    { id: 'dark', label: 'Dark theme', icon: Moon },
+  ];
+  return (
+    <div className="themeSwitch" role="group" aria-label="Theme">
+      {options.map(({ id, label, icon: Icon }) => (
+        <button key={id} type="button" aria-pressed={theme === id} aria-label={label} title={label} onClick={() => choose(id)}><Icon size={15} /></button>
+      ))}
+    </div>
+  );
+}
+
+/** Counts shown next to sidebar entries so problems are visible from any page. */
+function useNavBadges(): Partial<Record<Page, { count: number; tone: 'warn' | 'error'; label: string }>> {
+  const queue = useResource(() => api<QueueSummary>('/api/queue/summary'), [], 60000, 'queue');
+  const settings = useResource(() => api<SettingsView>('/api/settings'), [], 60000, 'settings');
+  const badges: ReturnType<typeof useNavBadges> = {};
+  if (queue.data?.failed) badges.delivery = { count: queue.data.failed, tone: 'error', label: `${queue.data.failed} failed` };
+  const view = settings.data;
+  const restarts = view && view.managed ? view.services.filter((service) => service.restart_required).length : 0;
+  if (restarts) badges.settings = { count: restarts, tone: 'warn', label: `${restarts} service${restarts === 1 ? '' : 's'} need a restart` };
+  return badges;
 }
 
 function AuthScreen({ children, title, subtitle }: { children: React.ReactNode; title: string; subtitle: string }) {
@@ -104,8 +164,21 @@ function Console({ session, setSession }: { session: Session; setSession: (sessi
   const [page, setPage] = useState<Page>(() => pageFromPath(window.location.pathname));
   const [mobileNav, setMobileNav] = useState(false);
 
+  const badges = useNavBadges();
+  const pageRef = React.useRef(page);
+  pageRef.current = page;
+
   useEffect(() => {
-    const onPopState = () => setPage(pageFromPath(window.location.pathname));
+    const onPopState = async () => {
+      const next = pageFromPath(window.location.pathname);
+      if (next === pageRef.current) return;
+      // The URL already changed; put it back unless the page agrees to leave.
+      if (!await confirmLeave()) {
+        window.history.pushState({}, '', pageMeta[pageRef.current].path);
+        return;
+      }
+      setPage(next);
+    };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
@@ -114,7 +187,10 @@ function Console({ session, setSession }: { session: Session; setSession: (sessi
     document.title = `${pageMeta[page].label} · rMail Admin`;
   }, [page]);
 
-  const navigate = useCallback((next: Page) => {
+  const navigate = useCallback(async (next: Page) => {
+    setMobileNav(false);
+    if (next === pageRef.current) return;
+    if (!await confirmLeave()) return;
     window.history.pushState({}, '', pageMeta[next].path);
     setPage(next);
     setMobileNav(false);
@@ -122,6 +198,7 @@ function Console({ session, setSession }: { session: Session; setSession: (sessi
   }, []);
 
   async function logout() {
+    if (!await confirmLeave()) return;
     await api('/api/logout', 'POST').catch(() => undefined);
     setSession(null);
   }
@@ -140,20 +217,29 @@ function Console({ session, setSession }: { session: Session; setSession: (sessi
               {group.pages.map((key) => {
                 const item = pageMeta[key];
                 const Icon = item.icon;
-                return <a key={key} href={item.path} className={page === key ? 'active' : ''} aria-current={page === key ? 'page' : undefined} onClick={(event) => { event.preventDefault(); navigate(key); }}><Icon size={18} /><span>{item.label}</span><ChevronRight size={15} /></a>;
+                const badge = badges[key];
+                return (
+                  <a key={key} href={item.path} className={page === key ? 'active' : ''} aria-current={page === key ? 'page' : undefined} onClick={(event) => { event.preventDefault(); navigate(key); }}>
+                    <Icon size={18} /><span>{item.label}</span>
+                    {badge ? <span className={`navBadge ${badge.tone}`} title={badge.label}>{badge.count}<span className="visuallyHidden">: {badge.label}</span></span> : <span />}
+                  </a>
+                );
               })}
             </div>
           ))}
         </nav>
-        <div className="account">
-          <div><strong>{session.user || 'Local access'}</strong><span>{session.user ? 'Administrator' : 'No admin password set'}</span></div>
-          {session.user && <button className="iconButton ghost" title="Sign out" onClick={logout}><LogOut size={16} /></button>}
+        <div className="sidebarFoot">
+          <ThemeSwitch />
+          <div className="account">
+            <div><strong>{session.user || 'Local access'}</strong><span>{session.user ? 'Administrator' : 'No admin password set'}</span></div>
+            {session.user && <button className="iconButton ghost" aria-label="Sign out" title="Sign out" onClick={logout}><LogOut size={16} /></button>}
+          </div>
         </div>
       </aside>
       <section className="content">
         <header className="topbar">
           <button className="menuButton" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button>
-          <div className="pageTitle"><span>{meta.eyebrow}</span><h1>{meta.label}</h1><p>{meta.description}</p></div>
+          <div className="pageTitle"><h1>{meta.label}</h1><p>{meta.description}</p></div>
         </header>
         {page === 'overview' && <OverviewPage navigate={navigate} />}
         {page === 'accounts' && <AccountsPage />}
