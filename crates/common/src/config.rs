@@ -151,6 +151,9 @@ pub struct ListenerEndpoints {
     pub smtps: Option<Vec<String>>,
     pub imap: Option<Vec<String>>,
     pub imaps: Option<Vec<String>>,
+    /// ManageSieve (RFC 5804) endpoints, usually port 4190, served by the IMAP
+    /// daemon. Empty (disabled) by default.
+    pub managesieve: Option<Vec<String>>,
     pub admin: Option<Vec<String>>,
     pub webmail: Option<Vec<String>>,
     /// Plain-HTTP listeners (usually port 80) served by the admin daemon:
@@ -229,6 +232,10 @@ impl Global {
                 .clone()
                 .unwrap_or_else(|| vec![format!("0.0.0.0:{port}")])
         })
+    }
+
+    pub fn managesieve_listeners(&self) -> Vec<String> {
+        self.listeners.managesieve.clone().unwrap_or_default()
     }
 
     pub fn admin_listeners(&self) -> Vec<String> {

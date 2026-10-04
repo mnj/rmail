@@ -359,6 +359,22 @@ pub fn set_active_sieve_script<P: AsRef<Path>>(
     Ok(true)
 }
 
+/// Rename a script, keeping its active flag. Returns false when `from` does
+/// not exist; fails when `to` already does.
+pub fn rename_sieve_script<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let changed = conn.execute(
+        "UPDATE sieve_scripts SET name = ?3, updated_at = ?4 WHERE account = ?1 AND name = ?2",
+        params![account.to_ascii_lowercase(), from, to, unix_now()],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Delete an inactive script. Returns false when it does not exist or is active.
 pub fn delete_sieve_script<P: AsRef<Path>>(path: P, account: &str, name: &str) -> Result<bool> {
     let conn = Connection::open(path)?;

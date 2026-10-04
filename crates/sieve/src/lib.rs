@@ -18,6 +18,7 @@ use std::fmt;
 pub use ast::{Cmd, Vacation};
 pub use eval::Action;
 pub use message::Message;
+pub use parser::SUPPORTED_EXTENSIONS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

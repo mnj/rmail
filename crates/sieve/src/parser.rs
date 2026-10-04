@@ -9,7 +9,8 @@ use crate::{Error, Script};
 const MAX_DEPTH: usize = 32;
 const MAX_SCRIPT_BYTES: usize = 1 << 20;
 
-const EXTENSIONS: &[&str] = &[
+/// Extensions a script may `require`, as advertised by ManageSieve.
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "fileinto",
     "envelope",
     "imap4flags",
@@ -742,7 +743,7 @@ pub(crate) fn parse(source: &str) -> Result<Script, Error> {
             }
             for name in strings(&parsed.pos[0], node.line, "require")? {
                 let name = name.to_ascii_lowercase();
-                if !EXTENSIONS.contains(&name.as_str()) {
+                if !SUPPORTED_EXTENSIONS.contains(&name.as_str()) {
                     return Err(Error::syntax(
                         node.line,
                         format!("unsupported extension \"{name}\""),
