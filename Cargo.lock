@@ -3404,6 +3404,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmail_sieve"
+version = "1.0.0"
+
+[[package]]
 name = "rmail_smtpd"
 version = "1.0.0"
 dependencies = [
