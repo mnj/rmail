@@ -437,18 +437,25 @@ How it decides:
 
 ### Labels
 
-Users can also have new INBOX mail labeled. This is a separate switch in **Organize my mail**: it
-works without folder suggestions, and folder suggestions work without it.
+Users can also have new INBOX mail labeled automatically. This is a separate switch in
+**Organize my mail**: it works without folder suggestions, and folder suggestions work without it.
 
-- Each user defines up to 30 labels, each a name plus a sentence describing it (for example
-  "Invoices: bills I need to pay"). The fallback model (local chat model, OpenRouter or Jev) decides
-  which labels apply to each new message. A label is applied when its probability reaches
-  `classifier.label_confidence` (70% by default). Jev gets one yes/no question per label in a single
-  request. Chat models answer with a JSON list limited to the user's label names.
+- Turning it on seeds common labels (Action needed, Receipts, Shipping, Travel, Finance, Events,
+  Security, Newsletters, Promotions, Notifications, Social, Work, Personal). The fallback model
+  (local chat model, OpenRouter or Jev) then decides which labels apply to each new message. A label
+  is applied when its probability reaches `classifier.label_confidence` (70% by default), with at
+  most three labels per message.
+- When no label fits, the local and OpenRouter chat models may create a new label: one to three
+  words, with a short description, applied to that message and offered for later mail. Set
+  `classifier.label_discovery` to `false` to turn this off. Jev only picks from existing labels; it
+  gets one yes/no question per label in a single request.
+- Each account has at most 30 labels, at most 15 of them created by the AI. A starter or AI label
+  the user removes is never created again. Users can add their own labels and reword descriptions
+  to steer the model; webmail marks the labels the AI created.
 - Labels are stored as IMAP keywords, so IMAP clients that show keywords (Thunderbird, for example)
-  see them too. Keywords must be ASCII atoms, so "To do" becomes `To_do` and letters such as "Ø"
-  become `_`. Webmail always shows the label's name. Removing a label in webmail or any IMAP client
-  removes the keyword.
+  see them too. Keywords must be ASCII atoms, so "Action needed" becomes `Action_needed` and
+  letters such as "Ø" become `_`. Webmail always shows the label's name. Removing a label in webmail
+  or any IMAP client removes the keyword.
 - Labels need a fallback model. With a cloud fallback, every new INBOX message of a user who turned
   labels on goes to that provider, so the same per-user consent applies (see above).
 - When a label has been applied to 10 or more messages and the user has no folder with that name,

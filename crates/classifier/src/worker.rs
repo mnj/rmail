@@ -27,6 +27,8 @@ const INITIAL_INBOX_SUGGESTIONS: usize = 50;
 const LABEL_BUDGET: usize = 32;
 /// INBOX messages labeled when an account first turns labels on.
 const INITIAL_INBOX_LABELS: usize = 50;
+/// Most labels put on one message.
+const MAX_LABELS_PER_MESSAGE: usize = 3;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct CycleReport {
@@ -131,13 +133,15 @@ impl Account<'_> {
         let chooser = self.models.chooser.clone().context("no fallback model")?;
         let conn = store::open_existing(self.mail_root, self.domain, self.localpart)?
             .context("store disappeared")?;
-        let labels = store::labels(&conn)?;
+        store::seed_starter_labels(&conn)?;
+        let mut labels = store::labels(&conn)?;
         let (inbox, messages) =
             imap_state::load_folder(self.mail_root, self.domain, self.localpart, "INBOX")?;
         let mark = store::label_mark(&conn)?;
         let high = messages.iter().map(|m| m.uid).max().unwrap_or(0);
         let first = mark.is_none_or(|m| m.uidvalidity != inbox.uidvalidity);
-        if labels.is_empty() {
+        let discover = self.cfg.label_discovery;
+        if labels.is_empty() && !discover {
             // Nothing to apply; start from new mail once labels exist.
             return store::set_label_mark(
                 &conn,
@@ -154,23 +158,35 @@ impl Account<'_> {
             messages.iter().filter(|m| m.uid > last).collect()
         };
         pending.sort_by_key(|m| m.uid);
-        let hints: Vec<crate::engine::LabelHint> = labels
-            .iter()
-            .map(|label| crate::engine::LabelHint {
-                name: label.name.clone(),
-                description: label.description.clone(),
-            })
-            .collect();
+        let hint = |label: &store::Label| crate::engine::LabelHint {
+            name: label.name.clone(),
+            description: label.description.clone(),
+        };
+        let mut hints: Vec<crate::engine::LabelHint> = labels.iter().map(hint).collect();
         let threshold = self.cfg.label_confidence as f64 / 100.0;
         let mut done = mark.filter(|_| !first).map_or(0, |m| m.last_uid);
         let caught_up = pending.len() <= LABEL_BUDGET;
         for message in pending.into_iter().take(LABEL_BUDGET) {
             if let Some(doc) = read_document(&message.path, self.cfg) {
-                let applied: Vec<(String, f64)> = chooser
-                    .label(&doc.text, &hints)?
+                let answer = chooser.label(&doc.text, &hints, discover)?;
+                let mut applied: Vec<(String, f64)> = answer
+                    .labels
                     .into_iter()
                     .filter(|(_, probability)| *probability >= threshold)
                     .collect();
+                applied.sort_by(|a, b| b.1.total_cmp(&a.1));
+                applied.truncate(MAX_LABELS_PER_MESSAGE);
+                // The model found no fitting label and named one; it applies
+                // to this message and is offered for later mail.
+                if let Some((name, description)) = answer.proposed
+                    && applied.len() < MAX_LABELS_PER_MESSAGE
+                    && let Some(label) = store::add_ai_label(&conn, &name, &description)?
+                {
+                    classifier_log!("info", "label_created", { "account": self.name(), "label": label.name });
+                    hints.push(hint(&label));
+                    applied.push((label.name.clone(), 1.0));
+                    labels.push(label);
+                }
                 for (name, _) in &applied {
                     if let Some(label) = labels.iter().find(|label| &label.name == name) {
                         store::set_keyword(
@@ -734,7 +750,7 @@ mod tests {
             .iter()
             .map(|(name, description)| (name.to_string(), description.to_string()))
             .collect();
-        store::set_labels(&conn, &pairs).unwrap();
+        store::set_labels(&conn, &pairs, None).unwrap();
     }
 
     #[test]
@@ -772,6 +788,75 @@ mod tests {
         assert!(
             !store::prefs(&conn).unwrap().enabled,
             "folder suggestions stay off"
+        );
+    }
+
+    #[test]
+    fn labels_work_without_setup_and_the_model_can_add_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        let (_, uid) = imap_state::deliver_message(
+            root,
+            D,
+            L,
+            &mail("pta@school.test", "Parent evening", "Tuesday 18:00"),
+        )
+        .unwrap();
+        // Labels on, but the user defined none.
+        enable_labels(root, &[]);
+        let models = Models {
+            chooser: Some(Arc::new(fake::Fixed::proposing(
+                "School",
+                "The kids' school",
+            ))),
+            ..Models::default()
+        };
+        let report = run_cycle(root, &cfg(), &models);
+        assert_eq!(report.labeled, 1, "{report:?}");
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        let labels = store::labels(&conn).unwrap();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.name == "Receipts" && l.origin == store::ORIGIN_STARTER)
+        );
+        let school = labels
+            .iter()
+            .find(|l| l.name == "School")
+            .expect("AI label created");
+        assert_eq!(school.origin, store::ORIGIN_AI);
+        assert!(
+            inbox_flags(root, uid)
+                .unwrap()
+                .iter()
+                .any(|f| f == "School")
+        );
+    }
+
+    #[test]
+    fn label_discovery_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        imap_state::deliver_message(root, D, L, &mail("a@b.test", "Hi", "x")).unwrap();
+        enable_labels(root, &[]);
+        let models = Models {
+            chooser: Some(Arc::new(fake::Fixed::proposing("School", ""))),
+            ..Models::default()
+        };
+        let no_discovery = ClassifierConfig {
+            label_discovery: false,
+            ..cfg()
+        };
+        let report = run_cycle(root, &no_discovery, &models);
+        assert_eq!(report.labeled, 0, "{report:?}");
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        assert!(
+            !store::labels(&conn)
+                .unwrap()
+                .iter()
+                .any(|l| l.name == "School")
         );
     }
 

@@ -839,8 +839,16 @@ pub const SETTINGS: &[SettingSpec] = &[
         "classifier.label_confidence",
         "classifier",
         "Label confidence (%)",
-        "Minimum probability before one of a user's labels is applied. Labels use the fallback model.",
+        "Minimum probability before a label is applied. Labels use the fallback model.",
         int(1, 100),
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.label_discovery",
+        "classifier",
+        "AI-created labels",
+        "Let the local or OpenRouter chat model create a new label when none fits (Jev only picks existing labels). Labels users remove are not created again.",
+        SettingKind::Bool,
         CLASSIFIER,
     ),
     spec(

@@ -1,7 +1,7 @@
 //! The folder-choice prompt and answer format shared by the generative
 //! choosers (llama.cpp and OpenAI-compatible APIs).
 
-use crate::engine::{Choice, FolderHint, LabelHint};
+use crate::engine::{Choice, FolderHint, LabelHint, Labeling};
 
 pub fn system_prompt(folders: &[FolderHint]) -> String {
     let mut text = String::from(
@@ -65,13 +65,27 @@ pub fn parse_answer(raw: &str, folders: &[FolderHint]) -> Choice {
     }
 }
 
-pub fn label_prompt(labels: &[LabelHint]) -> String {
+pub fn label_prompt(labels: &[LabelHint], may_propose: bool) -> String {
     let mut text = String::from(
-        "You tag email with the user's labels. List every label below that applies to the \
-         message, each with how sure you are, and leave out labels that do not apply. Answer \
-         with JSON: {\"labels\": [{\"name\": <label>, \"confidence\": <0.0-1.0>}, ...]}.\n\n\
-         Labels:\n",
+        "You tag email with labels. List every label below that applies to the message, each \
+         with how sure you are, and leave out labels that do not apply.",
     );
+    if may_propose {
+        text.push_str(
+            " If no label fits the message well, also propose one new label in \"new_label\": \
+             a general, reusable category of one to three words (never a person, company or \
+             detail of this one message) with a short description. Otherwise set \
+             \"new_label\" to null. Answer with JSON: {\"labels\": [{\"name\": <label>, \
+             \"confidence\": <0.0-1.0>}, ...], \"new_label\": null or {\"name\": <name>, \
+             \"description\": <text>}}.",
+        );
+    } else {
+        text.push_str(
+            " Answer with JSON: {\"labels\": [{\"name\": <label>, \"confidence\": \
+             <0.0-1.0>}, ...]}.",
+        );
+    }
+    text.push_str("\n\nLabels:\n");
     for label in labels {
         text.push_str("- ");
         text.push_str(&label.name);
@@ -84,9 +98,10 @@ pub fn label_prompt(labels: &[LabelHint]) -> String {
     text
 }
 
-/// Read a `{"labels": [{"name", "confidence"}]}` answer. Names not in
-/// `labels` are ignored, as are repeats.
-pub fn parse_labels(raw: &str, labels: &[LabelHint]) -> Vec<(String, f64)> {
+/// Read a `{"labels": [{"name", "confidence"}], "new_label": ...}` answer.
+/// Names not in `labels` are ignored, as are repeats; a proposal is only
+/// kept when `may_propose` and it is not an existing label.
+pub fn parse_labels(raw: &str, labels: &[LabelHint], may_propose: bool) -> Labeling {
     #[derive(serde::Deserialize)]
     struct Item {
         name: String,
@@ -94,12 +109,21 @@ pub fn parse_labels(raw: &str, labels: &[LabelHint]) -> Vec<(String, f64)> {
         confidence: Option<f64>,
     }
     #[derive(serde::Deserialize)]
+    struct Proposal {
+        name: String,
+        #[serde(default)]
+        description: String,
+    }
+    #[derive(serde::Deserialize)]
     struct Answer {
+        #[serde(default)]
         labels: Vec<Item>,
+        #[serde(default)]
+        new_label: Option<Proposal>,
     }
     let Some(answer) = json_object(raw).and_then(|json| serde_json::from_str::<Answer>(json).ok())
     else {
-        return Vec::new();
+        return Labeling::default();
     };
     let mut out: Vec<(String, f64)> = Vec::new();
     for item in answer.labels {
@@ -109,7 +133,19 @@ pub fn parse_labels(raw: &str, labels: &[LabelHint]) -> Vec<(String, f64)> {
             out.push((item.name, item.confidence.unwrap_or(1.0).clamp(0.0, 1.0)));
         }
     }
-    out
+    let proposed = answer
+        .new_label
+        .filter(|_| may_propose)
+        .filter(|p| {
+            !labels
+                .iter()
+                .any(|label| label.name.eq_ignore_ascii_case(p.name.trim()))
+        })
+        .map(|p| (p.name.trim().to_string(), p.description.trim().to_string()));
+    Labeling {
+        labels: out,
+        proposed,
+    }
 }
 
 /// The outermost `{...}` in `raw`, for models that wrap JSON in prose.
@@ -163,13 +199,32 @@ mod tests {
         let parsed = parse_labels(
             r#"{"labels": [{"name": "Urgent", "confidence": 0.9}, {"name": "Spam", "confidence": 1}, {"name": "Urgent", "confidence": 0.1}, {"name": "Invoices"}]}"#,
             &labels,
+            false,
         );
         assert_eq!(
-            parsed,
+            parsed.labels,
             vec![("Urgent".to_string(), 0.9), ("Invoices".to_string(), 1.0)]
         );
-        assert!(parse_labels("nope", &labels).is_empty());
-        assert!(label_prompt(&labels).contains("- Invoices: about Invoices"));
+        assert!(parse_labels("nope", &labels, true).labels.is_empty());
+        assert!(label_prompt(&labels, false).contains("- Invoices: about Invoices"));
+        assert!(!label_prompt(&labels, false).contains("new_label"));
+        assert!(label_prompt(&labels, true).contains("new_label"));
+    }
+
+    #[test]
+    fn proposals_are_kept_only_when_allowed_and_new() {
+        let labels = label_hints(&["Invoices"]);
+        let raw =
+            r#"{"labels": [], "new_label": {"name": " School ", "description": "Kids' school"}}"#;
+        assert_eq!(
+            parse_labels(raw, &labels, true).proposed,
+            Some(("School".to_string(), "Kids' school".to_string()))
+        );
+        assert_eq!(parse_labels(raw, &labels, false).proposed, None);
+        let existing = r#"{"labels": [], "new_label": {"name": "invoices", "description": ""}}"#;
+        assert_eq!(parse_labels(existing, &labels, true).proposed, None);
+        let none = r#"{"labels": [{"name": "Invoices", "confidence": 0.8}], "new_label": null}"#;
+        assert_eq!(parse_labels(none, &labels, true).proposed, None);
     }
 
     #[test]

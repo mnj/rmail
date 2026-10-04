@@ -29,9 +29,17 @@ pub trait Chooser: Send + Sync {
     /// Pick one of `folders` for `message`, or none. `hints` are example
     /// subjects per folder.
     fn choose(&self, message: &str, folders: &[FolderHint]) -> Result<Choice>;
-    /// The probability that each of `labels` applies to `message`. Labels
-    /// the model leaves out have probability zero.
-    fn label(&self, message: &str, labels: &[LabelHint]) -> Result<Vec<(String, f64)>>;
+    /// The probability that each of `labels` applies to `message`; labels
+    /// left out have probability zero. With `may_propose`, a model that
+    /// writes text may also propose one new label when none fits.
+    fn label(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Result<Labeling>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Labeling {
+    pub labels: Vec<(String, f64)>,
+    /// A new label (name, description) for mail no existing label fits.
+    pub proposed: Option<(String, String)>,
 }
 
 /// A user's label as the model sees it.
@@ -328,7 +336,7 @@ pub mod fake {
         pub answer: Choice,
         pub calls: Mutex<usize>,
         /// Answer for every `label` call.
-        pub labels: Vec<(String, f64)>,
+        pub labels: Labeling,
         pub label_calls: Mutex<usize>,
     }
 
@@ -341,17 +349,30 @@ pub mod fake {
                     raw: String::new(),
                 },
                 calls: Mutex::new(0),
-                labels: Vec::new(),
+                labels: Labeling::default(),
                 label_calls: Mutex::new(0),
             }
         }
 
         pub fn labelling(labels: &[(&str, f64)]) -> Self {
             Self {
-                labels: labels
-                    .iter()
-                    .map(|(name, p)| (name.to_string(), *p))
-                    .collect(),
+                labels: Labeling {
+                    labels: labels
+                        .iter()
+                        .map(|(name, p)| (name.to_string(), *p))
+                        .collect(),
+                    proposed: None,
+                },
+                ..Self::new(None, 0.0)
+            }
+        }
+
+        pub fn proposing(name: &str, description: &str) -> Self {
+            Self {
+                labels: Labeling {
+                    labels: Vec::new(),
+                    proposed: Some((name.to_string(), description.to_string())),
+                },
                 ..Self::new(None, 0.0)
             }
         }
@@ -363,9 +384,18 @@ pub mod fake {
             Ok(self.answer.clone())
         }
 
-        fn label(&self, _message: &str, _labels: &[LabelHint]) -> Result<Vec<(String, f64)>> {
+        fn label(
+            &self,
+            _message: &str,
+            _labels: &[LabelHint],
+            may_propose: bool,
+        ) -> Result<Labeling> {
             *self.label_calls.lock().unwrap() += 1;
-            Ok(self.labels.clone())
+            let mut answer = self.labels.clone();
+            if !may_propose {
+                answer.proposed = None;
+            }
+            Ok(answer)
         }
     }
 }

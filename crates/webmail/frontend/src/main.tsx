@@ -9,7 +9,7 @@ type Message = { uid: number; flags: string[]; size: number; internal_date: numb
 type MessageDetail = Message & { date: string; text_body: string; html_body: string | null; has_remote_content: boolean };
 type OrganizeFolder = { name: string; learned: number; accepted: number; dismissed: number; excluded: boolean; autofile: boolean };
 type Label = { name: string; keyword: string; description: string };
-type OrganizeLabel = Label & { count: number };
+type OrganizeLabel = Label & { count: number; origin: 'user' | 'starter' | 'ai' };
 type Organize = {
   server_enabled: boolean; enabled: boolean; pending: number; folders: OrganizeFolder[];
   cloud_providers: string[]; cloud_consent: boolean; cloud_required: boolean;
@@ -48,9 +48,15 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
   const [data, setData] = useState<Organize | null>(null);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
+  // Labels the editor showed; ones the AI adds meanwhile are not removed on save.
+  const [seen, setSeen] = useState<string[]>([]);
+  const [editingLabels, setEditingLabels] = useState(false);
 
   useEffect(() => {
-    api<Organize>('/api/organize').then(setData).catch((err) => setError((err as Error).message));
+    api<Organize>('/api/organize').then((loaded) => {
+      setData(loaded);
+      setSeen(loaded.labels.map((l) => l.name));
+    }).catch((err) => setError((err as Error).message));
   }, []);
 
   function updateLabel(index: number, change: Partial<OrganizeLabel>) {
@@ -86,6 +92,7 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
           enabled: data.enabled,
           labels_enabled: data.labels_enabled,
           labels: data.labels.filter((l) => l.name.trim()).map((l) => ({ name: l.name, description: l.description })),
+          labels_seen: seen,
           ...(data.cloud_providers.length ? { cloud_consent: data.cloud_consent } : {}),
           excluded_folders: data.folders.filter((f) => f.excluded).map((f) => f.name),
           autofile_folders: data.folders.filter((f) => f.autofile && !f.excluded).map((f) => f.name),
@@ -130,21 +137,34 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
           {data.enabled && <p className="dialog-hint">Automatic moves only happen when rMail is very confident and the suggestion is based on mail you filed yourself. Everything else stays in your inbox as a suggestion.</p>}
 
           <h3 className="dialog-section"><Tag size={16} />Labels</h3>
-          <p className="dialog-hint">rMail can tag new mail in your inbox with labels you describe, such as “Invoices: bills I need to pay”. Labels show here and, as keywords, in IMAP apps that support them.</p>
+          <p className="dialog-hint">rMail labels new mail in your inbox automatically. It starts with common labels such as Receipts, Travel and Action needed, and its AI adds a new label when nothing fits. Remove any you don't want and they won't come back; add or reword your own to steer it. Labels show here and, as keywords, in IMAP apps that support them.</p>
           {!data.labels_available && <p className="notice">Your administrator has not set up a model for labels yet. Your labels are saved and used once they do.</p>}
           <label className="switch-row"><input type="checkbox" checked={data.labels_enabled} onChange={(e) => setData({ ...data, labels_enabled: e.target.checked })} /><span>Label new mail</span></label>
           {data.labels_enabled && <>
-            <div className="label-editor">
+            {data.labels.length === 0 && <p className="notice">Common labels are added when you save.</p>}
+            {!editingLabels ? (
+              <div className="label-summary">
+                {data.labels.map((label) => (
+                  <span className="label-chip" key={label.name} title={label.description || label.name}>
+                    <Tag size={11} />{label.name}{label.origin === 'ai' && <span className="ai-badge" title="Created by the AI for mail no other label fit">AI</span>}{label.count > 0 && <small>{label.count}</small>}
+                    <button aria-label={`Remove label ${label.name}`} title="Remove label" onClick={() => setData({ ...data, labels: data.labels.filter((l) => l.name !== label.name) })}><X size={11} /></button>
+                  </span>
+                ))}
+                <button className="add-label" onClick={() => setEditingLabels(true)}>Edit labels</button>
+              </div>
+            ) : (
+              <div className="label-editor">
               {data.labels.map((label, index) => (
                 <div className="label-row" key={index}>
                   <input aria-label="Label name" value={label.name} maxLength={40} placeholder="Name" onChange={(e) => updateLabel(index, { name: e.target.value })} />
-                  <input aria-label={`What ${label.name || 'this label'} means`} value={label.description} maxLength={300} placeholder="What it means, e.g. bills I need to pay" onChange={(e) => updateLabel(index, { description: e.target.value })} />
-                  <small>{label.count ? `${label.count} labeled` : ''}</small>
+                  <input aria-label={`What ${label.name || 'this label'} means`} value={label.description} maxLength={300} placeholder="What it means (helps the AI)" onChange={(e) => updateLabel(index, { description: e.target.value })} />
+                  <small>{label.origin === 'ai' && <span className="ai-badge" title="Created by the AI for mail no other label fit">AI</span>}{label.count ? ` ${label.count} labeled` : ''}</small>
                   <button className="icon" title="Remove label" aria-label={`Remove ${label.name}`} onClick={() => setData({ ...data, labels: data.labels.filter((_, i) => i !== index) })}><X size={15} /></button>
                 </div>
               ))}
-              {data.labels.length < 30 && <button className="add-label" onClick={() => setData({ ...data, labels: [...data.labels, { name: '', description: '', keyword: '', count: 0 }] })}><Plus size={14} />Add label</button>}
+              {data.labels.length < 30 && <button className="add-label" onClick={() => setData({ ...data, labels: [...data.labels, { name: '', description: '', keyword: '', count: 0, origin: 'user' }] })}><Plus size={14} />Add label</button>}
             </div>
+            )}
             {data.folder_ideas.length > 0 && (
               <div className="folder-ideas">
                 <p className="dialog-hint">You use these labels a lot. They might deserve a folder:</p>

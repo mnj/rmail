@@ -80,6 +80,8 @@ struct LabelView {
     name: String,
     description: String,
     keyword: String,
+    /// `user`, `starter` or `ai`.
+    origin: String,
     /// Messages labeled with it so far.
     count: u64,
 }
@@ -201,6 +203,7 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
                     name: label.name,
                     description: label.description,
                     keyword: label.keyword,
+                    origin: label.origin,
                 })
                 .collect(),
             folder_ideas,
@@ -238,6 +241,10 @@ struct SaveRequest {
     labels_enabled: Option<bool>,
     #[serde(default)]
     labels: Option<Vec<LabelInput>>,
+    /// Label names the editor showed, so labels the model added meanwhile
+    /// are not taken as removed.
+    #[serde(default)]
+    labels_seen: Option<Vec<String>>,
 }
 
 async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
@@ -274,7 +281,7 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
                 .iter()
                 .map(|label| (label.name.clone(), label.description.clone()))
                 .collect();
-            if let Err(error) = store::set_labels(&conn, &pairs) {
+            if let Err(error) = store::set_labels(&conn, &pairs, input.labels_seen.as_deref()) {
                 return Ok(Err(error.to_string()));
             }
         }
@@ -312,6 +319,10 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
             labels_enabled: labels_on,
         };
         store::set_prefs(&conn, &prefs)?;
+        if prefs.labels_enabled {
+            // Common labels, so labeling works without setting anything up.
+            store::seed_starter_labels(&conn)?;
+        }
         if !prefs.enabled {
             clear_pending(root, domain, local, &conn)?;
         }

@@ -770,9 +770,12 @@ pub struct ClassifierConfig {
     /// Folders with fewer learned messages than this defer to the chat model.
     #[serde(default = "default_classifier_min_examples")]
     pub min_examples: u32,
-    /// Minimum probability (percent) before a user's label is applied.
+    /// Minimum probability (percent) before a label is applied.
     #[serde(default = "default_classifier_label_confidence")]
     pub label_confidence: u32,
+    /// Let models that write text create a new label when none fits.
+    #[serde(default = "default_true")]
+    pub label_discovery: bool,
     /// Where embeddings are computed. Cloud providers receive the text of
     /// every message learned or classified, and only for accounts whose users
     /// agreed to that provider in webmail.
@@ -884,6 +887,7 @@ impl Default for ClassifierConfig {
             autofile_confidence: default_classifier_autofile_confidence(),
             min_examples: default_classifier_min_examples(),
             label_confidence: default_classifier_label_confidence(),
+            label_discovery: true,
             embed_provider: EmbedProvider::Local,
             chat_provider: ChatProvider::Local,
             openrouter_api_key: None,

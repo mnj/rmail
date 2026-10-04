@@ -99,3 +99,8 @@ button, input { font: inherit; }
 .label-chip button { border: 0; background: transparent; color: inherit; padding: 2px; display: grid; place-items: center; cursor: pointer; opacity: .65; border-radius: 50%; }
 .label-chip button:hover { opacity: 1; background: rgba(85, 39, 184, .12); }
 @media (max-width: 820px) { .label-row { grid-template-columns: 1fr auto; } .label-row input:nth-child(2) { grid-column: 1 / -1; grid-row: 2; } .label-row small { display: none; } }
+.ai-badge { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .04em; padding: 1px 5px; border-radius: 4px; background: #f1ecfd; color: #5527b8; }
+.label-summary { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.label-summary .label-chip { padding: 3px 4px 3px 9px; font-size: 13px; }
+.label-summary .label-chip small { color: #7a5fc4; font-size: 11px; margin-left: 2px; }
+.label-chip .ai-badge { margin-left: 4px; }

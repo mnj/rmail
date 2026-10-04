@@ -1035,6 +1035,14 @@ mod tests {
         );
         let listed = json(&call("GET", "/api/labels".into(), vec![]).await.body);
         assert_eq!(listed[1]["name"], "Invoices");
+        assert_eq!(overview["labels"][0]["origin"], "user");
+        let starter = overview["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == "Receipts")
+            .expect("starter labels are seeded when labels are turned on");
+        assert_eq!(starter["origin"], "starter");
 
         let duplicate = call(
             "PUT",
