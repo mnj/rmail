@@ -1019,4 +1019,112 @@ mod tests {
         assert!(out.contains("OK (TAG \"t1\") \"Done\""), "{out}");
         assert!(out.contains("OK \"Done\""), "{out}");
     }
+
+    #[derive(Debug)]
+    struct AcceptAnyCertificate;
+
+    impl tokio_rustls::rustls::client::ServerCertVerifier for AcceptAnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &tokio_rustls::rustls::Certificate,
+            _intermediates: &[tokio_rustls::rustls::Certificate],
+            _server_name: &tokio_rustls::rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<tokio_rustls::rustls::client::ServerCertVerified, tokio_rustls::rustls::Error>
+        {
+            Ok(tokio_rustls::rustls::client::ServerCertVerified::assertion())
+        }
+    }
+
+    async fn read_until(reader: &mut (impl AsyncBufReadExt + Unpin), marker: &str) -> String {
+        let mut out = String::new();
+        loop {
+            let mut line = String::new();
+            let read = timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .expect("server reply in time")
+                .unwrap();
+            assert!(read > 0, "connection closed before {marker:?}: {out}");
+            out.push_str(&line);
+            if line.starts_with(marker) {
+                return out;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn starttls_upgrades_then_allows_plain_login() {
+        let (_td, db) = setup();
+        let (cert, key) = rmail_common::test_support::localhost_cert();
+        let tls = crate::tls::load_tls_context(cert, key).unwrap();
+        let (client, server) = duplex(1 << 20);
+        let task = tokio::spawn(serve(
+            Box::new(server),
+            Some("203.0.113.9:5000".parse().unwrap()),
+            Some(tls),
+            db.clone(),
+        ));
+
+        let mut plain = BufReader::new(client);
+        let greeting = read_until(&mut plain, "OK ").await;
+        assert!(greeting.contains("\"STARTTLS\"\r\n"), "{greeting}");
+        assert!(greeting.contains("\"SASL\" \"\"\r\n"), "{greeting}");
+        // Plain-text login is refused before TLS.
+        plain.get_mut().write_all(login().as_bytes()).await.unwrap();
+        assert!(
+            read_until(&mut plain, "NO ")
+                .await
+                .contains("(ENCRYPT-NEEDED)")
+        );
+        plain.get_mut().write_all(b"STARTTLS\r\n").await.unwrap();
+        assert!(
+            read_until(&mut plain, "OK ")
+                .await
+                .contains("Begin TLS negotiation now")
+        );
+
+        let mut config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(tokio_rustls::rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(AcceptAnyCertificate));
+        let tls_stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                tokio_rustls::rustls::ServerName::try_from("localhost").unwrap(),
+                plain.into_inner(),
+            )
+            .await
+            .expect("TLS handshake");
+        let mut secure = BufReader::new(tls_stream);
+        // The server re-sends its capabilities once TLS is up.
+        let caps = read_until(&mut secure, "OK ").await;
+        assert!(caps.contains("\"SASL\" \"PLAIN\"\r\n"), "{caps}");
+        assert!(!caps.contains("STARTTLS"), "{caps}");
+        assert!(caps.contains("TLS negotiation completed"), "{caps}");
+
+        secure
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}PUTSCRIPT \"s\" \"keep;\"\r\nSTARTTLS\r\nLOGOUT\r\n",
+                    login()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let rest = read_until(&mut secure, "OK \"Logout").await;
+        assert!(rest.contains("OK \"Authentication successful\""), "{rest}");
+        assert!(rest.contains("OK \"Putscript completed\""), "{rest}");
+        assert!(rest.contains("NO \"TLS is already active\""), "{rest}");
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            rmail_common::db::list_sieve_scripts(&db, "user@example.test").unwrap(),
+            vec![("s".to_string(), false)]
+        );
+    }
 }
