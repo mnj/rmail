@@ -136,8 +136,8 @@ pub(crate) fn router(state: Shared) -> Router {
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(log_request))
         .with_state(state.clone());
-    // Public discovery endpoints sit outside the CSRF layer: Outlook's
-    // autodiscover POST carries no custom header, and nothing here mutates state.
+    // Public discovery endpoints sit outside the CSRF layer (see
+    // `discovery::public_routes`), so they are merged after it.
     let app = app.merge(discovery::public_routes().with_state(state));
     rmail_common::http::harden(app, MAX_BODY_BYTES)
 }

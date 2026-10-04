@@ -2172,6 +2172,14 @@ async fn tls_report_task(base: PathBuf, db_path: PathBuf, hostname: String) {
     }
 }
 
+/// Whether a day's counters can be dropped after a send attempt. Once any
+/// copy is queued the day is settled, so recipients are never sent the same
+/// report twice. With nothing queued (no `rua` found, possibly a DNS failure,
+/// or every queue attempt failed) it is retried until the day is `stale`.
+fn tls_report_settled(queued_copies: usize, stale: bool) -> bool {
+    queued_copies > 0 || stale
+}
+
 async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
     let today = rmail_common::tlsrpt::today();
     let stale_before = (Utc::now() - chrono::Duration::days(3))
@@ -2205,7 +2213,7 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
             }
         };
         let recipients = tls_report_recipients(resolver, &domain).await;
-        let mut sent_all = true;
+        let mut queued_copies = 0usize;
         if let Some((report_id, json)) = rmail_common::tlsrpt::build_report(
             "rMail",
             &format!("postmaster@{hostname}"),
@@ -2230,19 +2238,17 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
                     rmail_common::outbound::queue_outbound(&base, &recipient, &message, None)
                 })
                 .await;
-                if !matches!(queued, Ok(Ok(_))) {
-                    sent_all = false;
+                if matches!(queued, Ok(Ok(_))) {
+                    queued_copies += 1;
+                } else {
                     rmail_common::structured_log!(
                         "error", "outbound", "tls_report_queue_failed",
                         { "domain": domain, "day": day }
                     );
                 }
             }
-        } else if day.as_str() >= stale_before.as_str() {
-            // No recipients found: DNS may have failed, so retry for a few days.
-            sent_all = false;
         }
-        if sent_all {
+        if tls_report_settled(queued_copies, day.as_str() < stale_before.as_str()) {
             let (path, day, domain) = (db_path.to_path_buf(), day.clone(), domain.clone());
             let _ = tokio::task::spawn_blocking(move || {
                 rmail_common::db::tlsrpt_delete(&path, &day, &domain)
@@ -2443,7 +2449,16 @@ async fn deliver_to_remote(
                 Ok(connection) if connection.encrypted => {
                     rmail_common::tlsrpt::record_success(domain, "sts", &key.host);
                 }
-                Ok(_) => {}
+                // Only a `testing` policy gets here unencrypted: `enforce`
+                // refuses plaintext above. Testing exists to report this.
+                Ok(_) => {
+                    rmail_common::tlsrpt::record_failure(
+                        domain,
+                        "sts",
+                        &key.host,
+                        &format!("remote host {} does not offer STARTTLS", key.host),
+                    );
+                }
                 Err(error) => {
                     let diagnostic = format!("{error:#}");
                     let lower = diagnostic.to_ascii_lowercase();
@@ -3225,5 +3240,15 @@ mod tests {
         .await
         .unwrap();
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn tls_report_days_settle_once_queued_or_stale() {
+        // Queued copies settle the day even if other recipients failed.
+        assert!(tls_report_settled(1, false));
+        assert!(tls_report_settled(3, false));
+        // Nothing queued: keep retrying while recent, give up when stale.
+        assert!(!tls_report_settled(0, false));
+        assert!(tls_report_settled(0, true));
     }
 }

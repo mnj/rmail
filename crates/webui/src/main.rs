@@ -2548,7 +2548,7 @@ mod tests {
         let mut state = api::AdminState::new(
             td.path().to_path_buf(),
             Some(db.display().to_string()),
-            Some(("admin".into(), hash("correct horse battery"))),
+            None,
             ReadinessConfig::default(),
         );
         state.config_path = Some(config.display().to_string());
@@ -2567,6 +2567,12 @@ mod tests {
         )
         .await;
         assert!(policy.starts_with("HTTP/1.1 200"), "{policy}");
+        let lower = policy.to_ascii_lowercase();
+        assert!(lower.contains("cache-control: no-store"), "{policy}");
+        assert!(
+            lower.contains("x-content-type-options: nosniff"),
+            "{policy}"
+        );
         assert!(
             policy.ends_with(
                 "version: STSv1\r\nmode: testing\r\nmx: mail.example.com\r\nmax_age: 604800\r\n"
@@ -2625,6 +2631,11 @@ mod tests {
         )
         .await;
         assert!(http.starts_with("HTTP/1.1 200"), "{http}");
+        assert!(
+            http.to_ascii_lowercase()
+                .contains("cache-control: no-store"),
+            "{http}"
+        );
         let http_sts = send_http(
             state,
             "GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: mta-sts.example.com\r\n\r\n",
