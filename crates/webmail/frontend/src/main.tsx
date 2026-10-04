@@ -1,254 +1,376 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, FolderInput, FolderPlus, FolderTree, Image, LogOut, Mail, MailOpen, Menu, Plus, RefreshCw, Search, Tag, Trash2, X } from 'lucide-react';
+import {
+  AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
+  Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, RefreshCw, Search, Send, Sparkles,
+  Star, Sun, Tag, Trash2, X,
+} from 'lucide-react';
+import { OrganizeDialog } from './organize';
+import {
+  Api, ApiError, Attachment, Folder, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
+  formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sortFolders, splitAddress,
+} from './types';
 import './style.css';
 
-type Folder = { name: string; special_use: string | null; messages: number; unread: number };
-type Suggestion = { folder: string; score: number; method: 'sender' | 'knn' | 'llm' };
-type Message = { uid: number; flags: string[]; size: number; internal_date: number; from: string; to: string; subject: string; snippet: string; suggestion?: Suggestion; labels?: Label[] };
-type MessageDetail = Message & { date: string; text_body: string; html_body: string | null; has_remote_content: boolean };
-type OrganizeFolder = { name: string; learned: number; accepted: number; dismissed: number; excluded: boolean; autofile: boolean };
-type Label = { name: string; keyword: string; description: string };
-type OrganizeLabel = Label & { count: number; origin: 'user' | 'starter' | 'ai' };
-type Organize = {
-  server_enabled: boolean; enabled: boolean; pending: number; folders: OrganizeFolder[];
-  cloud_providers: string[]; cloud_consent: boolean; cloud_required: boolean;
-  labels_enabled: boolean; labels_available: boolean; labels_cloud: boolean; labels: OrganizeLabel[];
-  folder_ideas: { label: string; count: number }[];
-};
+const PAGE = 50;
 
-type Api = <T>(url: string, options?: RequestInit) => Promise<T>;
+// ---------------------------------------------------------------------------
+// Theme: follows the OS unless the user picks one (per browser).
 
-const methodLabel: Record<Suggestion['method'], string> = {
-  sender: 'where you file mail from this sender',
-  knn: 'similar messages you filed',
-  llm: 'an AI model',
-};
+type Theme = 'system' | 'light' | 'dark';
+const themeKey = 'rmail-webmail-theme';
 
-const providerNames: Record<string, string> = {
-  openrouter: 'OpenRouter (openrouter.ai)',
-  typesafe: 'TypeSafe (typesafe.ai)',
-};
-
-function listNames(ids: string[]): string {
-  const names = ids.map((id) => providerNames[id] || id);
-  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0] || '';
-}
-
-/** What a cloud provider would receive for the features this user turned on. */
-function cloudUses(data: Organize): string[] {
-  const uses: string[] = [];
-  if (data.enabled && data.cloud_required) uses.push('Every message you file or receive is sent to learn your folders, including recent mail already in them.');
-  else if (data.enabled && data.labels_cloud) uses.push('Messages rMail is unsure where to file are sent.');
-  if (data.labels_enabled && data.labels_cloud) uses.push('Every new message in your inbox is sent to label it.');
-  return uses;
-}
-
-function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => void; onSaved: () => void }) {
-  const [data, setData] = useState<Organize | null>(null);
-  const [error, setError] = useState('');
-  const [saving, setSaving] = useState(false);
-  // Labels the editor showed; ones the AI adds meanwhile are not removed on save.
-  const [seen, setSeen] = useState<string[]>([]);
-  const [editingLabels, setEditingLabels] = useState(false);
-  const [ideaParent, setIdeaParent] = useState('');
-
-  useEffect(() => {
-    api<Organize>('/api/organize').then((loaded) => {
-      setData(loaded);
-      setSeen(loaded.labels.map((l) => l.name));
-    }).catch((err) => setError((err as Error).message));
-  }, []);
-
-  function updateLabel(index: number, change: Partial<OrganizeLabel>) {
-    if (!data) return;
-    setData({ ...data, labels: data.labels.map((l, i) => (i === index ? { ...l, ...change } : l)) });
+function storedTheme(): Theme {
+  try {
+    const value = localStorage.getItem(themeKey);
+    return value === 'light' || value === 'dark' ? value : 'system';
+  } catch {
+    return 'system';
   }
+}
 
-  async function createFolder(label: string) {
-    if (!data) return;
+function applyTheme(theme: Theme) {
+  if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', theme);
+}
+
+applyTheme(storedTheme());
+
+function ThemeSwitch() {
+  const [theme, setTheme] = useState<Theme>(storedTheme);
+  const choose = (next: Theme) => {
+    setTheme(next);
+    applyTheme(next);
     try {
-      await api('/api/organize/folders', { method: 'POST', body: JSON.stringify({ label, ...(ideaParent ? { parent: ideaParent } : {}) }) });
-      setData({ ...data, folder_ideas: data.folder_ideas.filter((idea) => idea.label !== label) });
-      onSaved();
-    } catch (err) {
-      setError((err as Error).message);
+      if (next === 'system') localStorage.removeItem(themeKey);
+      else localStorage.setItem(themeKey, next);
+    } catch {
+      // storage unavailable: lasts for this page load
     }
-  }
+  };
+  const options: [Theme, string, React.ElementType][] = [['light', 'Light theme', Sun], ['system', 'Match system theme', Monitor], ['dark', 'Dark theme', Moon]];
+  return (
+    <div className="theme-switch" role="group" aria-label="Theme">
+      {options.map(([id, label, Icon]) => (
+        <button key={id} type="button" aria-pressed={theme === id} aria-label={label} title={label} onClick={() => choose(id)}><Icon size={14} /></button>
+      ))}
+    </div>
+  );
+}
 
-  function update(name: string, change: Partial<OrganizeFolder>) {
-    if (!data) return;
-    setData({ ...data, folders: data.folders.map((f) => (f.name === name ? { ...f, ...change } : f)) });
-  }
+// ---------------------------------------------------------------------------
+// Small pieces
 
-  async function save() {
-    if (!data) return;
-    setSaving(true);
+function useApi(onUnauthorized: () => void): Api {
+  return useCallback(async <T,>(url: string, options?: RequestInit): Promise<T> => {
+    // X-Rmail-Webmail marks the request as same-origin (CSRF protection).
+    const res = await fetch(url, { ...options, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Rmail-Webmail': '1', ...(options?.headers || {}) } });
+    if (res.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/session')) onUnauthorized();
+    if (!res.ok) throw new ApiError((await res.text()) || res.statusText, res.status);
+    if (res.status === 204 || res.status === 201) return undefined as T;
+    const type = res.headers.get('content-type') || '';
+    return (type.includes('json') ? res.json() : res.text()) as Promise<T>;
+  }, [onUnauthorized]) as Api;
+}
+
+function IconButton({ label, onClick, children, disabled, active, className }: { label: string; onClick: () => void; children: React.ReactNode; disabled?: boolean; active?: boolean; className?: string }) {
+  return <button type="button" className={`icon ${active ? 'active' : ''} ${className || ''}`} aria-label={label} title={label} disabled={disabled} onClick={onClick}>{children}</button>;
+}
+
+function folderIcon(folder: Folder) {
+  if (folder.name === 'INBOX') return Inbox;
+  switch (folder.special_use) {
+    case '\\Sent': return Send;
+    case '\\Drafts': return Pencil;
+    case '\\Archive': return Archive;
+    case '\\Junk': return AlertOctagon;
+    case '\\Trash': return Trash2;
+    default: return FolderTree;
+  }
+}
+
+const folderLabel = (folder: Folder) => (folder.name === 'INBOX' ? 'Inbox' : folder.name);
+
+function LabelChips({ labels, onRemove }: { labels: Label[]; onRemove?: (label: Label) => void }) {
+  if (!labels.length) return null;
+  return (
+    <div className="label-chips">
+      {labels.map((label) => (
+        <span className="label-chip" key={label.keyword} title={label.description || label.name}>
+          <Tag size={11} />{label.name}
+          {onRemove && <button aria-label={`Remove label ${label.name}`} title="Remove label" onClick={(e) => { e.stopPropagation(); onRemove(label); }}><X size={11} /></button>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** A small modal: a text prompt (folder names) or a confirmation. */
+function PromptDialog({ title, label, initial, confirm, danger, onSubmit, onClose }: { title: string; label?: string; initial?: string; confirm: string; danger?: boolean; onSubmit: (value: string) => Promise<void> | void; onClose: () => void }) {
+  const [value, setValue] = useState(initial || '');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
     try {
-      await api('/api/organize', {
-        method: 'PUT',
-        body: JSON.stringify({
-          enabled: data.enabled,
-          labels_enabled: data.labels_enabled,
-          labels: data.labels.filter((l) => l.name.trim()).map((l) => ({ name: l.name, description: l.description })),
-          labels_seen: seen,
-          ...(data.cloud_providers.length ? { cloud_consent: data.cloud_consent } : {}),
-          excluded_folders: data.folders.filter((f) => f.excluded).map((f) => f.name),
-          autofile_folders: data.folders.filter((f) => f.autofile && !f.excluded).map((f) => f.name),
-        }),
-      });
-      onSaved();
+      await onSubmit(value.trim());
       onClose();
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setSaving(false);
+      setBusy(false);
     }
   }
-
   return (
-    <div className="dialog-scrim" onClick={onClose}>
-      <section className="dialog" role="dialog" aria-label="Organize my mail" onClick={(e) => e.stopPropagation()}>
-        <header><h2>Organize my mail</h2><button className="icon" onClick={onClose} title="Close"><X size={18} /></button></header>
+    <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <form className="dialog small" role="dialog" aria-label={title} onSubmit={submit} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
+        <header><h2>{title}</h2><IconButton label="Close" onClick={onClose}><X size={16} /></IconButton></header>
+        {label && <label className="field"><span>{label}</span><input autoFocus value={value} onChange={(e) => setValue(e.target.value)} placeholder="Folder name, e.g. Projects or Projects/2026" /></label>}
         {error && <p className="error">{error}</p>}
-        {!data ? <p>Loading…</p> : <>
-          <p className="dialog-intro">rMail learns from how you file mail into your folders and suggests a folder for new mail in your inbox.{' '}
-            {data.cloud_providers.length === 0
-              ? 'It runs entirely on this server; your mail is not sent anywhere.'
-              : <>Your administrator uses {listNames(data.cloud_providers)} for this. They only receive your mail if you agree below.</>}
-          </p>
-          {!data.server_enabled && <p className="notice">Your administrator has not turned this on yet. Your choices are saved and take effect once they do.</p>}
-          <label className="switch-row"><input type="checkbox" checked={data.enabled} onChange={(e) => setData({ ...data, enabled: e.target.checked })} /><span>Suggest folders for new mail</span></label>
+        <footer><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className={danger ? 'danger' : 'primary'} disabled={busy || (!!label && !value.trim())} autoFocus={!label}>{confirm}</button></footer>
+      </form>
+    </div>
+  );
+}
 
-          {data.enabled && (data.folders.length === 0
-            ? <p className="notice">Create a few folders and file some mail into them first; suggestions are based on your own filing.</p>
-            : <table className="organize-table">
-              <thead><tr><th>Folder</th><th>Learn &amp; suggest</th><th>Move automatically</th><th>Last 30 days</th></tr></thead>
-              <tbody>{data.folders.map((f) => (
-                <tr key={f.name}>
-                  <td><strong>{f.name}</strong><small>{f.learned} messages learned</small></td>
-                  <td><input type="checkbox" aria-label={`Suggest ${f.name}`} checked={!f.excluded} onChange={(e) => update(f.name, { excluded: !e.target.checked })} /></td>
-                  <td><input type="checkbox" aria-label={`Move to ${f.name} automatically`} disabled={f.excluded} checked={f.autofile && !f.excluded} onChange={(e) => update(f.name, { autofile: e.target.checked })} /></td>
-                  <td><small>{f.accepted} accepted · {f.dismissed} dismissed</small></td>
-                </tr>
-              ))}</tbody>
-            </table>)}
-          {data.enabled && <p className="dialog-hint">Automatic moves only happen when rMail is very confident and the suggestion is based on mail you filed yourself. Everything else stays in your inbox as a suggestion.</p>}
-
-          <h3 className="dialog-section"><Tag size={16} />Labels</h3>
-          <p className="dialog-hint">rMail labels new mail in your inbox automatically. It starts with common labels such as Receipts, Travel and Action needed, and its AI adds a new label when nothing fits. Remove any you don't want and they won't come back; add or reword your own to steer it. Labels show here and, as keywords, in IMAP apps that support them.</p>
-          {!data.labels_available && <p className="notice">Your administrator has not set up a model for labels yet. Your labels are saved and used once they do.</p>}
-          <label className="switch-row"><input type="checkbox" checked={data.labels_enabled} onChange={(e) => setData({ ...data, labels_enabled: e.target.checked })} /><span>Label new mail</span></label>
-          {data.labels_enabled && <>
-            {data.labels.length === 0 && <p className="notice">Common labels are added when you save.</p>}
-            {!editingLabels ? (
-              <div className="label-summary">
-                {data.labels.map((label) => (
-                  <span className="label-chip" key={label.name} title={label.description || label.name}>
-                    <Tag size={11} />{label.name}{label.origin === 'ai' && <span className="ai-badge" title="Created by the AI for mail no other label fit">AI</span>}{label.count > 0 && <small>{label.count}</small>}
-                    <button aria-label={`Remove label ${label.name}`} title="Remove label" onClick={() => setData({ ...data, labels: data.labels.filter((l) => l.name !== label.name) })}><X size={11} /></button>
-                  </span>
-                ))}
-                <button className="add-label" onClick={() => setEditingLabels(true)}>Edit labels</button>
-              </div>
-            ) : (
-              <div className="label-editor">
-              {data.labels.map((label, index) => (
-                <div className="label-row" key={index}>
-                  <input aria-label="Label name" value={label.name} maxLength={40} placeholder="Name" onChange={(e) => updateLabel(index, { name: e.target.value })} />
-                  <input aria-label={`What ${label.name || 'this label'} means`} value={label.description} maxLength={300} placeholder="What it means (helps the AI)" onChange={(e) => updateLabel(index, { description: e.target.value })} />
-                  <small>{label.origin === 'ai' && <span className="ai-badge" title="Created by the AI for mail no other label fit">AI</span>}{label.count ? ` ${label.count} labeled` : ''}</small>
-                  <button className="icon" title="Remove label" aria-label={`Remove ${label.name}`} onClick={() => setData({ ...data, labels: data.labels.filter((_, i) => i !== index) })}><X size={15} /></button>
-                </div>
-              ))}
-              {data.labels.length < 30 && <button className="add-label" onClick={() => setData({ ...data, labels: [...data.labels, { name: '', description: '', keyword: '', count: 0, origin: 'user' }] })}><Plus size={14} />Add label</button>}
-            </div>
-            )}
-            {data.folder_ideas.length > 0 && (
-              <div className="folder-ideas">
-                <p className="dialog-hint">You use these labels a lot. They might deserve a folder:</p>
-                <label className="idea-parent">Create in <select value={ideaParent} onChange={(e) => setIdeaParent(e.target.value)}><option value="">Top level</option>{data.folders.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</select></label>
-                {data.folder_ideas.map((idea) => (
-                  <button key={idea.label} onClick={() => createFolder(idea.label)}><FolderPlus size={14} />{idea.label} <small>{idea.count} messages</small></button>
-                ))}
-              </div>
-            )}
-          </>}
-
-          {(data.enabled || data.labels_enabled) && data.cloud_providers.length > 0 && <>
-            <h3 className="dialog-section">Privacy</h3>
-            <label className="switch-row"><input type="checkbox" checked={data.cloud_consent} onChange={(e) => setData({ ...data, cloud_consent: e.target.checked })} /><span>Send my mail to {listNames(data.cloud_providers)}</span></label>
-            <p className="dialog-hint">
-              {cloudUses(data).join(' ')} Only the sender, subject and the start of the body are sent.
-              {' '}Without this, {data.enabled && !data.cloud_required ? 'folder suggestions still come from mail you filed, on this server' : 'rMail cannot do this for you'}. You can withdraw at any time.
-            </p>
-          </>}
-          <footer><button className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving} onClick={save}>{saving ? 'Saving…' : 'Save'}</button></footer>
-        </>}
+function RawDialog({ api, folder, uid, onClose }: { api: Api; folder: string; uid: number; onClose: () => void }) {
+  const [raw, setRaw] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const base = `/api/folders/${encodeURIComponent(folder)}/messages/${uid}/raw`;
+  useEffect(() => {
+    api<string>(base).then(setRaw).catch((err) => setError((err as Error).message));
+  }, [api, base]);
+  return (
+    <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
+      <section className="dialog wide" role="dialog" aria-label="Message source">
+        <header>
+          <h2>Message source</h2>
+          <div className="header-actions">
+            <button className="secondary" disabled={!raw} onClick={() => raw && navigator.clipboard?.writeText(raw)}>Copy</button>
+            <a className="button secondary" href={`${base}?download=1`} download><Download size={14} />Download .eml</a>
+            <IconButton label="Close" onClick={onClose}><X size={16} /></IconButton>
+          </div>
+        </header>
+        {error && <p className="error">{error}</p>}
+        <pre className="raw-source" tabIndex={0}>{raw ?? 'Loading…'}</pre>
       </section>
     </div>
   );
 }
 
-function App() {
-  const [address, setAddress] = useState<string | null>(null);
-  const [loginAddress, setLoginAddress] = useState('');
-  const [password, setPassword] = useState('');
-  const [folders, setFolders] = useState<Folder[]>([]);
-  const [folder, setFolder] = useState('INBOX');
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [selected, setSelected] = useState<MessageDetail | null>(null);
-  const [checked, setChecked] = useState<number[]>([]);
-  const [query, setQuery] = useState('');
-  const [mobileView, setMobileView] = useState<'folders' | 'list' | 'message'>('list');
+function attachmentIcon(attachment: Attachment) {
+  if (attachment.content_type.startsWith('image/')) return ImageIcon;
+  if (attachment.content_type.startsWith('text/') || attachment.content_type === 'application/pdf') return FileText;
+  return File;
+}
+
+function Attachments({ folder, uid, attachments }: { folder: string; uid: number; attachments: Attachment[] }) {
+  if (!attachments.length) return null;
+  const url = (a: Attachment, inline = false) => `/api/folders/${encodeURIComponent(folder)}/messages/${uid}/attachments/${a.index}${inline ? '?inline=1' : ''}`;
+  const previewable = (a: Attachment) => ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(a.content_type);
+  const total = attachments.reduce((sum, a) => sum + a.size, 0);
+  return (
+    <section className="attachments" aria-label="Attachments">
+      <h3><Paperclip size={14} />{attachments.length} attachment{attachments.length === 1 ? '' : 's'} <small>{formatSize(total)}</small></h3>
+      <div className="attachment-grid">
+        {attachments.map((a) => {
+          const Icon = attachmentIcon(a);
+          return (
+            <a key={a.index} className="attachment" href={url(a)} download={a.filename} title={`Download ${a.filename}`}>
+              {previewable(a) ? <img src={url(a, true)} alt="" loading="lazy" /> : <span className="attachment-icon"><Icon size={20} /></span>}
+              <span className="attachment-meta"><strong>{a.filename}</strong><small>{formatSize(a.size)}</small></span>
+              <Download size={14} className="attachment-download" />
+            </a>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/** On-demand AI actions for one message, when the server offers them. */
+function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettings }: { api: Api; folder: string; message: MessageDetail; organize: Organize | null; onLabelsChanged: () => void; onOpenSettings: () => void }) {
+  const [busy, setBusy] = useState<'summary' | 'labels' | null>(null);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [preview, setPreview] = useState<LabelPreview | null>(null);
   const [error, setError] = useState('');
-  const [organizing, setOrganizing] = useState(false);
+  const [consentNeeded, setConsentNeeded] = useState<string | null>(null);
+  useEffect(() => { setSummary(null); setPreview(null); setError(''); setConsentNeeded(null); }, [message.uid]);
+  if (!organize || (!organize.ai_labels && !organize.ai_summary)) return null;
+  const base = `/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`;
+  // The fallback model's provider, when it is a cloud one.
+  const cloud = organize.labels_cloud ? organize.cloud_providers[organize.cloud_providers.length - 1] : null;
 
-  async function api<T>(url: string, options?: RequestInit): Promise<T> {
-    // X-Rmail-Webmail marks the request as same-origin (CSRF protection).
-    const res = await fetch(url, { ...options, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Rmail-Webmail': '1', ...(options?.headers || {}) } });
-    if (!res.ok) throw Object.assign(new Error(await res.text() || res.statusText), { status: res.status });
-    if (res.status === 204) return undefined as T;
-    return res.json() as Promise<T>;
-  }
-
-  async function refresh(nextFolder = folder) {
-    const q = query ? `&q=${encodeURIComponent(query)}` : '';
-    const [folderData, messageData] = await Promise.all([
-      api<Folder[]>('/api/folders'),
-      api<Message[]>(`/api/folders/${encodeURIComponent(nextFolder)}/messages?limit=100${q}`),
-    ]);
-    setFolders(folderData);
-    setMessages(messageData);
-    setChecked([]);
-  }
-
-  useEffect(() => {
-    api<{ address: string }>('/api/session').then((s) => {
-      setAddress(s.address);
-      return refresh();
-    }).catch(() => setAddress(null));
-  }, []);
-
-  async function login(event: React.FormEvent) {
-    event.preventDefault();
+  async function run(action: 'summary' | 'labels') {
+    setBusy(action);
     setError('');
+    setConsentNeeded(null);
     try {
-      const session = await api<{ address: string }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password }) });
-      setAddress(session.address);
-      setPassword('');
-      await refresh();
+      const result = await api<{ summary?: string } & LabelPreview>(`${base}/ai`, { method: 'POST', body: JSON.stringify({ action }) });
+      if (action === 'summary') setSummary(result.summary || '');
+      else setPreview(result);
     } catch (err) {
-      setError((err as { status?: number }).status === 429 ? (err as Error).message : 'Invalid mailbox or password');
+      const text = (err as Error).message;
+      if (err instanceof ApiError && err.status === 403 && text.startsWith('consent:')) setConsentNeeded(text.slice('consent:'.length));
+      else setError(text);
+    } finally {
+      setBusy(null);
     }
   }
 
-  async function logout() {
-    await api('/api/logout', { method: 'POST' }).catch(() => undefined);
-    setAddress(null);
+  async function apply(keyword: string, present: boolean) {
+    await api(base, { method: 'PATCH', body: JSON.stringify({ keywords: { [keyword]: present } }) }).catch((err) => setError((err as Error).message));
+    setPreview((p) => p && { ...p, labels: p.labels.map((l) => (l.keyword === keyword ? { ...l, applied: present } : l)) });
+    onLabelsChanged();
+  }
+
+  async function addProposed() {
+    if (!preview?.proposed) return;
+    try {
+      const label = await api<Label>('/api/organize/labels', { method: 'POST', body: JSON.stringify(preview.proposed) });
+      await api(base, { method: 'PATCH', body: JSON.stringify({ keywords: { [label.keyword]: true } }) });
+      setPreview({ ...preview, proposed: null, labels: [{ name: label.name, keyword: label.keyword, probability: 1, applied: true }, ...preview.labels] });
+      onLabelsChanged();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  const sends = cloud ? `Sends this message's sender, subject and start of the body to ${providerName(cloud)}.` : 'Runs on this server.';
+  const shown = preview ? preview.labels.filter((l) => l.probability >= 0.15).slice(0, 6) : [];
+  return (
+    <section className="ai-panel" aria-label="AI">
+      <div className="ai-actions">
+        <Sparkles size={15} className="ai-mark" />
+        {organize.ai_summary && <button className="chip-button" disabled={busy !== null} onClick={() => run('summary')} title={sends}>{busy === 'summary' ? 'Summarizing…' : 'Summarize'}</button>}
+        {organize.ai_labels && <button className="chip-button" disabled={busy !== null} onClick={() => run('labels')} title={sends}>{busy === 'labels' ? 'Thinking…' : 'Suggest labels'}</button>}
+      </div>
+      {consentNeeded && (
+        <p className="ai-note">This uses {providerName(consentNeeded)}, which only receives your mail if you agree. <button className="link" onClick={onOpenSettings}>Review in Organize my mail</button></p>
+      )}
+      {error && <p className="error">{error}</p>}
+      {summary !== null && <p className="ai-summary">{summary || 'The model returned no summary.'}</p>}
+      {preview && (
+        <div className="ai-labels">
+          {shown.length === 0 && !preview.proposed && <span className="muted">No label fits this message.</span>}
+          {shown.map((guess) => (
+            <button key={guess.name} className={`guess ${guess.applied ? 'applied' : ''} ${guess.probability >= preview.threshold ? 'likely' : ''}`} disabled={!guess.keyword} onClick={() => guess.keyword && apply(guess.keyword, !guess.applied)} title={guess.applied ? 'Remove this label' : 'Add this label'}>
+              <Tag size={11} />{guess.name}<small>{Math.round(guess.probability * 100)}%</small>
+            </button>
+          ))}
+          {preview.proposed && (
+            <button className="guess proposed" onClick={addProposed} title={preview.proposed.description}>
+              <Sparkles size={11} />New label: {preview.proposed.name}
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Mailbox
+
+function Mailbox({ api, address, onLogout }: { api: Api; address: string; onLogout: () => void }) {
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [folder, setFolder] = useState('INBOX');
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState<MessageDetail | null>(null);
+  const [checked, setChecked] = useState<number[]>([]);
+  const [query, setQuery] = useState('');
+  const [activeQuery, setActiveQuery] = useState('');
+  const [view, setView] = useState<'folders' | 'list' | 'message'>('list');
+  const [organize, setOrganize] = useState<Organize | null>(null);
+  const [organizing, setOrganizing] = useState(false);
+  const [prompt, setPrompt] = useState<React.ComponentProps<typeof PromptDialog> | null>(null);
+  const [rawFor, setRawFor] = useState<number | null>(null);
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [notice, setNotice] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const flash = (text: string) => {
+    setNotice(text);
+    window.setTimeout(() => setNotice((current) => (current === text ? '' : current)), 4000);
+  };
+
+  const loadFolders = useCallback(async () => setFolders(sortFolders(await api<Folder[]>('/api/folders'))), [api]);
+  const loadOrganize = useCallback(() => api<Organize>('/api/organize').then(setOrganize).catch(() => setOrganize(null)), [api]);
+
+  const loadMessages = useCallback(async (name: string, q: string, offset = 0) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: String(PAGE), offset: String(offset) });
+      if (q) params.set('q', q);
+      const page = await api<MessagePage>(`/api/folders/${encodeURIComponent(name)}/messages?${params}`);
+      setTotal(page.total);
+      setMessages((current) => (offset ? [...current, ...page.messages] : page.messages));
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([loadFolders(), loadMessages(folder, activeQuery)]);
+    setChecked([]);
+  }, [loadFolders, loadMessages, folder, activeQuery]);
+
+  useEffect(() => {
+    loadOrganize();
+    refresh().catch((err) => flash((err as Error).message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // New mail without a manual refresh.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (document.visibilityState === 'visible' && !activeQuery) {
+        loadFolders().catch(() => undefined);
+        loadMessages(folder, '', 0).catch(() => undefined);
+      }
+    }, 60000);
+    return () => window.clearInterval(id);
+  }, [folder, activeQuery, loadFolders, loadMessages]);
+
+  const current = useMemo(() => folders.find((f) => f.name === folder), [folders, folder]);
+  const userFolders = useMemo(() => folders.filter(isUserFolder), [folders]);
+  const selectedListItem = selected ? messages.find((m) => m.uid === selected.uid) : undefined;
+  const selectedIndex = selected ? messages.findIndex((m) => m.uid === selected.uid) : -1;
+  const suggested = messages.filter((m) => m.suggestion).length;
+
+  async function chooseFolder(name: string) {
+    setFolder(name);
     setSelected(null);
-    setMessages([]);
-    setFolders([]);
+    setChecked([]);
+    setQuery('');
+    setActiveQuery('');
+    setView('list');
+    await loadMessages(name, '').catch((err) => flash((err as Error).message));
+  }
+
+  async function search(event?: React.FormEvent) {
+    event?.preventDefault();
+    setActiveQuery(query.trim());
+    setSelected(null);
+    await loadMessages(folder, query.trim());
+  }
+
+  async function openMessage(message: Message) {
+    const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`);
+    setSelected(detail);
+    setView('message');
+    setMoreOpen(false);
+    setMoveOpen(false);
+    if (!hasFlag(message.flags, '\\Seen')) {
+      await api(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`, { method: 'PATCH', body: JSON.stringify({ seen: true }) });
+      setMessages((list) => list.map((m) => (m.uid === message.uid ? { ...m, flags: [...m.flags, '\\Seen'] } : m)));
+      loadFolders().catch(() => undefined);
+    }
   }
 
   async function loadRemoteContent() {
@@ -257,98 +379,344 @@ function App() {
     setSelected({ ...detail, has_remote_content: false });
   }
 
-  async function openMessage(message: Message) {
-    const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`);
-    setSelected(detail);
-    setMobileView('message');
-    if (!message.flags.some((f) => f.toLowerCase() === '\\seen')) {
-      await api(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`, { method: 'PATCH', body: JSON.stringify({ seen: true }) });
-      await refresh();
+  /** Apply a bulk action; moves remove the messages from the list and select the next one. */
+  async function act(action: string, uids: number[], target?: string) {
+    if (!uids.length) return;
+    const removes = ['archive', 'delete', 'junk', 'move'].includes(action);
+    const next = removes && selected && uids.includes(selected.uid) ? messages.filter((m) => !uids.includes(m.uid))[Math.max(0, selectedIndex)] : undefined;
+    try {
+      await api(`/api/folders/${encodeURIComponent(folder)}/messages/bulk`, { method: 'POST', body: JSON.stringify({ action, uids, ...(target ? { target } : {}) }) });
+    } catch (err) {
+      flash((err as Error).message);
+      return;
     }
-  }
-
-  async function actOnSelected(action: string) {
-    if (!selected) return;
-    await api(`/api/folders/${encodeURIComponent(folder)}/messages/bulk`, { method: 'POST', body: JSON.stringify({ action, uids: [selected.uid] }) });
-    setSelected(null);
     setChecked([]);
-    setMobileView('list');
-    await refresh();
+    setMoveOpen(false);
+    if (removes) {
+      setMessages((list) => list.filter((m) => !uids.includes(m.uid)));
+      setTotal((t) => t - uids.length);
+      if (selected && uids.includes(selected.uid)) {
+        if (next) openMessage(next).catch(() => setSelected(null));
+        else { setSelected(null); setView('list'); }
+      }
+      const verb = action === 'move' ? `Moved to ${target}` : action === 'archive' ? 'Archived' : action === 'junk' ? 'Moved to Junk' : 'Deleted';
+      flash(`${verb}: ${uids.length} message${uids.length === 1 ? '' : 's'}`);
+    } else {
+      const flag = action.endsWith('flag') ? '\\Flagged' : '\\Seen';
+      const present = action === 'flag' || action === 'mark_read';
+      const update = (flags: string[]) => (present ? [...flags.filter((f) => f !== flag), flag] : flags.filter((f) => f !== flag));
+      setMessages((list) => list.map((m) => (uids.includes(m.uid) ? { ...m, flags: update(m.flags) } : m)));
+      if (selected && uids.includes(selected.uid)) setSelected({ ...selected, flags: update(selected.flags) });
+    }
+    loadFolders().catch(() => undefined);
   }
 
   async function resolveSuggestion(uid: number, action: 'accept' | 'dismiss') {
     try {
       await api(`/api/suggestions/${uid}/${action}`, { method: 'POST' });
     } catch (err) {
-      window.alert((err as Error).message);
+      flash((err as Error).message);
     }
-    if (selected?.uid === uid) {
-      if (action === 'accept') {
-        setSelected(null);
-        setMobileView('list');
-      } else {
-        setSelected({ ...selected, suggestion: undefined });
-      }
-    }
+    if (selected?.uid === uid && action === 'accept') { setSelected(null); setView('list'); }
     await refresh();
-  }
-
-  async function removeLabel(uid: number, keyword: string) {
-    await api(`/api/folders/${encodeURIComponent(folder)}/messages/${uid}`, { method: 'PATCH', body: JSON.stringify({ keywords: { [keyword]: false } }) })
-      .catch((err) => window.alert((err as Error).message));
-    if (selected?.uid === uid) setSelected({ ...selected, flags: selected.flags.filter((f) => f !== keyword) });
-    await refresh();
-  }
-
-  /** The user's labels on a message (as the list reports them), as removable chips. */
-  function labelChips(message: Message) {
-    const present = (messages.find((m) => m.uid === message.uid) || message).labels || [];
-    if (!present.length) return null;
-    return (
-      <div className="label-chips">
-        {present.map((label) => (
-          <span className="label-chip" key={label.keyword} title={label.description || label.name}>
-            <Tag size={11} />{label.name}
-            <button aria-label={`Remove label ${label.name}`} title="Remove label" onClick={() => removeLabel(message.uid, label.keyword)}><X size={11} /></button>
-          </span>
-        ))}
-      </div>
-    );
   }
 
   async function acceptAll() {
-    await api('/api/suggestions/accept-all', { method: 'POST' }).catch((err) => window.alert((err as Error).message));
+    await api('/api/suggestions/accept-all', { method: 'POST' }).catch((err) => flash((err as Error).message));
     setSelected(null);
     await refresh();
   }
 
-  async function chooseFolder(name: string) {
-    setFolder(name);
-    setSelected(null);
-    setMobileView('list');
-    await refresh(name);
+  /** Refresh one message's labels and flags in the list and the reader. */
+  async function reloadMessage(uid: number) {
+    const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${uid}`).catch(() => null);
+    if (!detail) return;
+    setMessages((list) => list.map((m) => (m.uid === uid ? { ...m, flags: detail.flags, labels: detail.labels } : m)));
+    setSelected((s) => (s && s.uid === uid ? { ...s, flags: detail.flags, labels: detail.labels } : s));
   }
 
-  const title = useMemo(() => folders.find((f) => f.name === folder)?.name || folder, [folders, folder]);
-  const suggested = messages.filter((m) => m.suggestion).length;
-  const selectedSuggestion = selected ? messages.find((m) => m.uid === selected.uid)?.suggestion : undefined;
-
-  if (!address) {
-    return <main className="login-shell"><form className="login-panel" onSubmit={login}><h1>rMail</h1><input value={loginAddress} onChange={(e) => setLoginAddress(e.target.value)} placeholder="Mailbox" autoComplete="username" /><input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" type="password" autoComplete="current-password" />{error && <p className="error">{error}</p>}<button type="submit">Sign in</button></form></main>;
+  async function removeLabel(uid: number, label: Label) {
+    await api(`/api/folders/${encodeURIComponent(folder)}/messages/${uid}`, { method: 'PATCH', body: JSON.stringify({ keywords: { [label.keyword]: false } }) }).catch((err) => flash((err as Error).message));
+    await reloadMessage(uid);
   }
+
+  function newFolder() {
+    setPrompt({
+      title: 'New folder', label: 'Name', confirm: 'Create', onClose: () => setPrompt(null),
+      onSubmit: async (name) => { await api('/api/folders', { method: 'POST', body: JSON.stringify({ name }) }); await loadFolders(); },
+    });
+  }
+
+  function renameFolder(name: string) {
+    setPrompt({
+      title: `Rename ${name}`, label: 'New name', initial: name, confirm: 'Rename', onClose: () => setPrompt(null),
+      onSubmit: async (next) => {
+        await api(`/api/folders/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify({ name: next }) });
+        await loadFolders();
+        if (folder === name) await chooseFolder(next);
+      },
+    });
+  }
+
+  function deleteFolder(name: string) {
+    setPrompt({
+      title: `Delete ${name}?`, confirm: 'Delete folder', danger: true, onClose: () => setPrompt(null),
+      onSubmit: async () => {
+        await api(`/api/folders/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        await loadFolders();
+        if (folder === name) await chooseFolder('INBOX');
+      },
+    });
+  }
+
+  // Keyboard shortcuts, like most mail clients.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement;
+      if (target.closest('input, textarea, select, [contenteditable], .dialog') || event.metaKey || event.ctrlKey || event.altKey) return;
+      const move = (delta: number) => {
+        const index = selectedIndex < 0 ? (delta > 0 ? 0 : messages.length - 1) : selectedIndex + delta;
+        const message = messages[index];
+        if (message) openMessage(message).catch(() => undefined);
+      };
+      const uids = selected ? [selected.uid] : checked;
+      switch (event.key) {
+        case 'j': move(1); break;
+        case 'k': move(-1); break;
+        case 'e': act('archive', uids); break;
+        case '#': case 'Delete': act('delete', uids); break;
+        case '!': act('junk', uids); break;
+        case 's': if (selected) act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid]); break;
+        case 'u': if (selected) { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); } break;
+        case '/': event.preventDefault(); searchRef.current?.focus(); break;
+        case 'Escape':
+          // Close an open menu first; only then the message.
+          if (moveOpen || moreOpen) { setMoveOpen(false); setMoreOpen(false); }
+          else { setSelected(null); setView('list'); }
+          break;
+        default: return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  const allChecked = messages.length > 0 && checked.length === messages.length;
+
+  const moveMenu = (uids: number[]) => (
+    <div className="menu" role="menu">
+      {userFolders.filter((f) => f.name !== folder).map((f) => <button key={f.name} role="menuitem" onClick={() => act('move', uids, f.name)}><FolderTree size={14} />{f.name}</button>)}
+      {folders.filter((f) => !isUserFolder(f) && f.name !== folder && f.special_use !== '\\Drafts' && f.special_use !== '\\Sent').map((f) => {
+        const Icon = folderIcon(f);
+        return <button key={f.name} role="menuitem" onClick={() => act('move', uids, f.name)}><Icon size={14} />{folderLabel(f)}</button>;
+      })}
+      {userFolders.length === 0 && <p className="menu-empty">No folders yet.</p>}
+      <button role="menuitem" className="menu-new" onClick={() => { setMoveOpen(false); newFolder(); }}><FolderPlus size={14} />New folder…</button>
+    </div>
+  );
 
   return (
-    <main className={`app mobile-${mobileView}`}>
-      <aside className="folders"><div className="account">{address}</div>{folders.map((f) => <button key={f.name} className={f.name === folder ? 'active' : ''} onClick={() => chooseFolder(f.name)}><span>{f.name}</span><small>{f.unread ? f.unread : f.messages}</small></button>)}</aside>
+    <main className={`app view-${view}`}>
+      <aside className="sidebar">
+        <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span title={address}>{address}</span></div></div>
+        <nav aria-label="Folders">
+          {folders.map((f) => {
+            const Icon = folderIcon(f);
+            return (
+              <div key={f.name} className={`folder ${f.name === folder ? 'active' : ''}`}>
+                <button className="folder-name" onClick={() => chooseFolder(f.name)} aria-current={f.name === folder ? 'page' : undefined}>
+                  <Icon size={16} /><span>{folderLabel(f)}</span>{f.unread > 0 && <small className="count">{f.unread}</small>}
+                </button>
+                {isUserFolder(f) && (
+                  <span className="folder-actions">
+                    <button aria-label={`Rename ${f.name}`} title="Rename" onClick={() => renameFolder(f.name)}><Pencil size={12} /></button>
+                    <button aria-label={`Delete ${f.name}`} title="Delete" onClick={() => deleteFolder(f.name)}><Trash2 size={12} /></button>
+                  </span>
+                )}
+              </div>
+            );
+          })}
+          <button className="new-folder" onClick={newFolder}><FolderPlus size={15} />New folder</button>
+        </nav>
+        <div className="sidebar-foot">
+          <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
+          <ThemeSwitch />
+          <button className="sidebar-link" onClick={onLogout}><LogOut size={15} />Sign out</button>
+        </div>
+      </aside>
+
       <section className="mailbox">
-        <header className="topbar"><button className="icon mobile-only" onClick={() => setMobileView('folders')} title="Folders"><Menu size={18} /></button><div className="search"><Search size={18} /><input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && refresh()} placeholder="Search mail" /></div><button className="icon" onClick={() => refresh()} title="Refresh"><RefreshCw size={18} /></button><button className="icon" onClick={() => setOrganizing(true)} title="Organize my mail"><FolderTree size={18} /></button><button className="icon" onClick={logout} title="Sign out"><LogOut size={18} /></button></header>
-        <div className="toolbar"><strong>{title}</strong>{folder === 'INBOX' && suggested > 0 && <button className="accept-all" onClick={acceptAll} title="Move every suggested message to its suggested folder"><FolderInput size={15} />Move {suggested} suggested</button>}<span>{messages.length}</span></div>
-        <div className="message-list">{messages.map((m) => <div key={m.uid} className={`row ${m.flags.some((f) => f.toLowerCase() === '\\seen') ? '' : 'unread'}`}><input type="checkbox" checked={checked.includes(m.uid)} onChange={(e) => setChecked(e.target.checked ? [...checked, m.uid] : checked.filter((id) => id !== m.uid))} /><button onClick={() => openMessage(m)}><span className="from">{m.from || '(unknown)'}</span><span className="subject">{m.subject || '(no subject)'}</span><span className="snippet">{m.snippet}</span></button>{labelChips(m)}{m.suggestion && <div className="suggestion-chip"><button className="chip-move" onClick={() => resolveSuggestion(m.uid, 'accept')} title={`Suggested from ${methodLabel[m.suggestion.method]}`}><FolderInput size={13} />{m.suggestion.folder}</button><button className="chip-dismiss" onClick={() => resolveSuggestion(m.uid, 'dismiss')} title="Not this folder"><X size={13} /></button></div>}</div>)}</div>
+        <header className="topbar">
+          <IconButton label="Folders" className="mobile-only" onClick={() => setView('folders')}><Menu size={18} /></IconButton>
+          <form className="search" onSubmit={search} role="search">
+            <Search size={16} />
+            <input ref={searchRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder={`Search ${current ? folderLabel(current) : 'mail'}`} aria-label="Search mail" />
+            {activeQuery && <button type="button" className="clear" aria-label="Clear search" onClick={() => { setQuery(''); setActiveQuery(''); loadMessages(folder, ''); }}><X size={14} /></button>}
+          </form>
+          <IconButton label="Refresh" onClick={() => refresh().catch((err) => flash((err as Error).message))}><RefreshCw size={16} className={loading ? 'spin' : ''} /></IconButton>
+        </header>
+        <div className="toolbar">
+          <input type="checkbox" aria-label="Select all" checked={allChecked} ref={(el) => { if (el) el.indeterminate = checked.length > 0 && !allChecked; }} onChange={(e) => setChecked(e.target.checked ? messages.map((m) => m.uid) : [])} />
+          {checked.length > 0 ? (
+            <div className="bulk">
+              <span>{checked.length} selected</span>
+              <IconButton label="Archive (e)" onClick={() => act('archive', checked)}><Archive size={16} /></IconButton>
+              <IconButton label="Delete (#)" onClick={() => act('delete', checked)}><Trash2 size={16} /></IconButton>
+              <IconButton label="Junk (!)" onClick={() => act('junk', checked)}><AlertOctagon size={16} /></IconButton>
+              <span className="menu-anchor">
+                <IconButton label="Move to…" onClick={() => setMoveOpen(!moveOpen)}><FolderInput size={16} /></IconButton>
+                {moveOpen && moveMenu(checked)}
+              </span>
+              <IconButton label="Mark read" onClick={() => act('mark_read', checked)}><MailOpen size={16} /></IconButton>
+              <IconButton label="Mark unread" onClick={() => act('mark_unread', checked)}><Mail size={16} /></IconButton>
+              <IconButton label="Star" onClick={() => act('flag', checked)}><Star size={16} /></IconButton>
+            </div>
+          ) : (
+            <strong className="folder-title">{activeQuery ? `Results for “${activeQuery}”` : current ? folderLabel(current) : folder}</strong>
+          )}
+          {folder === 'INBOX' && suggested > 0 && !checked.length && <button className="accept-all" onClick={acceptAll} title="Move every suggested message to its suggested folder"><FolderInput size={14} />Move {suggested} suggested</button>}
+          <span className="total">{total ? `${messages.length < total ? `${messages.length} of ` : ''}${total}` : ''}</span>
+        </div>
+        <div className="message-list" role="list">
+          {messages.map((m) => {
+            const from = splitAddress(m.from);
+            const unread = !hasFlag(m.flags, '\\Seen');
+            const starred = hasFlag(m.flags, '\\Flagged');
+            return (
+              <div key={m.uid} role="listitem" className={`row ${unread ? 'unread' : ''} ${selected?.uid === m.uid ? 'selected' : ''} ${checked.includes(m.uid) ? 'checked' : ''}`}>
+                <input type="checkbox" aria-label={`Select ${m.subject || 'message'}`} checked={checked.includes(m.uid)} onChange={(e) => setChecked(e.target.checked ? [...checked, m.uid] : checked.filter((id) => id !== m.uid))} />
+                <button className={`star ${starred ? 'on' : ''}`} aria-label={starred ? 'Unstar' : 'Star'} aria-pressed={starred} onClick={() => act(starred ? 'unflag' : 'flag', [m.uid])}><Star size={15} /></button>
+                <button className="row-main" onClick={() => openMessage(m).catch((err) => flash((err as Error).message))}>
+                  <span className="from" title={from.address}>{from.name || '(unknown)'}</span>
+                  <span className="date">{m.has_attachments && <Paperclip size={12} aria-label="Has attachments" />}{formatListDate(m.internal_date)}</span>
+                  <span className="subject">{m.subject || '(no subject)'}</span>
+                  <span className="snippet">{m.snippet}</span>
+                </button>
+                {(m.labels?.length || m.suggestion) ? (
+                  <div className="row-extra">
+                    <LabelChips labels={m.labels || []} onRemove={(label) => removeLabel(m.uid, label)} />
+                    {m.suggestion && <div className="suggestion-chip"><button className="chip-move" onClick={() => resolveSuggestion(m.uid, 'accept')} title={`Suggested from ${methodLabel[m.suggestion.method]}`}><FolderInput size={12} />{m.suggestion.folder}</button><button className="chip-dismiss" onClick={() => resolveSuggestion(m.uid, 'dismiss')} aria-label="Not this folder" title="Not this folder"><X size={12} /></button></div>}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+          {!loading && messages.length === 0 && <div className="empty-list">{activeQuery ? 'No messages match your search.' : 'No messages here.'}</div>}
+          {messages.length < total && <button className="load-more" disabled={loading} onClick={() => loadMessages(folder, activeQuery, messages.length)}>{loading ? 'Loading…' : `Load ${Math.min(PAGE, total - messages.length)} more`}</button>}
+        </div>
       </section>
-      <article className="reader">{selected ? <><div className="reader-actions"><button className="back mobile-only" onClick={() => setMobileView('list')}>Back</button><button className="icon" onClick={() => actOnSelected('archive')} title="Archive"><Archive size={18} /></button><button className="icon" onClick={() => actOnSelected('delete')} title="Delete"><Trash2 size={18} /></button><button className="icon" onClick={() => actOnSelected('mark_read')} title="Mark read"><MailOpen size={18} /></button><button className="icon" onClick={() => actOnSelected('mark_unread')} title="Mark unread"><Mail size={18} /></button></div>{selectedSuggestion && <div className="suggestion-banner"><FolderInput size={16} /><span>Suggested folder: <strong>{selectedSuggestion.folder}</strong>, based on {methodLabel[selectedSuggestion.method]}.</span><button onClick={() => resolveSuggestion(selected.uid, 'accept')}>Move</button><button onClick={() => resolveSuggestion(selected.uid, 'dismiss')}>Not this</button></div>}<h2>{selected.subject || '(no subject)'}</h2><div className="meta">From {selected.from || '(unknown)'} to {selected.to || address}</div>{labelChips(selected)}{selected.html_body && selected.has_remote_content && <div className="remote-banner"><Image size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}{selected.html_body ? <iframe className="html-message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} /> : <pre>{selected.text_body}</pre>}</> : <div className="empty">Select a message</div>}</article>
-      {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => refresh()} />}
+
+      <article className="reader">
+        {selected ? (
+          <>
+            <div className="reader-actions">
+              <IconButton label="Back" className="mobile-only" onClick={() => setView('list')}><ChevronLeft size={18} /></IconButton>
+              <IconButton label="Archive (e)" onClick={() => act('archive', [selected.uid])}><Archive size={16} /></IconButton>
+              <IconButton label="Delete (#)" onClick={() => act('delete', [selected.uid])}><Trash2 size={16} /></IconButton>
+              <IconButton label="Junk (!)" onClick={() => act('junk', [selected.uid])}><AlertOctagon size={16} /></IconButton>
+              <span className="menu-anchor">
+                <IconButton label="Move to…" onClick={() => { setMoveOpen(!moveOpen); setMoreOpen(false); }}><FolderInput size={16} /></IconButton>
+                {moveOpen && !checked.length && moveMenu([selected.uid])}
+              </span>
+              <IconButton label={hasFlag(selected.flags, '\\Flagged') ? 'Unstar (s)' : 'Star (s)'} active={hasFlag(selected.flags, '\\Flagged')} onClick={() => act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid])}><Star size={16} /></IconButton>
+              <IconButton label="Mark unread (u)" onClick={() => { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); }}><Mail size={16} /></IconButton>
+              <span className="spacer" />
+              <span className="menu-anchor">
+                <IconButton label="More" onClick={() => { setMoreOpen(!moreOpen); setMoveOpen(false); }}><MoreHorizontal size={16} /></IconButton>
+                {moreOpen && (
+                  <div className="menu right" role="menu">
+                    <button role="menuitem" onClick={() => { setRawFor(selected.uid); setMoreOpen(false); }}><Code2 size={14} />View source</button>
+                    <a role="menuitem" href={`/api/folders/${encodeURIComponent(folder)}/messages/${selected.uid}/raw?download=1`} download onClick={() => setMoreOpen(false)}><Download size={14} />Download .eml</a>
+                  </div>
+                )}
+              </span>
+            </div>
+            <div className="reader-scroll">
+              {selectedListItem?.suggestion && (
+                <div className="suggestion-banner"><FolderInput size={16} /><span>Suggested folder: <strong>{selectedListItem.suggestion.folder}</strong>, based on {methodLabel[selectedListItem.suggestion.method]}.</span><button onClick={() => resolveSuggestion(selected.uid, 'accept')}>Move</button><button onClick={() => resolveSuggestion(selected.uid, 'dismiss')}>Not this</button></div>
+              )}
+              <h1 className="subject-line">{selected.subject || '(no subject)'}</h1>
+              <LabelChips labels={selected.labels} onRemove={(label) => removeLabel(selected.uid, label)} />
+              <div className="message-head">
+                <div className="avatar" aria-hidden="true">{(splitAddress(selected.from).name || '?').charAt(0).toUpperCase()}</div>
+                <div className="head-text">
+                  <div><strong>{splitAddress(selected.from).name}</strong> <span className="muted">&lt;{splitAddress(selected.from).address}&gt;</span></div>
+                  <div className="muted small">To {selected.to || address}{selected.cc && <> · Cc {selected.cc}</>}</div>
+                  {selected.reply_to && selected.reply_to !== selected.from && <div className="muted small">Reply to {selected.reply_to}</div>}
+                </div>
+                <time className="muted small" title={selected.date}>{formatFullDate(selected.internal_date)}</time>
+              </div>
+              <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} />
+              {selected.html_body && selected.has_remote_content && <div className="remote-banner"><ImageIcon size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}
+              {selected.html_body
+                ? <iframe className="html-message" title="Message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} />
+                : <pre className="text-message">{selected.text_body}</pre>}
+              <Attachments folder={folder} uid={selected.uid} attachments={selected.attachments} />
+            </div>
+          </>
+        ) : (
+          <div className="empty"><Mail size={32} /><p>Select a message</p><small>Shortcuts: j/k next and previous · e archive · # delete · s star · / search</small></div>
+        )}
+      </article>
+
+      {notice && <div className="toast" role="status">{notice}</div>}
+      {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} />}
+      {prompt && <PromptDialog {...prompt} />}
+      {rawFor !== null && <RawDialog api={api} folder={folder} uid={rawFor} onClose={() => setRawFor(null)} />}
     </main>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in
+
+function App() {
+  const [address, setAddress] = useState<string | null | undefined>(undefined);
+  const [loginAddress, setLoginAddress] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const api = useApi(useCallback(() => setAddress(null), []));
+
+  useEffect(() => {
+    api<{ address: string }>('/api/session').then((s) => setAddress(s.address)).catch(() => setAddress(null));
+  }, [api]);
+
+  async function login(event: React.FormEvent) {
+    event.preventDefault();
+    setError('');
+    setBusy(true);
+    try {
+      const session = await api<{ address: string }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password }) });
+      setPassword('');
+      setAddress(session.address);
+    } catch (err) {
+      setError(err instanceof ApiError && err.status === 429 ? err.message : 'Invalid mailbox or password');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logout() {
+    await api('/api/logout', { method: 'POST' }).catch(() => undefined);
+    setAddress(null);
+  }
+
+  if (address === undefined) return <div className="boot">Loading…</div>;
+  if (!address) {
+    return (
+      <main className="login-shell">
+        <form className="login-panel" onSubmit={login}>
+          <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span>Webmail</span></div></div>
+          <label className="field"><span>Mailbox</span><input value={loginAddress} onChange={(e) => setLoginAddress(e.target.value)} placeholder="you@example.com" autoComplete="username" autoFocus /></label>
+          <label className="field"><span>Password</span><input value={password} onChange={(e) => setPassword(e.target.value)} type="password" autoComplete="current-password" /></label>
+          {error && <p className="error">{error}</p>}
+          <button type="submit" className="primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+        </form>
+      </main>
+    );
+  }
+  return <Mailbox api={api} address={address} onLogout={logout} />;
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
