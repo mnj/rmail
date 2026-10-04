@@ -84,6 +84,8 @@ install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_restart.service" "${PKG_ROO
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail.env" "${PKG_ROOT}/etc/default/rmail"
 install -m 0644 "${ROOT_DIR}/config/example.toml" "${PKG_ROOT}/etc/rmail/config.toml"
 
+# rmail_classifier links llama.cpp, which needs the C++ runtime and OpenMP
+# (libgomp) at run time; minimal installs lack libgomp1.
 cat > "${PKG_ROOT}/DEBIAN/control" <<EOF
 Package: rmail
 Version: ${VERSION}
@@ -91,7 +93,7 @@ Section: mail
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: rMail Maintainers <noreply@example.invalid>
-Depends: systemd, libssl3 | libssl3t64
+Depends: systemd, libssl3 | libssl3t64, libgomp1, libstdc++6, libgcc-s1
 Description: rMail daemons and admin tools
  Minimal Rust mail stack packaged with SMTP, IMAP, web, outbound,
  webmail, mail classifier, and administrative CLI binaries for systemd-based

@@ -463,6 +463,11 @@ Every merge to `main` runs CI and, when it passes, publishes packages for `amd64
 - `latest`: a rolling release that always points at the newest build, with version-less asset
   names such as `rmail_latest_amd64.deb`, so download URLs stay stable.
 
+The `.deb` pulls in its runtime libraries. When installing from the `.tar.gz`, make sure
+`rmail_classifier`'s are present too: the C++ runtime and OpenMP (`libstdc++6` and `libgomp1`
+on Debian and Ubuntu, `libstdc++` and `libgomp` on Fedora and RHEL). Without libgomp the
+classifier exits with `libgomp.so.1: cannot open shared object file`.
+
 The version is the last `vX.Y.Z` tag plus a bump chosen from the merged PR:
 
 - label `release:major`, `release:minor` or `release:patch`, otherwise
