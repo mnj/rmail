@@ -113,6 +113,9 @@ pub(super) struct Session {
     helo_name: Option<String>,
     extended_smtp: bool,
     authenticated_user: Option<String>,
+    /// Webmail on this host authenticated with the local submission secret
+    /// (`X-RMAIL-WEBMAIL`); loopback traffic stands in for TLS.
+    local_trusted: bool,
     /// Tracking ID of the current transaction (set by MAIL).
     message_id: Option<String>,
     tx: Transaction,
@@ -222,6 +225,7 @@ pub(crate) async fn process_stream_with_bindings(
         helo_name: None,
         extended_smtp: false,
         authenticated_user: None,
+        local_trusted: false,
         message_id: None,
         tx: Transaction::default(),
         generation: 0,
@@ -477,8 +481,10 @@ impl Session {
             return Some(b"500 5.5.1 LHLO is only valid for LMTP\r\n");
         }
 
+        let local_webmail_auth = self.local_webmail_auth(command);
+        let protected = self.encrypted || self.local_trusted || local_webmail_auth;
         if self.service == SmtpService::Submission {
-            if !self.encrypted
+            if !protected
                 && !matches!(
                     command,
                     SmtpCommand::Ehlo(_)
@@ -492,7 +498,7 @@ impl Session {
             {
                 return Some(b"530 5.7.0 Must issue STARTTLS first\r\n");
             }
-            if self.encrypted
+            if protected
                 && self.authenticated_user.is_none()
                 && matches!(command, SmtpCommand::Mail(_))
             {
@@ -505,7 +511,7 @@ impl Session {
             protocol::SessionContext {
                 greeted: self.helo_name.is_some(),
                 extended_smtp: self.extended_smtp,
-                encrypted: self.encrypted,
+                encrypted: protected,
                 authenticated: self.authenticated_user.is_some(),
                 transaction_active: self.tx.active,
                 recipients: self.tx.rcpts.len(),
@@ -543,6 +549,17 @@ impl Session {
                 .smtp_sasl_mechanisms
                 .iter()
                 .any(|mechanism| mechanism.eq_ignore_ascii_case("SCRAM-SHA-256-PLUS"))
+    }
+
+    /// `AUTH X-RMAIL-WEBMAIL` from this host's loopback on the submission
+    /// service: webmail sending as its signed-in user.
+    fn local_webmail_auth(&self, command: &SmtpCommand<'_>) -> bool {
+        self.service == SmtpService::Submission
+            && self.peer.is_some_and(|peer| peer.ip().is_loopback())
+            && matches!(command, SmtpCommand::Auth(args) if args
+                .split_ascii_whitespace()
+                .next()
+                .is_some_and(|mechanism| mechanism.eq_ignore_ascii_case(authenticate::WEBMAIL_MECHANISM)))
     }
 
     /// The AUTH extension is offered on this session (EHLO lists it until
@@ -606,6 +623,41 @@ impl Session {
         let mechanism = parsed.mechanism.to_ascii_uppercase();
         let initial = parsed.initial_response;
         session_log!(self, "info", "authentication_attempted", { "encrypted": self.encrypted, "mechanism": mechanism });
+        // Webmail on this host: not advertised, loopback submission only.
+        if mechanism == authenticate::WEBMAIL_MECHANISM {
+            let loopback = self.peer.is_some_and(|peer| peer.ip().is_loopback());
+            if self.service != SmtpService::Submission || !loopback {
+                return reply(
+                    reader,
+                    b"504 5.5.4 Unrecognized authentication mechanism\r\n",
+                )
+                .await;
+            }
+            if let Some(remaining) = self.peer.and_then(|peer| auth_block_remaining(peer.ip())) {
+                let message = format!(
+                    "454 4.7.1 Too many failed auth attempts; try again in {}s\r\n",
+                    remaining.as_secs()
+                );
+                return reply(reader, message.as_bytes()).await;
+            }
+            let outcome = authenticate::handle_webmail(
+                reader,
+                initial,
+                self.db_path.as_ref(),
+                self.peer,
+                std::path::Path::new(&self.mail_root),
+            )
+            .await;
+            if outcome.disconnected {
+                return Ok(Flow::Close);
+            }
+            if let Some(user) = outcome.authenticated_user {
+                session_log!(self, "info", "authentication_succeeded", { "user": user, "mechanism": authenticate::WEBMAIL_MECHANISM });
+                self.authenticated_user = Some(user);
+                self.local_trusted = true;
+            }
+            return Ok(Flow::Continue);
+        }
         if !self
             .security
             .smtp_sasl_mechanisms

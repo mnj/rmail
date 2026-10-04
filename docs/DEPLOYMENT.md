@@ -405,6 +405,35 @@ sudo rmail_ctl service status
 journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u rmail_webmail.service -u rmail_outbound.service -u rmail_classifier.service -n 200 --no-pager
 ```
 
+## Webmail
+
+`rmail_webmail` is the users' mail client: folders (create, rename, delete, nest with `/`), search,
+paging, stars, move, archive, junk and delete (also in bulk), keyboard shortcuts, attachments
+(downloaded under a sandbox; PNG, JPEG, GIF and WebP previewed inline), the raw source of any message
+with its headers (**View source**, or download as `.eml`), light and dark themes, and a phone layout.
+When mail organization is enabled with a fallback model, messages also offer **Summarize** and
+**Suggest labels**.
+
+### Sending
+
+Compose, reply, reply all and forward (with attachments up to 10 MB in total) go through this
+server's own submission service. Webmail does not hold users' passwords, so it signs in to submission
+over loopback with SASL `X-RMAIL-WEBMAIL`, presenting a shared secret and acting as the signed-in user:
+
+- The secret is `<mail_root>/run/webmail-submission.key`, created on first use with mode `0600`.
+  Webmail and SMTP run as the same `rmail` user; no other local user can read it.
+- `rmail_smtpd` accepts the mechanism only on the submission service and only from a loopback
+  address, never advertises it, and counts failures towards the usual authentication lockout.
+- After that the session is an ordinary authenticated submission for that user: the sender must be
+  the user's own address, and rate limits, content scanning, DKIM signing and local, alias and
+  remote routing all apply as for any mail client.
+- Webmail needs a submission listener it can reach on loopback: a wildcard (`0.0.0.0:587`,
+  `[::]:587`) or loopback address in `listeners.submission`. Without one, sending is off and webmail
+  hides Compose. Restart webmail after changing the submission listeners.
+
+A copy of each sent message (including Bcc) is saved to Sent; replies mark the original
+`\Answered` and forwards `$Forwarded`. Drafts are saved to Drafts and can be reopened and sent.
+
 ## Mail organization
 
 `rmail_classifier` suggests folders for new INBOX mail. It learns from how each user files their mail.

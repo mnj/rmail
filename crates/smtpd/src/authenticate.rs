@@ -11,6 +11,10 @@ use tokio::time::timeout;
 
 use crate::{AUTH_CONTINUATION_TIMEOUT, protocol};
 
+/// SASL mechanism webmail uses to submit as its signed-in user. Never
+/// advertised; accepted only over loopback on the submission service.
+pub(crate) const WEBMAIL_MECHANISM: &str = "X-RMAIL-WEBMAIL";
+
 pub(crate) struct Outcome {
     pub(crate) authenticated_user: Option<String>,
     pub(crate) disconnected: bool,
@@ -106,6 +110,59 @@ pub(crate) async fn handle_password<S: AsyncRead + AsyncWrite + Unpin>(
             );
             failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await
         }
+    }
+}
+
+/// `AUTH X-RMAIL-WEBMAIL <base64(user NUL secret)>`: the secret must match
+/// the local webmail submission key and the user must be a mailbox. The
+/// caller has checked that the peer is loopback.
+pub(crate) async fn handle_webmail<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    initial_response: Option<&str>,
+    db_path: Option<&String>,
+    peer: Option<SocketAddr>,
+    mail_root: &std::path::Path,
+) -> Outcome {
+    let Some(decoded) = initial_response.and_then(|wire| BASE64_ENGINE.decode(wire).ok()) else {
+        return failure(reader, b"501 5.5.2 Invalid AUTH response\r\n").await;
+    };
+    let mut parts = decoded.splitn(2, |&byte| byte == 0);
+    let (Some(user), Some(secret)) = (parts.next(), parts.next()) else {
+        return failure(reader, b"501 5.5.2 Invalid AUTH response\r\n").await;
+    };
+    let key = match rmail_common::runtime::webmail_submission_key(mail_root) {
+        Ok(key) => key,
+        Err(error) => {
+            rmail_common::structured_log!("error", "smtpd", "webmail_key_unavailable", { "error": format!("{error:#}") });
+            return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
+        }
+    };
+    if !rmail_common::runtime::constant_time_eq(secret, key.as_bytes()) {
+        record_failure(peer);
+        return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
+    }
+    let user = String::from_utf8_lossy(user);
+    let normalized = rmail_common::auth::normalize_login_name(&user).unwrap_or_default();
+    let mailbox = match rmail_common::auth::lookup_mailbox(db_path, &normalized).await {
+        Ok(Some(mailbox)) => mailbox,
+        Ok(None) => {
+            record_failure(peer);
+            return failure(reader, b"535 5.7.8 Authentication credentials invalid\r\n").await;
+        }
+        Err(error) => {
+            rmail_common::structured_log!("error", "smtpd", "webmail_mailbox_lookup_failed", { "error": error.to_string() });
+            return failure(reader, b"454 4.7.0 Temporary authentication failure\r\n").await;
+        }
+    };
+    if write_reply(reader, b"235 2.7.0 Authentication succeeded\r\n")
+        .await
+        .is_err()
+    {
+        return disconnected();
+    }
+    Outcome {
+        authenticated_user: Some(mailbox.address.to_ascii_lowercase()),
+        disconnected: false,
     }
 }
 

@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::Shared;
-use crate::engine::FolderHint;
+use crate::engine::{FolderHint, LabelHint};
 
 pub async fn serve(shared: Arc<Shared>, socket: &Path) -> Result<()> {
     if let Some(parent) = socket.parent() {
@@ -107,6 +107,50 @@ async fn execute(shared: &Arc<Shared>, request: Request) -> Result<serde_json::V
                 "folder": choice.folder,
                 "confidence": choice.confidence,
                 "raw": choice.raw,
+                "ms": started.elapsed().as_millis() as u64,
+            }))
+        }
+        Request::Label {
+            text,
+            labels,
+            may_propose,
+        } => {
+            let runtime = shared.runtime().await;
+            let chooser = runtime
+                .models
+                .chooser
+                .clone()
+                .context("no fallback model is loaded")?;
+            let hints: Vec<LabelHint> = labels
+                .into_iter()
+                .map(|label| LabelHint {
+                    name: label.name,
+                    description: label.description,
+                })
+                .collect();
+            let started = Instant::now();
+            let answer =
+                tokio::task::spawn_blocking(move || chooser.label(&text, &hints, may_propose))
+                    .await??;
+            Ok(json!({
+                "model": runtime.models.chat_info.as_ref().map(|m| m.file.clone()),
+                "labels": answer.labels,
+                "proposed": answer.proposed.map(|(name, description)| json!({ "name": name, "description": description })),
+                "ms": started.elapsed().as_millis() as u64,
+            }))
+        }
+        Request::Summarize { text } => {
+            let runtime = shared.runtime().await;
+            let chooser = runtime
+                .models
+                .chooser
+                .clone()
+                .context("no fallback model is loaded")?;
+            let started = Instant::now();
+            let summary = tokio::task::spawn_blocking(move || chooser.summarize(&text)).await??;
+            Ok(json!({
+                "model": runtime.models.chat_info.as_ref().map(|m| m.file.clone()),
+                "summary": summary,
                 "ms": started.elapsed().as_millis() as u64,
             }))
         }

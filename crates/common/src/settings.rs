@@ -1143,6 +1143,9 @@ pub struct ClassifierModels {
     pub chat_cloud: Option<&'static str>,
     /// Whether a fallback model is configured at all; labels need one.
     pub chat_configured: bool,
+    /// Whether that model writes text (local or OpenRouter chat), which
+    /// summaries need; Jev only picks from options.
+    pub chat_writes_text: bool,
 }
 
 impl ClassifierModels {
@@ -1177,6 +1180,7 @@ pub fn classifier_models(conn: &Connection) -> Result<ClassifierModels> {
         embed_cloud: embed.cloud(),
         chat_cloud: chat.cloud().filter(|_| chat_configured),
         chat_configured,
+        chat_writes_text: chat_configured && chat != ChatProvider::Jev,
     })
 }
 
