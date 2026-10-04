@@ -18,7 +18,9 @@ use rmail_common::throttle::AuthThrottle;
 use rmail_common::{auth, db, imap_state, websession};
 use serde::{Deserialize, Serialize};
 
-use rmail_common::mime::{has_remote_content, parse_message, sanitize_email_html, snippet};
+use rmail_common::mime::{
+    Attachment, attachment_data, has_remote_content, parse_message, sanitize_email_html, snippet,
+};
 
 mod organize;
 
@@ -49,11 +51,24 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/session", get(session_info))
-        .route("/api/folders", get(folders))
+        .route("/api/folders", get(folders).post(create_folder))
+        .route(
+            "/api/folders/{folder}",
+            axum::routing::patch(rename_folder).delete(delete_folder),
+        )
         .route("/api/folders/{folder}/messages", get(message_list))
         .route(
             "/api/folders/{folder}/messages/{uid}",
             get(message_detail).patch(patch_message),
+        )
+        .route(
+            "/api/folders/{folder}/messages/{uid}/attachments/{index}",
+            get(attachment),
+        )
+        .route("/api/folders/{folder}/messages/{uid}/raw", get(raw_message))
+        .route(
+            "/api/folders/{folder}/messages/{uid}/ai",
+            post(organize::ai_action),
         )
         .route("/api/folders/{folder}/messages/bulk", post(bulk))
         .merge(organize::routes())
@@ -333,11 +348,21 @@ pub(crate) struct MessageListItem {
     pub to: String,
     pub subject: String,
     pub snippet: String,
+    #[serde(default)]
+    pub has_attachments: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<organize::SuggestionView>,
     /// The user's labels whose keyword the message carries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<rmail_common::classifier_store::Label>,
+}
+
+/// A page of a folder's messages, newest first.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MessagePage {
+    /// Messages in the folder, or matching the search.
+    pub total: usize,
+    pub messages: Vec<MessageListItem>,
 }
 
 #[derive(Serialize)]
@@ -348,8 +373,13 @@ struct MessageDetail {
     internal_date: i64,
     from: String,
     to: String,
+    cc: String,
+    reply_to: String,
+    message_id: String,
     subject: String,
     date: String,
+    attachments: Vec<Attachment>,
+    labels: Vec<rmail_common::classifier_store::Label>,
     text_body: String,
     html_body: Option<String>,
     /// The HTML references remote images or styles, which are blocked unless
@@ -375,6 +405,8 @@ fn default_limit() -> usize {
 struct DetailQuery {
     #[serde(default)]
     remote_content: Option<String>,
+    #[serde(default)]
+    inline: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -401,7 +433,13 @@ fn is_user_keyword(keyword: &str) -> bool {
 struct BulkRequest {
     action: String,
     uids: Vec<u64>,
+    /// Folder for `move`.
+    #[serde(default)]
+    target: Option<String>,
 }
+
+/// Most messages one bulk request may touch.
+const MAX_BULK: usize = 1000;
 
 async fn folders(State(state): State<Shared>, session: Session) -> Response {
     let result = blocking(move || {
@@ -431,7 +469,8 @@ async fn message_list(
     Path(folder): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let needle = query.q.to_ascii_lowercase();
+    let needle = query.q.trim().to_lowercase();
+    let limit = query.limit.clamp(1, 200);
     let result = blocking(move || {
         let (info, mut messages) = imap_state::load_folder(
             &state.mail_root,
@@ -451,29 +490,52 @@ async fn message_list(
         };
         let labels = organize::labels(&state.mail_root, &session.domain, &session.localpart);
         messages.sort_by(|a, b| b.internaldate.cmp(&a.internaldate).then(b.uid.cmp(&a.uid)));
-        Ok(messages
+        let read = |message: &imap_state::Message| {
+            std::fs::read(&message.path)
+                .ok()
+                .map(|raw| parse_message(&raw))
+        };
+        // Without a search only the requested page is read from disk.
+        let (total, page): (
+            usize,
+            Vec<(imap_state::Message, rmail_common::mime::ParsedMessage)>,
+        ) = if needle.is_empty() {
+            let total = messages.len();
+            let page = messages
+                .into_iter()
+                .skip(query.offset)
+                .take(limit)
+                .filter_map(|message| read(&message).map(|parsed| (message, parsed)))
+                .collect();
+            (total, page)
+        } else {
+            let matching: Vec<_> = messages
+                .into_iter()
+                .filter_map(|message| read(&message).map(|parsed| (message, parsed)))
+                .filter(|(_, parsed)| {
+                    format!(
+                        "{} {} {} {} {}",
+                        parsed.from, parsed.to, parsed.cc, parsed.subject, parsed.text_body
+                    )
+                    .to_lowercase()
+                    .contains(&needle)
+                })
+                .collect();
+            let total = matching.len();
+            (
+                total,
+                matching
+                    .into_iter()
+                    .skip(query.offset)
+                    .take(limit)
+                    .collect(),
+            )
+        };
+        let messages = page
             .into_iter()
-            .filter_map(|message| {
-                let parsed = parse_message(&std::fs::read(&message.path).ok()?);
-                let haystack = format!(
-                    "{} {} {} {}",
-                    parsed.from, parsed.to, parsed.subject, parsed.text_body
-                )
-                .to_ascii_lowercase();
-                if !needle.is_empty() && !haystack.contains(&needle) {
-                    return None;
-                }
-                let labels = labels
-                    .iter()
-                    .filter(|label| {
-                        message
-                            .flags
-                            .iter()
-                            .any(|flag| flag.eq_ignore_ascii_case(&label.keyword))
-                    })
-                    .cloned()
-                    .collect();
-                Some(MessageListItem {
+            .map(|(message, parsed)| {
+                let labels = labels_for(&labels, &message.flags);
+                MessageListItem {
                     uid: message.uid,
                     flags: message.flags,
                     size: message.size,
@@ -482,19 +544,35 @@ async fn message_list(
                     to: parsed.to,
                     subject: parsed.subject,
                     snippet: snippet(&parsed.text_body),
+                    has_attachments: parsed.attachments.iter().any(|a| !a.inline),
                     suggestion: suggestions.remove(&message.uid),
                     labels,
-                })
+                }
             })
-            .skip(query.offset)
-            .take(query.limit)
-            .collect::<Vec<_>>())
+            .collect();
+        Ok(MessagePage { total, messages })
     })
     .await;
     match result {
-        Ok(items) => Json(items).into_response(),
+        Ok(page) => Json(page).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// The labels among `labels` whose keyword is in `flags`.
+fn labels_for(
+    labels: &[rmail_common::classifier_store::Label],
+    flags: &[String],
+) -> Vec<rmail_common::classifier_store::Label> {
+    labels
+        .iter()
+        .filter(|label| {
+            flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case(&label.keyword))
+        })
+        .cloned()
+        .collect()
 }
 
 async fn message_detail(
@@ -519,6 +597,10 @@ async fn message_detail(
             .find(|message| message.uid == uid)
             .ok_or_else(|| anyhow::anyhow!("no such message"))?;
         let parsed = parse_message(&std::fs::read(&message.path)?);
+        let labels = labels_for(
+            &organize::labels(&state.mail_root, &session.domain, &session.localpart),
+            &message.flags,
+        );
         Ok(MessageDetail {
             uid: message.uid,
             flags: message.flags,
@@ -526,8 +608,13 @@ async fn message_detail(
             internal_date: message.internaldate,
             from: parsed.from,
             to: parsed.to,
+            cc: parsed.cc,
+            reply_to: parsed.reply_to,
+            message_id: parsed.message_id,
             subject: parsed.subject,
             date: parsed.date,
+            attachments: parsed.attachments,
+            labels,
             text_body: parsed.text_body,
             has_remote_content: parsed.html_body.as_deref().is_some_and(has_remote_content),
             html_body: parsed
@@ -603,43 +690,325 @@ async fn bulk(
     };
     if !matches!(
         input.action.as_str(),
-        "mark_read" | "mark_unread" | "archive" | "delete"
+        "mark_read" | "mark_unread" | "flag" | "unflag" | "archive" | "delete" | "junk" | "move"
     ) {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     }
+    if input.uids.len() > MAX_BULK {
+        return (StatusCode::BAD_REQUEST, "too many messages").into_response();
+    }
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
+        // Destinations come from the account's folder list, never the request.
+        let folders = imap_state::list_folders(root, domain, local)?;
+        let special = |attribute: &str, fallback: &str| {
+            folders
+                .iter()
+                .find(|f| f.special_use.as_deref() == Some(attribute))
+                .or_else(|| {
+                    folders
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(fallback))
+                })
+                .map(|f| f.name.clone())
+        };
+        let destination = match input.action.as_str() {
+            "archive" => {
+                Some(special("\\Archive", "Archive").unwrap_or_else(|| "Archive".to_string()))
+            }
+            "junk" => Some(special("\\Junk", "Junk").unwrap_or_else(|| "Junk".to_string())),
+            "move" => {
+                let Some(found) = input
+                    .target
+                    .as_deref()
+                    .and_then(|target| folders.iter().find(|f| f.name == target))
+                else {
+                    return Ok(Err("no such folder"));
+                };
+                Some(found.name.clone())
+            }
+            _ => None,
+        };
+        if let Some(target) = &destination {
+            if !folders.iter().any(|f| &f.name == target) {
+                imap_state::create_folder(root, domain, local, target)?;
+            }
+            if target != &folder {
+                imap_state::transfer_messages_by_uid(
+                    root,
+                    domain,
+                    local,
+                    &folder,
+                    &input.uids,
+                    target,
+                    true,
+                )?;
+            }
+            return Ok(Ok(()));
+        }
         for uid in input.uids {
             match input.action.as_str() {
-                "mark_read" => update_seen(root, domain, local, &folder, uid, true)?,
-                "mark_unread" => update_seen(root, domain, local, &folder, uid, false)?,
-                "archive" => {
-                    imap_state::move_message_by_uid(root, domain, local, &folder, uid, "Archive")?;
-                }
+                "mark_read" => update_flag(root, domain, local, &folder, uid, "\\Seen", true)?,
+                "mark_unread" => update_flag(root, domain, local, &folder, uid, "\\Seen", false)?,
+                "flag" => update_flag(root, domain, local, &folder, uid, "\\Flagged", true)?,
+                "unflag" => update_flag(root, domain, local, &folder, uid, "\\Flagged", false)?,
                 _ => imap_state::delete_or_trash_message_by_uid(root, domain, local, &folder, uid)?,
             }
         }
-        Ok(())
+        Ok(Ok(()))
     })
     .await;
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(message)) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
         Err(error) => internal_error(error),
     }
 }
 
-fn update_seen(
+/// Serve attachment `index`. Only images that browsers render safely are
+/// shown inline (`?inline=1`); everything else downloads, under a sandbox
+/// policy, so an attachment can never run in this origin.
+async fn attachment(
+    State(state): State<Shared>,
+    session: Session,
+    Path((folder, uid, index)): Path<(String, String, String)>,
+    Query(query): Query<DetailQuery>,
+) -> Response {
+    let (Ok(uid), Ok(index)) = (uid.parse::<u64>(), index.parse::<usize>()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let inline_requested = query.inline.as_deref() == Some("1");
+    let result = blocking(move || {
+        let (_, messages) = imap_state::load_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
+        let message = messages
+            .into_iter()
+            .find(|message| message.uid == uid)
+            .ok_or_else(|| anyhow::anyhow!("no such message"))?;
+        attachment_data(&std::fs::read(&message.path)?, index)
+            .ok_or_else(|| anyhow::anyhow!("no such attachment"))
+    })
+    .await;
+    let Ok((meta, bytes)) = result else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let previewable = matches!(
+        meta.content_type.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    );
+    let inline = inline_requested && previewable;
+    let content_type = if previewable {
+        meta.content_type.as_str()
+    } else {
+        "application/octet-stream"
+    };
+    let disposition = format!(
+        "{}; filename=\"{}\"; filename*=UTF-8''{}",
+        if inline { "inline" } else { "attachment" },
+        meta.filename
+            .replace(['"', '\\'], "_")
+            .chars()
+            .filter(char::is_ascii)
+            .collect::<String>(),
+        percent_encode(&meta.filename)
+    );
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'; img-src 'self'"),
+    );
+    response
+}
+
+/// The message as stored, headers included: as text to show
+/// (`text/plain`, sandboxed) or, with `?download=1`, as an `.eml` file.
+async fn raw_message(
+    State(state): State<Shared>,
+    session: Session,
+    Path((folder, uid)): Path<(String, String)>,
+    Query(query): Query<RawQuery>,
+) -> Response {
+    let Ok(uid) = uid.parse::<u64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = blocking(move || {
+        let (_, messages) = imap_state::load_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
+        let message = messages
+            .into_iter()
+            .find(|message| message.uid == uid)
+            .ok_or_else(|| anyhow::anyhow!("no such message"))?;
+        Ok(std::fs::read(&message.path)?)
+    })
+    .await;
+    let Ok(bytes) = result else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let download = query.download.as_deref() == Some("1");
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(if download {
+            "message/rfc822"
+        } else {
+            "text/plain; charset=utf-8"
+        }),
+    );
+    if download
+        && let Ok(value) =
+            HeaderValue::from_str(&format!("attachment; filename=\"message-{uid}.eml\""))
+    {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    response
+}
+
+#[derive(Deserialize)]
+struct RawQuery {
+    #[serde(default)]
+    download: Option<String>,
+}
+
+/// RFC 5987 percent-encoding for `filename*`.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct FolderName {
+    name: String,
+}
+
+/// Folder names users may create or rename to: what IMAP accepts, minus INBOX.
+fn valid_new_folder(name: &str) -> Option<String> {
+    let name = name.trim();
+    let normalized = rmail_common::maildir::normalize_mailbox_name(name).ok()?;
+    (!normalized.eq_ignore_ascii_case("INBOX") && normalized.chars().count() <= 200)
+        .then_some(normalized)
+}
+
+async fn create_folder(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+    let Ok(input) = serde_json::from_slice::<FolderName>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let Some(name) = valid_new_folder(&input.name) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "invalid folder name").into_response();
+    };
+    let result = blocking(move || {
+        imap_state::create_folder(&state.mail_root, &session.domain, &session.localpart, &name)
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+/// Only the user's own folders can be renamed or deleted, never INBOX or
+/// special-use folders such as Sent and Trash.
+fn own_folder(
+    root: &std::path::Path,
+    domain: &str,
+    local: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    Ok(imap_state::list_folders(root, domain, local)?
+        .into_iter()
+        .filter(rmail_common::classifier_store::is_user_folder)
+        .find(|folder| folder.name == name)
+        .map(|folder| folder.name))
+}
+
+async fn rename_folder(
+    State(state): State<Shared>,
+    session: Session,
+    Path(folder): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(input) = serde_json::from_slice::<FolderName>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let Some(name) = valid_new_folder(&input.name) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "invalid folder name").into_response();
+    };
+    let result = blocking(move || {
+        let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
+        let Some(current) = own_folder(root, domain, local, &folder)? else {
+            return Ok(false);
+        };
+        imap_state::rename_folder(root, domain, local, &current, &name)?;
+        Ok(true)
+    })
+    .await;
+    match result {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn delete_folder(
+    State(state): State<Shared>,
+    session: Session,
+    Path(folder): Path<String>,
+) -> Response {
+    let result = blocking(move || {
+        let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
+        let Some(current) = own_folder(root, domain, local, &folder)? else {
+            return Ok(false);
+        };
+        imap_state::delete_folder(root, domain, local, &current)?;
+        Ok(true)
+    })
+    .await;
+    match result {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+fn update_flag(
     mail_root: &std::path::Path,
     domain: &str,
     local: &str,
     folder: &str,
     uid: u64,
-    seen: bool,
+    flag: &str,
+    present: bool,
 ) -> Result<()> {
     let (_, messages) = imap_state::load_folder(mail_root, domain, local, folder)?;
     if let Some(message) = messages.into_iter().find(|message| message.uid == uid) {
         let mut flags = message.flags;
-        set_flag(&mut flags, "\\Seen", seen);
+        set_flag(&mut flags, flag, present);
         imap_state::set_uid_flags(mail_root, domain, local, folder, uid, flags)?;
     }
     Ok(())
@@ -708,6 +1077,15 @@ mod tests {
         content_type: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+    }
+
+    impl TestResponse {
+        fn header(&self, name: &str) -> &str {
+            self.headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map_or("", |(_, value)| value.as_str())
+        }
     }
 
     /// Run a request through the real router.
@@ -835,7 +1213,9 @@ mod tests {
         )
         .await;
         assert_eq!(list.status, 200);
-        let items: Vec<MessageListItem> = serde_json::from_slice(&list.body).unwrap();
+        let page: MessagePage = serde_json::from_slice(&list.body).unwrap();
+        assert_eq!(page.total, page.messages.len());
+        let items = page.messages;
         assert_eq!(items.len(), 1);
         let patch = route(
             req(
@@ -1011,6 +1391,296 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_organizing_and_ai_endpoints() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (&state.mail_root, "example.test", "user");
+        imap_state::init_account(root, d, l).unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call = |method: &'static str, path: String, body: Vec<u8>| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move { route(req(method, &path, &body, cookie), &state).await }
+        };
+        let json = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap();
+
+        for n in 0..5 {
+            let raw = format!("From: a@b.test\r\nSubject: Note {n}\r\n\r\nbody {n}");
+            imap_state::deliver_message(root, d, l, raw.as_bytes()).unwrap();
+        }
+        let with_files = b"From: s@b.test\r\nSubject: Files\r\nContent-Type: multipart/mixed; boundary=\"x\"\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n--x\r\nContent-Type: image/png\r\nContent-Disposition: attachment; filename=\"pic.png\"\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n--x\r\nContent-Type: text/html\r\nContent-Disposition: attachment; filename=\"evil.html\"\r\n\r\n<script>alert(1)</script>\r\n--x--\r\n";
+        let (_, files_uid) = imap_state::deliver_message(root, d, l, with_files).unwrap();
+
+        // Paging reports the folder total; search narrows it.
+        let page = json(
+            &call(
+                "GET",
+                "/api/folders/INBOX/messages?limit=2&offset=1".into(),
+                vec![],
+            )
+            .await
+            .body,
+        );
+        assert_eq!(page["total"], 6);
+        assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+        let found = json(
+            &call(
+                "GET",
+                "/api/folders/INBOX/messages?q=note%203".into(),
+                vec![],
+            )
+            .await
+            .body,
+        );
+        assert_eq!(found["total"], 1);
+
+        // Attachments: listed, downloaded under a sandbox, previewed only when safe.
+        let detail = json(
+            &call(
+                "GET",
+                format!("/api/folders/INBOX/messages/{files_uid}"),
+                vec![],
+            )
+            .await
+            .body,
+        );
+        assert_eq!(detail["text_body"], "see attached");
+        let attachments = detail["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 2);
+        let png = attachments[0]["index"].as_u64().unwrap();
+        let html = attachments[1]["index"].as_u64().unwrap();
+        let shown = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{files_uid}/attachments/{png}?inline=1"),
+            vec![],
+        )
+        .await;
+        assert_eq!(shown.status, 200);
+        assert_eq!(shown.header("content-type"), "image/png");
+        assert!(shown.header("content-disposition").starts_with("inline"));
+        assert!(
+            shown
+                .header("content-security-policy")
+                .starts_with("sandbox")
+        );
+        let script = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{files_uid}/attachments/{html}?inline=1"),
+            vec![],
+        )
+        .await;
+        assert_eq!(script.header("content-type"), "application/octet-stream");
+        assert!(
+            script
+                .header("content-disposition")
+                .starts_with("attachment; filename=\"evil.html\"")
+        );
+        let missing = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{files_uid}/attachments/9"),
+            vec![],
+        )
+        .await;
+        assert_eq!(missing.status, 404);
+
+        // Raw source, as text or as an .eml download.
+        let raw = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{files_uid}/raw"),
+            vec![],
+        )
+        .await;
+        assert!(raw.header("content-type").starts_with("text/plain"));
+        assert!(String::from_utf8_lossy(&raw.body).starts_with("From: s@b.test\r\nSubject: Files"));
+        let eml = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{files_uid}/raw?download=1"),
+            vec![],
+        )
+        .await;
+        assert_eq!(eml.header("content-type"), "message/rfc822");
+
+        // Bulk: star, move to an existing folder only, junk.
+        let uids: Vec<u64> = page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["uid"].as_u64().unwrap())
+            .collect();
+        let bulk = |body: String| {
+            call(
+                "POST",
+                "/api/folders/INBOX/messages/bulk".into(),
+                body.into_bytes(),
+            )
+        };
+        assert_eq!(
+            bulk(format!(r#"{{"action":"flag","uids":[{}]}}"#, uids[0]))
+                .await
+                .status,
+            204
+        );
+        let (_, inbox) = imap_state::load_folder(root, d, l, "INBOX").unwrap();
+        assert!(
+            inbox
+                .iter()
+                .find(|m| m.uid == uids[0])
+                .unwrap()
+                .flags
+                .iter()
+                .any(|f| f == "\\Flagged")
+        );
+        assert_eq!(
+            bulk(format!(
+                r#"{{"action":"move","uids":[{}],"target":"Nope"}}"#,
+                uids[0]
+            ))
+            .await
+            .status,
+            422
+        );
+        assert_eq!(
+            call(
+                "POST",
+                "/api/folders".into(),
+                br#"{"name":"Projects"}"#.to_vec()
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            bulk(format!(
+                r#"{{"action":"move","uids":[{}],"target":"Projects"}}"#,
+                uids[0]
+            ))
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            imap_state::load_folder(root, d, l, "Projects")
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        assert_eq!(
+            bulk(format!(r#"{{"action":"junk","uids":[{}]}}"#, uids[1]))
+                .await
+                .status,
+            204
+        );
+        assert_eq!(
+            imap_state::load_folder(root, d, l, "Junk").unwrap().1.len(),
+            1
+        );
+
+        // Folders: create, rename and delete the user's own; never INBOX or system folders.
+        assert_eq!(
+            call(
+                "POST",
+                "/api/folders".into(),
+                br#"{"name":"../x"}"#.to_vec()
+            )
+            .await
+            .status,
+            422
+        );
+        assert_eq!(
+            call(
+                "POST",
+                "/api/folders".into(),
+                br#"{"name":"inbox"}"#.to_vec()
+            )
+            .await
+            .status,
+            422
+        );
+        assert_eq!(
+            call(
+                "PATCH",
+                "/api/folders/Projects".into(),
+                br#"{"name":"Work"}"#.to_vec()
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            call(
+                "PATCH",
+                "/api/folders/Junk".into(),
+                br#"{"name":"Spam"}"#.to_vec()
+            )
+            .await
+            .status,
+            404
+        );
+        assert_eq!(
+            call("DELETE", "/api/folders/INBOX".into(), vec![])
+                .await
+                .status,
+            404
+        );
+        assert_eq!(
+            call("DELETE", "/api/folders/Work".into(), vec![])
+                .await
+                .status,
+            204
+        );
+
+        // AI actions: unavailable without a model, then gated on consent.
+        let ai = |action: &'static str| {
+            call(
+                "POST",
+                format!("/api/folders/INBOX/messages/{files_uid}/ai"),
+                format!(r#"{{"action":"{action}"}}"#).into_bytes(),
+            )
+        };
+        assert_eq!(ai("labels").await.status, 409);
+        let mut conn = rmail_common::settings::open(&state.db_path).unwrap();
+        rmail_common::settings::write_raw(
+            &mut conn,
+            &[
+                (
+                    "classifier.enabled".to_string(),
+                    Some(serde_json::Value::from(true)),
+                ),
+                (
+                    "classifier.chat_provider".to_string(),
+                    Some(serde_json::Value::from("jev")),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(ai("summary").await.status, 409, "Jev cannot summarize");
+        let refused = ai("labels").await;
+        assert_eq!(refused.status, 403);
+        assert_eq!(String::from_utf8_lossy(&refused.body), "consent:typesafe");
+        let overview = json(&call("GET", "/api/organize".into(), vec![]).await.body);
+        assert_eq!(
+            (
+                overview["ai_labels"].as_bool(),
+                overview["ai_summary"].as_bool()
+            ),
+            (Some(true), Some(false))
+        );
+        call(
+            "PUT",
+            "/api/organize".into(),
+            br#"{"enabled":false,"cloud_consent":true}"#.to_vec(),
+        )
+        .await;
+        // Consented, but no classifier daemon is running in the test.
+        assert_eq!(ai("labels").await.status, 502);
+    }
+
+    #[tokio::test]
     async fn labels_are_their_own_setting_and_suggest_folders() {
         use rmail_common::classifier_store as store;
         let td = tempfile::tempdir().unwrap();
@@ -1082,8 +1752,8 @@ mod tests {
                 .await
                 .body,
         );
-        assert_eq!(listed[0]["labels"][0]["name"], "To do");
-        assert_eq!(listed[0]["labels"][0]["keyword"], "To_do");
+        assert_eq!(listed["messages"][0]["labels"][0]["name"], "To do");
+        assert_eq!(listed["messages"][0]["labels"][0]["keyword"], "To_do");
         let path = format!("/api/folders/INBOX/messages/{uid}");
         let removed = call(
             "PATCH",

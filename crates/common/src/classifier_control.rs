@@ -28,6 +28,25 @@ pub enum Request {
     TestEmbed { text: String },
     /// Pick one of `folders` for `text` with the active chat model.
     TestChat { text: String, folders: Vec<String> },
+    /// Which of `labels` apply to `text` (and, with `may_propose`, a new
+    /// label when none fits), from the fallback model. Webmail's "preview
+    /// labels" action.
+    Label {
+        text: String,
+        labels: Vec<LabelSpec>,
+        #[serde(default)]
+        may_propose: bool,
+    },
+    /// A short summary of `text` from the fallback model, which must be one
+    /// that writes text (not Jev).
+    Summarize { text: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LabelSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

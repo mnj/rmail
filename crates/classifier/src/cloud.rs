@@ -10,7 +10,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, Labeling, l2_normalize};
-use crate::prompt::{label_prompt, parse_answer, parse_labels, quoted_examples, system_prompt};
+use crate::prompt::{
+    SUMMARY_PROMPT, label_prompt, parse_answer, parse_labels, quoted_examples, system_prompt,
+    tidy_summary,
+};
 
 pub const TYPESAFE_API: &str = "https://api.typesafe.ai/v1";
 
@@ -299,6 +302,19 @@ impl Chooser for OpenAiChooser {
             },
         });
         Ok(parse_labels(&self.complete(body)?, labels, may_propose))
+    }
+
+    fn summarize(&self, message: &str) -> Result<String> {
+        let body = json!({
+            "model": self.model,
+            "temperature": 0.2,
+            "max_tokens": 220,
+            "messages": [
+                { "role": "system", "content": SUMMARY_PROMPT },
+                { "role": "user", "content": message },
+            ],
+        });
+        Ok(tidy_summary(&self.complete(body)?))
     }
 }
 
@@ -641,6 +657,20 @@ mod tests {
         let schema = &request["response_format"]["json_schema"]["schema"];
         assert_eq!(schema["required"], json!(["labels", "new_label"]));
         assert!(schema["properties"]["new_label"]["anyOf"].is_array());
+    }
+
+    #[test]
+    fn chat_summaries_are_plain_text_and_jev_declines() {
+        let reply =
+            json!({"choices": [{"message": {"content": "Summary: Invoice 42 is due Friday."}}]});
+        let (base, requests) = serve(vec![(200, reply.to_string())]);
+        let chooser = OpenAiChooser::load(&base, "k", "m").unwrap();
+        assert_eq!(chooser.summarize("…").unwrap(), "Invoice 42 is due Friday.");
+        let (_, request) = requests.recv().unwrap();
+        assert!(request.get("response_format").is_none());
+        assert_eq!(request["messages"][0]["content"], SUMMARY_PROMPT);
+        let jev = JevChooser::load(TYPESAFE_API, "k", "").unwrap();
+        assert!(jev.summarize("…").is_err());
     }
 
     #[test]

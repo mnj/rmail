@@ -180,10 +180,20 @@ pub fn mailbox_dir(
     let normalized = normalize_mailbox_name(mailbox)?;
     let root = account_maildir(maildir_root, domain, localpart);
     if normalized.eq_ignore_ascii_case("INBOX") {
-        Ok(root)
-    } else {
-        Ok(root.join(format!(".{}", normalized)))
+        return Ok(root);
     }
+    let dir = root.join(format!(".{}", normalized));
+    // normalize_mailbox_name already rules out traversal; check the result
+    // too, so no name can ever resolve outside the account's Maildir.
+    let inside = dir.strip_prefix(&root).is_ok_and(|relative| {
+        relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    });
+    if !inside || !dir.starts_with(&root) {
+        return Err(anyhow::anyhow!("invalid mailbox name"));
+    }
+    Ok(dir)
 }
 
 pub fn normalize_mailbox_name(mailbox: &str) -> anyhow::Result<String> {

@@ -98,6 +98,22 @@ pub fn label_prompt(labels: &[LabelHint], may_propose: bool) -> String {
     text
 }
 
+pub const SUMMARY_PROMPT: &str = "Summarize the email below for its recipient in one to three short \
+     sentences, in the email's own language. Say what it is about and anything the recipient must \
+     do or note, such as deadlines or amounts. No preamble, no quotes, no markdown.";
+
+/// A summary as a model wrote it, tidied: trimmed, without a leading
+/// "Summary:" and at most 600 characters.
+pub fn tidy_summary(raw: &str) -> String {
+    let text = raw.trim();
+    let text = text
+        .strip_prefix("Summary:")
+        .or_else(|| text.strip_prefix("summary:"))
+        .unwrap_or(text)
+        .trim();
+    text.chars().take(600).collect()
+}
+
 /// Read a `{"labels": [{"name", "confidence"}], "new_label": ...}` answer.
 /// Names not in `labels` are ignored, as are repeats; a proposal is only
 /// kept when `may_propose` and it is not an existing label.

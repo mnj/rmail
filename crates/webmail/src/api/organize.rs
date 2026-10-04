@@ -22,6 +22,7 @@ pub(crate) fn routes() -> Router<Shared> {
     Router::new()
         .route("/api/organize", get(overview).put(save))
         .route("/api/organize/folders", post(create_folder))
+        .route("/api/organize/labels", post(add_label))
         .route("/api/suggestions/accept-all", post(accept_all))
         .route("/api/suggestions/{uid}/accept", post(accept))
         .route("/api/suggestions/{uid}/dismiss", post(dismiss))
@@ -125,6 +126,9 @@ struct Overview {
     labels_cloud: bool,
     /// Whether the administrator configured a model that can apply labels.
     labels_available: bool,
+    /// Per-message AI actions this server offers (see [`ai_action`]).
+    ai_labels: bool,
+    ai_summary: bool,
     labels_enabled: bool,
     labels: Vec<LabelView>,
     folder_ideas: Vec<FolderIdea>,
@@ -205,6 +209,8 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
             cloud_required: models.embed_cloud.is_some(),
             labels_cloud: models.chat_cloud.is_some(),
             labels_available: models.chat_configured,
+            ai_labels: server_enabled && models.chat_configured,
+            ai_summary: server_enabled && models.chat_writes_text,
             cloud_providers,
             labels_enabled: prefs.labels_enabled,
             labels: labels
@@ -282,7 +288,12 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
         // Opting out of an account that never opted in leaves no file behind.
         let conn = match existing {
             Some(conn) => conn,
-            None if input.enabled || labels_on || input.labels.is_some() => {
+            // Consent alone is worth keeping: on-demand AI actions need it.
+            None if input.enabled
+                || labels_on
+                || input.labels.is_some()
+                || input.cloud_consent == Some(true) =>
+            {
                 store::open_or_create(root, domain, local)?
             }
             None => return Ok(Ok(())),
@@ -483,6 +494,250 @@ async fn accept_all(State(state): State<Shared>, session: Session) -> Response {
     .await;
     match result {
         Ok(moved) => Json(serde_json::json!({ "moved": moved })).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-message AI actions
+
+#[derive(Deserialize)]
+struct AiRequest {
+    /// `labels` or `summary`.
+    action: String,
+}
+
+#[derive(Serialize)]
+struct LabelGuess {
+    name: String,
+    /// The IMAP keyword, when the label exists.
+    keyword: Option<String>,
+    probability: f64,
+    /// Whether the message already carries the label.
+    applied: bool,
+}
+
+fn setting(db_path: &std::path::Path, key: &str) -> Option<serde_json::Value> {
+    rmail_common::settings::open(db_path)
+        .and_then(|conn| rmail_common::settings::get(&conn, key))
+        .ok()
+        .flatten()
+}
+
+/// The text a model sees: sender, subject and the start of the body.
+fn model_text(parsed: &rmail_common::mime::ParsedMessage, max_bytes: usize) -> String {
+    let body = parsed
+        .text_body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut text = format!(
+        "From: {}\nSubject: {}\n\n{}",
+        parsed.from, parsed.subject, body
+    );
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// Run an AI action on one message on demand: preview which labels apply,
+/// or summarize it. Uses the server's fallback model, and a cloud model
+/// only for users who agreed to that provider.
+pub(crate) async fn ai_action(
+    State(state): State<Shared>,
+    session: Session,
+    Path((folder, uid)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let Ok(uid) = uid.parse::<u64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(input) = serde_json::from_slice::<AiRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let summary = match input.action.as_str() {
+        "summary" => true,
+        "labels" => false,
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    let shared = state.clone();
+    let prepared = blocking(move || {
+        let state = shared;
+        let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
+        let (server_enabled, models) = server_settings(&state.db_path);
+        let available = if summary {
+            models.chat_writes_text
+        } else {
+            models.chat_configured
+        };
+        if !server_enabled || !available {
+            return Ok(Err((
+                StatusCode::CONFLICT,
+                "this server has no AI model for that".to_string(),
+            )));
+        }
+        let conn = store::open_existing(root, domain, local)?;
+        let prefs = match &conn {
+            Some(conn) => store::prefs(conn)?,
+            None => Prefs::default(),
+        };
+        if let Some(provider) = models.chat_cloud
+            && !prefs.allows_cloud(&[provider])
+        {
+            return Ok(Err((StatusCode::FORBIDDEN, format!("consent:{provider}"))));
+        }
+        let (_, messages) = imap_state::load_folder(root, domain, local, &folder)?;
+        let Some(message) = messages.into_iter().find(|message| message.uid == uid) else {
+            return Ok(Err((StatusCode::NOT_FOUND, "no such message".to_string())));
+        };
+        let parsed = rmail_common::mime::parse_message(&std::fs::read(&message.path)?);
+        let max_input = setting(&state.db_path, "classifier.max_input_bytes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(2048) as usize;
+        let text = model_text(
+            &parsed,
+            if summary {
+                max_input.max(8192)
+            } else {
+                max_input
+            },
+        );
+        let mut labels = match &conn {
+            Some(conn) => store::labels(conn)?,
+            None => Vec::new(),
+        };
+        if labels.is_empty() {
+            // Preview with the starter labels for users who have none yet.
+            labels = store::STARTER_LABELS
+                .iter()
+                .map(|(name, description)| store::Label {
+                    name: name.to_string(),
+                    keyword: store::keyword_for(name),
+                    description: description.to_string(),
+                    origin: store::ORIGIN_STARTER.to_string(),
+                })
+                .collect();
+        }
+        let may_propose = setting(&state.db_path, "classifier.label_discovery")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        Ok(Ok((text, labels, message.flags, may_propose)))
+    })
+    .await;
+    let (text, labels, flags, may_propose) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err((status, message))) => return (status, message).into_response(),
+        Err(error) => return internal_error(error),
+    };
+    let socket = rmail_common::classifier_control::socket_path(&state.mail_root);
+    let request = if summary {
+        rmail_common::classifier_control::Request::Summarize { text }
+    } else {
+        rmail_common::classifier_control::Request::Label {
+            text,
+            labels: labels
+                .iter()
+                .map(|label| rmail_common::classifier_control::LabelSpec {
+                    name: label.name.clone(),
+                    description: label.description.clone(),
+                })
+                .collect(),
+            may_propose,
+        }
+    };
+    let reply = match rmail_common::classifier_control::call(
+        &socket,
+        &request,
+        std::time::Duration::from_secs(90),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => return (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
+    };
+    if summary {
+        return Json(serde_json::json!({
+            "summary": reply["summary"],
+            "model": reply["model"],
+        }))
+        .into_response();
+    }
+    let threshold = setting(&state.db_path, "classifier.label_confidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(70.0)
+        / 100.0;
+    let mut guesses: Vec<LabelGuess> = reply["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|pair| {
+            let name = pair.get(0)?.as_str()?.to_string();
+            let probability = pair.get(1)?.as_f64()?;
+            let keyword = labels
+                .iter()
+                .find(|label| label.name == name)
+                .map(|label| label.keyword.clone());
+            Some(LabelGuess {
+                applied: keyword.as_deref().is_some_and(|keyword| {
+                    flags.iter().any(|flag| flag.eq_ignore_ascii_case(keyword))
+                }),
+                keyword,
+                probability,
+                name,
+            })
+        })
+        .collect();
+    guesses.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+    Json(serde_json::json!({
+        "labels": guesses,
+        "threshold": threshold,
+        "proposed": reply["proposed"],
+        "model": reply["model"],
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct NewLabel {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Add one label (for example one the AI proposed in a preview) and return
+/// it with its keyword.
+async fn add_label(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+    let Ok(input) = serde_json::from_slice::<NewLabel>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let result = blocking(move || {
+        let conn = store::open_or_create(&state.mail_root, &session.domain, &session.localpart)?;
+        let mut pairs: Vec<(String, String)> = store::labels(&conn)?
+            .into_iter()
+            .map(|label| (label.name, label.description))
+            .collect();
+        if !pairs
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(input.name.trim()))
+        {
+            pairs.push((input.name.clone(), input.description.clone()));
+        }
+        Ok(store::set_labels(&conn, &pairs, None).map(|labels| {
+            labels
+                .into_iter()
+                .find(|label| label.name.eq_ignore_ascii_case(input.name.trim()))
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(label))) => Json(label).into_response(),
+        Ok(Ok(None)) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        Ok(Err(error)) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
         Err(error) => internal_error(error),
     }
 }

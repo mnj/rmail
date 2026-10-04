@@ -18,7 +18,10 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
 use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, Labeling, l2_normalize};
-use crate::prompt::{json_escape, label_prompt, parse_answer, parse_labels, system_prompt};
+use crate::prompt::{
+    SUMMARY_PROMPT, json_escape, label_prompt, parse_answer, parse_labels, system_prompt,
+    tidy_summary,
+};
 use rmail_common::classifier_models;
 
 /// llama.cpp allows one backend per process.
@@ -156,6 +159,7 @@ const CHAT_CTX: u32 = 4096;
 const MAX_ANSWER_TOKENS: usize = 96;
 /// Room for a dozen `{"name", "confidence"}` items.
 const MAX_LABEL_TOKENS: usize = 320;
+const MAX_SUMMARY_TOKENS: usize = 200;
 
 impl LlamaChooser {
     pub fn load(models_dir: &Path, file: &str, threads: u32) -> Result<Self> {
@@ -187,7 +191,7 @@ impl LlamaChooser {
         &self,
         system: String,
         message: &str,
-        grammar: &str,
+        grammar: Option<&str>,
         max_tokens: usize,
         done: impl Fn(&str) -> bool,
     ) -> Result<String> {
@@ -220,11 +224,14 @@ impl LlamaChooser {
         }
         ctx.decode(&mut batch).context("evaluating prompt")?;
 
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::grammar(&self.model, grammar, "root")
-                .map_err(|error| anyhow!("building grammar: {error:?}"))?,
-            LlamaSampler::greedy(),
-        ]);
+        let mut sampler = match grammar {
+            Some(grammar) => LlamaSampler::chain_simple([
+                LlamaSampler::grammar(&self.model, grammar, "root")
+                    .map_err(|error| anyhow!("building grammar: {error:?}"))?,
+                LlamaSampler::greedy(),
+            ]),
+            None => LlamaSampler::greedy(),
+        };
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut answer = String::new();
         let mut index = batch.n_tokens() - 1;
@@ -263,7 +270,7 @@ impl Chooser for LlamaChooser {
         let answer = self.generate(
             system_prompt(folders),
             message,
-            &answer_grammar(folders),
+            Some(&answer_grammar(folders)),
             MAX_ANSWER_TOKENS,
             json_complete,
         )?;
@@ -277,11 +284,22 @@ impl Chooser for LlamaChooser {
         let answer = self.generate(
             label_prompt(labels, may_propose),
             message,
-            &label_grammar(labels, may_propose),
+            Some(&label_grammar(labels, may_propose)),
             MAX_LABEL_TOKENS,
             json_complete,
         )?;
         Ok(parse_labels(&answer, labels, may_propose))
+    }
+
+    fn summarize(&self, message: &str) -> Result<String> {
+        let answer = self.generate(
+            SUMMARY_PROMPT.to_string(),
+            message,
+            None,
+            MAX_SUMMARY_TOKENS,
+            |_| false,
+        )?;
+        Ok(tidy_summary(&answer))
     }
 }
 
@@ -463,7 +481,7 @@ mod tests {
                 .generate(
                     label_prompt(&labels, propose),
                     "Invoice 42 is due Friday",
-                    &label_grammar(&labels, propose),
+                    Some(&label_grammar(&labels, propose)),
                     MAX_LABEL_TOKENS,
                     json_complete,
                 )
@@ -475,6 +493,9 @@ mod tests {
             assert_eq!(value.get("new_label").is_some(), propose, "{answer}");
             eprintln!("propose={propose}: {answer}");
         }
+        // Free text ends at end of generation or the token budget.
+        let summary = chooser.summarize("Invoice 42 is due Friday").unwrap();
+        assert!(summary.chars().count() <= 600, "{summary}");
     }
 
     /// End-to-end with real models. Set `RMAIL_TEST_MODEL_DIR` to a directory

@@ -33,6 +33,10 @@ pub trait Chooser: Send + Sync {
     /// left out have probability zero. With `may_propose`, a model that
     /// writes text may also propose one new label when none fits.
     fn label(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Result<Labeling>;
+    /// A short summary of `message`, for models that write text.
+    fn summarize(&self, _message: &str) -> Result<String> {
+        anyhow::bail!("this model picks from options and cannot write summaries")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

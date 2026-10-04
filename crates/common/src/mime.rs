@@ -2,96 +2,292 @@
 //! transfer encodings, inline images, and sanitizing HTML for the webmail
 //! reader. Shared by webmail and the mail classifier.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use base64::Engine;
+use serde::Serialize;
+
+/// Nested multipart levels followed; deeper parts are ignored.
+const MAX_DEPTH: usize = 12;
 
 #[derive(Default)]
 pub struct ParsedMessage {
     pub from: String,
     pub to: String,
+    pub cc: String,
+    pub reply_to: String,
     pub subject: String,
     pub date: String,
     pub list_id: String,
+    pub message_id: String,
+    pub in_reply_to: String,
+    pub references: String,
     pub text_body: String,
     pub html_body: Option<String>,
     pub inline_images: HashMap<String, String>,
+    pub attachments: Vec<Attachment>,
 }
 
-#[derive(Default)]
-struct MultipartParsed {
-    text_body: Option<String>,
-    html_body: Option<String>,
-    inline_images: HashMap<String, String>,
+/// A part of the message offered for download.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Attachment {
+    /// Position among the message's leaf parts; stable for a given message.
+    pub index: usize,
+    pub filename: String,
+    /// Lower-case `type/subtype`.
+    pub content_type: String,
+    /// Decoded size in bytes.
+    pub size: usize,
+    /// `Content-Disposition: inline` (shown in the body by some clients).
+    pub inline: bool,
+}
+
+/// A non-multipart part: its headers and still-encoded body.
+struct Leaf<'a> {
+    headers: HashMap<String, String>,
+    body: &'a [u8],
+}
+
+impl Leaf<'_> {
+    fn content_type(&self) -> String {
+        self.headers
+            .get("content-type")
+            .and_then(|value| value.split(';').next())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| value.contains('/'))
+            .unwrap_or_else(|| "text/plain".to_string())
+    }
+
+    fn param(&self, header: &str, name: &str) -> Option<String> {
+        self.headers
+            .get(header)
+            .and_then(|value| header_params(value).remove(name))
+    }
+
+    fn disposition(&self) -> String {
+        self.headers
+            .get("content-disposition")
+            .and_then(|value| value.split(';').next())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
+    fn filename(&self) -> Option<String> {
+        self.param("content-disposition", "filename")
+            .or_else(|| self.param("content-type", "name"))
+            .map(|name| sanitize_filename(&name))
+            .filter(|name| !name.is_empty())
+    }
+
+    fn decoded(&self) -> Vec<u8> {
+        let encoding = self
+            .headers
+            .get("content-transfer-encoding")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        decode_transfer_bytes(self.body, &encoding)
+    }
+
+    fn text(&self) -> String {
+        decode_charset(
+            &self.decoded(),
+            self.param("content-type", "charset").as_deref(),
+        )
+    }
 }
 
 pub fn parse_message(bytes: &[u8]) -> ParsedMessage {
-    let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
-    let (headers, body) = text.split_once("\n\n").unwrap_or(("", &text));
-    parse_message_parts(headers, body)
-}
-
-fn parse_message_parts(headers: &str, body: &str) -> ParsedMessage {
+    let (head, body) = split_head(bytes);
+    let headers = parse_headers(head);
     let mut parsed = ParsedMessage::default();
-    let header_map = parse_headers(headers);
-    parsed.from = header_map.get("from").cloned().unwrap_or_default();
-    parsed.to = header_map.get("to").cloned().unwrap_or_default();
-    parsed.subject = header_map.get("subject").cloned().unwrap_or_default();
-    parsed.date = header_map.get("date").cloned().unwrap_or_default();
-    parsed.list_id = header_map.get("list-id").cloned().unwrap_or_default();
+    let get = |name: &str| headers.get(name).cloned().unwrap_or_default();
+    parsed.from = get("from");
+    parsed.to = get("to");
+    parsed.cc = get("cc");
+    parsed.reply_to = get("reply-to");
+    parsed.subject = get("subject");
+    parsed.date = get("date");
+    parsed.list_id = get("list-id");
+    parsed.message_id = get("message-id");
+    parsed.in_reply_to = get("in-reply-to");
+    parsed.references = get("references");
 
-    let content_type_raw = header_map
-        .get("content-type")
-        .cloned()
-        .unwrap_or_else(|| "text/plain".to_string());
-    let content_type = content_type_raw.to_ascii_lowercase();
-    let transfer_encoding = header_map
-        .get("content-transfer-encoding")
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let (text_body, html_body, inline_images) = if content_type.starts_with("multipart/") {
-        if let Some(boundary) = header_param(&content_type_raw, "boundary") {
-            let multipart = parse_multipart_body(body, &boundary);
-            (
-                multipart.text_body.unwrap_or_else(|| {
-                    multipart
-                        .html_body
-                        .as_deref()
-                        .map(strip_html)
-                        .unwrap_or_default()
-                }),
-                multipart.html_body,
-                multipart.inline_images,
-            )
+    let mut parts = Vec::new();
+    collect_leaves(headers, body, 0, &mut parts);
+    let mut text = None;
+    let mut html = None;
+    for (index, part) in parts.iter().enumerate() {
+        let content_type = part.content_type();
+        let disposition = part.disposition();
+        let filename = part.filename();
+        let body_candidate = disposition != "attachment" && filename.is_none();
+        if body_candidate && content_type == "text/plain" && text.is_none() {
+            text = Some(part.text());
+        } else if body_candidate && content_type == "text/html" && html.is_none() {
+            html = Some(part.text());
+        } else if content_type.starts_with("image/")
+            && disposition != "attachment"
+            && let Some(cid) = part.headers.get("content-id")
+        {
+            let cid = cid.trim().trim_matches(['<', '>']).to_string();
+            parsed.inline_images.insert(
+                cid,
+                format!(
+                    "data:{content_type};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(part.decoded())
+                ),
+            );
         } else {
-            (
-                decode_transfer_text(body, &transfer_encoding),
-                None,
-                HashMap::new(),
-            )
+            let decoded_len = part.decoded().len();
+            if decoded_len == 0 && filename.is_none() {
+                continue;
+            }
+            parsed.attachments.push(Attachment {
+                index,
+                filename: filename.unwrap_or_else(|| default_filename(&content_type, index)),
+                content_type,
+                size: decoded_len,
+                inline: disposition == "inline",
+            });
         }
-    } else {
-        let decoded = decode_transfer_text(body, &transfer_encoding);
-        if content_type.contains("text/html") {
-            (strip_html(decoded.trim()), Some(decoded), HashMap::new())
-        } else {
-            (decoded, None, HashMap::new())
-        }
-    };
-
-    parsed.text_body = text_body.trim().to_string();
-    parsed.inline_images = inline_images;
-    parsed.html_body =
-        html_body.map(|html| apply_inline_images(html.trim(), &parsed.inline_images));
+    }
+    parsed.text_body = text
+        .unwrap_or_else(|| html.as_deref().map(strip_html).unwrap_or_default())
+        .trim()
+        .to_string();
+    parsed.html_body = html.map(|html| apply_inline_images(html.trim(), &parsed.inline_images));
     parsed
 }
 
-fn parse_headers(headers: &str) -> HashMap<String, String> {
+/// The decoded bytes of attachment `index` (see [`Attachment::index`]).
+pub fn attachment_data(bytes: &[u8], index: usize) -> Option<(Attachment, Vec<u8>)> {
+    parse_message(bytes)
+        .attachments
+        .into_iter()
+        .find(|attachment| attachment.index == index)
+        .and_then(|attachment| {
+            let (head, body) = split_head(bytes);
+            let mut parts = Vec::new();
+            collect_leaves(parse_headers(head), body, 0, &mut parts);
+            parts.get(index).map(|part| (attachment, part.decoded()))
+        })
+}
+
+/// A file name safe to offer for download: no directories or control
+/// characters, at most 200 characters.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .take(200)
+        .collect()
+}
+
+fn default_filename(content_type: &str, index: usize) -> String {
+    let extension = match content_type {
+        "message/rfc822" => "eml",
+        "text/calendar" => "ics",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/html" => "html",
+        other => other.rsplit('/').next().unwrap_or("bin"),
+    };
+    format!("attachment-{}.{extension}", index + 1)
+}
+
+/// Split at the first empty line (CRLF or LF).
+fn split_head(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let crlf = find(bytes, b"\r\n\r\n").map(|i| (i, 4));
+    let lf = find(bytes, b"\n\n").map(|i| (i, 2));
+    match (crlf, lf) {
+        (Some(a), Some(b)) => {
+            let (i, n) = if a.0 <= b.0 { a } else { b };
+            (&bytes[..i], &bytes[i + n..])
+        }
+        (Some((i, n)), None) | (None, Some((i, n))) => (&bytes[..i], &bytes[i + n..]),
+        (None, None) => (bytes, &[]),
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn collect_leaves<'a>(
+    headers: HashMap<String, String>,
+    body: &'a [u8],
+    depth: usize,
+    out: &mut Vec<Leaf<'a>>,
+) {
+    let content_type = headers.get("content-type").cloned().unwrap_or_default();
+    if content_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("multipart/")
+        && depth < MAX_DEPTH
+        && let Some(boundary) = header_params(&content_type).remove("boundary")
+    {
+        for part in split_multipart(body, boundary.as_bytes()) {
+            let (head, body) = split_head(part);
+            collect_leaves(parse_headers(head), body, depth + 1, out);
+        }
+        return;
+    }
+    out.push(Leaf { headers, body });
+}
+
+/// The parts between `--boundary` delimiter lines, up to `--boundary--`.
+fn split_multipart<'a>(body: &'a [u8], boundary: &[u8]) -> Vec<&'a [u8]> {
+    let mut delimiter = b"--".to_vec();
+    delimiter.extend_from_slice(boundary);
+    let mut parts = Vec::new();
+    let mut part_start: Option<usize> = None;
+    let mut line_start = 0;
+    while line_start < body.len() {
+        let line_end = body[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(body.len(), |i| line_start + i + 1);
+        let line = &body[line_start..line_end];
+        if line.starts_with(&delimiter) {
+            if let Some(start) = part_start {
+                let mut end = line_start;
+                if end > start && body[end - 1] == b'\n' {
+                    end -= 1;
+                }
+                if end > start && body[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                parts.push(&body[start..end.max(start)]);
+            }
+            if line[delimiter.len()..].starts_with(b"--") {
+                return parts;
+            }
+            part_start = Some(line_end);
+        }
+        line_start = line_end;
+    }
+    // A missing closing delimiter still yields the last part.
+    if let Some(start) = part_start
+        && start < body.len()
+    {
+        parts.push(&body[start..]);
+    }
+    parts
+}
+
+fn parse_headers(head: &[u8]) -> HashMap<String, String> {
+    let text = String::from_utf8_lossy(head);
     let mut out = HashMap::new();
     let mut current_name: Option<String> = None;
     let mut current_value = String::new();
-    for line in headers.lines() {
+    for line in text.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
             if !current_value.is_empty() {
                 current_value.push(' ');
@@ -100,7 +296,8 @@ fn parse_headers(headers: &str) -> HashMap<String, String> {
             continue;
         }
         if let Some(name) = current_name.take() {
-            out.insert(name, decode_rfc2047_words(current_value.trim()));
+            out.entry(name)
+                .or_insert_with(|| decode_rfc2047_words(current_value.trim()));
             current_value.clear();
         }
         let Some((name, value)) = line.split_once(':') else {
@@ -110,98 +307,171 @@ fn parse_headers(headers: &str) -> HashMap<String, String> {
         current_value.push_str(value.trim());
     }
     if let Some(name) = current_name {
-        out.insert(name, decode_rfc2047_words(current_value.trim()));
+        out.entry(name)
+            .or_insert_with(|| decode_rfc2047_words(current_value.trim()));
     }
     out
 }
 
-fn header_param(content_type: &str, name: &str) -> Option<String> {
-    for part in content_type.split(';').skip(1) {
-        let (k, v) = part.trim().split_once('=')?;
-        if k.trim().eq_ignore_ascii_case(name) {
-            return Some(v.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-fn parse_multipart_body(body: &str, boundary: &str) -> MultipartParsed {
-    let marker = format!("--{boundary}");
-    let mut parsed = MultipartParsed::default();
-    for raw_part in body.split(&marker).skip(1) {
-        let part = raw_part.trim_start_matches('\n').trim_end();
-        if part.starts_with("--") {
+/// Parameters of a structured header (`type/sub; a=1; b="x;y"`), with names
+/// lower-cased, quotes removed, and RFC 2231 extended and continued values
+/// (`name*=utf-8''..`, `name*0*=..`) decoded.
+fn header_params(value: &str) -> HashMap<String, String> {
+    let mut raw: Vec<(String, String)> = Vec::new();
+    let mut rest = match value.find(';') {
+        Some(i) => &value[i + 1..],
+        None => return HashMap::new(),
+    };
+    while !rest.trim().is_empty() {
+        let Some(eq) = rest.find('=') else {
             break;
-        }
-        let Some((part_headers, part_body)) = part.split_once("\n\n") else {
-            continue;
         };
-        let headers = parse_headers(part_headers);
-        let content_type_raw = headers
-            .get("content-type")
-            .cloned()
-            .unwrap_or_else(|| "text/plain".to_string());
-        let content_type = content_type_raw.to_ascii_lowercase();
-        let transfer_encoding = headers
-            .get("content-transfer-encoding")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if content_type.starts_with("multipart/") {
-            if let Some(boundary) = header_param(&content_type_raw, "boundary") {
-                let nested = parse_multipart_body(part_body, &boundary);
-                if parsed.text_body.is_none() {
-                    parsed.text_body = nested.text_body;
+        let name = rest[..eq]
+            .trim()
+            .trim_start_matches(';')
+            .trim()
+            .to_ascii_lowercase();
+        let after = rest[eq + 1..].trim_start();
+        let (val, next) = if let Some(quoted) = after.strip_prefix('"') {
+            let mut out = String::new();
+            let mut chars = quoted.char_indices();
+            let mut end = quoted.len();
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => {
+                        if let Some((_, escaped)) = chars.next() {
+                            out.push(escaped);
+                        }
+                    }
+                    '"' => {
+                        end = i + 1;
+                        break;
+                    }
+                    _ => out.push(c),
                 }
-                if parsed.html_body.is_none() {
-                    parsed.html_body = nested.html_body;
-                }
-                parsed.inline_images.extend(nested.inline_images);
             }
+            let remainder = &quoted[end.min(quoted.len())..];
+            (out, remainder.find(';').map_or("", |i| &remainder[i + 1..]))
+        } else {
+            match after.find(';') {
+                Some(i) => (after[..i].trim().to_string(), &after[i + 1..]),
+                None => (after.trim().to_string(), ""),
+            }
+        };
+        if !name.is_empty() {
+            raw.push((name, val));
+        }
+        rest = next;
+    }
+
+    let mut params = HashMap::new();
+    let mut continued: BTreeMap<String, BTreeMap<u32, (bool, String)>> = BTreeMap::new();
+    for (name, value) in raw {
+        let (base, extended) = match name.strip_suffix('*') {
+            Some(base) => (base.to_string(), true),
+            None => (name.clone(), false),
+        };
+        if let Some((stem, n)) = base.rsplit_once('*')
+            && let Ok(n) = n.parse::<u32>()
+        {
+            continued
+                .entry(stem.to_string())
+                .or_default()
+                .insert(n, (extended, value));
             continue;
         }
-
-        let decoded = decode_transfer_text(part_body, &transfer_encoding);
-        if content_type.starts_with("image/") {
-            if let Some(cid) = headers
-                .get("content-id")
-                .map(|v| v.trim().trim_matches('<').trim_matches('>').to_string())
-            {
-                let bytes = decode_transfer_bytes(part_body, &transfer_encoding);
-                parsed.inline_images.insert(
-                    cid,
-                    format!(
-                        "data:{};base64,{}",
-                        content_type_raw
-                            .split(';')
-                            .next()
-                            .unwrap_or("application/octet-stream"),
-                        base64::engine::general_purpose::STANDARD.encode(bytes)
-                    ),
-                );
+        let value = if extended {
+            decode_rfc2231(&value, None)
+        } else {
+            value
+        };
+        params.insert(base, value);
+    }
+    for (name, pieces) in continued {
+        // The charset is given on the first extended piece only.
+        let mut charset = None;
+        let mut bytes = Vec::new();
+        for (n, (extended, value)) in pieces {
+            if extended {
+                let encoded = if n == 0 {
+                    let mut fields = value.splitn(3, '\'');
+                    match (fields.next(), fields.next(), fields.next()) {
+                        (Some(cs), Some(_), Some(text)) => {
+                            charset = Some(cs.to_string());
+                            text.to_string()
+                        }
+                        _ => value,
+                    }
+                } else {
+                    value
+                };
+                bytes.extend(percent_decode(&encoded));
+            } else {
+                bytes.extend(value.into_bytes());
             }
-        } else if content_type.contains("text/plain") && parsed.text_body.is_none() {
-            parsed.text_body = Some(decoded);
-        } else if content_type.contains("text/html") && parsed.html_body.is_none() {
-            parsed.html_body = Some(decoded);
+        }
+        params
+            .entry(name)
+            .or_insert_with(|| decode_charset(&bytes, charset.as_deref()));
+    }
+    params
+}
+
+/// `charset'lang'percent-encoded` (RFC 2231).
+fn decode_rfc2231(value: &str, charset: Option<&str>) -> String {
+    let mut fields = value.splitn(3, '\'');
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(cs), Some(_), Some(text)) => decode_charset(&percent_decode(text), Some(cs)),
+        _ => decode_charset(&percent_decode(value), charset),
+    }
+}
+
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len() + 1
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|b| hex_val(*b)),
+                bytes.get(i + 2).and_then(|b| hex_val(*b)),
+            )
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
     }
-    parsed
+    out
 }
 
-fn decode_transfer_text(input: &str, encoding: &str) -> String {
-    String::from_utf8_lossy(&decode_transfer_bytes(input, encoding)).to_string()
+/// Text in `charset` (any label encoding_rs knows; UTF-8 when absent or
+/// unknown), with malformed sequences replaced.
+fn decode_charset(bytes: &[u8], charset: Option<&str>) -> String {
+    let encoding = charset
+        .and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    encoding.decode(bytes).0.into_owned()
 }
 
-fn decode_transfer_bytes(input: &str, encoding: &str) -> Vec<u8> {
+fn decode_transfer_bytes(input: &[u8], encoding: &str) -> Vec<u8> {
     if encoding.contains("quoted-printable") {
-        decode_quoted_printable(input.as_bytes())
+        decode_quoted_printable(input)
     } else if encoding.contains("base64") {
-        let compact = input.split_whitespace().collect::<String>();
+        let compact: Vec<u8> = input
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
         base64::engine::general_purpose::STANDARD
-            .decode(compact)
-            .unwrap_or_else(|_| input.as_bytes().to_vec())
+            .decode(&compact)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))
+            .unwrap_or_else(|_| input.to_vec())
     } else {
-        input.as_bytes().to_vec()
+        input.to_vec()
     }
 }
 
@@ -250,17 +520,26 @@ fn hex_val(byte: u8) -> Option<u8> {
     }
 }
 
+/// RFC 2047 encoded words in any charset. Whitespace between adjacent
+/// encoded words is dropped, as the RFC requires.
 fn decode_rfc2047_words(input: &str) -> String {
     let mut out = String::new();
     let mut rest = input;
+    let mut last_was_word = false;
     while let Some(start) = rest.find("=?") {
-        out.push_str(&rest[..start]);
+        let gap = &rest[..start];
+        if !(last_was_word && gap.trim().is_empty()) {
+            out.push_str(gap);
+        }
         let after_start = &rest[start + 2..];
         let Some(charset_end) = after_start.find('?') else {
             out.push_str(&rest[start..]);
             return out;
         };
-        let charset = &after_start[..charset_end];
+        let charset = after_start[..charset_end]
+            .split('*')
+            .next()
+            .unwrap_or_default();
         let after_charset = &after_start[charset_end + 1..];
         let Some(enc_end) = after_charset.find('?') else {
             out.push_str(&rest[start..]);
@@ -273,23 +552,18 @@ fn decode_rfc2047_words(input: &str) -> String {
             return out;
         };
         let data = &after_encoding[..data_end];
-        if charset.eq_ignore_ascii_case("utf-8") || charset.eq_ignore_ascii_case("us-ascii") {
-            if encoding.eq_ignore_ascii_case("q") {
-                let qp = data.replace('_', " ");
-                out.push_str(&String::from_utf8_lossy(&decode_quoted_printable(
-                    qp.as_bytes(),
-                )));
-            } else if encoding.eq_ignore_ascii_case("b") {
-                match base64::engine::general_purpose::STANDARD.decode(data) {
-                    Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
-                    Err(_) => out.push_str(data),
-                }
-            } else {
-                out.push_str(data);
-            }
+        let bytes = if encoding.eq_ignore_ascii_case("q") {
+            Some(decode_quoted_printable(data.replace('_', " ").as_bytes()))
+        } else if encoding.eq_ignore_ascii_case("b") {
+            base64::engine::general_purpose::STANDARD.decode(data).ok()
         } else {
-            out.push_str(data);
+            None
+        };
+        match bytes {
+            Some(bytes) => out.push_str(&decode_charset(&bytes, Some(charset))),
+            None => out.push_str(data),
         }
+        last_was_word = true;
         rest = &after_encoding[data_end + 2..];
     }
     out.push_str(rest);
@@ -556,6 +830,77 @@ mod tests {
         let html = parsed.html_body.unwrap();
         assert!(html.contains("Logo"));
         assert!(html.contains("src=\"data:image/png;base64,aGVsbG8=\""));
+    }
+
+    fn mixed_message() -> Vec<u8> {
+        let mut raw = b"From: =?ISO-8859-1?Q?S=F8ren?= <soren@example.test>\r\n\
+To: a@example.test\r\nCc: b@example.test, c@example.test\r\n\
+Subject: =?UTF-8?B?UmVwb3J0?= =?UTF-8?B?IOKAkyBRMw==?=\r\n\
+Message-ID: <m1@example.test>\r\nReferences: <m0@example.test>\r\n\
+Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n\
+preamble\r\n--outer\r\n\
+Content-Type: multipart/alternative; boundary=\"alt\"\r\n\r\n\
+--alt\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n\
+Hej, se vedh=E6ftet rapport.\r\n--alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hej</p>\r\n--alt--\r\n\
+--outer\r\nContent-Type: application/pdf; name=\"ignored.pdf\"\r\n\
+Content-Disposition: attachment; filename*=UTF-8''Q3%20rapport%20%E2%80%93%20final.pdf\r\n\
+Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n\
+--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"../../etc/passwd\"\r\n\r\n"
+            .to_vec();
+        // An unencoded binary part (8bit): bytes must survive untouched.
+        raw.extend_from_slice(&[0x00, 0xff, 0xfe, 0x80, b'\r', b'\n']);
+        raw.extend_from_slice(b"--outer\r\nContent-Type: message/rfc822\r\n\r\nSubject: inner\r\n\r\nhi\r\n--outer--\r\n");
+        raw
+    }
+
+    #[test]
+    fn attachments_charsets_and_headers_are_parsed() {
+        let raw = mixed_message();
+        let parsed = parse_message(&raw);
+        assert_eq!(parsed.from, "Søren <soren@example.test>");
+        assert_eq!(parsed.subject, "Report – Q3", "adjacent encoded words join");
+        assert_eq!(parsed.cc, "b@example.test, c@example.test");
+        assert_eq!(parsed.message_id, "<m1@example.test>");
+        assert_eq!(parsed.references, "<m0@example.test>");
+        assert_eq!(parsed.text_body, "Hej, se vedhæftet rapport.");
+        assert_eq!(parsed.html_body.as_deref(), Some("<p>Hej</p>"));
+
+        let names: Vec<&str> = parsed
+            .attachments
+            .iter()
+            .map(|a| a.filename.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Q3 rapport – final.pdf", "passwd", "attachment-5.eml"]
+        );
+        let pdf = &parsed.attachments[0];
+        assert_eq!(
+            (pdf.content_type.as_str(), pdf.size),
+            ("application/pdf", 9)
+        );
+
+        let (_, bytes) = attachment_data(&raw, pdf.index).unwrap();
+        assert_eq!(bytes, b"%PDF-1.4\n");
+        let (_, binary) = attachment_data(&raw, parsed.attachments[1].index).unwrap();
+        assert_eq!(binary, [0x00, 0xff, 0xfe, 0x80]);
+        assert!(attachment_data(&raw, 99).is_none());
+        assert!(
+            attachment_data(&raw, 0).is_none(),
+            "the text body is not an attachment"
+        );
+    }
+
+    #[test]
+    fn rfc2231_continuations_and_quoted_params() {
+        let params = header_params(
+            "attachment; filename*0*=utf-8''%C3%85rs; filename*1=\"rapport.pdf\"; note=\"a;b\"",
+        );
+        assert_eq!(params["filename"], "Årsrapport.pdf");
+        assert_eq!(params["note"], "a;b");
+        assert!(header_params("text/plain").is_empty());
+        assert_eq!(sanitize_filename("..\\..\\boot.ini"), "boot.ini");
+        assert_eq!(sanitize_filename(".hidden"), "hidden");
     }
 
     #[test]
