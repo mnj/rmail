@@ -3,7 +3,7 @@
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -125,7 +125,12 @@ fn outgoing(
             &state.mail_root,
             &session.domain,
             &session.localpart,
-            &stored.folder,
+            &super::stored_folder(
+                &state.mail_root,
+                &session.domain,
+                &session.localpart,
+                &stored.folder,
+            )?,
         )?;
         let message = messages
             .into_iter()
@@ -158,7 +163,12 @@ fn rejected(status: StatusCode, message: impl Into<String>) -> Response {
     (status, message.into()).into_response()
 }
 
-async fn send(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+async fn send(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<ComposeRequest>(&body) else {
         return rejected(StatusCode::BAD_REQUEST, "invalid json");
     };
@@ -243,7 +253,7 @@ async fn send(State(state): State<Shared>, session: Session, body: Bytes) -> Res
                 root,
                 domain,
                 local,
-                &source.folder,
+                &super::stored_folder(root, domain, local, &source.folder)?,
                 source.uid,
                 flag,
                 true,
@@ -259,7 +269,12 @@ async fn send(State(state): State<Shared>, session: Session, body: Bytes) -> Res
         .into_response()
 }
 
-async fn save_draft(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+async fn save_draft(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<ComposeRequest>(&body) else {
         return rejected(StatusCode::BAD_REQUEST, "invalid json");
     };

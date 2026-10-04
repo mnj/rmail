@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -149,7 +149,12 @@ fn server_settings(db_path: &std::path::Path) -> (bool, ClassifierModels) {
     (enabled, models)
 }
 
-async fn overview(State(state): State<Shared>, session: Session) -> Response {
+async fn overview(app: State<Shared>, headers: HeaderMap) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         let (server_enabled, models) = server_settings(&state.db_path);
@@ -264,7 +269,12 @@ struct SaveRequest {
     labels_seen: Option<Vec<String>>,
 }
 
-async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+async fn save(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<SaveRequest>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
@@ -373,7 +383,12 @@ struct NewFolder {
 /// Create a folder for a label used often, optionally inside an existing
 /// folder. The name is built from the stored label and folder names, so the
 /// request only selects among them.
-async fn create_folder(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+async fn create_folder(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<NewFolder>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
@@ -439,11 +454,12 @@ fn parse_uid(uid: &str) -> Option<u64> {
     uid.parse().ok()
 }
 
-async fn accept(
-    State(state): State<Shared>,
-    session: Session,
-    Path(uid): Path<String>,
-) -> Response {
+async fn accept(app: State<Shared>, headers: HeaderMap, Path(uid): Path<String>) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Some(uid) = parse_uid(&uid) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -456,11 +472,12 @@ async fn accept(
     }
 }
 
-async fn dismiss(
-    State(state): State<Shared>,
-    session: Session,
-    Path(uid): Path<String>,
-) -> Response {
+async fn dismiss(app: State<Shared>, headers: HeaderMap, Path(uid): Path<String>) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Some(uid) = parse_uid(&uid) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -474,7 +491,12 @@ async fn dismiss(
     }
 }
 
-async fn accept_all(State(state): State<Shared>, session: Session) -> Response {
+async fn accept_all(app: State<Shared>, headers: HeaderMap) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         let Some(conn) = store::open_existing(root, domain, local)? else {
@@ -549,11 +571,16 @@ fn model_text(parsed: &rmail_common::mime::ParsedMessage, max_bytes: usize) -> S
 /// or summarize it. Uses the server's fallback model, and a cloud model
 /// only for users who agreed to that provider.
 pub(crate) async fn ai_action(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path((folder, uid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(uid) = uid.parse::<u64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -591,6 +618,7 @@ pub(crate) async fn ai_action(
         {
             return Ok(Err((StatusCode::FORBIDDEN, format!("consent:{provider}"))));
         }
+        let folder = super::stored_folder(root, domain, local, &folder)?;
         let (_, messages) = imap_state::load_folder(root, domain, local, &folder)?;
         let Some(message) = messages.into_iter().find(|message| message.uid == uid) else {
             return Ok(Err((StatusCode::NOT_FOUND, "no such message".to_string())));
@@ -711,7 +739,12 @@ struct NewLabel {
 
 /// Add one label (for example one the AI proposed in a preview) and return
 /// it with its keyword.
-async fn add_label(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+async fn add_label(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<NewLabel>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };

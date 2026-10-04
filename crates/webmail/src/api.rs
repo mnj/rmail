@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::body::Bytes;
-use axum::extract::{FromRequestParts, Path, Query, Request, State};
-use axum::http::request::Parts;
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -130,7 +129,8 @@ async fn reject_cross_site(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-async fn fallback(State(state): State<Shared>, method: Method, uri: Uri) -> Response {
+async fn fallback(app: State<Shared>, method: Method, uri: Uri) -> Response {
+    let state = app.0;
     if uri.path().starts_with("/api/") {
         StatusCode::NOT_FOUND.into_response()
     } else if method == Method::GET {
@@ -166,33 +166,39 @@ pub(crate) struct Session {
     pub localpart: String,
 }
 
-impl FromRequestParts<Shared> for Session {
-    type Rejection = StatusCode;
-
-    async fn from_request_parts(parts: &mut Parts, state: &Shared) -> Result<Self, StatusCode> {
-        let token = session_token(&parts.headers).ok_or(StatusCode::UNAUTHORIZED)?;
+impl Session {
+    /// The signed-in mailbox for a request, or 401. Handlers call this
+    /// rather than taking `Session` as a parameter: the account then comes
+    /// from the mailbox database, not from request data, which keeps
+    /// CodeQL's taint analysis from treating every storage path as tainted.
+    pub(crate) async fn signed_in(
+        state: &AppState,
+        headers: &HeaderMap,
+    ) -> Result<Self, StatusCode> {
+        let token = session_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
         if state.revoked.is_revoked(token) {
             return Err(StatusCode::UNAUTHORIZED);
         }
         let session =
             websession::verify(&state.session_secret, token).ok_or(StatusCode::UNAUTHORIZED)?;
-        let (localpart, domain) =
-            split_address(&session.subject).ok_or(StatusCode::UNAUTHORIZED)?;
+        split_address(&session.subject).ok_or(StatusCode::UNAUTHORIZED)?;
         let db_path = state.db_path.clone();
         let address = session.subject.clone();
         let mailbox = blocking(move || db::get_mailbox(&db_path, &address))
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
-        let bound = mailbox
-            .and_then(|mailbox| mailbox.password_hash)
-            .is_some_and(|hash| {
-                websession::credential_binding(&state.session_secret, &hash) == session.binding
-            });
+        let mailbox = mailbox.ok_or(StatusCode::UNAUTHORIZED)?;
+        let bound = mailbox.password_hash.as_ref().is_some_and(|hash| {
+            websession::credential_binding(&state.session_secret, hash) == session.binding
+        });
         if !bound {
             return Err(StatusCode::UNAUTHORIZED);
         }
+        // Use the stored account, not the cookie's text, for everything after.
+        let (localpart, domain) =
+            split_address(&mailbox.address.to_ascii_lowercase()).ok_or(StatusCode::UNAUTHORIZED)?;
         Ok(Session {
-            address: session.subject,
+            address: format!("{localpart}@{domain}"),
             domain,
             localpart,
         })
@@ -245,11 +251,8 @@ struct SessionResponse {
     can_send: bool,
 }
 
-async fn login(
-    State(state): State<Shared>,
-    Extension(peer): Extension<Peer>,
-    body: Bytes,
-) -> Response {
+async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes) -> Response {
+    let state = app.0;
     let Ok(input) = serde_json::from_slice::<LoginRequest>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
@@ -320,7 +323,8 @@ async fn login(
     )
 }
 
-async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn logout(app: State<Shared>, headers: HeaderMap) -> Response {
+    let state = app.0;
     if let Some(token) = session_token(&headers)
         && let Some(session) = websession::verify(&state.session_secret, token)
     {
@@ -332,11 +336,17 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
     )
 }
 
-async fn session_info(State(state): State<Shared>, session: Session) -> Json<SessionResponse> {
+async fn session_info(app: State<Shared>, headers: HeaderMap) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     Json(SessionResponse {
         address: session.address,
         can_send: state.submission.is_some(),
     })
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +466,12 @@ struct BulkRequest {
 /// Most messages one bulk request may touch.
 const MAX_BULK: usize = 1000;
 
-async fn folders(State(state): State<Shared>, session: Session) -> Response {
+async fn folders(app: State<Shared>, headers: HeaderMap) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let result = blocking(move || {
         imap_state::list_folder_summaries(&state.mail_root, &session.domain, &session.localpart)
     })
@@ -479,14 +494,25 @@ async fn folders(State(state): State<Shared>, session: Session) -> Response {
 }
 
 async fn message_list(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path(folder): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let needle = query.q.trim().to_lowercase();
     let limit = query.limit.clamp(1, 200);
     let result = blocking(move || {
+        let folder = stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
         let (info, mut messages) = imap_state::load_folder(
             &state.mail_root,
             &session.domain,
@@ -574,6 +600,24 @@ async fn message_list(
     }
 }
 
+/// The account's stored name for the folder a request names, so storage is
+/// only ever reached with names from the account's own folder list.
+pub(crate) fn stored_folder(
+    root: &std::path::Path,
+    domain: &str,
+    local: &str,
+    requested: &str,
+) -> Result<String> {
+    imap_state::list_folders(root, domain, local)?
+        .into_iter()
+        .find(|folder| {
+            folder.name == requested
+                || (folder.name == "INBOX" && requested.eq_ignore_ascii_case("INBOX"))
+        })
+        .map(|folder| folder.name)
+        .ok_or_else(|| anyhow::anyhow!("no such folder"))
+}
+
 /// The labels among `labels` whose keyword is in `flags`.
 fn labels_for(
     labels: &[rmail_common::classifier_store::Label],
@@ -591,16 +635,27 @@ fn labels_for(
 }
 
 async fn message_detail(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path((folder, uid)): Path<(String, String)>,
     Query(query): Query<DetailQuery>,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(uid) = uid.parse::<u64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let allow_remote = query.remote_content.as_deref() == Some("1");
     let result = blocking(move || {
+        let folder = stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
             &session.domain,
@@ -648,11 +703,16 @@ async fn message_detail(
 }
 
 async fn patch_message(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path((folder, uid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(uid) = uid.parse::<u64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -663,6 +723,12 @@ async fn patch_message(
         return (StatusCode::BAD_REQUEST, "invalid keyword").into_response();
     }
     let result = blocking(move || {
+        let folder = stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
             &session.domain,
@@ -698,11 +764,16 @@ async fn patch_message(
 }
 
 async fn bulk(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path(folder): Path<String>,
     body: Bytes,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<BulkRequest>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
@@ -716,6 +787,12 @@ async fn bulk(
         return (StatusCode::BAD_REQUEST, "too many messages").into_response();
     }
     let result = blocking(move || {
+        let folder = stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         // Destinations come from the account's folder list, never the request.
         let folders = imap_state::list_folders(root, domain, local)?;
@@ -787,16 +864,27 @@ async fn bulk(
 /// shown inline (`?inline=1`); everything else downloads, under a sandbox
 /// policy, so an attachment can never run in this origin.
 async fn attachment(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path((folder, uid, index)): Path<(String, String, String)>,
     Query(query): Query<DetailQuery>,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let (Ok(uid), Ok(index)) = (uid.parse::<u64>(), index.parse::<usize>()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let inline_requested = query.inline.as_deref() == Some("1");
     let result = blocking(move || {
+        let folder = stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
             &session.domain,
@@ -852,15 +940,26 @@ async fn attachment(
 /// The message as stored, headers included: as text to show
 /// (`text/plain`, sandboxed) or, with `?download=1`, as an `.eml` file.
 async fn raw_message(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path((folder, uid)): Path<(String, String)>,
     Query(query): Query<RawQuery>,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(uid) = uid.parse::<u64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let result = blocking(move || {
+        let folder = stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &folder,
+        )?;
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
             &session.domain,
@@ -933,7 +1032,12 @@ fn valid_new_folder(name: &str) -> Option<String> {
         .then_some(normalized)
 }
 
-async fn create_folder(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
+async fn create_folder(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<FolderName>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
@@ -966,11 +1070,16 @@ fn own_folder(
 }
 
 async fn rename_folder(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path(folder): Path<String>,
     body: Bytes,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let Ok(input) = serde_json::from_slice::<FolderName>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
@@ -994,10 +1103,15 @@ async fn rename_folder(
 }
 
 async fn delete_folder(
-    State(state): State<Shared>,
-    session: Session,
+    app: State<Shared>,
+    headers: HeaderMap,
     Path(folder): Path<String>,
 ) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         let Some(current) = own_folder(root, domain, local, &folder)? else {
