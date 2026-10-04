@@ -1,7 +1,8 @@
-//! rmail_classifier: suggests folders for new INBOX mail using local models.
+//! rmail_classifier: suggests folders for new INBOX mail using local or
+//! hosted models.
 //!
 //! - `engine` loads models behind small traits; `llama` runs GGUF files with
-//!   llama.cpp in-process.
+//!   llama.cpp in-process; `cloud` calls OpenRouter-style APIs and Jev.
 //! - `pipeline` decides a folder from sender history, an embedding vote and,
 //!   when unsure, the chat model.
 //! - `worker` runs one poll cycle over the accounts that opted in.
@@ -22,11 +23,13 @@ macro_rules! classifier_log {
     };
 }
 
+mod cloud;
 mod control;
 mod engine;
 #[cfg(feature = "local-models")]
 mod llama;
 mod pipeline;
+mod prompt;
 mod worker;
 
 use engine::Models;
@@ -77,9 +80,12 @@ impl Shared {
     pub async fn status_json(&self) -> serde_json::Value {
         let runtime = self.runtime().await;
         let mail_root = PathBuf::from(&runtime.config.global.mail_root);
-        let accounts = tokio::task::spawn_blocking(move || worker::folder_counts(&mail_root))
-            .await
-            .unwrap_or_default();
+        let cloud = runtime.config.classifier.cloud_providers();
+        let counted = cloud.clone();
+        let accounts =
+            tokio::task::spawn_blocking(move || worker::folder_counts(&mail_root, &counted))
+                .await
+                .unwrap_or_default();
         let status = self.status.lock().unwrap();
         let cfg = &runtime.config.classifier;
         json!({
@@ -87,7 +93,13 @@ impl Shared {
             "local_models": cfg!(feature = "local-models"),
             "embed_model": runtime.models.embed_info,
             "chat_model": runtime.models.chat_info,
-            "configured": { "embed_model": cfg.embed_model, "chat_model": cfg.chat_model },
+            "configured": {
+                "embed_model": cfg.embed_model,
+                "chat_model": cfg.chat_model,
+                "embed_provider": cfg.embed_provider,
+                "chat_provider": cfg.chat_provider,
+            },
+            "cloud_providers": cloud,
             "errors": runtime.models.errors,
             "accounts": accounts,
             "loaded_at": status.loaded_at,

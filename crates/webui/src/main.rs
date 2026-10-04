@@ -2371,6 +2371,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn organization_overview_never_returns_api_keys() {
+        let td = tempdir().unwrap();
+        let db = organization_db(td.path());
+        let mut conn = rmail_common::settings::open(&db).unwrap();
+        rmail_common::settings::write_raw(
+            &mut conn,
+            &BTreeMap::from([
+                (
+                    "classifier.openrouter_api_key".to_string(),
+                    Some(serde_json::Value::from("sk-or-secret-123")),
+                ),
+                (
+                    "classifier.chat_provider".to_string(),
+                    Some(serde_json::Value::from("jev")),
+                ),
+            ]),
+        )
+        .unwrap();
+        let response = send_request_with_db(
+            td.path().to_path_buf(),
+            "GET /api/organization HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+            Some(db),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            !response.contains("sk-or-secret-123"),
+            "API key leaked: {response}"
+        );
+        assert!(
+            response.contains("\"openrouter_api_key\":true"),
+            "{response}"
+        );
+        assert!(response.contains("\"chat_provider\":\"jev\""), "{response}");
+    }
+
+    #[tokio::test]
     async fn organization_activate_requires_installed_models_of_the_right_kind() {
         let td = tempdir().unwrap();
         let db = organization_db(td.path());

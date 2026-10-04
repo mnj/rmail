@@ -18,6 +18,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
 use crate::engine::{Choice, Chooser, Embedder, FolderHint, l2_normalize};
+use crate::prompt::{json_escape, parse_answer, system_prompt};
 use rmail_common::classifier_models;
 
 /// llama.cpp allows one backend per process.
@@ -249,30 +250,6 @@ impl Chooser for LlamaChooser {
     }
 }
 
-fn system_prompt(folders: &[FolderHint]) -> String {
-    let mut text = String::from(
-        "You sort email into the user's existing folders. Choose the single folder the \
-         message below belongs in, or null when none clearly fits. Answer with JSON: \
-         {\"folder\": <name or null>, \"confidence\": <0.0-1.0>}.\n\nFolders:\n",
-    );
-    for folder in folders {
-        text.push_str("- ");
-        text.push_str(&folder.name);
-        if !folder.examples.is_empty() {
-            text.push_str(" (for example: ");
-            let examples: Vec<String> = folder
-                .examples
-                .iter()
-                .map(|subject| format!("\"{}\"", subject.chars().take(80).collect::<String>()))
-                .collect();
-            text.push_str(&examples.join(", "));
-            text.push(')');
-        }
-        text.push('\n');
-    }
-    text
-}
-
 /// GBNF that only admits `{"folder": "<one of the names>" | null,
 /// "confidence": d.d}`.
 pub fn answer_grammar(folders: &[FolderHint]) -> String {
@@ -286,12 +263,6 @@ pub fn answer_grammar(folders: &[FolderHint]) -> String {
          conf ::= \"0.\" [0-9] | \"1.0\"\n",
         names.join(" | ")
     )
-}
-
-fn json_escape(text: &str) -> String {
-    serde_json::to_string(text)
-        .map(|quoted| quoted[1..quoted.len() - 1].to_string())
-        .unwrap_or_default()
 }
 
 fn gbnf_literal(text: &str) -> String {
@@ -310,62 +281,16 @@ fn gbnf_literal(text: &str) -> String {
     out
 }
 
-/// Read the grammar-constrained answer. Names not in `folders` are ignored.
-pub fn parse_answer(raw: &str, folders: &[FolderHint]) -> Choice {
-    #[derive(serde::Deserialize)]
-    struct Answer {
-        folder: Option<String>,
-        confidence: f64,
-    }
-    let parsed = serde_json::from_str::<Answer>(raw.trim()).ok();
-    let folder = parsed
-        .as_ref()
-        .and_then(|answer| answer.folder.clone())
-        .filter(|name| folders.iter().any(|folder| &folder.name == name));
-    Choice {
-        confidence: if folder.is_some() {
-            parsed
-                .map(|answer| answer.confidence.clamp(0.0, 1.0))
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        },
-        folder,
-        raw: raw.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hints(names: &[&str]) -> Vec<FolderHint> {
-        names
-            .iter()
-            .map(|name| FolderHint {
-                name: name.to_string(),
-                examples: vec![],
-            })
-            .collect()
-    }
+    use crate::prompt::hints;
 
     #[test]
     fn grammar_escapes_folder_names() {
         let grammar = answer_grammar(&hints(&["Receipts", "Say \"hi\""]));
         assert!(grammar.contains(r#""\"Receipts\"""#), "{grammar}");
         assert!(grammar.contains(r#""\"Say \\\"hi\\\"\"""#), "{grammar}");
-    }
-
-    #[test]
-    fn answers_outside_the_folder_list_are_ignored() {
-        let folders = hints(&["Receipts", "Travel"]);
-        let choice = parse_answer(r#"{"folder": "Travel", "confidence": 0.8}"#, &folders);
-        assert_eq!(choice.folder.as_deref(), Some("Travel"));
-        assert_eq!(choice.confidence, 0.8);
-        let invented = parse_answer(r#"{"folder": "Taxes", "confidence": 0.9}"#, &folders);
-        assert_eq!(invented.folder, None);
-        assert_eq!(invented.confidence, 0.0);
-        assert_eq!(parse_answer("garbage", &folders).folder, None);
     }
 
     /// Compiles the answer grammar against a real vocabulary. Set

@@ -1,5 +1,5 @@
 [Unit]
-Description=rMail mail organization (local-model folder suggestions)
+Description=rMail mail organization (folder suggestions)
 After=network.target
 
 [Service]

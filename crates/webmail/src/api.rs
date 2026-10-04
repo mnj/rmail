@@ -975,6 +975,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn organize_asks_for_cloud_consent_per_provider() {
+        use rmail_common::classifier_store as store;
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (&state.mail_root, "example.test", "user");
+        imap_state::init_account(root, d, l).unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let get = |state: Arc<AppState>, cookie: Option<String>| async move {
+            let response = route(req("GET", "/api/organize", b"", cookie), &state).await;
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+        };
+
+        // Everything local: nothing to consent to.
+        let local = get(state.clone(), cookie.clone()).await;
+        assert_eq!(local["cloud_providers"], serde_json::json!([]));
+        assert_eq!(local["cloud_consent"], false);
+
+        let mut conn = rmail_common::settings::open(&state.db_path).unwrap();
+        rmail_common::settings::write_raw(
+            &mut conn,
+            &[(
+                "classifier.embed_provider".to_string(),
+                Some(serde_json::Value::from("openrouter")),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let cloud = get(state.clone(), cookie.clone()).await;
+        assert_eq!(cloud["cloud_providers"], serde_json::json!(["openrouter"]));
+        assert_eq!(cloud["cloud_consent"], false);
+        assert_eq!(cloud["cloud_required"], true);
+
+        let put = |body: &'static [u8]| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move {
+                route(req("PUT", "/api/organize", body, cookie), &state)
+                    .await
+                    .status
+            }
+        };
+        assert_eq!(put(br#"{"enabled":true,"cloud_consent":true}"#).await, 204);
+        assert_eq!(
+            get(state.clone(), cookie.clone()).await["cloud_consent"],
+            true
+        );
+        let prefs = || store::prefs(&store::open_existing(root, d, l).unwrap().unwrap()).unwrap();
+        assert_eq!(prefs().cloud_consent, vec!["openrouter".to_string()]);
+
+        // Saving folders without the field keeps the decision.
+        assert_eq!(put(br#"{"enabled":true}"#).await, 204);
+        assert_eq!(prefs().cloud_consent, vec!["openrouter".to_string()]);
+
+        assert_eq!(put(br#"{"enabled":true,"cloud_consent":false}"#).await, 204);
+        assert!(prefs().cloud_consent.is_empty());
+    }
+
+    #[tokio::test]
     async fn organize_opt_in_suggestions_accept_and_dismiss() {
         use rmail_common::classifier_store as store;
         let td = tempfile::tempdir().unwrap();

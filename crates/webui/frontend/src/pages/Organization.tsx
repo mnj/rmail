@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { CheckCircle2, Download, FlaskConical, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { api, CatalogModel, ModelKind, Organization } from '../api';
+import { CheckCircle2, Cloud, Download, FlaskConical, Plus, RefreshCw, Save, Trash2 } from 'lucide-react';
+import { api, CatalogModel, ChatProvider, EmbedProvider, ModelKind, Organization } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, formatRelative, IconButton, Modal, Panel, Toggle, useFeedback, useResource } from '../ui';
 
 const kindLabel: Record<ModelKind, string> = { embedding: 'Embedding', chat: 'Chat' };
@@ -47,6 +47,113 @@ function CustomModelModal({ onClose, onStarted }: { onClose: () => void; onStart
         <Field label="Input prefix" hint="Text the model expects before each input, e.g. “classification: ” for Nomic. Usually empty."><input value={prefix} onChange={(event) => setPrefix(event.target.value)} /></Field>
       </form>
     </Modal>
+  );
+}
+
+const providerNames: Record<string, string> = { openrouter: 'OpenRouter', typesafe: 'TypeSafe' };
+
+type ProviderForm = {
+  embed_provider: EmbedProvider;
+  chat_provider: ChatProvider;
+  openrouter_base_url: string;
+  openrouter_embed_model: string;
+  openrouter_chat_model: string;
+  jev_model: string;
+  /** Typed replacements; empty keeps the stored key. */
+  openrouter_api_key: string;
+  typesafe_api_key: string;
+};
+
+function providerForm(org: Organization): ProviderForm {
+  const text = (key: string, fallback = '') => (typeof org.settings[key] === 'string' ? (org.settings[key] as string) : fallback);
+  return {
+    embed_provider: (text('embed_provider', 'local') as EmbedProvider),
+    chat_provider: (text('chat_provider', 'local') as ChatProvider),
+    openrouter_base_url: text('openrouter_base_url', 'https://openrouter.ai/api/v1'),
+    openrouter_embed_model: text('openrouter_embed_model', 'openai/text-embedding-3-small'),
+    openrouter_chat_model: text('openrouter_chat_model'),
+    jev_model: text('jev_model', 'jev-latest'),
+    openrouter_api_key: '',
+    typesafe_api_key: '',
+  };
+}
+
+/** Local or hosted models per role. Hosted ones only see mail of users who agree in webmail. */
+function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => void }) {
+  const { run } = useFeedback();
+  const stored = providerForm(org);
+  const [form, setForm] = useState<ProviderForm>(stored);
+  const [saving, setSaving] = useState(false);
+  const set = (change: Partial<ProviderForm>) => setForm({ ...form, ...change });
+  const keySet = (key: string) => org.settings[key] === true;
+  const status = org.daemon.running ? org.daemon.status : null;
+  const usesOpenRouter = form.embed_provider === 'openrouter' || form.chat_provider === 'openrouter';
+  const usesJev = form.chat_provider === 'jev';
+  const changes = Object.fromEntries(Object.entries(form).filter(([key, value]) =>
+    key.endsWith('_api_key') ? value !== '' : value !== stored[key as keyof ProviderForm]));
+  const dirty = Object.keys(changes).length > 0;
+  const cloud = status?.cloud_providers || [];
+  const optedIn = status?.accounts.opted_in || 0;
+  const consented = status?.accounts.cloud_consented || 0;
+
+  async function save() {
+    setSaving(true);
+    const ok = await run(async () => {
+      await api('/api/settings', 'PUT', { changes: Object.fromEntries(Object.entries(changes).map(([key, value]) => [`classifier.${key}`, value])) });
+      if (status) await api('/api/organization/reload', 'POST');
+    }, 'Providers saved');
+    setSaving(false);
+    if (ok) {
+      setForm({ ...form, openrouter_api_key: '', typesafe_api_key: '' });
+      onSaved();
+    }
+  }
+
+  return (
+    <Panel
+      title="Providers"
+      subtitle="Run models on this server, or use a hosted provider. Hosted providers only receive mail from users who agree to it in webmail."
+      actions={<button className="button primary" disabled={!dirty || saving || !org.managed} onClick={save}><Save size={16} />{saving ? 'Saving…' : 'Save'}</button>}
+    >
+      {cloud.length > 0 && (
+        <p className="panelNote"><Cloud size={14} /> Mail goes to {cloud.map((id) => providerNames[id] || id).join(' and ')} for {consented} of {optedIn} opted-in mailbox{optedIn === 1 ? '' : 'es'}; the rest {status?.embed_model?.cloud ? 'get no suggestions until their users agree' : 'get suggestions from this server only'}.</p>
+      )}
+      <div className="formStack padded">
+        <div className="grid even">
+          <Field label="Embeddings" hint={form.embed_provider === 'openrouter' ? 'Every message learned or classified is sent. Changing the model relearns every mailbox.' : 'Pick the model in the table below.'}>
+            <select value={form.embed_provider} onChange={(event) => set({ embed_provider: event.target.value as EmbedProvider })}>
+              <option value="local">On this server</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+          </Field>
+          <Field label="Fallback for uncertain mail" hint={form.chat_provider === 'jev' ? 'Jev picks one folder with a confidence instead of generating text.' : form.chat_provider === 'local' ? 'Pick the chat model in the table below.' : 'Only messages the vote is unsure about are sent.'}>
+            <select value={form.chat_provider} onChange={(event) => set({ chat_provider: event.target.value as ChatProvider })}>
+              <option value="local">On this server</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="jev">TypeSafe Jev</option>
+            </select>
+          </Field>
+        </div>
+        {usesOpenRouter && <>
+          <Field label="OpenRouter API key" hint={<>From openrouter.ai/settings/keys.{keySet('openrouter_api_key') ? ' A key is stored; type to replace it.' : ''}</>}>
+            <input type="password" autoComplete="new-password" value={form.openrouter_api_key} placeholder={keySet('openrouter_api_key') ? '•••••••• (set)' : 'sk-or-…'} onChange={(event) => set({ openrouter_api_key: event.target.value })} />
+          </Field>
+          <div className="grid even">
+            {form.embed_provider === 'openrouter' && <Field label="Embedding model"><input value={form.openrouter_embed_model} onChange={(event) => set({ openrouter_embed_model: event.target.value })} placeholder="openai/text-embedding-3-small" /></Field>}
+            {form.chat_provider === 'openrouter' && <Field label="Chat model" hint="Empty turns the fallback off."><input value={form.openrouter_chat_model} onChange={(event) => set({ openrouter_chat_model: event.target.value })} placeholder="openai/gpt-4.1-mini" /></Field>}
+          </div>
+          <Field label="API base" hint="Any OpenAI-compatible endpoint, such as a self-hosted vLLM or Ollama."><input value={form.openrouter_base_url} onChange={(event) => set({ openrouter_base_url: event.target.value })} /></Field>
+        </>}
+        {usesJev && (
+          <div className="grid even">
+            <Field label="TypeSafe API key" hint={keySet('typesafe_api_key') ? 'A key is stored; type to replace it.' : undefined}>
+              <input type="password" autoComplete="new-password" value={form.typesafe_api_key} placeholder={keySet('typesafe_api_key') ? '•••••••• (set)' : 'Not set'} onChange={(event) => set({ typesafe_api_key: event.target.value })} />
+            </Field>
+            <Field label="Jev model"><input value={form.jev_model} onChange={(event) => set({ jev_model: event.target.value })} placeholder="jev-latest" /></Field>
+          </div>
+        )}
+      </div>
+    </Panel>
   );
 }
 
@@ -163,7 +270,7 @@ export function OrganizationPage() {
       <div className="systemHero">
         <div>
           <span className={`statusDot ${status && enabled && status.embed_model ? 'ok' : 'error'}`} />
-          <strong>{!status ? 'Classifier daemon not running' : !enabled ? 'Mail organization is off' : status.embed_model ? 'Suggesting folders for opted-in mailboxes' : activeFile(data, 'embedding') ? 'The embedding model did not load' : 'Choose an embedding model'}</strong>
+          <strong>{!status ? 'Classifier daemon not running' : !enabled ? 'Mail organization is off' : status.embed_model ? 'Suggesting folders for opted-in mailboxes' : activeFile(data, 'embedding') || data.settings.embed_provider === 'openrouter' ? 'The embedding model did not load' : 'Choose an embedding model'}</strong>
           <p>
             {status
               ? <>{status.accounts.opted_in || 0} mailbox{status.accounts.opted_in === 1 ? '' : 'es'} opted in from webmail.{status.last_cycle && <> Last check {formatRelative(status.last_cycle.finished_at)}: {status.last_cycle.report.learned} learned, {status.last_cycle.report.suggested} suggested, {status.last_cycle.report.moved} moved.</>}</>
@@ -194,6 +301,7 @@ export function OrganizationPage() {
         </div>
         <p className="panelNote">Catalog checksums are not pinned yet. Each download records the SHA-256 it received, and a model added by URL can require a specific checksum.</p>
       </Panel>
+      <ProvidersPanel org={data} onSaved={org.reload} />
       <TestPanel org={data} />
       {custom && <CustomModelModal onClose={() => setCustom(false)} onStarted={org.reload} />}
     </div>

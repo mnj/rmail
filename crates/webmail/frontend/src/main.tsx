@@ -8,15 +8,25 @@ type Suggestion = { folder: string; score: number; method: 'sender' | 'knn' | 'l
 type Message = { uid: number; flags: string[]; size: number; internal_date: number; from: string; to: string; subject: string; snippet: string; suggestion?: Suggestion };
 type MessageDetail = Message & { date: string; text_body: string; html_body: string | null; has_remote_content: boolean };
 type OrganizeFolder = { name: string; learned: number; accepted: number; dismissed: number; excluded: boolean; autofile: boolean };
-type Organize = { server_enabled: boolean; enabled: boolean; pending: number; folders: OrganizeFolder[] };
+type Organize = { server_enabled: boolean; enabled: boolean; pending: number; folders: OrganizeFolder[]; cloud_providers: string[]; cloud_consent: boolean; cloud_required: boolean };
 
 type Api = <T>(url: string, options?: RequestInit) => Promise<T>;
 
 const methodLabel: Record<Suggestion['method'], string> = {
   sender: 'where you file mail from this sender',
   knn: 'similar messages you filed',
-  llm: 'the local AI model',
+  llm: 'an AI model',
 };
+
+const providerNames: Record<string, string> = {
+  openrouter: 'OpenRouter (openrouter.ai)',
+  typesafe: 'TypeSafe (typesafe.ai)',
+};
+
+function listNames(ids: string[]): string {
+  const names = ids.map((id) => providerNames[id] || id);
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0] || '';
+}
 
 function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => void; onSaved: () => void }) {
   const [data, setData] = useState<Organize | null>(null);
@@ -40,6 +50,7 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
         method: 'PUT',
         body: JSON.stringify({
           enabled: data.enabled,
+          ...(data.cloud_providers.length ? { cloud_consent: data.cloud_consent } : {}),
           excluded_folders: data.folders.filter((f) => f.excluded).map((f) => f.name),
           autofile_folders: data.folders.filter((f) => f.autofile && !f.excluded).map((f) => f.name),
         }),
@@ -59,9 +70,22 @@ function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: () => vo
         <header><h2>Organize my mail</h2><button className="icon" onClick={onClose} title="Close"><X size={18} /></button></header>
         {error && <p className="error">{error}</p>}
         {!data ? <p>Loading…</p> : <>
-          <p className="dialog-intro">rMail learns from how you file mail into your folders and suggests a folder for new mail in your inbox. It runs entirely on this server; your mail is not sent anywhere.</p>
+          <p className="dialog-intro">rMail learns from how you file mail into your folders and suggests a folder for new mail in your inbox.{' '}
+            {data.cloud_providers.length === 0
+              ? 'It runs entirely on this server; your mail is not sent anywhere.'
+              : <>Your administrator uses {listNames(data.cloud_providers)} for this. They only receive your mail if you agree below.</>}
+          </p>
           {!data.server_enabled && <p className="notice">Your administrator has not turned this on yet. Your choices are saved and take effect once they do.</p>}
           <label className="switch-row"><input type="checkbox" checked={data.enabled} onChange={(e) => setData({ ...data, enabled: e.target.checked })} /><span>Suggest folders for new mail</span></label>
+          {data.enabled && data.cloud_providers.length > 0 && <>
+            <label className="switch-row"><input type="checkbox" checked={data.cloud_consent} onChange={(e) => setData({ ...data, cloud_consent: e.target.checked })} /><span>Send my mail to {listNames(data.cloud_providers)} for suggestions</span></label>
+            <p className="dialog-hint">
+              {data.cloud_required
+                ? 'The sender, subject and start of each message you file or receive are sent to them, including recent mail already in your folders. Without this, rMail cannot make suggestions for you.'
+                : 'Only messages rMail is unsure about are sent: their sender, subject and the start of the body. Without this, suggestions still come from mail you filed, on this server.'}
+              {' '}You can withdraw this at any time.
+            </p>
+          </>}
           {data.enabled && (data.folders.length === 0
             ? <p className="notice">Create a few folders and file some mail into them first; suggestions are based on your own filing.</p>
             : <table className="organize-table">

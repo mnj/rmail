@@ -77,6 +77,14 @@ struct Overview {
     /// Whether the administrator runs the classifier at all.
     server_enabled: bool,
     enabled: bool,
+    /// Third parties that would receive this mailbox's message text; empty
+    /// when everything runs on this server.
+    cloud_providers: Vec<&'static str>,
+    /// Whether the user agreed to all of `cloud_providers`.
+    cloud_consent: bool,
+    /// Whether learning itself runs in the cloud, so nothing happens for
+    /// this mailbox without consent (otherwise only the fallback is skipped).
+    cloud_required: bool,
     pending: usize,
     folders: Vec<FolderView>,
 }
@@ -89,6 +97,13 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
             .ok()
             .flatten()
             .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let cloud_providers = cloud_providers(&state.db_path);
+        let cloud_required = rmail_common::settings::open(&state.db_path)
+            .and_then(|conn| rmail_common::settings::get(&conn, "classifier.embed_provider"))
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_str().map(|provider| provider != "local"))
             .unwrap_or(false);
         let conn = store::open_existing(root, domain, local)?;
         let (prefs, learned, outcomes) = match &conn {
@@ -124,6 +139,9 @@ async fn overview(State(state): State<Shared>, session: Session) -> Response {
         Ok(Overview {
             server_enabled,
             enabled: prefs.enabled,
+            cloud_consent: !cloud_providers.is_empty() && prefs.allows_cloud(&cloud_providers),
+            cloud_required,
+            cloud_providers,
             pending,
             folders,
         })
@@ -142,6 +160,17 @@ struct SaveRequest {
     excluded_folders: Vec<String>,
     #[serde(default)]
     autofile_folders: Vec<String>,
+    /// Agree (or withdraw) for the providers currently configured; absent
+    /// keeps what the user decided before.
+    #[serde(default)]
+    cloud_consent: Option<bool>,
+}
+
+/// The cloud providers in use, or none when the settings cannot be read.
+fn cloud_providers(db_path: &std::path::Path) -> Vec<&'static str> {
+    rmail_common::settings::open(db_path)
+        .and_then(|conn| rmail_common::settings::classifier_cloud_providers(&conn))
+        .unwrap_or_default()
 }
 
 async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
@@ -155,6 +184,7 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
     }
     let address = session.address.clone();
     let enabled = input.enabled;
+    let cloud_consent = input.cloud_consent;
     let result = blocking(move || {
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         // Opting out of an account that never opted in leaves no file behind.
@@ -180,10 +210,21 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
             names.dedup();
             names
         };
+        // Consent names the providers the user saw, so a provider added
+        // later needs a new agreement.
+        let cloud_consent = match input.cloud_consent {
+            Some(true) => cloud_providers(&state.db_path)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            Some(false) => Vec::new(),
+            None => store::prefs(&conn)?.cloud_consent,
+        };
         let prefs = Prefs {
             enabled: input.enabled,
             excluded_folders: keep(input.excluded_folders),
             autofile_folders: keep(input.autofile_folders),
+            cloud_consent,
         };
         store::set_prefs(&conn, &prefs)?;
         if !prefs.enabled {
@@ -194,7 +235,7 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
     .await;
     match result {
         Ok(()) => {
-            webmail_log!("info", "organize_preferences_saved", { "address": address, "enabled": enabled });
+            webmail_log!("info", "organize_preferences_saved", { "address": address, "enabled": enabled, "cloud_consent": cloud_consent });
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => internal_error(error),

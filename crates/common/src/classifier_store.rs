@@ -105,6 +105,16 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    // Added after the first release: stores opted in before it start with no
+    // cloud consent.
+    let has_consent = conn
+        .prepare("SELECT 1 FROM pragma_table_info('prefs') WHERE name = 'cloud_consent'")?
+        .exists([])?;
+    if !has_consent {
+        conn.execute_batch(
+            "ALTER TABLE prefs ADD COLUMN cloud_consent TEXT NOT NULL DEFAULT '[]'",
+        )?;
+    }
     Ok(())
 }
 
@@ -125,17 +135,30 @@ pub struct Prefs {
     pub excluded_folders: Vec<String>,
     /// Folders the user trusts enough for automatic moves.
     pub autofile_folders: Vec<String>,
+    /// Cloud providers the user agreed may receive their mail's text.
+    #[serde(default)]
+    pub cloud_consent: Vec<String>,
+}
+
+impl Prefs {
+    /// Whether the user agreed to every provider in `providers`.
+    pub fn allows_cloud(&self, providers: &[&str]) -> bool {
+        providers
+            .iter()
+            .all(|provider| self.cloud_consent.iter().any(|agreed| agreed == provider))
+    }
 }
 
 pub fn prefs(conn: &Connection) -> Result<Prefs> {
-    let (enabled, excluded, autofile) = conn.query_row(
-        "SELECT enabled, excluded_folders, autofile_folders FROM prefs WHERE id = 1",
+    let (enabled, excluded, autofile, consent) = conn.query_row(
+        "SELECT enabled, excluded_folders, autofile_folders, cloud_consent FROM prefs WHERE id = 1",
         [],
         |row| {
             Ok((
                 row.get::<_, bool>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         },
     )?;
@@ -143,17 +166,19 @@ pub fn prefs(conn: &Connection) -> Result<Prefs> {
         enabled,
         excluded_folders: serde_json::from_str(&excluded).unwrap_or_default(),
         autofile_folders: serde_json::from_str(&autofile).unwrap_or_default(),
+        cloud_consent: serde_json::from_str(&consent).unwrap_or_default(),
     })
 }
 
 pub fn set_prefs(conn: &Connection, prefs: &Prefs) -> Result<()> {
     conn.execute(
         "UPDATE prefs SET enabled = ?1, excluded_folders = ?2, autofile_folders = ?3,
-             updated_at = ?4 WHERE id = 1",
+             cloud_consent = ?4, updated_at = ?5 WHERE id = 1",
         params![
             prefs.enabled,
             serde_json::to_string(&prefs.excluded_folders)?,
             serde_json::to_string(&prefs.autofile_folders)?,
+            serde_json::to_string(&prefs.cloud_consent)?,
             now()
         ],
     )?;
@@ -542,6 +567,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stores_from_before_cloud_consent_are_migrated_without_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_path(dir.path(), "example.test", "bob");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE prefs(id INTEGER PRIMARY KEY CHECK (id = 1),
+                     enabled INTEGER NOT NULL DEFAULT 0,
+                     excluded_folders TEXT NOT NULL DEFAULT '[]',
+                     autofile_folders TEXT NOT NULL DEFAULT '[]',
+                     updated_at INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO prefs(id, enabled) VALUES (1, 1);",
+            )
+            .unwrap();
+        }
+        let conn = open_existing(dir.path(), "example.test", "bob")
+            .unwrap()
+            .unwrap();
+        let migrated = prefs(&conn).unwrap();
+        assert!(migrated.enabled);
+        assert!(migrated.cloud_consent.is_empty());
+        assert!(!migrated.allows_cloud(&["openrouter"]));
+    }
+
+    #[test]
     fn store_round_trips_prefs_examples_and_suggestions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -557,9 +608,13 @@ mod tests {
             enabled: true,
             excluded_folders: vec!["Private".into()],
             autofile_folders: vec!["Receipts".into()],
+            cloud_consent: vec!["openrouter".into()],
         };
         set_prefs(&conn, &wanted).unwrap();
         assert_eq!(prefs(&conn).unwrap(), wanted);
+        assert!(wanted.allows_cloud(&[]));
+        assert!(wanted.allows_cloud(&["openrouter"]));
+        assert!(!wanted.allows_cloud(&["openrouter", "typesafe"]));
 
         let example = Example {
             folder: "Receipts".into(),

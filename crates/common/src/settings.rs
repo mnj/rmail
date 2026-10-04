@@ -143,7 +143,7 @@ pub const GROUPS: &[SettingGroup] = &[
     SettingGroup {
         id: "classifier",
         label: "Mail organization",
-        description: "Folder suggestions from local models. Download and pick models on the Organization page; changes apply without a restart.",
+        description: "Folder suggestions from local or cloud models. Pick models and providers on the Organization page; changes apply without a restart.",
     },
     SettingGroup {
         id: "logging",
@@ -836,18 +836,86 @@ pub const SETTINGS: &[SettingSpec] = &[
         CLASSIFIER,
     ),
     spec(
+        "classifier.embed_provider",
+        "classifier",
+        "Embedding provider",
+        "local runs a model on this server. openrouter sends the text of every message learned or classified to OpenRouter, only for users who agreed to it in webmail.",
+        SettingKind::Choice {
+            options: &["local", "openrouter"],
+        },
+        CLASSIFIER,
+    ),
+    spec(
         "classifier.embed_model",
         "classifier",
         "Embedding model",
-        "File name in the models directory.",
+        "File name in the models directory (local provider).",
         SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.chat_provider",
+        "classifier",
+        "Fallback provider",
+        "Where uncertain messages are decided. jev is TypeSafe's decision model, which picks one folder with a confidence instead of generating text. Cloud providers only see mail of users who agreed to them in webmail.",
+        SettingKind::Choice {
+            options: &["local", "openrouter", "jev"],
+        },
         CLASSIFIER,
     ),
     spec(
         "classifier.chat_model",
         "classifier",
         "Chat model",
-        "Optional fallback for uncertain messages. Empty disables it.",
+        "File name in the models directory (local provider). Empty disables the fallback.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openrouter_api_key",
+        "classifier",
+        "OpenRouter API key",
+        "From openrouter.ai/settings/keys.",
+        SettingKind::Secret,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openrouter_base_url",
+        "classifier",
+        "OpenRouter API base",
+        "Any OpenAI-compatible endpoint works, such as a self-hosted vLLM or Ollama.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openrouter_embed_model",
+        "classifier",
+        "OpenRouter embedding model",
+        "Model id, e.g. openai/text-embedding-3-small. Changing it relearns every opted-in mailbox.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openrouter_chat_model",
+        "classifier",
+        "OpenRouter chat model",
+        "Model id for the fallback, e.g. openai/gpt-4.1-mini. Empty disables it.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.typesafe_api_key",
+        "classifier",
+        "TypeSafe API key",
+        "For the jev fallback provider.",
+        SettingKind::Secret,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.jev_model",
+        "classifier",
+        "Jev model",
+        "jev-latest follows TypeSafe's current release.",
         SettingKind::Text,
         CLASSIFIER,
     ),
@@ -1049,6 +1117,20 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Value>> {
 }
 
 /// The admin password policy stored in the settings database.
+/// Cloud providers the classifier sends message text to under the stored
+/// settings, for webmail's consent prompt (see `config::cloud_providers`).
+pub fn classifier_cloud_providers(conn: &Connection) -> Result<Vec<&'static str>> {
+    let value = |key: &str| get(conn, key).map(|value| value.unwrap_or(Value::Null));
+    let embed = serde_json::from_value(value("classifier.embed_provider")?).unwrap_or_default();
+    let chat = serde_json::from_value(value("classifier.chat_provider")?).unwrap_or_default();
+    let chat_model = value("classifier.openrouter_chat_model")?;
+    Ok(crate::config::cloud_providers(
+        embed,
+        chat,
+        chat_model.as_str().unwrap_or_default(),
+    ))
+}
+
 pub fn admin_password_policy(conn: &Connection) -> Result<crate::config::AdminPasswordPolicy> {
     let stored = load_all(conn)?;
     let prefix = "security.admin_password_policy.";
@@ -2099,6 +2181,8 @@ mod tests {
                         | "acme.dns.rfc2136_server"
                         | "acme.dns.tsig_key_name"
                         | "acme.dns.tsig_secret"
+                        | "classifier.openrouter_api_key"
+                        | "classifier.typesafe_api_key"
                 )
                 || spec.key.starts_with("global.listeners.")
             {

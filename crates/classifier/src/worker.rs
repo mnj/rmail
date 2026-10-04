@@ -31,6 +31,9 @@ pub struct CycleReport {
     pub classified: usize,
     pub suggested: usize,
     pub moved: usize,
+    /// Opted-in accounts skipped because the embedder is a cloud provider
+    /// their user has not agreed to.
+    pub awaiting_consent: usize,
     pub errors: Vec<String>,
 }
 
@@ -57,11 +60,21 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
                 continue;
             }
         };
-        match store::prefs(&conn) {
-            Ok(prefs) if prefs.enabled => {}
+        let prefs = match store::prefs(&conn) {
+            Ok(prefs) if prefs.enabled => prefs,
             _ => continue,
-        }
+        };
         drop(conn);
+        // Mail only reaches a cloud provider the account's user agreed to.
+        if let Some(provider) = models.embed_cloud()
+            && !prefs.allows_cloud(&[provider])
+        {
+            report.awaiting_consent += 1;
+            continue;
+        }
+        let use_chooser = models
+            .chat_cloud()
+            .is_none_or(|provider| prefs.allows_cloud(&[provider]));
         report.accounts += 1;
         let mut account = Account {
             mail_root,
@@ -69,6 +82,7 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
             localpart: &localpart,
             cfg,
             models,
+            use_chooser,
             report: &mut report,
         };
         if let Err(error) = account.run() {
@@ -87,6 +101,8 @@ struct Account<'a> {
     localpart: &'a str,
     cfg: &'a ClassifierConfig,
     models: &'a Models,
+    /// False when the chooser is a cloud provider this user has not agreed to.
+    use_chooser: bool,
     report: &'a mut CycleReport,
 }
 
@@ -278,7 +294,7 @@ impl Account<'_> {
                     dismissed: &dismissed,
                 },
                 self.cfg,
-                self.models.chooser.as_deref(),
+                self.models.chooser.as_deref().filter(|_| self.use_chooser),
             )?;
             self.report.classified += 1;
             if let Some(decision) = decision {
@@ -402,15 +418,27 @@ fn read_document(path: &Path, cfg: &ClassifierConfig) -> Option<pipeline::Docume
 }
 
 /// Counts shown by the control socket's status command.
-pub fn folder_counts(mail_root: &Path) -> BTreeMap<String, usize> {
+/// Accounts by opt-in state; `cloud_consented` counts opted-in accounts
+/// whose users agreed to every provider in `cloud`.
+pub fn folder_counts(mail_root: &Path, cloud: &[&str]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     if let Ok(accounts) = imap_state::list_accounts(mail_root) {
         for (domain, localpart, _) in accounts {
             if let Ok(Some(conn)) = store::open_existing(mail_root, &domain, &localpart) {
-                let enabled = store::prefs(&conn).map(|p| p.enabled).unwrap_or(false);
+                let prefs = store::prefs(&conn).unwrap_or_default();
                 *counts
-                    .entry(if enabled { "opted_in" } else { "opted_out" }.to_string())
+                    .entry(
+                        if prefs.enabled {
+                            "opted_in"
+                        } else {
+                            "opted_out"
+                        }
+                        .to_string(),
+                    )
                     .or_default() += 1;
+                if prefs.enabled && !cloud.is_empty() && prefs.allows_cloud(cloud) {
+                    *counts.entry("cloud_consented".to_string()).or_default() += 1;
+                }
             }
         }
     }
@@ -503,6 +531,7 @@ mod tests {
                 enabled: true,
                 excluded_folders: vec![],
                 autofile_folders: autofile.iter().map(|s| s.to_string()).collect(),
+                cloud_consent: vec![],
             },
         )
         .unwrap();
@@ -511,6 +540,81 @@ mod tests {
     fn inbox_flags(root: &Path, uid: u64) -> Option<Vec<String>> {
         let (_, messages) = imap_state::load_folder(root, D, L, "INBOX").unwrap();
         messages.into_iter().find(|m| m.uid == uid).map(|m| m.flags)
+    }
+
+    fn hosted(provider: &'static str) -> Option<crate::engine::LoadedModel> {
+        Some(crate::engine::LoadedModel {
+            file: format!("{provider}:model"),
+            load_ms: 0,
+            cloud: Some(provider),
+            fingerprint: 0,
+        })
+    }
+
+    fn agree(root: &Path, providers: &[&str]) {
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        let mut prefs = store::prefs(&conn).unwrap();
+        prefs.cloud_consent = providers.iter().map(|p| p.to_string()).collect();
+        store::set_prefs(&conn, &prefs).unwrap();
+    }
+
+    #[test]
+    fn cloud_embeddings_wait_for_the_users_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        seed(root);
+        opt_in(root, &[]);
+        let cloud = Models {
+            embed_info: hosted("openrouter"),
+            ..models()
+        };
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(
+            (report.accounts, report.learned, report.awaiting_consent),
+            (0, 0, 1)
+        );
+
+        // Consent to a different provider is not consent to this one.
+        agree(root, &["typesafe"]);
+        assert_eq!(run_cycle(root, &cfg(), &cloud).awaiting_consent, 1);
+
+        agree(root, &["openrouter"]);
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(
+            (report.accounts, report.learned, report.awaiting_consent),
+            (1, 6, 0)
+        );
+    }
+
+    #[test]
+    fn cloud_fallback_is_only_asked_for_consenting_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        seed(root);
+        opt_in(root, &[]);
+        let chooser = Arc::new(fake::Fixed::new(Some("Receipts"), 0.9));
+        let cloud = Models {
+            chooser: Some(chooser.clone()),
+            chat_info: hosted("typesafe"),
+            ..models()
+        };
+        run_cycle(root, &cfg(), &cloud);
+        // Too unlike either folder for the vote, so only the fallback could decide.
+        let unsure = mail(
+            "x@y.test",
+            "Quarterly statement",
+            "tax statement for the quarter",
+        );
+        imap_state::deliver_message(root, D, L, &unsure).unwrap();
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!((report.classified, report.suggested), (1, 0), "{report:?}");
+        assert_eq!(*chooser.calls.lock().unwrap(), 0);
+
+        agree(root, &["typesafe"]);
+        imap_state::deliver_message(root, D, L, &unsure).unwrap();
+        let report = run_cycle(root, &cfg(), &cloud);
+        assert_eq!(*chooser.calls.lock().unwrap(), 1);
+        assert_eq!(report.suggested, 1, "{report:?}");
     }
 
     #[test]
@@ -682,6 +786,7 @@ mod tests {
                 enabled: true,
                 excluded_folders: vec!["Travel".into()],
                 autofile_folders: vec![],
+                cloud_consent: vec![],
             },
         )
         .unwrap();
