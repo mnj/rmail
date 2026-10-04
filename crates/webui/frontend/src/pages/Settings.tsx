@@ -102,6 +102,47 @@ export function SettingControl({ setting, value, onChange, labels }: { setting: 
   }
 }
 
+/** Banner listing services that must restart to apply saved settings, with a button to do it. */
+export function RestartNotice({ view, onRestarted }: { view: SettingsView; onRestarted: () => void }) {
+  const { run, confirm } = useFeedback();
+  const [restarting, setRestarting] = useState(false);
+  if (!view.managed) return null;
+  const restartNeeded = view.services.filter((service) => service.restart_required);
+  if (restartNeeded.length === 0) return null;
+  const names = restartNeeded.map((service) => service.service);
+
+  async function restart() {
+    const ok = await confirm({
+      title: `Restart ${names.join(', ')}?`,
+      message: names.includes('web')
+        ? 'Active connections to these services are dropped. This console restarts too, so it is unavailable for a few seconds.'
+        : 'Active connections to these services are dropped while they restart.',
+      confirmLabel: 'Restart',
+    });
+    if (!ok) return;
+    setRestarting(true);
+    const queued = await run(() => api('/api/services/restart', 'POST'), 'Restart requested');
+    // Services record their new revision as they come back up.
+    if (queued) for (const delay of [3000, 8000, 15000]) window.setTimeout(onRestarted, delay);
+    window.setTimeout(() => setRestarting(false), 15000);
+  }
+
+  return (
+    <div className="notice warn">
+      <RefreshCw size={18} />
+      <div>
+        <strong>Restart needed to apply saved changes</strong>
+        {restartNeeded.map((service) => (
+          <p key={service.service}><code>{service.service}</code> — {service.pending_changes.join(', ')}</p>
+        ))}
+        {view.restart_available
+          ? <button className="button primary" onClick={restart} disabled={restarting}><RefreshCw size={16} />{restarting ? 'Restarting…' : `Restart ${names.join(', ')}`}</button>
+          : <p>Run <code>rmail_ctl service restart {names.map((name) => `--unit ${name}`).join(' ')}</code> or restart the systemd units.</p>}
+      </div>
+    </div>
+  );
+}
+
 export function SettingsPage() {
   const { run, confirm, notify } = useFeedback();
   const resource = useResource(() => api<SettingsView>('/api/settings'), []);
@@ -109,7 +150,6 @@ export function SettingsPage() {
   const [filter, setFilter] = useState('');
   const [group, setGroup] = useState<string>('all');
   const [saving, setSaving] = useState(false);
-  const [restarting, setRestarting] = useState(false);
   const view = resource.data;
 
   // Certificate settings have their own page.
@@ -161,22 +201,6 @@ export function SettingsPage() {
     if (ok) notify('info', 'Restart the affected services to apply the changes.');
   }
 
-  async function restart(names: string[]) {
-    const ok = await confirm({
-      title: `Restart ${names.join(', ')}?`,
-      message: names.includes('web')
-        ? 'Active connections to these services are dropped. This console restarts too, so it is unavailable for a few seconds.'
-        : 'Active connections to these services are dropped while they restart.',
-      confirmLabel: 'Restart',
-    });
-    if (!ok) return;
-    setRestarting(true);
-    const queued = await run(() => api('/api/services/restart', 'POST'), 'Restart requested');
-    // Services record their new revision as they come back up.
-    if (queued) for (const delay of [3000, 8000, 15000]) window.setTimeout(() => resource.reload(), delay);
-    window.setTimeout(() => setRestarting(false), 15000);
-  }
-
   async function reset(setting: Setting) {
     const ok = await confirm({
       title: `Reset ${setting.label}?`,
@@ -194,25 +218,11 @@ export function SettingsPage() {
     }, `Removed ${key}`);
   }
 
-  const restartNeeded = view.services.filter((service) => service.restart_required);
   const groupsWithSettings = view.groups.filter((item) => settings.some((setting) => setting.group === item.id));
 
   return (
     <div className="settingsPage">
-      {restartNeeded.length > 0 && (
-        <div className="notice warn">
-          <RefreshCw size={18} />
-          <div>
-            <strong>Restart needed to apply saved changes</strong>
-            {restartNeeded.map((service) => (
-              <p key={service.service}><code>{service.service}</code> — {service.pending_changes.join(', ')}</p>
-            ))}
-            {view.restart_available
-              ? <button className="button primary" onClick={() => restart(restartNeeded.map((service) => service.service))} disabled={restarting}><RefreshCw size={16} />{restarting ? 'Restarting…' : `Restart ${restartNeeded.map((service) => service.service).join(', ')}`}</button>
-              : <p>Run <code>rmail_ctl service restart {restartNeeded.map((service) => `--unit ${service.service}`).join(' ')}</code> or restart the systemd units.</p>}
-          </div>
-        </div>
-      )}
+      <RestartNotice view={view} onRestarted={resource.reload} />
 
       <div className="settingsLayout">
         <nav className="settingsNav" aria-label="Setting groups">

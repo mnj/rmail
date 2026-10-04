@@ -1109,7 +1109,7 @@ fn point_settings_at(
     ]);
     crate::settings::update(&mut conn, &changes)?;
     progress.step(
-        "Set global.tls_cert and global.tls_key to the new files. Restart the rMail services once to enable TLS; later renewals are picked up automatically",
+        "Set global.tls_cert and global.tls_key to the new files. smtpd, imapd, web and webmail need one restart to start serving TLS; later renewals are picked up automatically",
     );
     Ok(true)
 }

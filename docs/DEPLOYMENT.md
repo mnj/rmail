@@ -272,8 +272,9 @@ it on the admin console's **Certificates** page, or with `rmail_ctl settings set
 
 The certificate is written with atomic renames to `global.tls_cert` / `global.tls_key`. When those are
 unset, it goes to `<mail_root>/tls/fullchain.pem` and `privkey.pem` (key mode 0600) and the settings
-are pointed there; restart the services once so they start serving TLS. Later renewals are picked up
-by the file watch above. The key is ECDSA P-256. OCSP stapling (`global.tls.ocsp_response`) cannot
+are pointed there automatically. The services need one restart to start serving TLS: the Certificates
+page offers a **Restart** button once the settings change, and `rmail_ctl acme issue` asks interactively.
+Later renewals are picked up by the file watch above. The key is ECDSA P-256. OCSP stapling (`global.tls.ocsp_response`) cannot
 be combined with ACME certificates.
 
 The services run sandboxed and can only write under their mail root, so certificates live in
