@@ -12,6 +12,7 @@ pub mod classifier_store;
 pub mod compose;
 pub mod config;
 pub mod db;
+pub mod discovery;
 pub mod domain;
 pub mod http;
 pub mod imap_state;

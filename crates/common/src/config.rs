@@ -468,6 +468,12 @@ pub struct SecurityConfig {
     pub rspamd_quarantine_actions: Vec<String>,
     #[serde(default)]
     pub rspamd_reject_actions: Vec<String>,
+    /// Publish an MTA-STS policy (RFC 8461) for hosted domains at
+    /// `https://mta-sts.<domain>/.well-known/mta-sts.txt`.
+    #[serde(default)]
+    pub mta_sts_mode: crate::discovery::MtaStsMode,
+    #[serde(default = "default_mta_sts_max_age_secs")]
+    pub mta_sts_max_age_secs: u64,
 }
 
 impl Default for SecurityConfig {
@@ -496,6 +502,8 @@ impl Default for SecurityConfig {
             rspamd_url: default_rspamd_url(),
             rspamd_quarantine_actions: default_rspamd_quarantine_actions(),
             rspamd_reject_actions: Vec::new(),
+            mta_sts_mode: crate::discovery::MtaStsMode::None,
+            mta_sts_max_age_secs: default_mta_sts_max_age_secs(),
         }
     }
 }
@@ -720,6 +728,10 @@ fn default_scanner_max_message_bytes() -> usize {
 
 fn default_clamav_endpoint() -> String {
     "unix:/run/clamav/clamd.ctl".to_string()
+}
+
+fn default_mta_sts_max_age_secs() -> u64 {
+    604_800
 }
 
 fn default_rspamd_url() -> String {

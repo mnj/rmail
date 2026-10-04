@@ -720,6 +720,24 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.mta_sts_mode",
+        "tls",
+        "MTA-STS policy",
+        "Publish an MTA-STS policy for hosted domains. Needs an mta-sts.<domain> DNS name and a trusted certificate. Start with testing.",
+        SettingKind::Choice {
+            options: &["none", "testing", "enforce"],
+        },
+        SMTP,
+    ),
+    spec(
+        "security.mta_sts_max_age_secs",
+        "tls",
+        "MTA-STS max age (s)",
+        "How long senders cache the policy.",
+        int(60, 31_557_600),
+        SMTP,
+    ),
+    spec(
         "security.scanner_failure_action",
         "filtering",
         "When a scanner fails",

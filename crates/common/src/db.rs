@@ -253,6 +253,30 @@ pub fn set_mailbox_quota<P: AsRef<Path>>(
     Ok(())
 }
 
+/// True when `domain` has a mailbox or a catchall on this server.
+pub fn is_local_domain<P: AsRef<Path>>(path: P, domain: &str) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let domain = domain.to_ascii_lowercase();
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE lower(substr(address, instr(address, '@') + 1)) = ?1)
+             OR EXISTS(SELECT 1 FROM catchalls WHERE lower(domain) = ?1)",
+        params![domain],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Every domain with a mailbox or a catchall, sorted.
+pub fn local_domains<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT lower(substr(address, instr(address, '@') + 1)) AS d FROM mailboxes WHERE instr(address, '@') > 0
+         UNION SELECT lower(domain) FROM catchalls ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Get catchall target for a domain
 pub fn get_catchall<P: AsRef<Path>>(path: P, domain: &str) -> Result<Option<String>> {
     let domain = crate::domain::canonicalize_domain(domain)?;
@@ -747,6 +771,25 @@ mod tests {
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
+
+    #[test]
+    fn local_domains_come_from_mailboxes_and_catchalls() {
+        let td = tempdir().expect("tempdir");
+        let db_path = td.path().join("domains.db");
+        init_db(&db_path).expect("init db");
+        add_mailbox(&db_path, "Alice@Example.COM", None, None, None).expect("mailbox");
+        set_catchall(&db_path, "other.test", "alice@example.com").expect("catchall");
+
+        assert!(super::is_local_domain(&db_path, "example.com").unwrap());
+        assert!(super::is_local_domain(&db_path, "EXAMPLE.com").unwrap());
+        assert!(super::is_local_domain(&db_path, "other.test").unwrap());
+        assert!(!super::is_local_domain(&db_path, "nope.test").unwrap());
+        assert!(!super::is_local_domain(&db_path, "xample.com").unwrap());
+        assert_eq!(
+            super::local_domains(&db_path).unwrap(),
+            vec!["example.com".to_string(), "other.test".to_string()]
+        );
+    }
 
     #[test]
     fn init_db_provisions_outbound_queue_columns() {
