@@ -335,6 +335,9 @@ pub(crate) struct MessageListItem {
     pub snippet: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<organize::SuggestionView>,
+    /// The user's labels whose keyword the message carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<rmail_common::classifier_store::Label>,
 }
 
 #[derive(Serialize)]
@@ -446,6 +449,7 @@ async fn message_list(
         } else {
             Default::default()
         };
+        let labels = organize::labels(&state.mail_root, &session.domain, &session.localpart);
         messages.sort_by(|a, b| b.internaldate.cmp(&a.internaldate).then(b.uid.cmp(&a.uid)));
         Ok(messages
             .into_iter()
@@ -459,6 +463,16 @@ async fn message_list(
                 if !needle.is_empty() && !haystack.contains(&needle) {
                     return None;
                 }
+                let labels = labels
+                    .iter()
+                    .filter(|label| {
+                        message
+                            .flags
+                            .iter()
+                            .any(|flag| flag.eq_ignore_ascii_case(&label.keyword))
+                    })
+                    .cloned()
+                    .collect();
                 Some(MessageListItem {
                     uid: message.uid,
                     flags: message.flags,
@@ -469,6 +483,7 @@ async fn message_list(
                     subject: parsed.subject,
                     snippet: snippet(&parsed.text_body),
                     suggestion: suggestions.remove(&message.uid),
+                    labels,
                 })
             })
             .skip(query.offset)
@@ -1033,8 +1048,6 @@ mod tests {
             overview["labels_available"], false,
             "no fallback model is configured"
         );
-        let listed = json(&call("GET", "/api/labels".into(), vec![]).await.body);
-        assert_eq!(listed[1]["name"], "Invoices");
         assert_eq!(overview["labels"][0]["origin"], "user");
         let starter = overview["labels"]
             .as_array()
@@ -1063,6 +1076,14 @@ mod tests {
         // A label on a message can be removed from webmail; system flags cannot be touched.
         let (_, uid) = imap_state::deliver_message(root, d, l, b"Subject: x\r\n\r\ny").unwrap();
         store::set_keyword(root, d, l, "INBOX", uid, "To_do", true).unwrap();
+        // The message list names the labels a message carries.
+        let listed = json(
+            &call("GET", "/api/folders/INBOX/messages".into(), vec![])
+                .await
+                .body,
+        );
+        assert_eq!(listed[0]["labels"][0]["name"], "To do");
+        assert_eq!(listed[0]["labels"][0]["keyword"], "To_do");
         let path = format!("/api/folders/INBOX/messages/{uid}");
         let removed = call(
             "PATCH",
@@ -1088,22 +1109,32 @@ mod tests {
         let overview = json(&call("GET", "/api/organize".into(), vec![]).await.body);
         assert_eq!(overview["folder_ideas"][0]["label"], "Invoices");
         assert_eq!(overview["folder_ideas"][0]["count"], 10);
+        // Folders are only created from a stored label, inside an existing folder.
+        let unknown = call(
+            "POST",
+            "/api/organize/folders".into(),
+            br#"{"label":"../etc"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(unknown.status, 422);
+        let no_parent = call(
+            "POST",
+            "/api/organize/folders".into(),
+            br#"{"label":"Invoices","parent":"Nope"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(no_parent.status, 422);
+        imap_state::create_folder(root, d, l, "Money").unwrap();
         let created = call(
             "POST",
             "/api/organize/folders".into(),
-            br#"{"name":"Invoices"}"#.to_vec(),
+            br#"{"label":"Invoices","parent":"Money"}"#.to_vec(),
         )
         .await;
         assert_eq!(created.status, 200);
+        assert_eq!(json(&created.body)["folder"], "Money/Invoices");
         let overview = json(&call("GET", "/api/organize".into(), vec![]).await.body);
         assert_eq!(overview["folder_ideas"], serde_json::json!([]));
-        let inbox = call(
-            "POST",
-            "/api/organize/folders".into(),
-            br#"{"name":"inbox"}"#.to_vec(),
-        )
-        .await;
-        assert_eq!(inbox.status, 422);
     }
 
     #[tokio::test]

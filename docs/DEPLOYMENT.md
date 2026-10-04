@@ -459,7 +459,7 @@ Users can also have new INBOX mail labeled automatically. This is a separate swi
 - Labels need a fallback model. With a cloud fallback, every new INBOX message of a user who turned
   labels on goes to that provider, so the same per-user consent applies (see above).
 - When a label has been applied to 10 or more messages and the user has no folder with that name,
-  webmail suggests creating one.
+  webmail suggests creating one, at the top level or inside an existing folder.
 
 Resource notes: embedding models cost roughly 100–900 MB RAM and milliseconds per message on CPU.
 Chat models (1–2 GB) take seconds per uncertain message. The unit runs at `Nice=10` with a reduced

@@ -22,7 +22,6 @@ pub(crate) fn routes() -> Router<Shared> {
     Router::new()
         .route("/api/organize", get(overview).put(save))
         .route("/api/organize/folders", post(create_folder))
-        .route("/api/labels", get(labels))
         .route("/api/suggestions/accept-all", post(accept_all))
         .route("/api/suggestions/{uid}/accept", post(accept))
         .route("/api/suggestions/{uid}/dismiss", post(dismiss))
@@ -34,6 +33,18 @@ pub(crate) struct SuggestionView {
     pub folder: String,
     pub score: f64,
     pub method: String,
+}
+
+/// The account's labels; empty when it never opted in.
+pub(crate) fn labels(
+    mail_root: &std::path::Path,
+    domain: &str,
+    localpart: &str,
+) -> Vec<store::Label> {
+    match store::open_existing(mail_root, domain, localpart) {
+        Ok(Some(conn)) => store::labels(&conn).unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// Pending suggestions for INBOX by UID; empty when the account never opted in.
@@ -339,42 +350,53 @@ async fn save(State(state): State<Shared>, session: Session, body: Bytes) -> Res
     }
 }
 
-/// The signed-in user's labels, for showing keywords as named chips.
-async fn labels(State(state): State<Shared>, session: Session) -> Response {
-    let result = blocking(move || {
-        match store::open_existing(&state.mail_root, &session.domain, &session.localpart)? {
-            Some(conn) => store::labels(&conn),
-            None => Ok(Vec::new()),
-        }
-    })
-    .await;
-    match result {
-        Ok(labels) => Json(labels).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
-
 #[derive(Deserialize)]
 struct NewFolder {
-    name: String,
+    /// One of the user's labels; the folder takes its name.
+    label: String,
+    /// An existing folder to create it in; absent creates it at the top.
+    #[serde(default)]
+    parent: Option<String>,
 }
 
-/// Create a folder, e.g. from a label used often.
+/// Create a folder for a label used often, optionally inside an existing
+/// folder. The name is built from the stored label and folder names, so the
+/// request only selects among them.
 async fn create_folder(State(state): State<Shared>, session: Session, body: Bytes) -> Response {
     let Ok(input) = serde_json::from_slice::<NewFolder>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
-    let name = input.name.trim().trim_matches('/').to_string();
-    if name.is_empty() || name.eq_ignore_ascii_case("INBOX") || name.chars().count() > 200 {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "invalid folder name").into_response();
-    }
-    let created = name.clone();
     let result = blocking(move || {
-        imap_state::create_folder(&state.mail_root, &session.domain, &session.localpart, &name)
+        let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
+        let Some(conn) = store::open_existing(root, domain, local)? else {
+            return Ok(Err("no such label"));
+        };
+        let Some(label) = store::labels(&conn)?
+            .into_iter()
+            .find(|label| label.name == input.label)
+        else {
+            return Ok(Err("no such label"));
+        };
+        let name = match &input.parent {
+            None => label.name,
+            Some(parent) => {
+                let Some(folder) = imap_state::list_folders(root, domain, local)?
+                    .into_iter()
+                    .filter(store::is_user_folder)
+                    .find(|folder| &folder.name == parent)
+                else {
+                    return Ok(Err("no such folder"));
+                };
+                format!("{}/{}", folder.name, label.name)
+            }
+        };
+        imap_state::create_folder(root, domain, local, &name)?;
+        Ok(Ok(name))
     })
     .await;
     match result {
-        Ok(()) => Json(serde_json::json!({ "folder": created })).into_response(),
+        Ok(Ok(folder)) => Json(serde_json::json!({ "folder": folder })).into_response(),
+        Ok(Err(message)) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
         Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
 }
