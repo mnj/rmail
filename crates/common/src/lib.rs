@@ -12,6 +12,7 @@ pub mod classifier_store;
 pub mod compose;
 pub mod config;
 pub mod db;
+pub mod dnsbl;
 pub mod domain;
 pub mod greylist;
 pub mod http;

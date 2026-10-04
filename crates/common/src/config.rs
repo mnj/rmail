@@ -477,6 +477,12 @@ pub struct SecurityConfig {
     /// How often changed greylist state is written to SQLite.
     #[serde(default = "default_greylist_persist_interval_secs")]
     pub greylist_persist_interval_secs: u64,
+    /// DNS blocklist zones (e.g. "zen.spamhaus.org") checked for unauthenticated
+    /// inbound SMTP clients; a listed client is rejected at MAIL FROM. Empty disables.
+    #[serde(default)]
+    pub dnsbl_zones: Vec<String>,
+    #[serde(default = "default_dnsbl_timeout_ms")]
+    pub dnsbl_timeout_ms: u64,
 }
 
 impl Default for SecurityConfig {
@@ -508,6 +514,8 @@ impl Default for SecurityConfig {
             greylist_enabled: false,
             greylist_delay_secs: default_greylist_delay_secs(),
             greylist_persist_interval_secs: default_greylist_persist_interval_secs(),
+            dnsbl_zones: Vec::new(),
+            dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }
 }
@@ -740,6 +748,10 @@ fn default_greylist_delay_secs() -> u64 {
 
 fn default_greylist_persist_interval_secs() -> u64 {
     300
+}
+
+fn default_dnsbl_timeout_ms() -> u64 {
+    2000
 }
 
 fn default_rspamd_url() -> String {

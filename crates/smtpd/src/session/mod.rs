@@ -747,6 +747,22 @@ impl Session {
         Ok(Flow::Continue)
     }
 
+    /// Blocklist check for unauthenticated inbound (port 25) clients only.
+    async fn dnsbl_listing(&self) -> Option<rmail_common::dnsbl::Listing> {
+        if self.security.dnsbl_zones.is_empty()
+            || self.service != SmtpService::Mta
+            || self.authenticated_user.is_some()
+        {
+            return None;
+        }
+        rmail_common::dnsbl::check(
+            self.peer?.ip(),
+            &self.security.dnsbl_zones,
+            Duration::from_millis(self.security.dnsbl_timeout_ms),
+        )
+        .await
+    }
+
     async fn mail(&mut self, reader: &mut SmtpReader, args: &str) -> Result<Flow> {
         let parsed = match parse_mail_from_args(args) {
             Ok(parsed) => parsed,
@@ -784,6 +800,16 @@ impl Session {
             .is_some_and(|size| size > MAX_MESSAGE_BYTES)
         {
             return reply(reader, b"552 5.3.4 Message size exceeds fixed maximum\r\n").await;
+        }
+        if let Some(listing) = self.dnsbl_listing().await {
+            session_log!(self, "warn", "client_rejected_by_dnsbl", { "zone": listing.zone, "code": listing.code.to_string() });
+            self.tx.mail_from = None;
+            self.tx.active = false;
+            let line = format!(
+                "554 5.7.1 Service unavailable; client host blocked using {}\r\n",
+                listing.zone
+            );
+            return reply(reader, line.as_bytes()).await;
         }
         self.tx.body = parsed.body;
         self.tx.smtp_utf8 = parsed.smtp_utf8;

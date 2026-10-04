@@ -744,6 +744,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.dnsbl_zones",
+        "filtering",
+        "DNS blocklists",
+        "Blocklist zones (e.g. zen.spamhaus.org). Listed clients are rejected at MAIL FROM; lookup failures never block mail.",
+        SettingKind::List,
+        SMTP,
+    ),
+    spec(
+        "security.dnsbl_timeout_ms",
+        "filtering",
+        "DNSBL timeout (ms)",
+        "",
+        int(100, 30_000),
+        SMTP,
+    ),
+    spec(
         "security.scanner_failure_action",
         "filtering",
         "When a scanner fails",

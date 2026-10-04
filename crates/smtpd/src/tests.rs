@@ -2344,3 +2344,64 @@ async fn greylisting_defers_unknown_triples_but_not_submission_or_loopback() {
     .await;
     assert!(responses.iter().any(|r| r.starts_with("250 2.1.5")));
 }
+
+#[tokio::test]
+async fn dnsbl_listed_clients_are_rejected_at_mail_from() {
+    let listed: std::net::SocketAddr = "203.0.113.50:40000".parse().unwrap();
+    let clean: std::net::SocketAddr = "203.0.113.51:40000".parse().unwrap();
+    let zone = "bl.test";
+    rmail_common::dnsbl::seed_cache(
+        listed.ip(),
+        zone,
+        Some(rmail_common::dnsbl::Listing {
+            zone: zone.to_string(),
+            code: std::net::Ipv4Addr::new(127, 0, 0, 2),
+        }),
+    )
+    .await;
+    rmail_common::dnsbl::seed_cache(clean.ip(), zone, None).await;
+    let security = || SecurityConfig {
+        dnsbl_zones: vec![zone.to_string()],
+        ..SecurityConfig::default()
+    };
+    let script =
+        b"EHLO localhost\r\nMAIL FROM:<a@sender.test>\r\nRCPT TO:<user@example.test>\r\nQUIT\r\n"
+            .to_vec();
+
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, _td) = run_prepared_session_from(
+        script.clone(),
+        16 * 1024,
+        security(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+        Some(listed),
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|r| r
+                .starts_with("554 5.7.1 Service unavailable; client host blocked using bl.test")),
+        "{responses:?}"
+    );
+    assert!(!responses.iter().any(|r| r.starts_with("250 2.1.0")));
+
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, _td) = run_prepared_session_from(
+        script,
+        16 * 1024,
+        security(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+        Some(clean),
+    )
+    .await;
+    assert!(responses.iter().any(|r| r.starts_with("250 2.1.0")));
+}
