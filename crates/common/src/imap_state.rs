@@ -533,7 +533,7 @@ pub fn create_folder_with_special_use(
     }
     ensure_maildir(&directory)?;
     let guard = FileMutationGuard::created_directory(directory);
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO folders(name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq)
          VALUES(?1, ?2, ?3, 1, ?4, 1, 1)",
@@ -592,7 +592,7 @@ pub fn delete_folder(
     } else {
         None
     };
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
     tx.execute("DELETE FROM subscriptions WHERE name = ?1", params![name])?;
     tx.commit()?;
@@ -664,7 +664,7 @@ pub fn rename_folder(
     fs::rename(&source_dir, &destination_dir)
         .with_context(|| format!("renaming mailbox {source} to {destination}"))?;
     let guard = FileMutationGuard::moved(source_dir, destination_dir);
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (old_name, new_name) in &mappings {
         tx.execute(
             "DELETE FROM subscriptions WHERE name = ?1 AND EXISTS (
@@ -923,7 +923,7 @@ pub fn set_uid_flags_batch(
     let name = normalize_mailbox_name(mailbox)?;
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let folder_id = folder_id(&tx, &name)?.context("missing folder")?;
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -981,7 +981,7 @@ pub fn delete_messages_by_uid(
     }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (deleted, staged) =
         expunge_uids_in_tx(&tx, maildir_root, domain, localpart, &name, &requested)?;
     tx.commit()?;
@@ -1296,7 +1296,7 @@ pub fn move_message_by_uid(
     reconcile_folder(&conn, maildir_root, domain, localpart, &source)?;
     reconcile_folder(&conn, maildir_root, domain, localpart, &destination)?;
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let source_id = folder_id(&tx, &source)?.context("missing source folder")?;
     let destination_id = folder_id(&tx, &destination)?.context("missing destination folder")?;
     let Some((filename, subdir, flags, size, internaldate, internaldate_tz, email_id)) = tx
