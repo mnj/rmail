@@ -527,13 +527,32 @@ async fn session_info(State(state): State<Shared>, headers: HeaderMap) -> Respon
     let user = credentials
         .filter(|(user, hash)| cookie_user(&headers, &state, user, hash))
         .map(|(user, _)| user);
+    // The policy is public so the setup screen can check a password before
+    // submitting it; it describes rules, not credentials.
+    let policy = match password_policy(&state).await {
+        Ok(policy) => policy,
+        Err(err) => return error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    };
     Json(json!({
         "authenticated": setup_required || user.is_some(),
         "user": user,
         "setup_required": setup_required,
         "settings_managed": state.db_path.is_some(),
+        "password_policy": policy,
     }))
     .into_response()
+}
+
+/// The admin password policy in effect: from the settings database when
+/// there is one, otherwise the built-in defaults.
+async fn password_policy(state: &AdminState) -> Result<rmail_common::config::AdminPasswordPolicy> {
+    let Some(db) = state.db_path.clone() else {
+        return Ok(Default::default());
+    };
+    blocking(move || {
+        rmail_common::settings::admin_password_policy(&rmail_common::settings::open(&db)?)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -973,12 +992,7 @@ async fn change_credentials(
             "username must be non-empty and must not contain ':'",
         );
     }
-    let policy_db = db.clone();
-    let policy = match blocking(move || {
-        rmail_common::settings::admin_password_policy(&rmail_common::settings::open(&policy_db)?)
-    })
-    .await
-    {
+    let policy = match password_policy(&state).await {
         Ok(policy) => policy,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
