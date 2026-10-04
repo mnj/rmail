@@ -29,6 +29,7 @@ mod input;
 mod listener;
 mod mailbox;
 mod parser;
+mod pop3;
 mod response;
 mod session;
 mod sort;
@@ -124,6 +125,15 @@ async fn main() -> Result<()> {
         None
     };
 
+    let pop3_context = db_path.clone().map(|db_path| pop3::Pop3Context {
+        mail_root: mail_root.clone(),
+        db_path,
+        tls: tls_receiver.clone(),
+        session_limit: session_limit.clone(),
+        connection_rate_limit,
+        implicit_tls: false,
+        shutdown: shutdown.clone(),
+    });
     let template = ListenerContext {
         mail_root,
         tls: tls_receiver,
@@ -156,6 +166,33 @@ async fn main() -> Result<()> {
         )?;
     } else if !imaps.is_empty() {
         imap_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
+    }
+
+    // POP3 (STLS) and POP3S (implicit TLS).
+    if let Some(context) = pop3_context {
+        for (addrs, implicit_tls) in [
+            (cfg.global.pop3_listeners(), false),
+            (cfg.global.pop3s_listeners(), true),
+        ] {
+            if implicit_tls && tls_context.is_none() && !addrs.is_empty() {
+                imap_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
+                continue;
+            }
+            for addr in addrs {
+                let listener = bind_tcp_listener_with_config(&addr, &tcp)
+                    .with_context(|| format!("starting POP3 listener on {addr}"))?;
+                let context = pop3::Pop3Context {
+                    implicit_tls,
+                    ..context.clone()
+                };
+                listeners.spawn(async move {
+                    if let Err(error) = pop3::run_listener(addr, listener, context).await {
+                        imap_log!("error", "pop3_listener_failed", { "error": error.to_string() });
+                    }
+                });
+                listener_count += 1;
+            }
+        }
     }
 
     if listener_count == 0 {
