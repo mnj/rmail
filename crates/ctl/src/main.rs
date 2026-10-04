@@ -247,9 +247,12 @@ async fn main() -> Result<()> {
                     line.trim_end_matches(['\r', '\n']).to_string()
                 }
             };
-            if password.chars().count() < 10 {
-                anyhow::bail!("admin password must be at least 10 characters");
-            }
+            let policy = rmail_common::settings::admin_password_policy(
+                &rmail_common::settings::open(&db_path)?,
+            )?;
+            policy
+                .check(user.trim(), &password)
+                .map_err(|message| anyhow::anyhow!("admin {message}"))?;
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
                 .hash_password(password.as_bytes(), &salt)
