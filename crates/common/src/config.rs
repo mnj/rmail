@@ -436,6 +436,12 @@ pub struct SecurityConfig {
     pub submission_max_recipients: usize,
     #[serde(default = "default_submission_max_messages_per_minute")]
     pub submission_max_messages_per_minute: usize,
+    /// Messages one account may submit per rolling 24 hours (0 = unlimited).
+    #[serde(default)]
+    pub submission_max_messages_per_user_per_day: usize,
+    /// Messages all accounts of one sending domain may submit per rolling hour (0 = unlimited).
+    #[serde(default)]
+    pub submission_max_messages_per_domain_per_hour: usize,
     /// Require every RFC 5322 From mailbox on authenticated submission to match the login.
     #[serde(default)]
     pub submission_require_from_alignment: bool,
@@ -478,6 +484,21 @@ pub struct SecurityConfig {
     /// `_smtp._tls` record.
     #[serde(default = "default_true")]
     pub tls_rpt_enabled: bool,
+    /// Defer the first delivery attempt from unknown (network, sender,
+    /// recipient) triples on unauthenticated SMTP sessions.
+    #[serde(default)]
+    pub greylist_enabled: bool,
+    #[serde(default = "default_greylist_delay_secs")]
+    pub greylist_delay_secs: u64,
+    /// How often changed greylist state is written to SQLite.
+    #[serde(default = "default_greylist_persist_interval_secs")]
+    pub greylist_persist_interval_secs: u64,
+    /// DNS blocklist zones (e.g. "zen.spamhaus.org") checked for unauthenticated
+    /// inbound SMTP clients; a listed client is rejected at MAIL FROM. Empty disables.
+    #[serde(default)]
+    pub dnsbl_zones: Vec<String>,
+    #[serde(default = "default_dnsbl_timeout_ms")]
+    pub dnsbl_timeout_ms: u64,
 }
 
 impl Default for SecurityConfig {
@@ -492,6 +513,8 @@ impl Default for SecurityConfig {
             smtp_max_recipients: default_smtp_max_recipients(),
             submission_max_recipients: default_submission_max_recipients(),
             submission_max_messages_per_minute: default_submission_max_messages_per_minute(),
+            submission_max_messages_per_user_per_day: 0,
+            submission_max_messages_per_domain_per_hour: 0,
             submission_require_from_alignment: false,
             imap_sasl_mechanisms: default_imap_sasl_mechanisms(),
             smtp_sasl_mechanisms: default_smtp_sasl_mechanisms(),
@@ -509,6 +532,11 @@ impl Default for SecurityConfig {
             mta_sts_mode: crate::discovery::MtaStsMode::None,
             mta_sts_max_age_secs: default_mta_sts_max_age_secs(),
             tls_rpt_enabled: true,
+            greylist_enabled: false,
+            greylist_delay_secs: default_greylist_delay_secs(),
+            greylist_persist_interval_secs: default_greylist_persist_interval_secs(),
+            dnsbl_zones: Vec::new(),
+            dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }
 }
@@ -737,6 +765,18 @@ fn default_clamav_endpoint() -> String {
 
 fn default_mta_sts_max_age_secs() -> u64 {
     604_800
+}
+
+fn default_greylist_delay_secs() -> u64 {
+    300
+}
+
+fn default_greylist_persist_interval_secs() -> u64 {
+    300
+}
+
+fn default_dnsbl_timeout_ms() -> u64 {
+    2000
 }
 
 fn default_rspamd_url() -> String {

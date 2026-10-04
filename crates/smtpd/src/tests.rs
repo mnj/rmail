@@ -251,6 +251,24 @@ async fn run_prepared_session(
     mail_root: std::path::PathBuf,
     db_path: std::path::PathBuf,
 ) -> (Vec<String>, tempfile::TempDir) {
+    run_prepared_session_from(
+        input, capacity, security, encrypted, service, td, mail_root, db_path, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_prepared_session_from(
+    input: Vec<u8>,
+    capacity: usize,
+    security: SecurityConfig,
+    encrypted: bool,
+    service: SmtpService,
+    td: tempfile::TempDir,
+    mail_root: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    peer: Option<std::net::SocketAddr>,
+) -> (Vec<String>, tempfile::TempDir) {
     let (client, server) = duplex(capacity);
     let server_task = tokio::spawn(async move {
         process_stream(
@@ -258,7 +276,7 @@ async fn run_prepared_session(
             mail_root.to_string_lossy().to_string(),
             None,
             Some(db_path.to_string_lossy().to_string()),
-            None,
+            peer,
             encrypted,
             false,
             true,
@@ -500,7 +518,7 @@ fn submission_message_quota_is_account_keyed() {
     let first = "quota-first@example.test";
     let second = "quota-second@example.test";
     assert!(super::submission_quota_available(first, 1));
-    super::record_submission_message(first);
+    super::record_submission_message(first, 0, 0);
     assert!(!super::submission_quota_available(first, 1));
     assert!(super::submission_quota_available(second, 1));
 }
@@ -2276,4 +2294,114 @@ async fn local_webmail_submits_as_its_user_over_loopback_only() {
     )
     .await;
     assert!(!mta.iter().any(|l| l.starts_with("235")), "{mta:?}");
+}
+
+#[tokio::test]
+async fn greylisting_defers_unknown_triples_but_not_submission_or_loopback() {
+    let security = || SecurityConfig {
+        greylist_enabled: true,
+        greylist_delay_secs: 3600,
+        ..SecurityConfig::default()
+    };
+    let script =
+        b"EHLO localhost\r\nMAIL FROM:<grey-defers-unknown@sender.test>\r\nRCPT TO:<user@example.test>\r\nQUIT\r\n"
+            .to_vec();
+    let peer: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
+
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, _td) = run_prepared_session_from(
+        script.clone(),
+        16 * 1024,
+        security(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+        Some(peer),
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|r| r.starts_with("451 4.7.1 Greylisted")),
+        "{responses:?}"
+    );
+
+    // Loopback peers are exempt.
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, _td) = run_prepared_session_from(
+        script,
+        16 * 1024,
+        security(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+        Some("127.0.0.1:40000".parse().unwrap()),
+    )
+    .await;
+    assert!(responses.iter().any(|r| r.starts_with("250 2.1.5")));
+}
+
+#[tokio::test]
+async fn dnsbl_listed_clients_are_rejected_at_mail_from() {
+    let listed: std::net::SocketAddr = "203.0.113.50:40000".parse().unwrap();
+    let clean: std::net::SocketAddr = "203.0.113.51:40000".parse().unwrap();
+    let zone = "bl.test";
+    rmail_common::dnsbl::seed_cache(
+        listed.ip(),
+        zone,
+        Some(rmail_common::dnsbl::Listing {
+            zone: zone.to_string(),
+            code: std::net::Ipv4Addr::new(127, 0, 0, 2),
+        }),
+    )
+    .await;
+    rmail_common::dnsbl::seed_cache(clean.ip(), zone, None).await;
+    let security = || SecurityConfig {
+        dnsbl_zones: vec![zone.to_string()],
+        ..SecurityConfig::default()
+    };
+    let script =
+        b"EHLO localhost\r\nMAIL FROM:<a@sender.test>\r\nRCPT TO:<user@example.test>\r\nQUIT\r\n"
+            .to_vec();
+
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, _td) = run_prepared_session_from(
+        script.clone(),
+        16 * 1024,
+        security(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+        Some(listed),
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|r| r
+                .starts_with("554 5.7.1 Service unavailable; client host blocked using bl.test")),
+        "{responses:?}"
+    );
+    assert!(!responses.iter().any(|r| r.starts_with("250 2.1.0")));
+
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, _td) = run_prepared_session_from(
+        script,
+        16 * 1024,
+        security(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+        Some(clean),
+    )
+    .await;
+    assert!(responses.iter().any(|r| r.starts_with("250 2.1.0")));
 }

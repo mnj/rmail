@@ -116,11 +116,57 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             info TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (day, domain, policy_type, mx_host, result)
         ) WITHOUT ROWID;
+
+        -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
+        CREATE TABLE IF NOT EXISTS greylist (
+            key TEXT PRIMARY KEY,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL
+        ) WITHOUT ROWID;
         "#,
     )?;
     ensure_outbound_columns(path)?;
     add_column_if_missing(path, "mailboxes", "quota_bytes", "INTEGER")?;
     Ok(())
+}
+
+/// Replace the persisted greylist with `records` in one transaction.
+pub fn save_greylist<P: AsRef<Path>>(
+    path: P,
+    records: &[crate::greylist::GreylistRecord],
+) -> Result<()> {
+    let mut conn = Connection::open(path)?;
+    // Wait out a concurrent save (e.g. the shutdown flush overlapping a
+    // periodic one) instead of failing with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM greylist", [])?;
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO greylist (key, first_seen, last_seen) VALUES (?1, ?2, ?3)")?;
+        for record in records {
+            stmt.execute(params![
+                record.key,
+                record.first_seen as i64,
+                record.last_seen as i64
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn load_greylist<P: AsRef<Path>>(path: P) -> Result<Vec<crate::greylist::GreylistRecord>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT key, first_seen, last_seen FROM greylist")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(crate::greylist::GreylistRecord {
+            key: row.get(0)?,
+            first_seen: row.get::<_, i64>(1)? as u64,
+            last_seen: row.get::<_, i64>(2)? as u64,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Add or replace mailbox
