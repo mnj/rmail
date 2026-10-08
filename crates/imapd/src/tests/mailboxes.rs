@@ -823,10 +823,12 @@ async fn savedate_and_status_size_use_persisted_message_metadata() {
     reader.read_line(&mut greeting).await.expect("greeting");
     let mut capability = String::new();
     reader.read_line(&mut capability).await.expect("capability");
+    // Saved today, but INTERNALDATE is 1996: the save-date keys must use the former.
+    let today = chrono::Utc::now().format("%-d-%b-%Y");
     reader
             .get_mut()
             .write_all(
-                b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 STATUS INBOX (MESSAGES SIZE)\r\nA004 SELECT INBOX\r\nA005 UID FETCH 1:* (UID INTERNALDATE SAVEDATE RFC822.SIZE)\r\nA006 STATUS INBOX (BOGUS)\r\nA007 LOGOUT\r\n",
+                format!("A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 STATUS INBOX (MESSAGES SIZE)\r\nA004 SELECT INBOX\r\nA005 UID FETCH 1:* (UID INTERNALDATE SAVEDATE RFC822.SIZE)\r\nS1 SEARCH SAVEDSINCE {today}\r\nS2 SEARCH SAVEDON {today}\r\nS3 SEARCH SAVEDBEFORE 1-Jan-2000\r\nS4 SEARCH BEFORE 1-Jan-2000 NOT SAVEDBEFORE 1-Jan-2000\r\nS5 SEARCH SAVEDATESUPPORTED\r\nA006 STATUS INBOX (BOGUS)\r\nA007 LOGOUT\r\n").as_bytes(),
             )
             .await
             .expect("commands");
@@ -848,6 +850,16 @@ async fn savedate_and_status_size_use_persisted_message_metadata() {
         2
     );
     assert!(!fetch.contains("SAVEDATE \"17-Jul-1996"));
+    for (tag, expected) in [
+        ("S1", "* SEARCH 1 2\r\n"),
+        ("S2", "* SEARCH 1 2\r\n"),
+        ("S3", "* SEARCH\r\n"),
+        ("S4", "* SEARCH 1 2\r\n"),
+        ("S5", "* SEARCH 1 2\r\n"),
+    ] {
+        let lines = read_until_contains(&mut reader, &format!("{tag} OK")).await;
+        assert!(lines.iter().any(|line| line == expected), "{tag}: {lines:?}");
+    }
     let invalid = read_until_contains(&mut reader, "A006 BAD").await.join("");
     assert!(invalid.contains("Invalid STATUS item"));
     let _logout = read_until_contains(&mut reader, "A007 OK").await;

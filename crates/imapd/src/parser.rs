@@ -883,6 +883,12 @@ pub(crate) enum SearchCriterion {
     SentSince(chrono::NaiveDate),
     SentBefore(chrono::NaiveDate),
     SentOn(chrono::NaiveDate),
+    /// RFC 8514 §4 save-date keys.
+    SavedSince(chrono::NaiveDate),
+    SavedBefore(chrono::NaiveDate),
+    SavedOn(chrono::NaiveDate),
+    /// RFC 8514 §4: every mailbox here records save dates, so this is ALL.
+    SaveDateSupported,
     Larger(usize),
     Smaller(usize),
     /// RFC 8474 §6 SEARCH EMAILID.
@@ -920,6 +926,8 @@ pub(crate) struct SearchMessage<'a> {
     pub(crate) uid: u64,
     pub(crate) flags: &'a [String],
     pub(crate) internal_date: i64,
+    /// When the message was stored in this mailbox (RFC 8514).
+    pub(crate) save_date: i64,
     pub(crate) in_saved_result: bool,
     pub(crate) now: i64,
     pub(crate) size: usize,
@@ -1172,6 +1180,22 @@ fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCr
             *pos += 1;
             Some(SearchCriterion::SentOn(date))
         }
+        "SAVEDSINCE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SavedSince(date))
+        }
+        "SAVEDBEFORE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SavedBefore(date))
+        }
+        "SAVEDON" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SavedOn(date))
+        }
+        "SAVEDATESUPPORTED" => Some(SearchCriterion::SaveDateSupported),
         "LARGER" => {
             let size = tokens.get(*pos)?.parse::<usize>().ok()?;
             *pos += 1;
@@ -1640,6 +1664,16 @@ pub(crate) fn search_matches(
         SearchCriterion::SentOn(date) => message_sent_date(msg.data)
             .map(|msg_date| msg_date == *date)
             .unwrap_or(false),
+        SearchCriterion::SavedSince(date) => message_internal_date(msg.save_date)
+            .map(|saved| saved >= *date)
+            .unwrap_or(false),
+        SearchCriterion::SavedBefore(date) => message_internal_date(msg.save_date)
+            .map(|saved| saved < *date)
+            .unwrap_or(false),
+        SearchCriterion::SavedOn(date) => message_internal_date(msg.save_date)
+            .map(|saved| saved == *date)
+            .unwrap_or(false),
+        SearchCriterion::SaveDateSupported => true,
         SearchCriterion::Larger(size) => msg.size > *size,
         SearchCriterion::Smaller(size) => msg.size < *size,
         SearchCriterion::EmailId(id) => msg.email_id == id,
@@ -2471,6 +2505,7 @@ mod tests {
             uid: 1,
             flags: &flags,
             internal_date: 0,
+            save_date: 0,
             in_saved_result: false,
             now: 0,
             size: data.len(),

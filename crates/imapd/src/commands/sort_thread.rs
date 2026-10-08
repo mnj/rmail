@@ -78,8 +78,13 @@ pub(crate) async fn sort(
             }
         }
         None => {
-            let ids = ids.iter().map(u64::to_string).collect::<Vec<_>>();
-            response = response.data(format!("SORT {}", ids.join(" ")));
+            // RFC 5256: "SORT" *(SP nz-number), so no space when empty.
+            let line = ids.iter().fold("SORT".to_string(), |mut line, id| {
+                line.push(' ');
+                line.push_str(&id.to_string());
+                line
+            });
+            response = response.data(line);
         }
     }
     let new_saved = options
@@ -162,8 +167,14 @@ pub(crate) async fn thread(
         parser::ThreadAlgorithm::References => thread::references(&messages, uid_mode),
         parser::ThreadAlgorithm::Refs => thread::refs(&messages, uid_mode),
     };
+    // RFC 5256: "THREAD" [SP 1*thread-list], so no space when empty.
+    let line = if body.is_empty() {
+        "THREAD".to_string()
+    } else {
+        format!("THREAD {body}")
+    };
     Response::new()
-        .data(format!("THREAD {body}"))
+        .data(line)
         .status(StatusLine::tagged(
             tag,
             Status::Ok,
@@ -200,6 +211,7 @@ fn execute_sort(
             uid: *uid,
             flags: &effective_flags,
             internal_date,
+            save_date: selected.save_dates.get(uid).copied().unwrap_or(0),
             in_saved_result: saved_uids.binary_search(uid).is_ok(),
             now,
             size: selected
@@ -248,6 +260,7 @@ fn execute_thread(
             uid: *uid,
             flags,
             internal_date,
+            save_date: selected.save_dates.get(uid).copied().unwrap_or(0),
             in_saved_result: saved_uids.binary_search(uid).is_ok(),
             now,
             size: selected
@@ -329,13 +342,13 @@ mod tests {
             .await
             .response
             .encode(),
-            "* SORT \r\nA1 OK SORT completed\r\n"
+            "* SORT\r\nA1 OK SORT completed\r\n"
         );
         assert_eq!(
             thread("A2", "REFERENCES UTF-8 ALL", &selected, &[], true)
                 .await
                 .encode(),
-            "* THREAD \r\nA2 OK UID THREAD completed\r\n"
+            "* THREAD\r\nA2 OK UID THREAD completed\r\n"
         );
     }
 }

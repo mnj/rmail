@@ -294,6 +294,7 @@ impl UpdateContext {
                     uid: *uid,
                     flags: &effective_flags,
                     internal_date,
+                    save_date: view.save_dates.get(uid).copied().unwrap_or(0),
                     in_saved_result: false,
                     now,
                     size: view.sizes.get(uid).copied().unwrap_or(0) as usize,

@@ -231,6 +231,7 @@ fn execute(
                 .get(uid)
                 .map(|date| date.0)
                 .unwrap_or(0),
+            save_date: selected.save_dates.get(uid).copied().unwrap_or(0),
             in_saved_result: saved_search_uids.binary_search(uid).is_ok(),
             now,
             size: selected.sizes.get(uid).copied().unwrap_or(0) as usize,
@@ -300,10 +301,12 @@ fn result_data(
         Some(options) => options,
         None if imap4rev2 => &rev2_default,
         None => {
-            return Some(format!(
-                "SEARCH {}",
-                ids.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
-            ));
+            // RFC 3501: "SEARCH" *(SP nz-number), so no space when empty.
+            return Some(ids.iter().fold("SEARCH".to_string(), |mut line, id| {
+                line.push(' ');
+                line.push_str(&id.to_string());
+                line
+            }));
         }
     };
     esearch_data(tag, uid_mode, ids, options)
