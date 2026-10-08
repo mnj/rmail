@@ -2261,6 +2261,8 @@ pub(crate) struct ListReturnOptions {
     pub(crate) children: bool,
     pub(crate) special_use: bool,
     pub(crate) status: Vec<StatusItem>,
+    /// RFC 9590 LIST-METADATA entries.
+    pub(crate) metadata: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2387,6 +2389,17 @@ fn parse_list_return(items: &[ImapArg]) -> Result<ListReturnOptions, ParseError>
                 pos += 1;
                 let status_items = arg_list(items.get(pos).ok_or(ParseError::UnexpectedEnd)?)?;
                 out.status = parse_status_items(status_items)?;
+            }
+            "METADATA" => {
+                pos += 1;
+                let entries = arg_list(items.get(pos).ok_or(ParseError::UnexpectedEnd)?)?;
+                if entries.is_empty() {
+                    return Err(ParseError::UnexpectedEnd);
+                }
+                out.metadata = entries
+                    .iter()
+                    .map(|entry| arg_text(entry).map(|text| text.to_string()))
+                    .collect::<Result<_, _>>()?;
             }
             _ => return Err(ParseError::InvalidAtom),
         }
