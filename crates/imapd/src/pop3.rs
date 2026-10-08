@@ -228,7 +228,8 @@ pub(crate) async fn serve(
         let rest = text
             .trim_start()
             .split_once(' ')
-            .map_or("", |(_, rest)| rest);
+            .map(|(_, rest)| rest)
+            .filter(|rest| !rest.is_empty());
         // A malformed line must never reveal a password in the log.
         match session.dispatch(&command, &args, rest).await? {
             Flow::Continue => {}
@@ -317,7 +318,7 @@ impl Session {
         self.encrypted || self.peer.is_some_and(|peer| peer.ip().is_loopback())
     }
 
-    async fn dispatch(&mut self, command: &str, args: &[&str], rest: &str) -> Result<Flow> {
+    async fn dispatch(&mut self, command: &str, args: &[&str], rest: Option<&str>) -> Result<Flow> {
         match command {
             "CAPA" => {
                 let mut text = String::from(
@@ -351,7 +352,10 @@ impl Session {
                     return self.err("Send USER first").await;
                 };
                 // The password may contain spaces: take the rest of the line.
-                self.login(&user, rest).await
+                let Some(password) = rest else {
+                    return self.err("PASS needs a password").await;
+                };
+                self.login(&user, password).await
             }
             "AUTH" => self.auth(args).await,
             _ if self.mailbox.is_none() => self.err("Authenticate first").await,
@@ -897,6 +901,22 @@ mod tests {
             out.contains("-ERR [AUTH] Authentication failed\r\n"),
             "{out}"
         );
+        // A bare PASS is refused without a login attempt.
+        let bare = run_session(
+            &env,
+            LOOPBACK,
+            &format!(
+                "USER {}@example.test\r\nPASS\r\nPASS \r\nQUIT\r\n",
+                env.local
+            ),
+        )
+        .await;
+        assert_eq!(
+            bare.matches("-ERR PASS needs a password\r\n").count(),
+            1,
+            "{bare}"
+        );
+        assert!(bare.contains("-ERR Send USER first\r\n"), "{bare}");
         // Passwords are taken verbatim: runs of spaces, tabs, and leading
         // or trailing spaces all survive.
         let spaced = setup("sp@example.test", &[]);
