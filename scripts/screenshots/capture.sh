@@ -62,6 +62,9 @@ for mailbox in alice@example.com bob@example.com support@example.com ops@example
   "${ctl}" add-mailbox "${mailbox}" --password Demo-pass-123 --config config.toml >/dev/null
 done
 "${ctl}" admin-password --password Demo-pass-123 --config config.toml >/dev/null
+"${ctl}" dkim add example.com mail2026 --config config.toml >/dev/null
+"${ctl}" dkim add example.com ed2026 --algorithm ed25519 --config config.toml >/dev/null
+"${ctl}" dkim set-arc example.com mail2026 --config config.toml
 
 export RMAIL_CONFIG=config.toml RMAIL_MAIL_ROOT=mail
 export RMAIL_WEB_STATIC_DIR="${root}/crates/webui/frontend/dist"

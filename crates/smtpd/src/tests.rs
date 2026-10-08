@@ -918,23 +918,18 @@ async fn multi_target_alias_emits_one_rcpt_reply_and_delivers_atomically() {
 
 #[tokio::test]
 async fn remote_alias_is_arc_sealed_before_queue_publication() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (td, mail_root, db_path) = setup_mailbox();
     rmail_common::db::add_alias(&db_path, "forward@example.test", &["recipient@example.net"])
         .unwrap();
-    std::fs::create_dir_all(&mail_root).unwrap();
-    let key = mail_root.join("arc.pem");
-    std::fs::write(&key, include_str!("../testdata/arc-test-key.pem")).unwrap();
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::write(
-            mail_root.join("dkim.toml"),
-            format!(
-                "[arc_signer]\ndomain = \"forwarder.example\"\nselector = \"arc1\"\nprivate_key = {:?}\nheaders = [\"From\", \"To\", \"Subject\"]\n",
-                key.to_string_lossy()
-            ),
-        )
-        .unwrap();
+    rmail_common::dkim::add_key(
+        &db_path,
+        "forwarder.example",
+        "arc1",
+        rmail_common::dkim::Algorithm::Rsa,
+        Some(include_str!("../testdata/arc-test-key.pem")),
+    )
+    .unwrap();
+    rmail_common::dkim::set_arc_key(&db_path, Some(("forwarder.example", "arc1"))).unwrap();
 
     let (responses, td) = run_prepared_session(
             b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<forward@example.test>\r\nDATA\r\nFrom: sender@localhost\r\nTo: forward@example.test\r\nSubject: forwarded\r\n\r\nmessage\r\n.\r\nQUIT\r\n"

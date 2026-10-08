@@ -90,7 +90,7 @@ impl Session {
             let forwarded =
                 is_forwarded_recipient(&self.forwarded_recipient, rcpt, self.generation);
             if forwarded && arc_sealed.is_none() {
-                match self.arc_seal(&mail_root, data).await {
+                match self.arc_seal(data).await {
                     Ok(sealed) => arc_sealed = Some(sealed),
                     Err(error) => {
                         report.any_rejected = true;
@@ -372,7 +372,7 @@ impl Session {
                 }
                 Action::Redirect { address } => {
                     // Redirected mail is forwarded mail: ARC-seal it like an alias.
-                    let body = match self.arc_seal(mail_root, data).await {
+                    let body = match self.arc_seal(data).await {
                         Ok(sealed) => sealed,
                         Err(error) => {
                             report.any_rejected = true;
@@ -505,13 +505,13 @@ impl Session {
         }
     }
 
-    async fn arc_seal(&self, mail_root: &Path, data: &Bytes) -> Result<Vec<u8>> {
+    async fn arc_seal(&self, data: &Bytes) -> Result<Vec<u8>> {
         let peer_ip = self
             .peer
             .map(|address| address.ip())
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let sealed = rmail_common::mail_auth::seal_forwarded(
-            mail_root,
+            self.db_path.as_deref().map(Path::new),
             data,
             peer_ip,
             self.helo_name.as_deref().unwrap_or("unknown"),

@@ -77,6 +77,14 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// DKIM signing keys and the ARC sealing key, stored in the database
+    Dkim {
+        #[command(subcommand)]
+        action: DkimAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// Aggregate and enqueue DMARC RUA reports for unreported events in the DB
     SendDmarcReports {
         /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
@@ -159,6 +167,30 @@ enum SettingsAction {
         #[arg(long)]
         stdout: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DkimAction {
+    /// List keys with the DNS records to publish
+    List,
+    /// Add a key for DOMAIN under SELECTOR; generated unless --private-key is given.
+    /// Every key of a domain signs its mail, so RSA and Ed25519 can run side by side.
+    Add {
+        domain: String,
+        selector: String,
+        /// rsa (2048-bit) or ed25519
+        #[arg(long, default_value = "rsa")]
+        algorithm: String,
+        /// Import this PEM private key file instead of generating one
+        #[arg(long)]
+        private_key: Option<String>,
+    },
+    /// Delete a key; mail stops being signed with it at once
+    Remove { domain: String, selector: String },
+    /// Seal mail forwarded by aliases and Sieve redirects with this RSA key (ARC)
+    SetArc { domain: String, selector: String },
+    /// Stop ARC sealing
+    ClearArc,
 }
 
 #[derive(Subcommand)]
@@ -475,6 +507,8 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
                 .to_string();
+            // Reports are DKIM-signed like other queued mail.
+            rmail_common::dkim::use_database(&dbp);
             let domains = rmail_common::db::get_unreported_dmarc_domains(&dbp)?;
             if domains.is_empty() {
                 println!("No unreported DMARC events");
@@ -592,6 +626,18 @@ async fn main() -> Result<()> {
             ServiceAction::Status(opts) => run_service_action("status", opts)?,
             ServiceAction::ApplyRequest { file } => apply_restart_request(&file)?,
         },
+        Commands::Dkim { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db_path = cfg
+                .global
+                .db_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?;
+            run_dkim(action, std::path::Path::new(db_path))?;
+        }
         Commands::Acme { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
@@ -599,6 +645,62 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&cfg_path)?;
             run_acme(action, &cfg).await?;
         }
+    }
+    Ok(())
+}
+
+fn run_dkim(action: DkimAction, db_path: &std::path::Path) -> Result<()> {
+    use rmail_common::dkim;
+    let print = |key: &dkim::DkimKey| {
+        println!(
+            "{}  {}{}\n  TXT {}",
+            key.dns_name(),
+            key.algorithm.as_str(),
+            if key.arc { "  (ARC)" } else { "" },
+            key.dns_record
+        );
+    };
+    match action {
+        DkimAction::List => {
+            let keys = dkim::list_keys(db_path)?;
+            if keys.is_empty() {
+                println!("No DKIM keys; outbound mail is not signed.");
+            }
+            keys.iter().for_each(print);
+        }
+        DkimAction::Add {
+            domain,
+            selector,
+            algorithm,
+            private_key,
+        } => {
+            let pem = private_key
+                .map(|path| {
+                    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))
+                })
+                .transpose()?;
+            let key = dkim::add_key(
+                db_path,
+                &domain,
+                &selector,
+                dkim::Algorithm::parse(&algorithm)?,
+                pem.as_deref(),
+            )?;
+            println!(
+                "Publish this record, then mail from {} is signed with it:",
+                key.domain
+            );
+            print(&key);
+        }
+        DkimAction::Remove { domain, selector } => {
+            if !dkim::delete_key(db_path, &domain, &selector)? {
+                anyhow::bail!("no key {selector}._domainkey.{domain}");
+            }
+        }
+        DkimAction::SetArc { domain, selector } => {
+            dkim::set_arc_key(db_path, Some((&domain, &selector)))?
+        }
+        DkimAction::ClearArc => dkim::set_arc_key(db_path, None)?,
     }
     Ok(())
 }

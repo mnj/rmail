@@ -188,7 +188,7 @@ pub fn queue_outbound_with_options(
     {
         anyhow::bail!("envelope addresses must not contain line breaks");
     }
-    let data = crate::mail_auth::sign_outbound(maildir_root, data, envelope_from.as_deref())?;
+    let data = crate::mail_auth::sign_outbound(data, envelope_from.as_deref())?;
     let outbound_dir = maildir_root.join("outbound").join("maildrop");
     let tmp_dir = outbound_dir.join("tmp");
     let queue_dir = outbound_dir.join("queue");

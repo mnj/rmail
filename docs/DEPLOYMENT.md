@@ -125,45 +125,27 @@ tracking, and graceful shutdown as SMTP delivery.
 Inbound SMTP verifies SPF, DKIM, DMARC, and ARC with the system asynchronous DNS resolver. DNS
 failures remain authentication temporary errors and do not turn into DMARC policy rejections.
 
-Outbound messages are signed immediately before their atomic queue publication. Create
-`<mail_root>/dkim.toml` with one or more sender-domain entries:
+Outbound messages are signed immediately before their atomic queue publication, with the keys
+stored in the database. Create them with `rmail_ctl dkim` (or the admin console's **DKIM** page),
+which prints the TXT record to publish:
 
-```toml
-[[signer]]
-domain = "example.com"
-selector = "mail2026"
-private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
-# Optional; these are the defaults.
-headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"]
-
-# Optional second signature with an Ed25519 key (RFC 8463). Every entry for
-# the sender domain signs, so verifiers without Ed25519 still see the RSA one.
-[[signer]]
-domain = "example.com"
-selector = "ed2026"
-private_key = "/etc/rmail/dkim/example.com-ed2026.pem"
-
-# Optional local ARC identity. This is used only for remote targets reached
-# through a local alias or catchall, never for ordinary authenticated relay.
-[arc_signer]
-domain = "example.com"
-selector = "mail2026"
-private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
-headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "DKIM-Signature"]
+```bash
+rmail_ctl dkim add example.com mail2026                       # 2048-bit RSA
+rmail_ctl dkim add example.com ed2026 --algorithm ed25519     # optional, RFC 8463
+rmail_ctl dkim add example.com old --private-key key.pem      # import an existing key
+rmail_ctl dkim list
 ```
 
-An RSA key may be PKCS#1 or PKCS#8 PEM; an Ed25519 key is PKCS#8 PEM (`openssl genpkey -algorithm
-ed25519`). Keys must have no group/other permission bits (for example, mode `0600`). Publish each
-public key at `<selector>._domainkey.example.com`: `v=DKIM1; k=rsa; p=...` for RSA, and
-`v=DKIM1; k=ed25519; p=...` with the raw 32-byte public key in base64 for Ed25519
-(`openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | base64`). Keep an RSA signer
-alongside Ed25519; many verifiers still ignore Ed25519 signatures. A missing `dkim.toml`, or a sender domain without a matching
-entry, leaves the message unsigned; an invalid matching entry prevents the message from entering
-the queue. When `arc_signer` is present, rMail verifies the incoming ARC chain and adds an
-ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal set before publishing a forwarded
-message. A chain with invalid continuity is forwarded unchanged rather than being extended with a
-misleading local seal. The ARC key must be RSA and has the same `0600` permission requirement as
-DKIM keys.
+Every key of a sender domain signs its mail, so RSA and Ed25519 signatures go out side by side;
+keep an RSA key, since many verifiers still ignore Ed25519. Signatures cover From, To, Subject,
+Date, Message-ID, MIME-Version and Content-Type. A domain without keys is sent unsigned; a key that
+fails to sign stops the message from entering the queue.
+
+`rmail_ctl dkim set-arc example.com mail2026` makes an RSA key the ARC identity. rMail then verifies
+the incoming ARC chain of mail it forwards to remote targets (aliases, catchalls and Sieve
+redirects) and adds an ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal set. A
+chain with invalid continuity is forwarded unchanged rather than being extended with a misleading
+local seal. `rmail_ctl dkim clear-arc` turns sealing off.
 
 Optional outbound-worker tuning in `/etc/default/rmail`:
 

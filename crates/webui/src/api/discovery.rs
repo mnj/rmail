@@ -18,6 +18,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rmail_common::config::Config;
 use rmail_common::discovery::{self, ServiceEndpoints};
+use rmail_common::dkim;
 use serde_json::json;
 
 use super::{Shared, blocking, error, require_db};
@@ -61,7 +62,13 @@ pub(crate) fn public_routes() -> Router<Shared> {
 }
 
 pub(crate) fn protected_routes() -> Router<Shared> {
-    Router::new().route("/api/discovery", get(records))
+    Router::new()
+        .route("/api/discovery", get(records))
+        .route(
+            "/api/dkim",
+            axum::routing::post(add_dkim_key).delete(delete_dkim_key),
+        )
+        .route("/api/dkim/arc", axum::routing::put(set_arc_key))
 }
 
 fn host_header(headers: &HeaderMap) -> Option<&str> {
@@ -211,18 +218,32 @@ async fn records(State(state): State<Shared>) -> Response {
     let result = blocking(move || {
         let config = Config::load(&path)?;
         let endpoints = ServiceEndpoints::from_global(&config.global);
-        let domains = rmail_common::db::local_domains(&db)?;
+        let keys = dkim::list_keys(std::path::Path::new(&db))?;
+        let mut domains = rmail_common::db::local_domains(&db)?;
+        domains.extend(keys.iter().map(|key| key.domain.clone()));
+        domains.sort();
+        domains.dedup();
         let per_domain = domains
             .into_iter()
             .map(|domain| {
-                let records = discovery::dns_records(
+                let domain_keys = keys
+                    .iter()
+                    .filter(|key| key.domain == domain)
+                    .collect::<Vec<_>>();
+                let mut records = discovery::dns_records(
                     &domain,
                     &endpoints,
                     config.security.mta_sts_mode,
                     config.security.mta_sts_max_age_secs,
                     &format!("postmaster@{domain}"),
                 );
-                json!({ "domain": domain, "records": records })
+                records.extend(domain_keys.iter().map(|key| discovery::DnsRecord {
+                    name: key.dns_name(),
+                    kind: "TXT",
+                    value: key.dns_record.clone(),
+                    purpose: "DKIM public key that verifies this server's signatures",
+                }));
+                json!({ "domain": domain, "records": records, "dkim": domain_keys })
             })
             .collect::<Vec<_>>();
         Ok(json!({ "hostname": endpoints.hostname, "domains": per_domain }))
@@ -232,6 +253,89 @@ async fn records(State(state): State<Shared>) -> Response {
         Ok(value) => Json(value).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct DkimKeyRequest {
+    domain: String,
+    selector: String,
+    #[serde(default)]
+    algorithm: Option<String>,
+    /// PEM to import instead of generating a key.
+    #[serde(default)]
+    private_key: Option<String>,
+}
+
+async fn add_dkim_key(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: DkimKeyRequest = match super::parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    super::outcome(
+        blocking(move || {
+            let algorithm = dkim::Algorithm::parse(input.algorithm.as_deref().unwrap_or("rsa"))?;
+            let pem = input.private_key.filter(|pem| !pem.trim().is_empty());
+            dkim::add_key(
+                std::path::Path::new(&db),
+                &input.domain,
+                &input.selector,
+                algorithm,
+                pem.as_deref(),
+            )
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn delete_dkim_key(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: DkimKeyRequest = match super::parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    super::outcome(
+        blocking(move || {
+            if !dkim::delete_key(std::path::Path::new(&db), &input.domain, &input.selector)? {
+                anyhow::bail!("no such key");
+            }
+            Ok(json!({ "result": "ok" }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// `{"domain", "selector"}` makes that RSA key the ARC key; `null` turns ARC off.
+async fn set_arc_key(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: Option<DkimKeyRequest> = match super::parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    super::outcome(
+        blocking(move || {
+            dkim::set_arc_key(
+                std::path::Path::new(&db),
+                input
+                    .as_ref()
+                    .map(|key| (key.domain.as_str(), key.selector.as_str())),
+            )?;
+            Ok(json!({ "result": "ok" }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
 }
 
 #[cfg(test)]

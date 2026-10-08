@@ -94,6 +94,9 @@ async fn main() -> Result<()> {
     rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
         .context("security.proxy_protocol_trusted_networks")?;
     let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
+    if let Some(db_path) = cfg.global.db_path.as_deref() {
+        rmail_common::dkim::use_database(db_path);
+    }
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
         smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
     }

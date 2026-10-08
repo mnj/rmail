@@ -206,6 +206,18 @@ pub fn dns_records(
             purpose: "Deliver mail for the domain to this server",
         },
         DnsRecord {
+            name: domain.to_string(),
+            kind: "TXT",
+            value: "v=spf1 mx -all".to_string(),
+            purpose: "SPF: only the domain's MX hosts send its mail (RFC 7208)",
+        },
+        DnsRecord {
+            name: format!("_dmarc.{domain}"),
+            kind: "TXT",
+            value: format!("v=DMARC1; p=none; rua=mailto:{tls_rpt_mailbox}"),
+            purpose: "DMARC: start with p=none and aggregate reports, then tighten to quarantine or reject",
+        },
+        DnsRecord {
             name: format!("autoconfig.{domain}"),
             kind: "CNAME",
             value: format!("{host}."),

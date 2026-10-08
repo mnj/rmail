@@ -136,6 +136,18 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             PRIMARY KEY (day, domain, policy_type, mx_host, result)
         ) WITHOUT ROWID;
 
+        -- DKIM keys (see dkim.rs): every key for a domain signs its mail; the
+        -- one with arc = 1 seals forwarded mail.
+        CREATE TABLE IF NOT EXISTS dkim_keys (
+            domain TEXT NOT NULL,
+            selector TEXT NOT NULL,
+            algorithm TEXT NOT NULL,
+            private_key TEXT NOT NULL,
+            arc INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (domain, selector)
+        ) WITHOUT ROWID;
+
         -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
         CREATE TABLE IF NOT EXISTS greylist (
             key TEXT PRIMARY KEY,

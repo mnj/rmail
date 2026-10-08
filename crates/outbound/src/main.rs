@@ -240,6 +240,10 @@ async fn main() -> anyhow::Result<()> {
                 rmail_common::structured_log!("warn", "outbound", "service_state_failed", { "error": format!("{error:#}") });
             }
             DANE_ENABLED.store(cfg.security.dane_enabled, Ordering::Relaxed);
+            // DSNs and TLS reports are DKIM-signed like any queued mail.
+            if let Some(db_path) = cfg.global.db_path.as_deref() {
+                rmail_common::dkim::use_database(db_path);
+            }
             if cfg.security.tls_rpt_enabled
                 && let Some(db_path) = cfg.global.db_path.clone()
             {
