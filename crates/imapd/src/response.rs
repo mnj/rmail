@@ -244,6 +244,7 @@ pub(crate) fn capability_tokens_with_policy(
             "SEARCHRES",
             "PARTIAL",
             "SORT",
+            "SORT=DISPLAY",
             "ESORT",
             "CONTEXT=SEARCH",
             "CONTEXT=SORT",

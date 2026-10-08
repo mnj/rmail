@@ -85,6 +85,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "SEARCHRES",
             "PARTIAL",
             "SORT",
+            "SORT=DISPLAY",
             "ESORT",
             "CONTEXT=SEARCH",
             "CONTEXT=SORT",

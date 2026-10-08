@@ -1458,6 +1458,9 @@ pub(crate) enum SortKey {
     Arrival,
     Cc,
     Date,
+    /// RFC 5957 display-name sort keys.
+    DisplayFrom,
+    DisplayTo,
     From,
     Size,
     Subject,
@@ -1517,6 +1520,8 @@ fn parse_sort_request_inner(input: &str) -> Option<SortRequest> {
             "ARRIVAL" => SortKey::Arrival,
             "CC" => SortKey::Cc,
             "DATE" => SortKey::Date,
+            "DISPLAYFROM" => SortKey::DisplayFrom,
+            "DISPLAYTO" => SortKey::DisplayTo,
             "FROM" => SortKey::From,
             "SIZE" => SortKey::Size,
             "SUBJECT" => SortKey::Subject,
