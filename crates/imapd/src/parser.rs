@@ -2269,6 +2269,8 @@ pub(crate) enum StatusItem {
     Size,
     /// RFC 9051 STATUS DELETED: messages with the \Deleted flag.
     Deleted,
+    /// RFC 9208 §4.2.4: KiB that EXPUNGE would reclaim.
+    DeletedStorage,
     /// RFC 8474 §4.2 STATUS MAILBOXID.
     MailboxId,
 }
@@ -2287,6 +2289,7 @@ impl StatusItem {
             "HIGHESTMODSEQ" => Ok(Self::HighestModSeq),
             "SIZE" => Ok(Self::Size),
             "DELETED" => Ok(Self::Deleted),
+            "DELETED-STORAGE" => Ok(Self::DeletedStorage),
             "MAILBOXID" => Ok(Self::MailboxId),
             _ => Err(ParseError::InvalidAtom),
         }

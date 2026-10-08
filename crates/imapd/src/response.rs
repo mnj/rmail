@@ -232,6 +232,7 @@ pub(crate) fn capability_tokens_with_policy(
             "MULTIAPPEND",
             "CATENATE",
             "QUOTA",
+            "QUOTA=RES-STORAGE",
             "NAMESPACE",
             "SPECIAL-USE",
             "LIST-EXTENDED",

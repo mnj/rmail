@@ -73,6 +73,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "MULTIAPPEND",
             "CATENATE",
             "QUOTA",
+            "QUOTA=RES-STORAGE",
             "NAMESPACE",
             "SPECIAL-USE",
             "LIST-EXTENDED",

@@ -521,3 +521,73 @@ async fn append_rejects_configured_storage_quota_without_publishing_message() {
         (0, Some(5))
     );
 }
+
+#[tokio::test]
+async fn unlimited_accounts_have_no_quota_root_and_status_reports_deleted_storage() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let mail_root = td.path().join("mail");
+    let db_path = td.path().join("config.db");
+    rmail_common::db::init_db(&db_path).expect("init db");
+    rmail_common::db::add_mailbox(
+        &db_path,
+        "user@example.test",
+        Some("plain:password"),
+        None,
+        None,
+    )
+    .expect("add mailbox");
+    let server_mail_root = mail_root.clone();
+    let (client, server) = duplex(32 * 1024);
+    let server_task = tokio::spawn(async move {
+        process_stream(
+            Box::new(server),
+            server_mail_root.to_string_lossy().to_string(),
+            None::<Arc<crate::tls::TlsContext>>,
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+        )
+        .await
+    });
+    let mut reader = BufReader::new(client);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.expect("greeting");
+    let mut capability = String::new();
+    reader.read_line(&mut capability).await.expect("capability");
+    // 2049 octets marked \Deleted round up to 3 KiB; the kept one does not count.
+    let deleted = "x".repeat(2049);
+    reader
+        .get_mut()
+        .write_all(
+            format!(
+                "A001 LOGIN \"user@example.test\" \"password\"\r\nA002 CAPABILITY\r\nA003 GETQUOTAROOT INBOX\r\nA004 GETQUOTA \"\"\r\nA005 APPEND INBOX (\\Deleted) {{2049+}}\r\n{deleted}\r\nA006 APPEND INBOX {{4+}}\r\nkeep\r\nA007 STATUS INBOX (DELETED DELETED-STORAGE)\r\nA008 LOGOUT\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("commands");
+    reader.get_mut().flush().await.expect("flush");
+    let _login = read_until_contains_bounded(&mut reader, "A001 OK").await;
+    let caps = read_until_contains_bounded(&mut reader, "A002 OK").await;
+    assert!(caps.join("").contains(" QUOTA=RES-STORAGE"), "{caps:?}");
+    let root = read_until_contains_bounded(&mut reader, "A003 OK").await;
+    assert!(
+        root.iter()
+            .any(|line| line.trim_end() == "* QUOTAROOT \"INBOX\""),
+        "{root:?}"
+    );
+    assert!(!root.iter().any(|line| line.starts_with("* QUOTA ")));
+    let getquota = read_until_contains_bounded(&mut reader, "A004 NO").await;
+    assert!(getquota.iter().any(|line| line.contains("[NONEXISTENT]")));
+    let _ = read_until_contains_bounded(&mut reader, "A005 OK").await;
+    let _ = read_until_contains_bounded(&mut reader, "A006 OK").await;
+    let status = read_until_contains_bounded(&mut reader, "A007 OK").await;
+    assert!(
+        status
+            .iter()
+            .any(|line| line.trim_end() == "* STATUS \"INBOX\" (DELETED 1 DELETED-STORAGE 3)"),
+        "{status:?}"
+    );
+    let _logout = read_until_contains_bounded(&mut reader, "A008 OK").await;
+    server_task.await.expect("join").expect("server");
+}
