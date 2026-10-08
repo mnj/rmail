@@ -11,10 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use once_cell::sync::Lazy;
 use rmail_common::auth::{PasswordAuthResult, authenticate_password};
 use rmail_common::runtime::GracefulShutdown;
-use rmail_common::throttle::AuthThrottle;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -32,8 +30,6 @@ const MAX_ARGS: usize = 8;
 const UNAUTHENTICATED_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const AUTHENTICATED_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
-static AUTH_THROTTLE: Lazy<AuthThrottle> = Lazy::new(AuthThrottle::default);
 
 type Stream = BufReader<Box<dyn RawStream + Send>>;
 
@@ -446,7 +442,7 @@ impl Session {
                 .await;
         }
         let ip: Option<IpAddr> = self.peer.map(|peer| peer.ip());
-        if let Some(remaining) = ip.and_then(|ip| AUTH_THROTTLE.blocked_for(ip)) {
+        if let Some(remaining) = ip.and_then(crate::auth::auth_block_remaining) {
             return self
                 .reply(&format!(
                     "NO \"Too many failed attempts; try again in {} seconds\"\r\n",
@@ -524,14 +520,14 @@ impl Session {
                         .await;
                 }
                 if let Some(ip) = ip {
-                    AUTH_THROTTLE.reset(ip);
+                    crate::auth::reset_auth_failures(ip);
                 }
                 self.user = Some(address);
                 self.reply("OK \"Authentication successful\"\r\n").await
             }
             PasswordAuthResult::Rejected => {
                 if let Some(ip) = ip {
-                    AUTH_THROTTLE.record_failure(ip);
+                    crate::auth::record_auth_failure(ip);
                 }
                 self.reply("NO \"Authentication failed\"\r\n").await
             }

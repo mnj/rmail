@@ -17,7 +17,6 @@ use once_cell::sync::Lazy;
 use rmail_common::auth::{PasswordAuthResult, authenticate_password};
 use rmail_common::imap_state::{self, Message};
 use rmail_common::runtime::GracefulShutdown;
-use rmail_common::throttle::AuthThrottle;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -34,7 +33,6 @@ const UNAUTHENTICATED_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
-static AUTH_THROTTLE: Lazy<AuthThrottle> = Lazy::new(AuthThrottle::default);
 /// Accounts with an open POP3 transaction (RFC 1939 section 8 exclusive access).
 static LOCKED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
@@ -225,8 +223,14 @@ pub(crate) async fn serve(
         let mut words = text.split_whitespace();
         let command = words.next().unwrap_or("").to_ascii_uppercase();
         let args: Vec<&str> = words.collect();
+        // Everything after the single space that ends the command word,
+        // verbatim: a PASS argument may hold any run of spaces (RFC 1939).
+        let rest = text
+            .trim_start()
+            .split_once(' ')
+            .map_or("", |(_, rest)| rest);
         // A malformed line must never reveal a password in the log.
-        match session.dispatch(&command, &args).await? {
+        match session.dispatch(&command, &args, rest).await? {
             Flow::Continue => {}
             Flow::Close => return Ok(()),
         }
@@ -313,7 +317,7 @@ impl Session {
         self.encrypted || self.peer.is_some_and(|peer| peer.ip().is_loopback())
     }
 
-    async fn dispatch(&mut self, command: &str, args: &[&str]) -> Result<Flow> {
+    async fn dispatch(&mut self, command: &str, args: &[&str], rest: &str) -> Result<Flow> {
         match command {
             "CAPA" => {
                 let mut text = String::from(
@@ -347,8 +351,7 @@ impl Session {
                     return self.err("Send USER first").await;
                 };
                 // The password may contain spaces: take the rest of the line.
-                let password = args.join(" ");
-                self.login(&user, &password).await
+                self.login(&user, rest).await
             }
             "AUTH" => self.auth(args).await,
             _ if self.mailbox.is_none() => self.err("Authenticate first").await,
@@ -503,7 +506,7 @@ impl Session {
             return self.err("[AUTH] TLS required before authentication").await;
         }
         let ip = self.peer.map(|peer| peer.ip());
-        if let Some(remaining) = ip.and_then(|ip| AUTH_THROTTLE.blocked_for(ip)) {
+        if let Some(remaining) = ip.and_then(crate::auth::auth_block_remaining) {
             return self
                 .err(&format!(
                     "[AUTH] Too many failed attempts; try again in {} seconds",
@@ -515,7 +518,7 @@ impl Session {
             PasswordAuthResult::Success(mailbox) => mailbox,
             PasswordAuthResult::Rejected => {
                 if let Some(ip) = ip {
-                    AUTH_THROTTLE.record_failure(ip);
+                    crate::auth::record_auth_failure(ip);
                 }
                 return self.err("[AUTH] Authentication failed").await;
             }
@@ -524,7 +527,7 @@ impl Session {
             }
         };
         if let Some(ip) = ip {
-            AUTH_THROTTLE.reset(ip);
+            crate::auth::reset_auth_failures(ip);
         }
         let address = mailbox.address.to_ascii_lowercase();
         let Some((local, domain)) = address
@@ -894,12 +897,13 @@ mod tests {
             out.contains("-ERR [AUTH] Authentication failed\r\n"),
             "{out}"
         );
-        // Passwords with spaces are taken whole.
+        // Passwords are taken verbatim: runs of spaces, tabs, and leading
+        // or trailing spaces all survive.
         let spaced = setup("sp@example.test", &[]);
         rmail_common::db::add_mailbox(
             &spaced.db,
             "sp@example.test",
-            Some("plain:pass word"),
+            Some("plain: pass  w\tord "),
             None,
             None,
         )
@@ -907,7 +911,7 @@ mod tests {
         let out = run_session(
             &spaced,
             LOOPBACK,
-            "USER sp@example.test\r\nPASS pass word\r\nQUIT\r\n",
+            "USER sp@example.test\r\nPASS  pass  w\tord \r\nQUIT\r\n",
         )
         .await;
         assert!(out.contains("+OK Logged in, 0 messages"), "{out}");
