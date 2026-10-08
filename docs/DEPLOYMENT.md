@@ -136,6 +136,13 @@ private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
 # Optional; these are the defaults.
 headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"]
 
+# Optional second signature with an Ed25519 key (RFC 8463). Every entry for
+# the sender domain signs, so verifiers without Ed25519 still see the RSA one.
+[[signer]]
+domain = "example.com"
+selector = "ed2026"
+private_key = "/etc/rmail/dkim/example.com-ed2026.pem"
+
 # Optional local ARC identity. This is used only for remote targets reached
 # through a local alias or catchall, never for ordinary authenticated relay.
 [arc_signer]
@@ -145,14 +152,18 @@ private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
 headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "DKIM-Signature"]
 ```
 
-The private key may be PKCS#1 or PKCS#8 PEM and must have no group/other permission bits (for
-example, mode `0600`). Publish the corresponding RSA public key at
-`mail2026._domainkey.example.com`. A missing `dkim.toml`, or a sender domain without a matching
+An RSA key may be PKCS#1 or PKCS#8 PEM; an Ed25519 key is PKCS#8 PEM (`openssl genpkey -algorithm
+ed25519`). Keys must have no group/other permission bits (for example, mode `0600`). Publish each
+public key at `<selector>._domainkey.example.com`: `v=DKIM1; k=rsa; p=...` for RSA, and
+`v=DKIM1; k=ed25519; p=...` with the raw 32-byte public key in base64 for Ed25519
+(`openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | base64`). Keep an RSA signer
+alongside Ed25519; many verifiers still ignore Ed25519 signatures. A missing `dkim.toml`, or a sender domain without a matching
 entry, leaves the message unsigned; an invalid matching entry prevents the message from entering
 the queue. When `arc_signer` is present, rMail verifies the incoming ARC chain and adds an
 ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal set before publishing a forwarded
 message. A chain with invalid continuity is forwarded unchanged rather than being extended with a
-misleading local seal. The ARC key has the same `0600` permission requirement as DKIM keys.
+misleading local seal. The ARC key must be RSA and has the same `0600` permission requirement as
+DKIM keys.
 
 Optional outbound-worker tuning in `/etc/default/rmail`:
 

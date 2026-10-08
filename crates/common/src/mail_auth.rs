@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use mail_auth::dmarc::{Dmarc, Policy, verify::DmarcParameters};
 use mail_auth::spf::verify::SpfParameters;
 use mail_auth::{AuthenticatedMessage, DkimResult, DmarcResult, MessageAuthenticator, SpfResult};
@@ -293,37 +293,69 @@ pub fn sign_outbound<'a>(
         Err(error) => return Err(error).context("reading DKIM signing configuration"),
     };
     let config: SigningFile = toml::from_str(&config).context("parsing dkim.toml")?;
-    let Some(entry) = config
+    // Every matching entry signs, so a domain can carry an RSA and an Ed25519
+    // signature side by side (RFC 8463 section 6).
+    let mut headers = String::new();
+    for entry in config
         .signer
         .iter()
-        .find(|entry| entry.domain.eq_ignore_ascii_case(sender_domain))
-    else {
+        .filter(|entry| entry.domain.eq_ignore_ascii_case(sender_domain))
+    {
+        headers.push_str(&dkim_signature(entry, data)?);
+    }
+    if headers.is_empty() {
         return Ok(Cow::Borrowed(data));
-    };
-
-    let domain = crate::domain::canonicalize_domain(&entry.domain)?;
-    validate_signing_selector(&domain, &entry.selector)?;
-    let key_path = Path::new(&entry.private_key);
-    ensure_private_key_permissions(key_path)?;
-    let pem = fs::read(key_path).context("reading DKIM private key")?;
-    use mail_auth::common::crypto::{RsaKey, Sha256};
-    use mail_auth::common::headers::HeaderWriter;
-    use mail_auth::dkim::DkimSigner;
-    use rustls_pki_types::pem::PemObject;
-    let key_der = rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem)
-        .context("parsing DKIM private key PEM")?;
-    let key = RsaKey::<Sha256>::from_key_der(key_der).context("loading RSA DKIM private key")?;
-    let signature = DkimSigner::from_key(key)
-        .domain(domain)
-        .selector(entry.selector.clone())
-        .headers(entry.headers.iter().map(String::as_str))
-        .sign(data)
-        .context("signing outbound message")?;
-    let header = signature.to_header();
-    let mut signed = Vec::with_capacity(header.len() + data.len());
-    signed.extend_from_slice(header.as_bytes());
+    }
+    let mut signed = Vec::with_capacity(headers.len() + data.len());
+    signed.extend_from_slice(headers.as_bytes());
     signed.extend_from_slice(data);
     Ok(Cow::Owned(signed))
+}
+
+/// A private key from a PEM file: Ed25519 (PKCS#8) or RSA (PKCS#1/PKCS#8).
+enum SigningKey {
+    Rsa(mail_auth::common::crypto::RsaKey<mail_auth::common::crypto::Sha256>),
+    Ed25519(mail_auth::common::crypto::Ed25519Key),
+}
+
+fn load_signing_key(path: &Path) -> Result<SigningKey> {
+    use mail_auth::common::crypto::{Ed25519Key, RsaKey};
+    use rustls_pki_types::pem::PemObject;
+    ensure_private_key_permissions(path)?;
+    let pem = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let key_der = rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    if let rustls_pki_types::PrivateKeyDer::Pkcs8(pkcs8) = &key_der
+        && let Ok(key) = Ed25519Key::from_pkcs8_der(pkcs8.secret_pkcs8_der())
+    {
+        return Ok(SigningKey::Ed25519(key));
+    }
+    RsaKey::from_key_der(key_der)
+        .map(SigningKey::Rsa)
+        .map_err(|error| anyhow!("{}: not an RSA or Ed25519 key ({error})", path.display()))
+}
+
+/// The DKIM-Signature header `entry` adds to `data`.
+fn dkim_signature(entry: &SigningEntry, data: &[u8]) -> Result<String> {
+    use mail_auth::common::headers::HeaderWriter;
+    use mail_auth::dkim::DkimSigner;
+    let domain = crate::domain::canonicalize_domain(&entry.domain)?;
+    validate_signing_selector(&domain, &entry.selector)?;
+    let headers = entry.headers.iter().map(String::as_str);
+    let signature = match load_signing_key(Path::new(&entry.private_key))? {
+        SigningKey::Rsa(key) => DkimSigner::from_key(key)
+            .domain(domain)
+            .selector(entry.selector.clone())
+            .headers(headers)
+            .sign(data),
+        SigningKey::Ed25519(key) => DkimSigner::from_key(key)
+            .domain(domain)
+            .selector(entry.selector.clone())
+            .headers(headers)
+            .sign(data),
+    }
+    .context("signing outbound message")?;
+    Ok(signature.to_header())
 }
 
 /// Add an ARC set when a message is being forwarded by a local alias or
@@ -351,8 +383,10 @@ pub async fn seal_forwarded<'a>(
     };
     let domain = crate::domain::canonicalize_domain(&entry.domain)?;
     validate_signing_selector(&domain, &entry.selector)?;
-    let key_path = Path::new(&entry.private_key);
-    ensure_private_key_permissions(key_path)?;
+    // ARC verifiers expect rsa-sha256 (RFC 8617 section 4.1.3).
+    let SigningKey::Rsa(key) = load_signing_key(Path::new(&entry.private_key))? else {
+        bail!("arc_signer needs an RSA key; Ed25519 is only supported for DKIM");
+    };
 
     let message = AuthenticatedMessage::parse(data)
         .ok_or_else(|| anyhow!("message does not contain valid RFC 5322 headers"))?;
@@ -392,14 +426,8 @@ pub async fn seal_forwarded<'a>(
         .with_spf_mailfrom_result(&spf_output, peer_ip, sender, helo_domain)
         .with_dmarc_result(&dmarc_output)
         .with_arc_result(&arc_output, peer_ip);
-    let pem = fs::read(key_path).context("reading ARC private key")?;
     use mail_auth::arc::ArcSealer;
-    use mail_auth::common::crypto::{RsaKey, Sha256};
     use mail_auth::common::headers::HeaderWriter;
-    use rustls_pki_types::pem::PemObject;
-    let key_der = rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem)
-        .context("parsing ARC private key PEM")?;
-    let key = RsaKey::<Sha256>::from_key_der(key_der).context("loading RSA ARC private key")?;
     let arc_set = ArcSealer::from_key(key)
         .domain(domain.clone())
         .selector(entry.selector.clone())
@@ -466,6 +494,49 @@ fn ensure_private_key_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domains_can_be_signed_with_rsa_and_ed25519_together() {
+        use base64::Engine;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let write_key = |name: &str, pem: String| {
+            let path = dir.path().join(name);
+            fs::write(&path, pem).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        };
+        let rsa = write_key(
+            "rsa.pem",
+            include_str!("../../smtpd/testdata/arc-test-key.pem").to_string(),
+        );
+        let pkcs8 = mail_auth::common::crypto::Ed25519Key::generate_pkcs8().unwrap();
+        let ed25519 = write_key(
+            "ed25519.pem",
+            format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+                base64::engine::general_purpose::STANDARD.encode(pkcs8)
+            ),
+        );
+        fs::write(
+            dir.path().join("dkim.toml"),
+            format!(
+                "[[signer]]\ndomain = \"example.test\"\nselector = \"rsa1\"\nprivate_key = {rsa:?}\n\n[[signer]]\ndomain = \"example.test\"\nselector = \"ed1\"\nprivate_key = {ed25519:?}\n"
+            ),
+        )
+        .unwrap();
+        let message = b"From: a@example.test\r\nTo: b@example.net\r\nSubject: hi\r\n\r\nbody\r\n";
+        let signed = sign_outbound(dir.path(), message, Some("a@example.test")).unwrap();
+        let signed = String::from_utf8(signed.into_owned()).unwrap();
+        assert_eq!(signed.matches("DKIM-Signature:").count(), 2, "{signed}");
+        assert!(signed.contains("a=rsa-sha256"), "{signed}");
+        assert!(signed.contains("a=ed25519-sha256"), "{signed}");
+        assert!(signed.contains("s=ed1"), "{signed}");
+        assert!(signed.ends_with("\r\n\r\nbody\r\n"));
+        // Other domains stay unsigned.
+        let other = sign_outbound(dir.path(), message, Some("a@other.test")).unwrap();
+        assert!(matches!(other, Cow::Borrowed(_)));
+    }
 
     const TEST_RSA_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
 MIICXwIBAAKBgQDwIRP/UC3SBsEmGqZ9ZJW3/DkMoGeLnQg1fWn7/zYtIxN2SnFC
