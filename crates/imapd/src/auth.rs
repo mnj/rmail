@@ -86,6 +86,8 @@ pub(crate) struct AuthPolicy {
     oauth: Option<rmail_common::oauth::OAuthValidator>,
     max_commands_per_minute: usize,
     timeouts: SessionTimeouts,
+    /// RFC 9738 MESSAGELIMIT; `None` when unlimited.
+    message_limit: Option<usize>,
 }
 
 impl Default for AuthPolicy {
@@ -99,6 +101,7 @@ impl Default for AuthPolicy {
             oauth: None,
             max_commands_per_minute: 300,
             timeouts: SessionTimeouts::default(),
+            message_limit: None,
         }
     }
 }
@@ -132,6 +135,7 @@ impl AuthPolicy {
             oauth: None,
             max_commands_per_minute: 300,
             timeouts: SessionTimeouts::default(),
+            message_limit: None,
         })
     }
 
@@ -154,6 +158,8 @@ impl AuthPolicy {
         }
         policy.oauth = oauth;
         policy.max_commands_per_minute = security.imap_max_commands_per_minute.max(1);
+        policy.message_limit =
+            (security.imap_message_limit > 0).then_some(security.imap_message_limit);
         Ok(policy)
     }
 
@@ -178,6 +184,7 @@ impl AuthPolicy {
             oauth: None,
             max_commands_per_minute: 300,
             timeouts: SessionTimeouts::default(),
+            message_limit: None,
         })
     }
 
@@ -217,6 +224,16 @@ impl AuthPolicy {
 
     pub(crate) fn max_commands_per_minute(&self) -> usize {
         self.max_commands_per_minute
+    }
+
+    pub(crate) fn message_limit(&self) -> Option<usize> {
+        self.message_limit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_message_limit(mut self, limit: usize) -> Self {
+        self.message_limit = Some(limit);
+        self
     }
 }
 

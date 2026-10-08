@@ -19,6 +19,8 @@ pub(crate) struct FetchContext {
     pub(crate) imap4rev2: bool,
     /// RFC 9586: responses are UIDFETCH.
     pub(crate) uidonly: bool,
+    /// RFC 9738 MESSAGELIMIT.
+    pub(crate) message_limit: Option<usize>,
 }
 
 #[derive(Default)]
@@ -125,6 +127,26 @@ pub(crate) async fn handle(
 
     let (mut targets, expunged_requested) =
         collect_targets(&request, selected, saved_uids, uid_mode);
+    // RFC 9738: a PARTIAL page larger than the limit is refused; otherwise
+    // the newest messages are fetched and the client continues below them.
+    if request.partial.is_some()
+        && let Some(code) = crate::commands::limit::exceeded(targets.len(), context.message_limit)
+    {
+        write_status(
+            reader,
+            StatusLine::tagged(tag, Status::No, "PARTIAL range exceeds the message limit")
+                .with_code(code),
+        )
+        .await?;
+        return Ok(Outcome::default());
+    }
+    let limited =
+        crate::commands::limit::truncate_by(&mut targets, context.message_limit, |target| {
+            target.uid
+        });
+    if limited.is_some() {
+        targets.sort_unstable_by_key(|target| target.sequence);
+    }
     let mark_seen = fetch_marks_seen(&request.items) && !selected.read_only;
     let seen_updates = if mark_seen {
         targets
@@ -261,7 +283,15 @@ pub(crate) async fn handle(
     } else {
         StatusLine::tagged(tag, Status::Ok, format!("{command} completed"))
     };
-    write_status(reader, completion).await?;
+    let mut response = Response::new().status(completion);
+    if let Some(code) = limited {
+        response = response.with_message_limit(code);
+    }
+    reader
+        .get_mut()
+        .write_all(response.encode().as_bytes())
+        .await?;
+    reader.get_mut().flush().await?;
     Ok(outcome)
 }
 

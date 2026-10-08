@@ -23,6 +23,7 @@ pub(crate) async fn handle(
     utf8_accept: bool,
     imap4rev2: bool,
     contexts: &UpdateContexts,
+    message_limit: Option<usize>,
 ) -> Outcome {
     let request = match parser::parse_search_request(raw_args) {
         Ok(request) => request,
@@ -64,18 +65,19 @@ pub(crate) async fn handle(
     let criterion = request.criterion.clone();
     let saved = previous_saved_uids.to_vec();
     let mail_root = mail_root.map(std::path::Path::to_path_buf);
-    let matches = match tokio::task::spawn_blocking(move || {
-        execute(
+    let (matches, limited) = match tokio::task::spawn_blocking(move || {
+        execute_limited(
             &selected,
             &criterion,
             &saved,
             imap4rev2,
             mail_root.as_deref(),
+            message_limit,
         )
     })
     .await
     {
-        Ok(Ok(matches)) => matches,
+        Ok(Ok(found)) => found,
         Ok(Err(error)) => {
             return response(
                 StatusLine::tagged(tag, Status::No, format!("SEARCH failed: {error}"))
@@ -128,6 +130,10 @@ pub(crate) async fn handle(
         Status::Ok,
         format!("{}SEARCH completed", if uid_mode { "UID " } else { "" }),
     ));
+    let result = match limited {
+        Some(code) => result.with_message_limit(code),
+        None => result,
+    };
     Outcome {
         response: result,
         saved_uids: save,
@@ -198,6 +204,7 @@ fn index_lookup(
     }
 }
 
+#[cfg(test)]
 fn execute(
     selected: &SelectedMailbox,
     criterion: &parser::SearchCriterion,
@@ -205,13 +212,52 @@ fn execute(
     imap4rev2: bool,
     mail_root: Option<&std::path::Path>,
 ) -> anyhow::Result<Vec<(u64, u64)>> {
+    execute_limited(
+        selected,
+        criterion,
+        saved_search_uids,
+        imap4rev2,
+        mail_root,
+        None,
+    )
+    .map(|(matches, _)| matches)
+}
+
+/// The (sequence, UID) pairs matching `criterion`, and the MESSAGELIMIT
+/// code when only part of the mailbox was examined.
+fn execute_limited(
+    selected: &SelectedMailbox,
+    criterion: &parser::SearchCriterion,
+    saved_search_uids: &[u64],
+    imap4rev2: bool,
+    mail_root: Option<&std::path::Path>,
+    message_limit: Option<usize>,
+) -> anyhow::Result<(Vec<(u64, u64)>, Option<String>)> {
     let mut matches = Vec::new();
     let now = chrono::Utc::now().timestamp();
     let fts = index_lookup(selected, criterion, mail_root);
+    // RFC 9738: examine at most `message_limit` messages, newest first, and
+    // name the lowest UID examined so the client can continue below it.
+    let live = selected
+        .msgs
+        .iter()
+        .filter(|(uid, _, _, _)| !selected.is_expunged(*uid))
+        .count();
+    let mut skip = message_limit.map_or(0, |limit| live.saturating_sub(limit));
+    let mut limited = None;
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
         // Expunged by another session; the file may already be gone.
         if selected.is_expunged(*uid) {
             continue;
+        }
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if limited.is_none()
+            && let Some(limit) = message_limit.filter(|limit| live > *limit)
+        {
+            limited = Some(format!("MESSAGELIMIT {limit} {uid}"));
         }
         let data = if parser::search_requires_message_data_for(criterion, *uid, fts.as_ref()) {
             std::fs::read(path)?
@@ -243,7 +289,7 @@ fn execute(
             matches.push((index as u64 + 1, *uid));
         }
     }
-    Ok(matches)
+    Ok((matches, limited))
 }
 
 /// The UIDs SEARCH or SORT RETURN (SAVE ...) stores as `$`: everything found,
@@ -524,6 +570,7 @@ mod tests {
             false,
             false,
             &Default::default(),
+            None,
         )
         .await;
         assert_eq!(outcome.saved_uids, None);

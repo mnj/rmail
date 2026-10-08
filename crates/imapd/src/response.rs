@@ -113,6 +113,32 @@ impl Response {
         self
     }
 
+    /// Report an RFC 9738 MESSAGELIMIT code: on the tagged OK when it carries
+    /// no other code, otherwise as an untagged NO before it.
+    pub(crate) fn with_message_limit(mut self, code: String) -> Self {
+        let tagged_ok = self.lines.iter().rposition(|line| {
+            matches!(line, Line::Status(status) if status.tag.is_some() && status.status == Status::Ok)
+        });
+        match tagged_ok {
+            Some(index) => {
+                let Line::Status(status) = &mut self.lines[index] else {
+                    unreachable!("matched a status line above");
+                };
+                if status.code.is_none() {
+                    status.code = Some(code);
+                } else {
+                    let notice =
+                        StatusLine::untagged(Status::No, "Message limit reached").with_code(code);
+                    self.lines.insert(index, Line::Status(notice));
+                }
+            }
+            None => self.lines.push(Line::Status(
+                StatusLine::untagged(Status::No, "Message limit reached").with_code(code),
+            )),
+        }
+        self
+    }
+
     pub(crate) fn continuation(mut self, text: impl Into<String>) -> Self {
         self.lines.push(Line::Continuation(text.into()));
         self
@@ -278,6 +304,9 @@ pub(crate) fn capability_tokens_with_policy(
     ) {
         // RFC 7889: the largest message APPEND accepts.
         caps.push_str(&format!(" APPENDLIMIT={}", crate::MAX_APPEND_LITERAL_BYTES));
+        if let Some(limit) = auth_policy.message_limit() {
+            caps.push_str(&format!(" MESSAGELIMIT={limit}"));
+        }
     }
     caps
 }

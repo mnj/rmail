@@ -221,6 +221,7 @@ impl Session {
             self.selected
                 .as_ref()
                 .map(|mailbox| mailbox.mailbox.as_str()),
+            self.auth_policy.message_limit(),
         )
         .await?;
         if outcome.close_connection {

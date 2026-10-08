@@ -117,6 +117,7 @@ pub(crate) async fn handle(
     address: &str,
     utf8_accept: bool,
     selected_mailbox: Option<&str>,
+    message_limit: Option<usize>,
 ) -> Result<Outcome> {
     if let Some((prefix, parts)) = split_catenate_args(raw_args) {
         return handle_catenate(
@@ -128,6 +129,7 @@ pub(crate) async fn handle(
             address,
             utf8_accept,
             selected_mailbox,
+            message_limit,
         )
         .await;
     }
@@ -343,6 +345,20 @@ pub(crate) async fn handle(
         current = Payload::Literal(next);
     }
 
+    // RFC 9738 §3.1: MULTIAPPEND is atomic, so a batch over the limit is
+    // refused after its literals were read (keeping the stream in sync).
+    if let Some(code) = crate::commands::limit::exceeded(staged.len(), message_limit) {
+        remove_staged_appends(&staged).await;
+        write_response(
+            reader,
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Too many messages for one APPEND")
+                    .with_code(code),
+            ),
+        )
+        .await?;
+        return Ok(failure());
+    }
     let root = mail_root.to_string();
     let cleanup_paths = staged
         .iter()
@@ -452,6 +468,7 @@ async fn handle_catenate(
     address: &str,
     utf8_accept: bool,
     selected_mailbox: Option<&str>,
+    message_limit: Option<usize>,
 ) -> Result<Outcome> {
     let request = match parser::parse_append_args(&format!("{prefix} {{0+}}")) {
         Ok(request) if !request.utf8 => request,
@@ -635,6 +652,20 @@ async fn handle_catenate(
         continuation.clear();
     }
 
+    // RFC 9738 §3.1: MULTIAPPEND is atomic, so a batch over the limit is
+    // refused after its literals were read (keeping the stream in sync).
+    if let Some(code) = crate::commands::limit::exceeded(staged.len(), message_limit) {
+        remove_staged_appends(&staged).await;
+        write_response(
+            reader,
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Too many messages for one APPEND")
+                    .with_code(code),
+            ),
+        )
+        .await?;
+        return Ok(failure());
+    }
     let cleanup_paths = staged
         .iter()
         .map(|item| item.path.clone())

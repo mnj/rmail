@@ -43,6 +43,7 @@ impl Session {
                     self.selected(),
                     self.state.saved_search_uids(),
                     self.state.vanished_enabled(),
+                    self.auth_policy.message_limit(),
                 )
                 .await;
                 self.report_context_removals(reader, &outcome.selection_effect)
@@ -84,6 +85,7 @@ impl Session {
                 condstore: self.state.condstore_enabled(),
                 imap4rev2: self.state.imap4rev2_enabled(),
                 uidonly: self.state.uidonly_enabled(),
+                message_limit: self.auth_policy.message_limit(),
             },
         )
         .await?;
@@ -115,6 +117,7 @@ impl Session {
                     condstore: self.state.condstore_enabled(),
                     imap4rev2: self.state.imap4rev2_enabled(),
                     uidonly: self.state.uidonly_enabled(),
+                    message_limit: self.auth_policy.message_limit(),
                 },
             ),
         )
@@ -148,6 +151,7 @@ impl Session {
                 self.state.utf8_enabled(),
                 self.state.imap4rev2_enabled(),
                 &self.contexts,
+                self.auth_policy.message_limit(),
             ),
         )
         .await?;
@@ -242,6 +246,7 @@ impl Session {
                 uid,
                 self.state.utf8_enabled(),
                 self.state.vanished_enabled(),
+                self.auth_policy.message_limit(),
             ),
         )
         .await?;

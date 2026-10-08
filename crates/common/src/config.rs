@@ -482,6 +482,10 @@ pub struct SecurityConfig {
     /// address. Empty disables the PROXY protocol.
     #[serde(default)]
     pub proxy_protocol_trusted_networks: Vec<String>,
+    /// RFC 9738 MESSAGELIMIT: the most messages one IMAP command may touch.
+    /// Zero (the default) means no limit and the extension is not advertised.
+    #[serde(default)]
+    pub imap_message_limit: usize,
     #[serde(default = "default_dnsbl_timeout_ms")]
     pub dnsbl_timeout_ms: u64,
 }
@@ -523,6 +527,7 @@ impl Default for SecurityConfig {
             greylist_persist_interval_secs: default_greylist_persist_interval_secs(),
             dnsbl_zones: Vec::new(),
             proxy_protocol_trusted_networks: Vec::new(),
+            imap_message_limit: 0,
             dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }

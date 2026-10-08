@@ -816,6 +816,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.imap_message_limit",
+        "limits",
+        "IMAP message limit",
+        "Most messages one IMAP command may touch (RFC 9738 MESSAGELIMIT, at least 1000). Larger FETCH, STORE, SEARCH and MOVE commands handle the newest messages and tell the client where to continue; larger COPY and APPEND are refused. Clients that do not know the extension see partial results, so 0 (no limit) is the default.",
+        int(0, 100_000_000),
+        IMAP,
+    ),
+    spec(
         "security.proxy_protocol_trusted_networks",
         "limits",
         "PROXY protocol networks",
@@ -1457,6 +1465,10 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
         crate::domain::canonicalize_domain(hostname.trim()).map_err(|error| {
             anyhow!("global.hostname: {hostname:?} is not a valid domain name ({error})")
         })?;
+    }
+    let limit = config.security.imap_message_limit;
+    if limit > 0 && limit < 1000 {
+        bail!("security.imap_message_limit: use 0 (no limit) or at least 1000 (RFC 9738)");
     }
     for network in &config.security.proxy_protocol_trusted_networks {
         crate::proxy::Network::parse(network)
