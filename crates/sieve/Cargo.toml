@@ -1,0 +1,7 @@
+[package]
+name = "rmail_sieve"
+version = "1.0.0"
+edition = "2024"
+description = "Sieve (RFC 5228) mail filtering language: parser and interpreter"
+
+[dependencies]

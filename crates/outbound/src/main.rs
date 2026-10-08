@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&inflight_dir).await?;
     tokio::fs::create_dir_all(&sent_dir).await?;
     tokio::fs::create_dir_all(&failed_dir).await?;
+    let mut tls_report_setup: Option<(PathBuf, String)> = None;
     let tracking_config = match std::env::var("RMAIL_CONFIG") {
         Ok(path) => {
             let cfg = rmail_common::config::Config::load(&path)
@@ -236,6 +237,11 @@ async fn main() -> anyhow::Result<()> {
             let _ = HELO_NAME.set(cfg.global.server_hostname());
             if let Err(error) = rmail_common::settings::record_service_start(&cfg, "outbound") {
                 rmail_common::structured_log!("warn", "outbound", "service_state_failed", { "error": format!("{error:#}") });
+            }
+            if cfg.security.tls_rpt_enabled
+                && let Some(db_path) = cfg.global.db_path.clone()
+            {
+                tls_report_setup = Some((PathBuf::from(db_path), cfg.global.server_hostname()));
             }
             cfg.global.tracking
         }
@@ -290,6 +296,9 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
+    let tls_report_db = tls_report_setup.as_ref().map(|(path, _)| path.clone());
+    let tls_report_handle = tls_report_setup
+        .map(|(db_path, hostname)| tokio::spawn(tls_report_task(base.clone(), db_path, hostname)));
     let mut deliveries = JoinSet::new();
     let shutdown_signal = rmail_common::runtime::wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -406,6 +415,16 @@ async fn main() -> anyhow::Result<()> {
         );
         deliveries.abort_all();
         while deliveries.join_next().await.is_some() {}
+    }
+    if let Some(handle) = tls_report_handle {
+        handle.abort();
+    }
+    if let Some(db_path) = tls_report_db
+        && let Err(error) = rmail_common::tlsrpt::flush(&db_path)
+    {
+        rmail_common::structured_log!(
+            "error", "outbound", "tlsrpt_flush_failed", { "error": error.to_string() }
+        );
     }
     Ok(())
 }
@@ -2126,88 +2145,131 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
     authorized
 }
 
-async fn queue_tls_failure_report(
-    mail_root: &Path,
-    resolver: &TokioAsyncResolver,
-    domain: &str,
-    mx_host: Option<&str>,
-    policy_type: &str,
-    diagnostic: &str,
-) {
-    let recipients = tls_report_recipients(resolver, domain).await;
-    if recipients.is_empty() {
-        return;
-    }
-    let (report_id, encoded) =
-        build_tls_failure_report_json(domain, mx_host, policy_type, diagnostic, Utc::now());
-    for recipient in recipients {
-        let mut message = format!(
-            "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\nTo: <{recipient}>\r\nSubject: Report Domain: {domain} Submitter: rMail Report-ID: {report_id}\r\nAuto-Submitted: auto-generated\r\nMIME-Version: 1.0\r\nContent-Type: application/tlsrpt+json\r\n\r\n"
-        )
-        .into_bytes();
-        message.extend_from_slice(&encoded);
-        message.extend_from_slice(b"\r\n");
-        let mail_root = mail_root.to_path_buf();
-        let result = tokio::task::spawn_blocking(move || {
-            rmail_common::outbound::queue_outbound(&mail_root, &recipient, &message, None)
-        })
-        .await;
-        match result {
+/// Flush TLS-RPT counters every few minutes and send each finished UTC day's
+/// aggregate report (RFC 8460) to the domain's published rua addresses.
+async fn tls_report_task(base: PathBuf, db_path: PathBuf, hostname: String) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(300));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    let mut ticks = 0u32;
+    loop {
+        ticker.tick().await;
+        let path = db_path.clone();
+        match tokio::task::spawn_blocking(move || rmail_common::tlsrpt::flush(&path)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => rmail_common::structured_log!(
-                "error", "outbound", "tls_report_queue_failed",
-                { "domain": domain, "error": error.to_string() }
+                "error", "outbound", "tlsrpt_flush_failed", { "error": error.to_string() }
             ),
             Err(error) => rmail_common::structured_log!(
-                "error", "outbound", "tls_report_queue_join_failed",
-                { "domain": domain, "error": error.to_string() }
+                "error", "outbound", "tlsrpt_flush_failed", { "error": error.to_string() }
             ),
+        }
+        // Reports for finished days are checked hourly.
+        ticks += 1;
+        if ticks % 12 == 1 {
+            send_due_tls_reports(&base, &db_path, &hostname).await;
         }
     }
 }
 
-fn build_tls_failure_report_json(
-    domain: &str,
-    mx_host: Option<&str>,
-    policy_type: &str,
-    diagnostic: &str,
-    now: chrono::DateTime<Utc>,
-) -> (String, Vec<u8>) {
-    let report_id = format!("{}-{}", now.timestamp(), std::process::id());
-    let report = serde_json::json!({
-        "organization-name": "rMail",
-        "date-range": {
-            "start-datetime": now.to_rfc3339(),
-            "end-datetime": now.to_rfc3339()
-        },
-        "contact-info": "postmaster@localhost",
-        "report-id": report_id,
-        "policies": [{
-            "policy": {
-                "policy-type": policy_type,
-                "policy-string": [],
-                "policy-domain": domain,
-                "mx-host": mx_host.into_iter().collect::<Vec<_>>()
-            },
-            "summary": { "total-successful-session-count": 0, "total-failure-session-count": 1 },
-            "failure-details": [{
-                "result-type": if diagnostic.contains("does not offer STARTTLS") {
-                    "starttls-not-supported"
-                } else if diagnostic.to_ascii_lowercase().contains("certificate") {
-                    "certificate-not-trusted"
+/// Whether a day's counters can be dropped after a send attempt. Once any
+/// copy is queued the day is settled, so recipients are never sent the same
+/// report twice. With nothing queued (no `rua` found, possibly a DNS failure,
+/// or every queue attempt failed) it is retried until the day is `stale`.
+fn tls_report_settled(queued_copies: usize, stale: bool) -> bool {
+    queued_copies > 0 || stale
+}
+
+async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
+    let today = rmail_common::tlsrpt::today();
+    let stale_before = (Utc::now() - chrono::Duration::days(3))
+        .format("%Y-%m-%d")
+        .to_string();
+    let due = {
+        let path = db_path.to_path_buf();
+        let today = today.clone();
+        match tokio::task::spawn_blocking(move || rmail_common::db::tlsrpt_due(&path, &today)).await
+        {
+            Ok(Ok(due)) => due,
+            _ => return,
+        }
+    };
+    if due.is_empty() {
+        return;
+    }
+    let Ok(resolver) = outbound_resolver().await else {
+        return;
+    };
+    for (day, domain) in due {
+        let rows = {
+            let (path, day, domain) = (db_path.to_path_buf(), day.clone(), domain.clone());
+            match tokio::task::spawn_blocking(move || {
+                rmail_common::db::tlsrpt_rows(&path, &day, &domain)
+            })
+            .await
+            {
+                Ok(Ok(rows)) => rows,
+                _ => continue,
+            }
+        };
+        let recipients = tls_report_recipients(resolver, &domain).await;
+        let mut queued_copies = 0usize;
+        if let Some((report_id, json)) = rmail_common::tlsrpt::build_report(
+            "rMail",
+            &format!("postmaster@{hostname}"),
+            &day,
+            &domain,
+            &rows,
+        ) && !recipients.is_empty()
+            && let Ok(gz) = rmail_common::tlsrpt::gzip(&json)
+        {
+            for recipient in recipients {
+                let message = rmail_common::tlsrpt::build_message(
+                    &format!("noreply-tls-rpt@{hostname}"),
+                    &recipient,
+                    hostname,
+                    &domain,
+                    &report_id,
+                    &day,
+                    &gz,
+                );
+                let base = base.to_path_buf();
+                let queued = tokio::task::spawn_blocking(move || {
+                    rmail_common::outbound::queue_outbound(&base, &recipient, &message, None)
+                })
+                .await;
+                if matches!(queued, Ok(Ok(_))) {
+                    queued_copies += 1;
                 } else {
-                    "validation-failure"
-                },
-                "receiving-mx-hostname": mx_host.unwrap_or(domain),
-                "failed-session-count": 1,
-                "additional-information": diagnostic
-            }]
-        }]
-    });
-    (
-        report_id,
-        serde_json::to_vec_pretty(&report).unwrap_or_default(),
-    )
+                    rmail_common::structured_log!(
+                        "error", "outbound", "tls_report_queue_failed",
+                        { "domain": domain, "day": day }
+                    );
+                }
+            }
+        }
+        if tls_report_settled(queued_copies, day.as_str() < stale_before.as_str()) {
+            let deleted = {
+                let (path, day, domain) = (db_path.to_path_buf(), day.clone(), domain.clone());
+                tokio::task::spawn_blocking(move || {
+                    rmail_common::db::tlsrpt_delete(&path, &day, &domain)
+                })
+                .await
+            };
+            let error = match deleted {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = error {
+                // The counters stay due, so the next run reports this day again.
+                rmail_common::structured_log!(
+                    "error", "outbound", "tls_report_delete_failed",
+                    { "domain": domain, "day": day, "error": error }
+                );
+            }
+        }
+    }
 }
 
 async fn deliver_to_remote(
@@ -2313,10 +2375,7 @@ async fn deliver_to_remote(
                     "no recipient MX matches the active MTA-STS policy (rejected: {})",
                     mismatched.join(", ")
                 );
-                if envelope_from.is_some() {
-                    queue_tls_failure_report(base, resolver, domain, None, "sts", &diagnostic)
-                        .await;
-                }
+                rmail_common::tlsrpt::record_failure(domain, "sts", "", &diagnostic);
                 anyhow::bail!(diagnostic);
             }
         } else if !mismatched.is_empty() {
@@ -2338,6 +2397,7 @@ async fn deliver_to_remote(
             host: host.trim_end_matches('.').to_ascii_lowercase(),
             port,
         };
+        let mut fresh_session = true;
         let connection = match connections.take(&key).await {
             Some(mut connection) if !transport_tls_required || connection.encrypted => {
                 let pooled_connection_id = connection.connection_id.clone();
@@ -2351,7 +2411,10 @@ async fn deliver_to_remote(
                     bytes_out: 0,
                 };
                 match smtp_noop(&mut connection, Some(&mut noop_trace)).await {
-                    Ok(()) => Ok(connection),
+                    Ok(()) => {
+                        fresh_session = false;
+                        Ok(connection)
+                    }
                     Err(error) => {
                         rmail_common::structured_log!(
                             "warn", "outbound", "smtp_session_discarded",
@@ -2389,6 +2452,37 @@ async fn deliver_to_remote(
                 .await
             }
         };
+        // TLS-RPT counts sessions, not messages: a reused connection is not new.
+        // Sessions are reported against the MTA-STS policy, when there is one.
+        if fresh_session
+            && mta_sts_policy
+                .as_ref()
+                .is_some_and(|policy| policy.mode != MtaStsMode::None)
+        {
+            match &connection {
+                Ok(connection) if connection.encrypted => {
+                    rmail_common::tlsrpt::record_success(domain, "sts", &key.host);
+                }
+                // Only a `testing` policy gets here unencrypted: `enforce`
+                // refuses plaintext above. Testing exists to report this.
+                Ok(_) => {
+                    rmail_common::tlsrpt::record_failure(
+                        domain,
+                        "sts",
+                        &key.host,
+                        &format!("remote host {} does not offer STARTTLS", key.host),
+                    );
+                }
+                Err(error) => {
+                    let diagnostic = format!("{error:#}");
+                    let lower = diagnostic.to_ascii_lowercase();
+                    // Refused connections and 4xx greetings are not TLS failures.
+                    if lower.contains("tls") || lower.contains("certificate") {
+                        rmail_common::tlsrpt::record_failure(domain, "sts", &key.host, &diagnostic);
+                    }
+                }
+            }
+        }
         let mut connection = match connection {
             Ok(connection) => connection,
             Err(error) => {
@@ -2447,21 +2541,6 @@ async fn deliver_to_remote(
                     .chain()
                     .any(|cause| cause.downcast_ref::<PermanentDeliveryError>().is_some());
                 if permanent_reply || permanent_policy {
-                    if transport_tls_required && envelope_from.is_some() {
-                        queue_tls_failure_report(
-                            base,
-                            resolver,
-                            domain,
-                            Some(&key.host),
-                            if mta_sts_enforced {
-                                "sts"
-                            } else {
-                                "no-policy-found"
-                            },
-                            &error.to_string(),
-                        )
-                        .await;
-                    }
                     return Err(error);
                 }
                 last_delivery_error = Some(error);
@@ -2471,21 +2550,6 @@ async fn deliver_to_remote(
 
     let error = last_delivery_error
         .unwrap_or_else(|| anyhow::anyhow!("failed to connect to any MX/A host"));
-    if transport_tls_required && envelope_from.is_some() {
-        queue_tls_failure_report(
-            base,
-            resolver,
-            domain,
-            None,
-            if mta_sts_enforced {
-                "sts"
-            } else {
-                "no-policy-found"
-            },
-            &error.to_string(),
-        )
-        .await;
-    }
     Err(error)
 }
 
@@ -2922,29 +2986,6 @@ mod tests {
         assert_eq!(parse_mta_sts_dns_id(&["v=other; id=x".to_string()]), None);
     }
 
-    #[test]
-    fn tls_failure_report_has_rfc8460_shape() {
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let (report_id, encoded) = build_tls_failure_report_json(
-            "example.test",
-            Some("mx.example.test"),
-            "sts",
-            "certificate validation failed",
-            now,
-        );
-        assert!(report_id.starts_with("1700000000-"));
-        let report: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(report["policies"][0]["policy"]["policy-type"], "sts");
-        assert_eq!(
-            report["policies"][0]["failure-details"][0]["result-type"],
-            "certificate-not-trusted"
-        );
-        assert_eq!(
-            report["policies"][0]["summary"]["total-failure-session-count"],
-            1
-        );
-    }
-
     #[tokio::test]
     async fn reply_parser_enforces_crlf_bounds_and_multiline_code_consistency() {
         let mut valid = BufReader::new(&b"250-mail.example\r\n250-8BITMIME\r\n250 OK\r\n"[..]);
@@ -3213,5 +3254,15 @@ mod tests {
         .await
         .unwrap();
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn tls_report_days_settle_once_queued_or_stale() {
+        // Queued copies settle the day even if other recipients failed.
+        assert!(tls_report_settled(1, false));
+        assert!(tls_report_settled(3, false));
+        // Nothing queued: keep retrying while recent, give up when stale.
+        assert!(!tls_report_settled(0, false));
+        assert!(tls_report_settled(0, true));
     }
 }

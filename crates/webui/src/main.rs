@@ -2530,4 +2530,158 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("\"folder\":\"Travel\""), "{response}");
     }
+
+    fn discovery_state(td: &tempfile::TempDir, mode: &str) -> Arc<api::AdminState> {
+        let db = td.path().join("rmail.db");
+        rmail_common::db::init_db(&db).unwrap();
+        rmail_common::db::add_mailbox(&db, "alice@example.com", None, None, None).unwrap();
+        let config = td.path().join("rmail.toml");
+        fs::write(
+            &config,
+            format!(
+                "[global]\nmail_root = \"{root}\"\ndb_path = \"{db}\"\nhostname = \"mail.example.com\"\n[global.listeners]\nimaps = [\"[::]:993\"]\nsubmission = [\"[::]:587\"]\n[security]\nmta_sts_mode = \"{mode}\"\n",
+                root = td.path().display(),
+                db = db.display(),
+            ),
+        )
+        .unwrap();
+        let mut state = api::AdminState::new(
+            td.path().to_path_buf(),
+            Some(db.display().to_string()),
+            None,
+            ReadinessConfig::default(),
+        );
+        state.config_path = Some(config.display().to_string());
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn discovery_endpoints_answer_for_hosted_domains_only() {
+        let td = tempdir().unwrap();
+        let state = discovery_state(&td, "testing");
+
+        let policy = send_to_state(
+            state.clone(),
+            "t",
+            "GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: mta-sts.example.com\r\n\r\n".into(),
+        )
+        .await;
+        assert!(policy.starts_with("HTTP/1.1 200"), "{policy}");
+        let lower = policy.to_ascii_lowercase();
+        assert!(lower.contains("cache-control: no-store"), "{policy}");
+        assert!(
+            lower.contains("x-content-type-options: nosniff"),
+            "{policy}"
+        );
+        assert!(
+            policy.ends_with(
+                "version: STSv1\r\nmode: testing\r\nmx: mail.example.com\r\nmax_age: 604800\r\n"
+            ),
+            "{policy}"
+        );
+        for request in [
+            "GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: mta-sts.other.test\r\n\r\n",
+            "GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        ] {
+            let response = send_to_state(state.clone(), "t", request.into()).await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        }
+
+        let tb = send_to_state(
+            state.clone(),
+            "t",
+            "GET /mail/config-v1.1.xml?emailaddress=alice@example.com HTTP/1.1\r\nHost: autoconfig.example.com\r\n\r\n".into(),
+        )
+        .await;
+        assert!(tb.starts_with("HTTP/1.1 200"), "{tb}");
+        assert!(tb.contains("<hostname>mail.example.com</hostname>"), "{tb}");
+        assert!(
+            tb.contains("<port>993</port>") && tb.contains("<port>587</port>"),
+            "{tb}"
+        );
+        let unknown = send_to_state(
+            state.clone(),
+            "t",
+            "GET /mail/config-v1.1.xml?emailaddress=x@unknown.test HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+
+        // Outlook posts without the admin CSRF header.
+        let body = "<Autodiscover><Request><EMailAddress>alice@example.com</EMailAddress></Request></Autodiscover>";
+        let pox = send_to_state(
+            state.clone(),
+            "t",
+            format!(
+                "POST /autodiscover/autodiscover.xml HTTP/1.1\r\nHost: autodiscover.example.com\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(pox.starts_with("HTTP/1.1 200"), "{pox}");
+        assert!(
+            pox.contains("<LoginName>alice@example.com</LoginName>"),
+            "{pox}"
+        );
+
+        // Unicode domains match the ASCII form stored for a hosted IDN.
+        rmail_common::db::add_mailbox(
+            td.path().join("rmail.db"),
+            "bob@bücher.example",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let tb = send_to_state(
+            state.clone(),
+            "t",
+            "GET /mail/config-v1.1.xml?emailaddress=bob%40B%C3%BCcher.example HTTP/1.1\r\n\r\n"
+                .into(),
+        )
+        .await;
+        assert!(tb.starts_with("HTTP/1.1 200"), "{tb}");
+        let body = "<Autodiscover><Request><EMailAddress>bob@bücher.example</EMailAddress></Request></Autodiscover>";
+        let pox = send_to_state(
+            state.clone(),
+            "t",
+            format!(
+                "POST /autodiscover/autodiscover.xml HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(pox.starts_with("HTTP/1.1 200"), "{pox}");
+
+        // Autoconfig is also served over plain HTTP; MTA-STS is not.
+        let http = send_http(
+            state.clone(),
+            "GET /mail/config-v1.1.xml?emailaddress=alice@example.com HTTP/1.1\r\nHost: autoconfig.example.com\r\n\r\n",
+        )
+        .await;
+        assert!(http.starts_with("HTTP/1.1 200"), "{http}");
+        assert!(
+            http.to_ascii_lowercase()
+                .contains("cache-control: no-store"),
+            "{http}"
+        );
+        let http_sts = send_http(
+            state,
+            "GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: mta-sts.example.com\r\n\r\n",
+        )
+        .await;
+        assert!(http_sts.starts_with("HTTP/1.1 301"), "{http_sts}");
+    }
+
+    #[tokio::test]
+    async fn mta_sts_is_not_published_when_mode_is_none() {
+        let td = tempdir().unwrap();
+        let response = send_to_state(
+            discovery_state(&td, "none"),
+            "t",
+            "GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: mta-sts.example.com\r\n\r\n".into(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
 }

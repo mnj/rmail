@@ -50,6 +50,7 @@ const SMTP_IDENTITY: &[&str] = &["smtpd", "outbound"];
 const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
 const CLASSIFIER: &[&str] = &["classifier"];
+const OUTBOUND: &[&str] = &["outbound"];
 const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail", "classifier"];
 /// Read on every use; no restart needed.
 const LIVE: &[&str] = &[];
@@ -267,6 +268,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         "network",
         "POP3S",
         "Implicit-TLS POP3 (port 995).",
+        SettingKind::AddressList,
+        IMAP,
+    ),
+    spec(
+        "global.listeners.managesieve",
+        "network",
+        "ManageSieve",
+        "Mail filter script management (RFC 5804), STARTTLS (port 4190). Needs a TLS certificate.",
         SettingKind::AddressList,
         IMAP,
     ),
@@ -688,6 +697,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.submission_max_messages_per_user_per_day",
+        "limits",
+        "Messages per account per day",
+        "Caps steady sending from one account, e.g. a compromised one. 0 means unlimited.",
+        int(0, 10_000_000),
+        SMTP,
+    ),
+    spec(
+        "security.submission_max_messages_per_domain_per_hour",
+        "limits",
+        "Messages per domain per hour",
+        "Caps all accounts of one sending domain together. 0 means unlimited.",
+        int(0, 10_000_000),
+        SMTP,
+    ),
+    spec(
         "security.clamav_enabled",
         "filtering",
         "ClamAV",
@@ -733,6 +758,72 @@ pub const SETTINGS: &[SettingSpec] = &[
         "Reject actions",
         "Rspamd actions that reject at SMTP time.",
         SettingKind::List,
+        SMTP,
+    ),
+    spec(
+        "security.mta_sts_mode",
+        "tls",
+        "MTA-STS policy",
+        "Publish an MTA-STS policy for hosted domains. Needs an mta-sts.<domain> DNS name and a trusted certificate. Start with testing.",
+        SettingKind::Choice {
+            options: &["none", "testing", "enforce"],
+        },
+        LIVE,
+    ),
+    spec(
+        "security.mta_sts_max_age_secs",
+        "tls",
+        "MTA-STS max age (s)",
+        "How long senders cache the policy.",
+        int(60, 31_557_600),
+        LIVE,
+    ),
+    spec(
+        "security.tls_rpt_enabled",
+        "tls",
+        "SMTP TLS reports",
+        "Send daily TLS reports (RFC 8460) to domains that publish a _smtp._tls record, covering sessions checked against their MTA-STS policy.",
+        SettingKind::Bool,
+        OUTBOUND,
+    ),
+    spec(
+        "security.greylist_enabled",
+        "filtering",
+        "Greylisting",
+        "Defer the first delivery from unknown sender/recipient/network triples on inbound SMTP.",
+        SettingKind::Bool,
+        SMTP,
+    ),
+    spec(
+        "security.greylist_delay_secs",
+        "filtering",
+        "Greylist delay (s)",
+        "Minimum wait before a deferred triple is accepted.",
+        int(1, 86_400),
+        SMTP,
+    ),
+    spec(
+        "security.greylist_persist_interval_secs",
+        "filtering",
+        "Greylist save interval (s)",
+        "How often changed greylist state is written to disk. Changes are batched; nothing is written while idle.",
+        int(10, 86_400),
+        SMTP,
+    ),
+    spec(
+        "security.dnsbl_zones",
+        "filtering",
+        "DNS blocklists",
+        "Blocklist zones (e.g. zen.spamhaus.org). Listed clients are rejected at MAIL FROM; lookup failures never block mail.",
+        SettingKind::List,
+        SMTP,
+    ),
+    spec(
+        "security.dnsbl_timeout_ms",
+        "filtering",
+        "DNSBL timeout (ms)",
+        "",
+        int(100, 30_000),
         SMTP,
     ),
     spec(

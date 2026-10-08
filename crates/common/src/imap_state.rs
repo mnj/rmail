@@ -1709,6 +1709,28 @@ pub fn deliver_message(
     )
 }
 
+/// Deliver an externally received message to `mailbox` with `flags`, as
+/// [`deliver_message`] does for INBOX (Sieve `fileinto`).
+pub fn deliver_message_to(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+    data: &[u8],
+    flags: Vec<String>,
+) -> Result<(u64, u64)> {
+    append_message_internal(
+        maildir_root,
+        domain,
+        localpart,
+        mailbox,
+        data,
+        flags,
+        None,
+        true,
+    )
+}
+
 fn append_message_internal(
     maildir_root: &Path,
     domain: &str,

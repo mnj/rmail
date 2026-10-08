@@ -245,6 +245,7 @@ pub(crate) async fn challenge(
 pub(crate) fn http_router(state: Shared) -> Router {
     let app = Router::new()
         .route("/.well-known/acme-challenge/{*token}", get(challenge))
+        .merge(super::discovery::autoconfig_routes())
         .fallback(redirect_to_https)
         .with_state(state);
     rmail_common::http::harden(app, 16 * 1024)

@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::future::Future;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TcpListenerConfig {
@@ -88,9 +90,50 @@ pub fn bind_tcp_listener_with_config(
     TcpListener::from_std(listener).with_context(|| format!("creating tokio listener for {addr}"))
 }
 
+/// Pause after the first failed accept; doubled per consecutive failure.
+const ACCEPT_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// Accept the next connection on `listener`. A failed accept (usually the
+/// process running out of file descriptors or memory) is logged and retried
+/// after a short pause instead of ending the listener, which would otherwise
+/// stay down until the daemon restarts.
+pub async fn accept_retrying(
+    listener: &TcpListener,
+    component: &str,
+    address: &str,
+) -> (TcpStream, SocketAddr) {
+    retry_accept(component, address, || listener.accept()).await
+}
+
+async fn retry_accept<T, F, Fut>(component: &str, address: &str, mut accept: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    let mut pause = ACCEPT_RETRY_INITIAL;
+    loop {
+        match accept().await {
+            Ok(accepted) => return accepted,
+            Err(error) => {
+                crate::structured_log!("error", component, "accept_failed", {
+                    "listener": address,
+                    "error": error.to_string(),
+                    "retry_ms": pause.as_millis() as u64,
+                });
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(ACCEPT_RETRY_MAX);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TcpListenerConfig, bind_tcp_listener, bind_tcp_listener_with_config};
+    use super::{
+        ACCEPT_RETRY_MAX, Duration, TcpListenerConfig, bind_tcp_listener,
+        bind_tcp_listener_with_config, retry_accept,
+    };
 
     /// True when the host has no usable IPv6 (common in containers). The OS
     /// error sits below our context, so inspect the whole error chain.
@@ -168,5 +211,29 @@ mod tests {
         let second = bind_tcp_listener_with_config(&address.to_string(), &config).unwrap();
 
         assert_eq!(second.local_addr().unwrap(), address);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_are_retried_with_capped_backoff() {
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let accepted = retry_accept("test", "127.0.0.1:0", || {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt <= 6 {
+                    Err(std::io::Error::from_raw_os_error(24)) // EMFILE
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+        assert_eq!(accepted, 7);
+        // 100 + 200 + 400 + 800 ms, then capped at 1 s twice.
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(1_500) + ACCEPT_RETRY_MAX * 2
+        );
     }
 }
