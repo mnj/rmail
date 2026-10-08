@@ -2408,6 +2408,76 @@ async fn sieve_redirect_queues_forwarded_copy_and_skips_inbox() {
 }
 
 #[tokio::test]
+async fn sieve_redirect_to_own_address_keeps_the_message() {
+    for script in [
+        "redirect \"User@example.test\";",
+        "keep; redirect \"user@example.test\";",
+    ] {
+        let (responses, td) =
+            deliver_with_script(script, &[("a@remote.test", "Subject: x\r\n\r\nb")]).await;
+        assert_eq!(accepted(&responses), 1, "{script}: {responses:?}");
+        assert_eq!(inbox(&td), 1, "{script}");
+        assert!(queued_eml(&td).is_empty(), "{script}");
+    }
+}
+
+#[tokio::test]
+async fn sieve_redirect_over_lmtp_reports_delivered() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    let account = "user@example.test";
+    rmail_common::db::put_sieve_script(&db_path, account, "main", "redirect \"x@forward.test\";")
+        .unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, account, Some("main")).unwrap();
+    let (responses, td) = run_prepared_session(
+        b"LHLO localhost\r\nMAIL FROM:<a@remote.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: x\r\n\r\nb\r\n.\r\nQUIT\r\n"
+            .to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Lmtp,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line == "250 2.1.5 Delivered <user@example.test>\r\n"),
+        "{responses:?}"
+    );
+    assert_eq!(queued_eml(&td).len(), 1);
+}
+
+#[tokio::test]
+async fn sieve_script_runs_for_unicode_domain_recipients() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::add_mailbox(&db_path, "bob@bücher.example", None, None, None).unwrap();
+    // ManageSieve stores scripts under the canonical (ASCII) address.
+    let account = "bob@xn--bcher-kva.example";
+    rmail_common::db::put_sieve_script(&db_path, account, "main", "redirect \"x@forward.test\";")
+        .unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, account, Some("main")).unwrap();
+    let (responses, td) = run_prepared_session(
+        "EHLO localhost\r\nMAIL FROM:<a@remote.test> SMTPUTF8\r\nRCPT TO:<bob@BÜCHER.example>\r\nDATA\r\nSubject: x\r\n\r\nb\r\n.\r\nQUIT\r\n"
+            .as_bytes()
+            .to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "{responses:?}");
+    assert!(queued[0].contains("X-RMail-Envelope-To: x@forward.test\r\n"));
+}
+
+#[tokio::test]
 async fn sieve_vacation_replies_once_per_sender_and_keeps_the_message() {
     let script = "require \"vacation\"; vacation :subject \"Away\" \"Back Monday\";";
     let message = "From: a@remote.test\r\nTo: user@example.test\r\nSubject: ping\r\n\r\nb";

@@ -263,9 +263,39 @@ impl Session {
         };
 
         let mut stored = false;
+        // Redirecting to oneself is a keep, unless the script already keeps.
+        let keeps = actions
+            .iter()
+            .any(|action| matches!(action, Action::Keep { .. }));
         for action in actions {
             let started = Instant::now();
             match action {
+                Action::Redirect { address } if is_own_address(&address, rcpt) => {
+                    if keeps {
+                        continue;
+                    }
+                    let result = self.sieve_store(
+                        mail_root,
+                        domain,
+                        local,
+                        quota_bytes,
+                        "INBOX",
+                        data,
+                        Vec::new(),
+                    );
+                    stored |= self
+                        .finish_local(
+                            mail_root,
+                            rcpt,
+                            "INBOX",
+                            result,
+                            data.len(),
+                            started,
+                            dmarc,
+                            report,
+                        )
+                        .await;
+                }
                 Action::Keep { flags } => {
                     let result = self.sieve_store(
                         mail_root,
@@ -341,9 +371,6 @@ impl Session {
                     stored = true;
                 }
                 Action::Redirect { address } => {
-                    if address.eq_ignore_ascii_case(rcpt) {
-                        continue;
-                    }
                     // Redirected mail is forwarded mail: ARC-seal it like an alias.
                     let body = match self.arc_seal(mail_root, data).await {
                         Ok(sealed) => sealed,
@@ -354,8 +381,14 @@ impl Session {
                         }
                     };
                     session_log!(self, "info", "sieve_redirect", { "message_id": self.message_id, "rcpt": rcpt, "to": address });
-                    self.queue_remote(mail_root, &address, body, report).await;
-                    stored = true;
+                    if self.queue_remote(mail_root, &address, body, report).await {
+                        // LMTP otherwise keeps its temporary failure and the
+                        // client retries, forwarding another copy each time.
+                        report
+                            .lmtp_status
+                            .insert(rcpt.to_string(), "250 2.1.5 Delivered");
+                        stored = true;
+                    }
                 }
                 Action::Vacation(vacation) => {
                     self.sieve_vacation(mail_root, rcpt, &vacation, &message)
@@ -414,7 +447,7 @@ impl Session {
         let Some(target) = vacation.reply_target(message) else {
             return;
         };
-        if target.eq_ignore_ascii_case(rcpt) {
+        if is_own_address(&target, rcpt) {
             return;
         }
         let claim = {
@@ -495,7 +528,7 @@ impl Session {
         rcpt: &str,
         body: Vec<u8>,
         report: &mut DeliveryReport,
-    ) {
+    ) -> bool {
         let bytes = body.len();
         let options = rmail_common::outbound::QueueOptions {
             require_tls: self.tx.require_tls,
@@ -524,17 +557,28 @@ impl Session {
             Ok(Ok(path)) => {
                 report.any_accepted = true;
                 session_log!(self, "info", "queued_outbound", { "message_id": self.message_id, "rcpt": rcpt, "queue_file": path.file_name().map(|name| name.to_string_lossy().into_owned()), "bytes": bytes });
+                true
             }
             Ok(Err(error)) => {
                 report.any_rejected = true;
                 session_log!(self, "error", "queue_outbound_failed", { "message_id": self.message_id, "rcpt": rcpt, "error": error.to_string() });
+                false
             }
             Err(error) => {
                 report.any_rejected = true;
                 session_log!(self, "error", "queue_outbound_failed", { "message_id": self.message_id, "rcpt": rcpt, "error": error.to_string() });
+                false
             }
         }
     }
+}
+
+/// True when `address` names the recipient itself. Recipients are already
+/// canonical (ASCII domain), so `address` is compared in that form too.
+fn is_own_address(address: &str, rcpt: &str) -> bool {
+    address.eq_ignore_ascii_case(rcpt)
+        || rmail_common::domain::canonicalize_mailbox_address(address)
+            .is_ok_and(|address| address.eq_ignore_ascii_case(rcpt))
 }
 
 /// Increment the on-disk delivered-message counter shown in the admin UI.

@@ -358,6 +358,12 @@ impl Session {
         self.send(&text).await
     }
 
+    /// Send `text` and keep the session open.
+    async fn reply(&mut self, text: &str) -> Result<Flow> {
+        self.send(text).await?;
+        Ok(Flow::Continue)
+    }
+
     async fn dispatch(&mut self, name: &str, args: &[Arg]) -> Result<Flow> {
         match name {
             "CAPABILITY" => {
@@ -375,7 +381,7 @@ impl Session {
                 return Ok(Flow::Close);
             }
             "STARTTLS" => self.starttls().await?,
-            "AUTHENTICATE" => self.authenticate(args).await?,
+            "AUTHENTICATE" => return self.authenticate(args).await,
             "UNAUTHENTICATE" => {
                 if self.user.take().is_some() {
                     self.send("OK \"Unauthenticated\"\r\n").await?;
@@ -420,27 +426,29 @@ impl Session {
         }
     }
 
-    async fn authenticate(&mut self, args: &[Arg]) -> Result<()> {
+    async fn authenticate(&mut self, args: &[Arg]) -> Result<Flow> {
         if self.user.is_some() {
-            return self.send("NO \"Already authenticated\"\r\n").await;
+            return self.reply("NO \"Already authenticated\"\r\n").await;
         }
         let Some(mechanism) = args.first().and_then(Arg::text) else {
-            return self.send("NO \"AUTHENTICATE needs a mechanism\"\r\n").await;
+            return self
+                .reply("NO \"AUTHENTICATE needs a mechanism\"\r\n")
+                .await;
         };
         if !mechanism.eq_ignore_ascii_case("PLAIN") {
             return self
-                .send("NO \"Unsupported authentication mechanism\"\r\n")
+                .reply("NO \"Unsupported authentication mechanism\"\r\n")
                 .await;
         }
         if !self.plaintext_auth_allowed() {
             return self
-                .send("NO (ENCRYPT-NEEDED) \"Start TLS before authenticating\"\r\n")
+                .reply("NO (ENCRYPT-NEEDED) \"Start TLS before authenticating\"\r\n")
                 .await;
         }
         let ip: Option<IpAddr> = self.peer.map(|peer| peer.ip());
         if let Some(remaining) = ip.and_then(|ip| AUTH_THROTTLE.blocked_for(ip)) {
             return self
-                .send(&format!(
+                .reply(&format!(
                     "NO \"Too many failed attempts; try again in {} seconds\"\r\n",
                     remaining.as_secs().max(1)
                 ))
@@ -450,23 +458,37 @@ impl Session {
             Some(arg) => arg.clone(),
             None => {
                 self.send("\"\"\r\n").await?;
-                match read_tokens(&mut self.reader).await {
-                    Ok(mut tokens) if tokens.len() == 1 => tokens.remove(0),
-                    _ => {
+                // Same idle limit as an unauthenticated command, so a silent
+                // client cannot hold a session slot.
+                match timeout(UNAUTHENTICATED_TIMEOUT, read_tokens(&mut self.reader)).await {
+                    Ok(Ok(mut tokens)) if tokens.len() == 1 => tokens.remove(0),
+                    Ok(Ok(_)) | Ok(Err(ProtoError::Syntax(_))) => {
                         return self
-                            .send("NO \"Invalid authentication response\"\r\n")
+                            .reply("NO \"Invalid authentication response\"\r\n")
                             .await;
                     }
+                    Err(_) => {
+                        self.send("BYE \"Idle timeout\"\r\n").await?;
+                        return Ok(Flow::Close);
+                    }
+                    // Unread literal bytes would otherwise be parsed as commands.
+                    Ok(Err(ProtoError::TooLarge)) => {
+                        self.send("BYE (QUOTA/MAXSIZE) \"Command too large\"\r\n")
+                            .await?;
+                        return Ok(Flow::Close);
+                    }
+                    Ok(Err(ProtoError::Closed)) => return Ok(Flow::Close),
+                    Ok(Err(ProtoError::Io(error))) => return Err(error.into()),
                 }
             }
         };
         let Some(encoded) = initial.text() else {
             return self
-                .send("NO \"Invalid authentication response\"\r\n")
+                .reply("NO \"Invalid authentication response\"\r\n")
                 .await;
         };
         if encoded == "*" {
-            return self.send("NO \"Authentication cancelled\"\r\n").await;
+            return self.reply("NO \"Authentication cancelled\"\r\n").await;
         }
         let decoded = if encoded.is_empty() || encoded == "=" {
             Vec::new()
@@ -475,7 +497,7 @@ impl Session {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return self
-                        .send("NO \"Invalid base64 in authentication\"\r\n")
+                        .reply("NO \"Invalid base64 in authentication\"\r\n")
                         .await;
                 }
             }
@@ -488,7 +510,7 @@ impl Session {
                     String::from_utf8_lossy(c).into_owned(),
                     String::from_utf8_lossy(p).into_owned(),
                 ),
-                _ => return self.send("NO \"Malformed PLAIN response\"\r\n").await,
+                _ => return self.reply("NO \"Malformed PLAIN response\"\r\n").await,
             };
         match authenticate_password(Some(&self.db_path), &authcid, &password).await {
             PasswordAuthResult::Success(mailbox) => {
@@ -498,23 +520,23 @@ impl Session {
                     && !authzid.eq_ignore_ascii_case(&address)
                 {
                     return self
-                        .send("NO \"Authorization identity not permitted\"\r\n")
+                        .reply("NO \"Authorization identity not permitted\"\r\n")
                         .await;
                 }
                 if let Some(ip) = ip {
                     AUTH_THROTTLE.reset(ip);
                 }
                 self.user = Some(address);
-                self.send("OK \"Authentication successful\"\r\n").await
+                self.reply("OK \"Authentication successful\"\r\n").await
             }
             PasswordAuthResult::Rejected => {
                 if let Some(ip) = ip {
                     AUTH_THROTTLE.record_failure(ip);
                 }
-                self.send("NO \"Authentication failed\"\r\n").await
+                self.reply("NO \"Authentication failed\"\r\n").await
             }
             PasswordAuthResult::Unavailable { .. } => {
-                self.send("NO \"Authentication temporarily unavailable\"\r\n")
+                self.reply("NO \"Authentication temporarily unavailable\"\r\n")
                     .await
             }
         }
@@ -803,6 +825,43 @@ mod tests {
         assert!(!out.contains("STARTTLS"), "no TLS configured: {out}");
         assert!(out.contains("OK \"rMail ManageSieve ready\"\r\n"), "{out}");
         assert!(out.ends_with("OK \"Logout completed\"\r\n"), "{out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_authenticate_continuation_times_out() {
+        let (_td, db) = setup();
+        let (mut client, server) = duplex(1 << 16);
+        let task = tokio::spawn(serve(
+            Box::new(server),
+            Some(LOOPBACK.parse().unwrap()),
+            None,
+            db,
+        ));
+        client
+            .write_all(b"AUTHENTICATE \"PLAIN\"\r\n")
+            .await
+            .unwrap();
+        // The client stays silent; paused time advances to the idle limit.
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        task.await.unwrap().unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.ends_with("\"\"\r\nBYE \"Idle timeout\"\r\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn oversized_authenticate_continuation_closes_the_session() {
+        let (_td, db) = setup();
+        let out = run_with(
+            &db,
+            LOOPBACK,
+            "AUTHENTICATE \"PLAIN\"\r\n{99999999+}\r\nLOGOUT\r\n",
+        )
+        .await;
+        assert!(
+            out.ends_with("BYE (QUOTA/MAXSIZE) \"Command too large\"\r\n"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

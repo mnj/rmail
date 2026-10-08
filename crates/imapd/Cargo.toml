@@ -21,6 +21,7 @@ unicode-normalization = "0.1"
 async-compression = { version = "0.4", features = ["tokio", "deflate"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 rmail_common = { path = "../common", features = ["insecure-plaintext-passwords", "test-support"] }
 tempfile = "3.5"
 hmac = "0.12"
