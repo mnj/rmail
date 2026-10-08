@@ -110,11 +110,12 @@ fn cached_config(path: &str) -> anyhow::Result<Arc<Config>> {
 /// Confirm `domain` is hosted here, then load the configuration. Unknown
 /// names are rejected before any configuration is read.
 async fn hosted(state: &Shared, domain: &str) -> Option<Arc<Config>> {
-    if !is_domain_name(domain) {
+    // Domains are stored in ASCII form, so Unicode names are converted first.
+    let domain = rmail_common::domain::canonicalize_domain(domain).ok()?;
+    if !is_domain_name(&domain) {
         return None;
     }
     let (path, db) = (state.config_path.clone()?, state.db_path.clone()?);
-    let domain = domain.to_ascii_lowercase();
     blocking(move || {
         if !rmail_common::db::is_local_domain(&db, &domain)? {
             return Ok(None);

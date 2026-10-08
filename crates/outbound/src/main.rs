@@ -2249,11 +2249,25 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
             }
         }
         if tls_report_settled(queued_copies, day.as_str() < stale_before.as_str()) {
-            let (path, day, domain) = (db_path.to_path_buf(), day.clone(), domain.clone());
-            let _ = tokio::task::spawn_blocking(move || {
-                rmail_common::db::tlsrpt_delete(&path, &day, &domain)
-            })
-            .await;
+            let deleted = {
+                let (path, day, domain) = (db_path.to_path_buf(), day.clone(), domain.clone());
+                tokio::task::spawn_blocking(move || {
+                    rmail_common::db::tlsrpt_delete(&path, &day, &domain)
+                })
+                .await
+            };
+            let error = match deleted {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = error {
+                // The counters stay due, so the next run reports this day again.
+                rmail_common::structured_log!(
+                    "error", "outbound", "tls_report_delete_failed",
+                    { "domain": domain, "day": day, "error": error }
+                );
+            }
         }
     }
 }

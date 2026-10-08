@@ -2624,6 +2624,35 @@ mod tests {
             "{pox}"
         );
 
+        // Unicode domains match the ASCII form stored for a hosted IDN.
+        rmail_common::db::add_mailbox(
+            td.path().join("rmail.db"),
+            "bob@bücher.example",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let tb = send_to_state(
+            state.clone(),
+            "t",
+            "GET /mail/config-v1.1.xml?emailaddress=bob%40B%C3%BCcher.example HTTP/1.1\r\n\r\n"
+                .into(),
+        )
+        .await;
+        assert!(tb.starts_with("HTTP/1.1 200"), "{tb}");
+        let body = "<Autodiscover><Request><EMailAddress>bob@bücher.example</EMailAddress></Request></Autodiscover>";
+        let pox = send_to_state(
+            state.clone(),
+            "t",
+            format!(
+                "POST /autodiscover/autodiscover.xml HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(pox.starts_with("HTTP/1.1 200"), "{pox}");
+
         // Autoconfig is also served over plain HTTP; MTA-STS is not.
         let http = send_http(
             state.clone(),

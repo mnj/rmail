@@ -50,6 +50,7 @@ const SMTP_IDENTITY: &[&str] = &["smtpd", "outbound"];
 const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
 const CLASSIFIER: &[&str] = &["classifier"];
+const OUTBOUND: &[&str] = &["outbound"];
 const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail", "classifier"];
 /// Read on every use; no restart needed.
 const LIVE: &[&str] = &[];
@@ -743,7 +744,7 @@ pub const SETTINGS: &[SettingSpec] = &[
         SettingKind::Choice {
             options: &["none", "testing", "enforce"],
         },
-        SMTP,
+        LIVE,
     ),
     spec(
         "security.mta_sts_max_age_secs",
@@ -751,7 +752,7 @@ pub const SETTINGS: &[SettingSpec] = &[
         "MTA-STS max age (s)",
         "How long senders cache the policy.",
         int(60, 31_557_600),
-        SMTP,
+        LIVE,
     ),
     spec(
         "security.tls_rpt_enabled",
@@ -759,7 +760,7 @@ pub const SETTINGS: &[SettingSpec] = &[
         "SMTP TLS reports",
         "Send daily TLS reports (RFC 8460) to domains that publish a _smtp._tls record, covering sessions checked against their MTA-STS policy.",
         SettingKind::Bool,
-        SMTP,
+        OUTBOUND,
     ),
     spec(
         "security.greylist_enabled",
