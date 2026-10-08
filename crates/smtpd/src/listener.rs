@@ -51,7 +51,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for SMTP shutdown signal")?;
                 return Ok(());
             }
-            accepted = listener.accept() => accepted?,
+            accepted = rmail_common::net::accept_retrying(&listener, "smtpd", &addr) => accepted,
         };
         let trace = ConnectionTrace::new(stream.local_addr().ok());
         smtp_log!("info", "connection_accepted", { "connection_id": trace.id, "listener": addr, "peer": peer.to_string(), "service": service.as_str(), "tls": ctx.implicit_tls, "starttls_available": !ctx.implicit_tls && ctx.tls.borrow().is_some() });

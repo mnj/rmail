@@ -62,7 +62,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for ManageSieve shutdown signal")?;
                 return Ok(());
             }
-            accepted = listener.accept() => accepted?,
+            accepted = rmail_common::net::accept_retrying(&listener, "imapd", &addr) => accepted,
         };
         if !accept_connection_from(peer.ip(), ctx.connection_rate_limit) {
             let _ = stream
