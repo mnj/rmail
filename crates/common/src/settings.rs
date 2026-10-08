@@ -50,6 +50,7 @@ const SMTP_IDENTITY: &[&str] = &["smtpd", "outbound"];
 const WEB: &[&str] = &["web"];
 const WEBMAIL: &[&str] = &["webmail"];
 const CLASSIFIER: &[&str] = &["classifier"];
+const OUTBOUND: &[&str] = &["outbound"];
 const ALL: &[&str] = &["smtpd", "imapd", "outbound", "web", "webmail", "classifier"];
 /// Read on every use; no restart needed.
 const LIVE: &[&str] = &[];
@@ -734,6 +735,32 @@ pub const SETTINGS: &[SettingSpec] = &[
         "Rspamd actions that reject at SMTP time.",
         SettingKind::List,
         SMTP,
+    ),
+    spec(
+        "security.mta_sts_mode",
+        "tls",
+        "MTA-STS policy",
+        "Publish an MTA-STS policy for hosted domains. Needs an mta-sts.<domain> DNS name and a trusted certificate. Start with testing.",
+        SettingKind::Choice {
+            options: &["none", "testing", "enforce"],
+        },
+        LIVE,
+    ),
+    spec(
+        "security.mta_sts_max_age_secs",
+        "tls",
+        "MTA-STS max age (s)",
+        "How long senders cache the policy.",
+        int(60, 31_557_600),
+        LIVE,
+    ),
+    spec(
+        "security.tls_rpt_enabled",
+        "tls",
+        "SMTP TLS reports",
+        "Send daily TLS reports (RFC 8460) to domains that publish a _smtp._tls record, covering sessions checked against their MTA-STS policy.",
+        SettingKind::Bool,
+        OUTBOUND,
     ),
     spec(
         "security.greylist_enabled",
