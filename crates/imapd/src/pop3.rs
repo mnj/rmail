@@ -86,7 +86,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for POP3 shutdown signal")?;
                 return Ok(());
             }
-            accepted = listener.accept() => accepted?,
+            accepted = rmail_common::net::accept_retrying(&listener, "imapd", &addr) => accepted,
         };
         let tls = ctx.tls.borrow().clone();
         if ctx.implicit_tls && tls.is_none() {
@@ -459,9 +459,17 @@ impl Session {
             Some(initial) => (*initial).to_string(),
             None => {
                 self.send(b"+ \r\n").await?;
-                match read_line(&mut self.reader).await? {
-                    Some(Some(line)) => String::from_utf8_lossy(&line).trim().to_string(),
-                    _ => return self.err("Invalid response").await,
+                // Same idle limit as an unauthenticated command, so a silent
+                // client cannot hold a session slot.
+                match timeout(UNAUTHENTICATED_TIMEOUT, read_line(&mut self.reader)).await {
+                    Ok(Ok(Some(Some(line)))) => String::from_utf8_lossy(&line).trim().to_string(),
+                    Ok(Ok(Some(None))) => return self.err("Invalid response").await,
+                    Ok(Ok(None)) => return Ok(Flow::Close),
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(_) => {
+                        self.send(b"-ERR Idle timeout\r\n").await?;
+                        return Ok(Flow::Close);
+                    }
                 }
             }
         };
@@ -715,6 +723,30 @@ mod tests {
         assert_eq!(message_lines(b""), Vec::<&[u8]>::new());
         assert_eq!(message_lines(b"x\r\n"), vec![&b"x"[..]]);
         assert_eq!(encode_lines(std::iter::empty()), b".\r\n");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_auth_continuation_times_out() {
+        let env = two();
+        let (mut client, server) = duplex(1 << 16);
+        let task = tokio::spawn(serve(
+            Box::new(server),
+            Some(LOOPBACK.parse().unwrap()),
+            None,
+            false,
+            env.root.clone(),
+            env.db.clone(),
+        ));
+        client.write_all(b"AUTH PLAIN\r\n").await.unwrap();
+        // The client stays silent; paused time advances to the idle limit.
+        let mut out = Vec::new();
+        timeout(Duration::from_secs(10 * 60), client.read_to_end(&mut out))
+            .await
+            .expect("session never timed out")
+            .unwrap();
+        task.await.unwrap().unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.ends_with("+ \r\n-ERR Idle timeout\r\n"), "{out}");
     }
 
     #[tokio::test]
