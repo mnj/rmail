@@ -3382,6 +3382,7 @@ dependencies = [
  "pbkdf2 0.12.2",
  "rand 0.8.8",
  "rmail_common",
+ "rmail_sieve",
  "rustls 0.21.12",
  "rustls-pemfile",
  "sha2 0.10.9",
@@ -3445,6 +3446,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmail_sieve"
+version = "1.0.0"
+
+[[package]]
 name = "rmail_smtpd"
 version = "1.0.0"
 dependencies = [
@@ -3457,6 +3462,7 @@ dependencies = [
  "pbkdf2 0.12.2",
  "rand 0.8.8",
  "rmail_common",
+ "rmail_sieve",
  "rustls 0.21.12",
  "rustls-pemfile",
  "sha2 0.10.9",

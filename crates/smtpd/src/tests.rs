@@ -2296,6 +2296,223 @@ async fn local_webmail_submits_as_its_user_over_loopback_only() {
     assert!(!mta.iter().any(|l| l.starts_with("235")), "{mta:?}");
 }
 
+fn files_in(path: std::path::PathBuf) -> usize {
+    std::fs::read_dir(path).map_or(0, |entries| entries.count())
+}
+
+fn queued_eml(td: &tempfile::TempDir) -> Vec<String> {
+    let queue = td.path().join("mail/outbound/maildrop/queue");
+    std::fs::read_dir(queue)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    (path.extension().and_then(|e| e.to_str()) == Some("eml"))
+                        .then(|| std::fs::read_to_string(path).unwrap_or_default())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn deliver_with_script(
+    script: &str,
+    messages: &[(&str, &str)],
+) -> (Vec<String>, tempfile::TempDir) {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::put_sieve_script(&db_path, "user@example.test", "main", script).unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, "user@example.test", Some("main")).unwrap();
+    let mut input = String::from("EHLO localhost\r\n");
+    for (from, headers_and_body) in messages {
+        input.push_str(&format!(
+            "MAIL FROM:<{from}>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n{headers_and_body}\r\n.\r\n"
+        ));
+    }
+    input.push_str("QUIT\r\n");
+    run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await
+}
+
+fn inbox(td: &tempfile::TempDir) -> usize {
+    files_in(td.path().join("mail/example.test/user/Maildir/new"))
+}
+
+fn accepted(responses: &[String]) -> usize {
+    responses
+        .iter()
+        .filter(|r| r.starts_with("250 2.0.0 Message accepted"))
+        .count()
+}
+
+#[tokio::test]
+async fn sieve_fileinto_routes_matching_mail_and_keeps_the_rest() {
+    let script =
+        "require \"fileinto\"; if header :contains \"subject\" \"invoice\" { fileinto \"Bills\"; }";
+    let (responses, td) = deliver_with_script(
+        script,
+        &[
+            ("a@remote.test", "Subject: Invoice 42\r\n\r\npay"),
+            ("b@remote.test", "Subject: hello\r\n\r\nhi"),
+        ],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 2, "{responses:?}");
+    assert_eq!(
+        files_in(td.path().join("mail/example.test/user/Maildir/.Bills/new")),
+        1
+    );
+    assert_eq!(inbox(&td), 1);
+}
+
+#[tokio::test]
+async fn sieve_discard_accepts_but_stores_nothing() {
+    let (responses, td) =
+        deliver_with_script("discard;", &[("a@remote.test", "Subject: x\r\n\r\nb")]).await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    assert_eq!(inbox(&td), 0);
+}
+
+#[tokio::test]
+async fn sieve_invalid_script_falls_back_to_inbox() {
+    let (responses, td) = deliver_with_script(
+        "this is not sieve",
+        &[("a@remote.test", "Subject: x\r\n\r\nb")],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    assert_eq!(inbox(&td), 1);
+}
+
+#[tokio::test]
+async fn sieve_redirect_queues_forwarded_copy_and_skips_inbox() {
+    let (responses, td) = deliver_with_script(
+        "redirect \"elsewhere@forward.test\";",
+        &[("a@remote.test", "Subject: x\r\n\r\nb")],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    assert_eq!(inbox(&td), 0);
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert!(queued[0].contains("X-RMail-Envelope-To: elsewhere@forward.test\r\n"));
+    assert!(queued[0].contains("X-RMail-Envelope-From: a@remote.test\r\n"));
+}
+
+#[tokio::test]
+async fn sieve_redirect_to_own_address_keeps_the_message() {
+    for script in [
+        "redirect \"User@example.test\";",
+        "keep; redirect \"user@example.test\";",
+    ] {
+        let (responses, td) =
+            deliver_with_script(script, &[("a@remote.test", "Subject: x\r\n\r\nb")]).await;
+        assert_eq!(accepted(&responses), 1, "{script}: {responses:?}");
+        assert_eq!(inbox(&td), 1, "{script}");
+        assert!(queued_eml(&td).is_empty(), "{script}");
+    }
+}
+
+#[tokio::test]
+async fn sieve_redirect_over_lmtp_reports_delivered() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    let account = "user@example.test";
+    rmail_common::db::put_sieve_script(&db_path, account, "main", "redirect \"x@forward.test\";")
+        .unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, account, Some("main")).unwrap();
+    let (responses, td) = run_prepared_session(
+        b"LHLO localhost\r\nMAIL FROM:<a@remote.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nSubject: x\r\n\r\nb\r\n.\r\nQUIT\r\n"
+            .to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Lmtp,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line == "250 2.1.5 Delivered <user@example.test>\r\n"),
+        "{responses:?}"
+    );
+    assert_eq!(queued_eml(&td).len(), 1);
+}
+
+#[tokio::test]
+async fn sieve_script_runs_for_unicode_domain_recipients() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::add_mailbox(&db_path, "bob@bücher.example", None, None, None).unwrap();
+    // ManageSieve stores scripts under the canonical (ASCII) address.
+    let account = "bob@xn--bcher-kva.example";
+    rmail_common::db::put_sieve_script(&db_path, account, "main", "redirect \"x@forward.test\";")
+        .unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, account, Some("main")).unwrap();
+    let (responses, td) = run_prepared_session(
+        "EHLO localhost\r\nMAIL FROM:<a@remote.test> SMTPUTF8\r\nRCPT TO:<bob@BÜCHER.example>\r\nDATA\r\nSubject: x\r\n\r\nb\r\n.\r\nQUIT\r\n"
+            .as_bytes()
+            .to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "{responses:?}");
+    assert!(queued[0].contains("X-RMail-Envelope-To: x@forward.test\r\n"));
+}
+
+#[tokio::test]
+async fn sieve_vacation_replies_once_per_sender_and_keeps_the_message() {
+    let script = "require \"vacation\"; vacation :subject \"Away\" \"Back Monday\";";
+    let message = "From: a@remote.test\r\nTo: user@example.test\r\nSubject: ping\r\n\r\nb";
+    let (responses, td) = deliver_with_script(
+        script,
+        &[("a@remote.test", message), ("a@remote.test", message)],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 2, "{responses:?}");
+    assert_eq!(inbox(&td), 2);
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "one reply per sender: {queued:?}");
+    assert!(queued[0].starts_with("X-RMail-Envelope-To: a@remote.test\r\n"));
+    assert!(queued[0].contains("Subject: Away\r\n"));
+    assert!(queued[0].contains("Auto-Submitted: auto-replied\r\n"));
+}
+
+#[tokio::test]
+async fn sieve_vacation_skips_bulk_mail_and_null_senders() {
+    let script = "require \"vacation\"; vacation \"away\";";
+    let (_, td) = deliver_with_script(
+        script,
+        &[
+            (
+                "a@remote.test",
+                "From: a@remote.test\r\nTo: user@example.test\r\nPrecedence: bulk\r\n\r\nb",
+            ),
+            ("", "To: user@example.test\r\nSubject: bounce\r\n\r\nb"),
+        ],
+    )
+    .await;
+    assert_eq!(inbox(&td), 2);
+    assert!(queued_eml(&td).is_empty());
+}
+
 #[tokio::test]
 async fn greylisting_defers_unknown_triples_but_not_submission_or_loopback() {
     let security = || SecurityConfig {

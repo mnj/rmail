@@ -105,6 +105,25 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             reported INTEGER DEFAULT 0
         );
 
+        -- Sieve scripts per account (full lowercase address); at most one is active.
+        CREATE TABLE IF NOT EXISTS sieve_scripts (
+            account TEXT NOT NULL,
+            name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (account, name)
+        ) WITHOUT ROWID;
+
+        -- Last vacation reply per (account, sender, reply key), to send one per period.
+        CREATE TABLE IF NOT EXISTS sieve_vacation (
+            account TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            reply_key TEXT NOT NULL,
+            sent_at INTEGER NOT NULL,
+            PRIMARY KEY (account, sender, reply_key)
+        ) WITHOUT ROWID;
+
         -- tlsrpt_counts aggregates outbound TLS outcomes per UTC day (see tlsrpt.rs).
         CREATE TABLE IF NOT EXISTS tlsrpt_counts (
             day TEXT NOT NULL,
@@ -309,6 +328,145 @@ pub fn set_mailbox_quota<P: AsRef<Path>>(
         anyhow::bail!("mailbox does not exist");
     }
     Ok(())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Store (create or replace) a script. Replacing keeps its active flag.
+pub fn put_sieve_script<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    name: &str,
+    content: &str,
+) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "INSERT INTO sieve_scripts (account, name, content, active, updated_at) VALUES (?1, ?2, ?3, 0, ?4)
+         ON CONFLICT(account, name) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+        params![account.to_ascii_lowercase(), name, content, unix_now()],
+    )?;
+    Ok(())
+}
+
+pub fn get_sieve_script<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt =
+        conn.prepare("SELECT content FROM sieve_scripts WHERE account = ?1 AND name = ?2")?;
+    let mut rows = stmt.query(params![account.to_ascii_lowercase(), name])?;
+    Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
+}
+
+/// `(name, active)` for each script, by name.
+pub fn list_sieve_scripts<P: AsRef<Path>>(path: P, account: &str) -> Result<Vec<(String, bool)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt =
+        conn.prepare("SELECT name, active FROM sieve_scripts WHERE account = ?1 ORDER BY name")?;
+    let rows = stmt.query_map(params![account.to_ascii_lowercase()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn get_active_sieve_script<P: AsRef<Path>>(path: P, account: &str) -> Result<Option<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn
+        .prepare("SELECT content FROM sieve_scripts WHERE account = ?1 AND active = 1 LIMIT 1")?;
+    let mut rows = stmt.query(params![account.to_ascii_lowercase()])?;
+    Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
+}
+
+/// Make `name` the only active script, or deactivate all with `None`.
+/// Returns false when `name` does not exist.
+pub fn set_active_sieve_script<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    name: Option<&str>,
+) -> Result<bool> {
+    let mut conn = Connection::open(path)?;
+    let tx = conn.transaction()?;
+    let account = account.to_ascii_lowercase();
+    if let Some(name) = name {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sieve_scripts WHERE account = ?1 AND name = ?2)",
+            params![account, name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+    }
+    tx.execute(
+        "UPDATE sieve_scripts SET active = 0 WHERE account = ?1",
+        params![account],
+    )?;
+    if let Some(name) = name {
+        tx.execute(
+            "UPDATE sieve_scripts SET active = 1 WHERE account = ?1 AND name = ?2",
+            params![account, name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Rename a script, keeping its active flag. Returns false when `from` does
+/// not exist; fails when `to` already does.
+pub fn rename_sieve_script<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let changed = conn.execute(
+        "UPDATE sieve_scripts SET name = ?3, updated_at = ?4 WHERE account = ?1 AND name = ?2",
+        params![account.to_ascii_lowercase(), from, to, unix_now()],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Delete an inactive script. Returns false when it does not exist or is active.
+pub fn delete_sieve_script<P: AsRef<Path>>(path: P, account: &str, name: &str) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let changed = conn.execute(
+        "DELETE FROM sieve_scripts WHERE account = ?1 AND name = ?2 AND active = 0",
+        params![account.to_ascii_lowercase(), name],
+    )?;
+    Ok(changed == 1)
+}
+
+/// True when a vacation reply may be sent now: records the send atomically,
+/// so two concurrent deliveries cannot both reply within `days`.
+pub fn vacation_claim_reply<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    sender: &str,
+    reply_key: &str,
+    days: u32,
+) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let now = unix_now();
+    let changed = conn.execute(
+        "INSERT INTO sieve_vacation (account, sender, reply_key, sent_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(account, sender, reply_key) DO UPDATE SET sent_at = excluded.sent_at
+         WHERE sieve_vacation.sent_at <= ?5",
+        params![
+            account.to_ascii_lowercase(),
+            sender.to_ascii_lowercase(),
+            reply_key,
+            now,
+            now - i64::from(days) * 86_400
+        ],
+    )?;
+    Ok(changed == 1)
 }
 
 /// Add `rows` to the persisted TLS-RPT counters in one transaction.
@@ -907,6 +1065,70 @@ mod tests {
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
+
+    #[test]
+    fn sieve_scripts_have_one_active_and_cannot_delete_it() {
+        let td = tempdir().expect("tempdir");
+        let db = td.path().join("sieve.db");
+        init_db(&db).expect("init db");
+        let acct = "Bob@Example.com";
+        super::put_sieve_script(&db, acct, "a", "keep;").unwrap();
+        super::put_sieve_script(&db, acct, "b", "discard;").unwrap();
+        assert_eq!(super::get_active_sieve_script(&db, acct).unwrap(), None);
+        assert!(super::set_active_sieve_script(&db, acct, Some("a")).unwrap());
+        assert!(super::set_active_sieve_script(&db, acct, Some("b")).unwrap());
+        assert_eq!(
+            super::get_active_sieve_script(&db, "bob@example.com")
+                .unwrap()
+                .as_deref(),
+            Some("discard;")
+        );
+        assert_eq!(
+            super::list_sieve_scripts(&db, acct).unwrap(),
+            vec![("a".to_string(), false), ("b".to_string(), true)]
+        );
+        assert!(!super::set_active_sieve_script(&db, acct, Some("nope")).unwrap());
+        assert!(
+            !super::delete_sieve_script(&db, acct, "b").unwrap(),
+            "active scripts stay"
+        );
+        assert!(super::delete_sieve_script(&db, acct, "a").unwrap());
+        // Replacing content keeps the active flag.
+        super::put_sieve_script(&db, acct, "b", "keep;").unwrap();
+        assert_eq!(
+            super::get_active_sieve_script(&db, acct)
+                .unwrap()
+                .as_deref(),
+            Some("keep;")
+        );
+        assert!(super::set_active_sieve_script(&db, acct, None).unwrap());
+        assert_eq!(super::get_active_sieve_script(&db, acct).unwrap(), None);
+        assert_eq!(
+            super::get_sieve_script(&db, acct, "b").unwrap().as_deref(),
+            Some("keep;")
+        );
+    }
+
+    #[test]
+    fn vacation_reply_is_claimed_once_per_period() {
+        let td = tempdir().expect("tempdir");
+        let db = td.path().join("vac.db");
+        init_db(&db).expect("init db");
+        assert!(super::vacation_claim_reply(&db, "bob@x.test", "A@y.test", "k", 7).unwrap());
+        assert!(!super::vacation_claim_reply(&db, "bob@x.test", "a@y.test", "k", 7).unwrap());
+        // Another sender, key or account is independent.
+        assert!(super::vacation_claim_reply(&db, "bob@x.test", "c@y.test", "k", 7).unwrap());
+        assert!(super::vacation_claim_reply(&db, "bob@x.test", "a@y.test", "k2", 7).unwrap());
+        assert!(super::vacation_claim_reply(&db, "eve@x.test", "a@y.test", "k", 7).unwrap());
+        // Backdate the record: after the period it can be claimed again.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE sieve_vacation SET sent_at = sent_at - 8 * 86400",
+            [],
+        )
+        .unwrap();
+        assert!(super::vacation_claim_reply(&db, "bob@x.test", "a@y.test", "k", 7).unwrap());
+    }
 
     #[test]
     fn local_domains_come_from_mailboxes_aliases_and_catchalls() {

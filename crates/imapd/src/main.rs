@@ -28,6 +28,7 @@ mod commands;
 mod input;
 mod listener;
 mod mailbox;
+mod managesieve;
 mod parser;
 mod response;
 mod session;
@@ -124,6 +125,15 @@ async fn main() -> Result<()> {
         None
     };
 
+    let managesieve_context = db_path
+        .clone()
+        .map(|db_path| managesieve::ManageSieveContext {
+            db_path,
+            tls: tls_receiver.clone(),
+            session_limit: session_limit.clone(),
+            connection_rate_limit,
+            shutdown: shutdown.clone(),
+        });
     let template = ListenerContext {
         mail_root,
         tls: tls_receiver,
@@ -156,6 +166,21 @@ async fn main() -> Result<()> {
         )?;
     } else if !imaps.is_empty() {
         imap_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
+    }
+
+    // ManageSieve (STARTTLS); plain-text login is only offered once TLS is active.
+    if let Some(context) = managesieve_context {
+        for addr in cfg.global.managesieve_listeners() {
+            let listener = bind_tcp_listener_with_config(&addr, &tcp)
+                .with_context(|| format!("starting ManageSieve listener on {addr}"))?;
+            let context = context.clone();
+            listeners.spawn(async move {
+                if let Err(error) = managesieve::run_listener(addr, listener, context).await {
+                    imap_log!("error", "managesieve_listener_failed", { "error": error.to_string() });
+                }
+            });
+            listener_count += 1;
+        }
     }
 
     if listener_count == 0 {

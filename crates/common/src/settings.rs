@@ -256,6 +256,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         IMAP,
     ),
     spec(
+        "global.listeners.managesieve",
+        "network",
+        "ManageSieve",
+        "Mail filter script management (RFC 5804), STARTTLS (port 4190). Needs a TLS certificate.",
+        SettingKind::AddressList,
+        IMAP,
+    ),
+    spec(
         "global.listeners.admin",
         "network",
         "Admin console",

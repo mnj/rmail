@@ -51,7 +51,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for IMAP shutdown signal")?;
                 return Ok(());
             }
-            accepted = listener.accept() => accepted?,
+            accepted = rmail_common::net::accept_retrying(&listener, "imapd", &addr) => accepted,
         };
         imap_log!("info", "connection_accepted", { "listener": addr, "peer": peer.to_string(), "tls": ctx.implicit_tls, "starttls_available": !ctx.implicit_tls && ctx.tls.borrow().is_some() });
         // Rejections are only announced in plaintext; an IMAPS client
