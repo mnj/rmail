@@ -819,6 +819,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.proxy_protocol_trusted_networks",
+        "limits",
+        "PROXY protocol networks",
+        "Load balancer addresses or networks (e.g. 10.0.0.0/8), one per line. Their SMTP, IMAP, POP3 and ManageSieve connections must start with a HAProxy PROXY header (v1 or v2) carrying the client address. Empty disables it.",
+        SettingKind::List,
+        MAIL,
+    ),
+    spec(
         "security.dnsbl_zones",
         "filtering",
         "DNS blocklists",
@@ -1638,6 +1646,10 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
         crate::domain::canonicalize_domain(hostname.trim()).map_err(|error| {
             anyhow!("global.hostname: {hostname:?} is not a valid domain name ({error})")
         })?;
+    }
+    for network in &config.security.proxy_protocol_trusted_networks {
+        crate::proxy::Network::parse(network)
+            .map_err(|error| anyhow!("security.proxy_protocol_trusted_networks: {error:#}"))?;
     }
     let policy = &config.security.admin_password_policy;
     if policy.min_length > policy.max_length {

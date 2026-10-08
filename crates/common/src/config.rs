@@ -521,6 +521,11 @@ pub struct SecurityConfig {
     /// inbound SMTP clients; a listed client is rejected at MAIL FROM. Empty disables.
     #[serde(default)]
     pub dnsbl_zones: Vec<String>,
+    /// Load balancer networks whose SMTP, IMAP, POP3 and ManageSieve
+    /// connections start with a HAProxy PROXY header carrying the client's
+    /// address. Empty disables the PROXY protocol.
+    #[serde(default)]
+    pub proxy_protocol_trusted_networks: Vec<String>,
     #[serde(default = "default_dnsbl_timeout_ms")]
     pub dnsbl_timeout_ms: u64,
 }
@@ -561,6 +566,7 @@ impl Default for SecurityConfig {
             greylist_delay_secs: default_greylist_delay_secs(),
             greylist_persist_interval_secs: default_greylist_persist_interval_secs(),
             dnsbl_zones: Vec::new(),
+            proxy_protocol_trusted_networks: Vec::new(),
             dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }

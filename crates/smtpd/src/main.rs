@@ -91,6 +91,8 @@ async fn main() -> Result<()> {
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
     rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
+    rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
+        .context("security.proxy_protocol_trusted_networks")?;
     let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
         smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
