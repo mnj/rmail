@@ -858,7 +858,10 @@ async fn savedate_and_status_size_use_persisted_message_metadata() {
         ("S5", "* SEARCH 1 2\r\n"),
     ] {
         let lines = read_until_contains(&mut reader, &format!("{tag} OK")).await;
-        assert!(lines.iter().any(|line| line == expected), "{tag}: {lines:?}");
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "{tag}: {lines:?}"
+        );
     }
     let invalid = read_until_contains(&mut reader, "A006 BAD").await.join("");
     assert!(invalid.contains("Invalid STATUS item"));

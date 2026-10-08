@@ -173,13 +173,11 @@ pub(crate) async fn thread(
     } else {
         format!("THREAD {body}")
     };
-    Response::new()
-        .data(line)
-        .status(StatusLine::tagged(
-            tag,
-            Status::Ok,
-            format!("{command} completed"),
-        ))
+    Response::new().data(line).status(StatusLine::tagged(
+        tag,
+        Status::Ok,
+        format!("{command} completed"),
+    ))
 }
 
 fn execute_sort(
