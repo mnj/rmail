@@ -51,11 +51,12 @@ pub(crate) async fn handle(
     };
     let root = mail_root.to_string();
     let lookup_name = mailbox_name.clone();
+    let (lookup_domain, lookup_local) = (domain.clone(), local.clone());
     let exists = match tokio::task::spawn_blocking(move || {
         rmail_common::imap_state::folder_exists(
             std::path::Path::new(&root),
-            &domain,
-            &local,
+            &lookup_domain,
+            &lookup_local,
             &lookup_name,
         )
     })
@@ -70,6 +71,13 @@ pub(crate) async fn handle(
             StatusLine::tagged(tag, Status::No, "Mailbox does not exist").with_code("NONEXISTENT"),
         ));
     }
+    // Claim before loading so every claimed UID is in the loaded view (see
+    // `refresh_selected_mailbox`).
+    let recent_uids =
+        match mailbox::claim_recent_uids(mail_root, &domain, &local, &mailbox_name).await {
+            Ok(uids) => uids.into_iter().collect(),
+            Err(error) => return failure(unavailable(tag, command_name, error)),
+        };
     let mut selected = match mailbox::load_selected_mailbox(mail_root, address, &mailbox_name).await
     {
         Ok(selected) => selected,
@@ -77,17 +85,7 @@ pub(crate) async fn handle(
     };
     let read_only = command_name == "EXAMINE";
     selected.read_only = read_only;
-    selected.recent_uids = match mailbox::claim_recent_uids(
-        mail_root,
-        &selected.domain,
-        &selected.local,
-        &selected.mailbox,
-    )
-    .await
-    {
-        Ok(uids) => uids.into_iter().collect(),
-        Err(error) => return failure(unavailable(tag, command_name, error)),
-    };
+    selected.recent_uids = recent_uids;
     let condstore_requested = request.condstore || condstore_enabled;
     let qresync_changes = if let Some(qresync) = request.qresync.as_ref() {
         if qresync.uidvalidity == selected.uidvalidity {
