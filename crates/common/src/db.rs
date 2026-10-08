@@ -123,11 +123,69 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             sent_at INTEGER NOT NULL,
             PRIMARY KEY (account, sender, reply_key)
         ) WITHOUT ROWID;
+
+        -- tlsrpt_counts aggregates outbound TLS outcomes per UTC day (see tlsrpt.rs).
+        CREATE TABLE IF NOT EXISTS tlsrpt_counts (
+            day TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            policy_type TEXT NOT NULL,
+            mx_host TEXT NOT NULL,
+            result TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            info TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (day, domain, policy_type, mx_host, result)
+        ) WITHOUT ROWID;
+
+        -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
+        CREATE TABLE IF NOT EXISTS greylist (
+            key TEXT PRIMARY KEY,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL
+        ) WITHOUT ROWID;
         "#,
     )?;
     ensure_outbound_columns(path)?;
     add_column_if_missing(path, "mailboxes", "quota_bytes", "INTEGER")?;
     Ok(())
+}
+
+/// Replace the persisted greylist with `records` in one transaction.
+pub fn save_greylist<P: AsRef<Path>>(
+    path: P,
+    records: &[crate::greylist::GreylistRecord],
+) -> Result<()> {
+    let mut conn = Connection::open(path)?;
+    // Wait out a concurrent save (e.g. the shutdown flush overlapping a
+    // periodic one) instead of failing with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM greylist", [])?;
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO greylist (key, first_seen, last_seen) VALUES (?1, ?2, ?3)")?;
+        for record in records {
+            stmt.execute(params![
+                record.key,
+                record.first_seen as i64,
+                record.last_seen as i64
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn load_greylist<P: AsRef<Path>>(path: P) -> Result<Vec<crate::greylist::GreylistRecord>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT key, first_seen, last_seen FROM greylist")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(crate::greylist::GreylistRecord {
+            key: row.get(0)?,
+            first_seen: row.get::<_, i64>(1)? as u64,
+            last_seen: row.get::<_, i64>(2)? as u64,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Add or replace mailbox
@@ -409,6 +467,108 @@ pub fn vacation_claim_reply<P: AsRef<Path>>(
         ],
     )?;
     Ok(changed == 1)
+}
+
+/// Add `rows` to the persisted TLS-RPT counters in one transaction.
+pub fn add_tlsrpt_counts<P: AsRef<Path>>(
+    path: P,
+    rows: &[crate::tlsrpt::CounterRow],
+) -> Result<()> {
+    let mut conn = Connection::open(path)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO tlsrpt_counts (day, domain, policy_type, mx_host, result, count, info)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(day, domain, policy_type, mx_host, result)
+             DO UPDATE SET count = count + excluded.count,
+                           info = CASE WHEN excluded.info = '' THEN info ELSE excluded.info END",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                row.day,
+                row.domain,
+                row.policy_type,
+                row.mx_host,
+                row.result,
+                row.count as i64,
+                row.info
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Counters for one day and policy domain.
+pub fn tlsrpt_rows<P: AsRef<Path>>(
+    path: P,
+    day: &str,
+    domain: &str,
+) -> Result<Vec<crate::tlsrpt::CounterRow>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT day, domain, policy_type, mx_host, result, count, info FROM tlsrpt_counts
+         WHERE day = ?1 AND domain = ?2 ORDER BY policy_type, mx_host, result",
+    )?;
+    let rows = stmt.query_map(params![day, domain], |row| {
+        Ok(crate::tlsrpt::CounterRow {
+            day: row.get(0)?,
+            domain: row.get(1)?,
+            policy_type: row.get(2)?,
+            mx_host: row.get(3)?,
+            result: row.get(4)?,
+            count: row.get::<_, i64>(5)? as u64,
+            info: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (day, domain) pairs from days before `today` that still need a report.
+pub fn tlsrpt_due<P: AsRef<Path>>(path: P, today: &str) -> Result<Vec<(String, String)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT day, domain FROM tlsrpt_counts WHERE day < ?1 ORDER BY day, domain",
+    )?;
+    let rows = stmt.query_map(params![today], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn tlsrpt_delete<P: AsRef<Path>>(path: P, day: &str, domain: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "DELETE FROM tlsrpt_counts WHERE day = ?1 AND domain = ?2",
+        params![day, domain],
+    )?;
+    Ok(())
+}
+
+/// True when `domain` has a mailbox, an alias with targets or a catchall on
+/// this server.
+pub fn is_local_domain<P: AsRef<Path>>(path: P, domain: &str) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let domain = domain.to_ascii_lowercase();
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE lower(substr(address, instr(address, '@') + 1)) = ?1)
+             OR EXISTS(SELECT 1 FROM aliases WHERE targets != '[]' AND lower(substr(address, instr(address, '@') + 1)) = ?1)
+             OR EXISTS(SELECT 1 FROM catchalls WHERE lower(domain) = ?1)",
+        params![domain],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Every domain with a mailbox, an alias with targets or a catchall, sorted.
+pub fn local_domains<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT lower(substr(address, instr(address, '@') + 1)) AS d FROM mailboxes WHERE instr(address, '@') > 0
+         UNION SELECT lower(substr(address, instr(address, '@') + 1)) FROM aliases WHERE instr(address, '@') > 0 AND targets != '[]'
+         UNION SELECT lower(domain) FROM catchalls ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Get catchall target for a domain
@@ -968,6 +1128,33 @@ mod tests {
         )
         .unwrap();
         assert!(super::vacation_claim_reply(&db, "bob@x.test", "a@y.test", "k", 7).unwrap());
+    }
+
+    #[test]
+    fn local_domains_come_from_mailboxes_aliases_and_catchalls() {
+        let td = tempdir().expect("tempdir");
+        let db_path = td.path().join("domains.db");
+        init_db(&db_path).expect("init db");
+        add_mailbox(&db_path, "Alice@Example.COM", None, None, None).expect("mailbox");
+        set_catchall(&db_path, "other.test", "alice@example.com").expect("catchall");
+        add_alias(&db_path, "info@Forward.test", &["alice@example.com"]).expect("alias");
+        add_alias(&db_path, "empty@dead.test", &[]).expect("empty alias");
+
+        assert!(super::is_local_domain(&db_path, "forward.test").unwrap());
+        assert!(!super::is_local_domain(&db_path, "dead.test").unwrap());
+        assert!(super::is_local_domain(&db_path, "example.com").unwrap());
+        assert!(super::is_local_domain(&db_path, "EXAMPLE.com").unwrap());
+        assert!(super::is_local_domain(&db_path, "other.test").unwrap());
+        assert!(!super::is_local_domain(&db_path, "nope.test").unwrap());
+        assert!(!super::is_local_domain(&db_path, "xample.com").unwrap());
+        assert_eq!(
+            super::local_domains(&db_path).unwrap(),
+            vec![
+                "example.com".to_string(),
+                "forward.test".to_string(),
+                "other.test".to_string()
+            ]
+        );
     }
 
     #[test]

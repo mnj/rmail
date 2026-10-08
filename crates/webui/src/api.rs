@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::*;
 
 pub(crate) mod certificates;
+mod discovery;
 mod organization;
 
 pub(crate) const SESSION_COOKIE: &str = "rmail_admin";
@@ -114,6 +115,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/services/restart", post(restart_services))
         .route("/api/admin/credentials", post(change_credentials))
         .merge(organization::routes())
+        .merge(discovery::protected_routes())
         .merge(certificates::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let app = Router::new()
@@ -133,7 +135,10 @@ pub(crate) fn router(state: Shared) -> Router {
         .layer(middleware::from_fn(reject_cross_site))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(log_request))
-        .with_state(state);
+        .with_state(state.clone());
+    // Public discovery endpoints sit outside the CSRF layer (see
+    // `discovery::public_routes`), so they are merged after it.
+    let app = app.merge(discovery::public_routes().with_state(state));
     rmail_common::http::harden(app, MAX_BODY_BYTES)
 }
 

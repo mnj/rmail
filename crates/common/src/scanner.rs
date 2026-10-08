@@ -15,6 +15,8 @@ pub enum ScanAction {
     Clean,
     Quarantine,
     Reject,
+    /// Temporary failure; the sender should retry (rspamd "greylist").
+    Defer,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +89,7 @@ async fn scan_message_inner(
         let rspamd = timeout(duration, scan_rspamd(cfg, message.clone(), envelope))
             .await
             .context("Rspamd scan timed out")??;
-        if rspamd.action == ScanAction::Reject {
+        if matches!(rspamd.action, ScanAction::Reject | ScanAction::Defer) {
             return Ok(rspamd);
         }
         if rspamd.action == ScanAction::Quarantine {
@@ -241,6 +243,13 @@ async fn scan_rspamd(
         ),
     ];
 
+    if action_lc == "greylist" {
+        return Ok(ScanVerdict {
+            action: ScanAction::Defer,
+            headers,
+            reason,
+        });
+    }
     if cfg
         .rspamd_reject_actions
         .iter()
@@ -423,6 +432,42 @@ mod tests {
             .expect("scan");
         assert_eq!(verdict.action, ScanAction::Quarantine);
         assert!(verdict.headers.iter().any(|(k, _)| k == "X-Rspamd-Action"));
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn rspamd_greylist_action_defers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await.expect("read");
+            let body = br#"{"action":"greylist","score":4.0,"required_score":6.0,"symbols":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.expect("head");
+            stream.write_all(body).await.expect("body");
+        });
+        let cfg = SecurityConfig {
+            rspamd_enabled: true,
+            rspamd_url: format!("http://{}/checkv2", addr),
+            ..SecurityConfig::default()
+        };
+        let env = ScanEnvelope {
+            mail_from: Some("sender@example.test".to_string()),
+            rcpts: vec!["one@example.test".to_string()],
+            peer_ip: Some(IpAddr::from([127, 0, 0, 1])),
+            helo: None,
+            hostname: None,
+            user: None,
+        };
+        let verdict = scan_message(&cfg, Bytes::from_static(b"Subject: hi\r\n\r\nbody"), &env)
+            .await
+            .expect("scan");
+        assert_eq!(verdict.action, ScanAction::Defer);
         server.await.expect("server");
     }
 }
