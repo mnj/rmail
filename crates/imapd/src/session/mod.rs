@@ -376,6 +376,40 @@ async fn run_session(
     Ok(())
 }
 
+/// RFC 9585: how often a long-running command says it is still working.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `work`, sending `* OK [INPROGRESS ("tag" NIL NIL)]` every
+/// [`PROGRESS_INTERVAL`] until it finishes so clients do not time out. The
+/// work is not counted, which RFC 9585 allows (both details NIL).
+async fn with_progress<T>(
+    reader: &mut ImapReader,
+    tag: &str,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::pin!(work);
+    let start = tokio::time::Instant::now() + PROGRESS_INTERVAL;
+    let mut ticker = tokio::time::interval_at(start, PROGRESS_INTERVAL);
+    // The tag is NIL when it cannot appear inside a quoted response code.
+    let tag = if tag.contains(['"', '\\', ']']) {
+        "NIL".to_string()
+    } else {
+        format!("\"{tag}\"")
+    };
+    loop {
+        tokio::select! {
+            output = &mut work => return Ok(output),
+            _ = ticker.tick() => {
+                write(
+                    reader,
+                    format!("* OK [INPROGRESS ({tag} NIL NIL)] Still working\r\n").as_bytes(),
+                )
+                .await?;
+            }
+        }
+    }
+}
+
 /// Write bytes to the client and flush.
 async fn write(reader: &mut ImapReader, bytes: &[u8]) -> Result<()> {
     let writer = reader.get_mut();
@@ -755,4 +789,37 @@ async fn sync_account_storage_quota(
     })
     .await??;
     Ok(())
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn long_commands_report_progress_until_they_finish() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let mut reader: ImapReader = BufReader::new(Box::new(
+            crate::transport::SwitchableStream::new(Box::new(server)),
+        ));
+        let output = with_progress(&mut reader, "A1", async {
+            tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+            7
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, 7);
+        let finished = with_progress(&mut reader, "x]y", async { 8 })
+            .await
+            .unwrap();
+        assert_eq!(finished, 8);
+        drop(reader);
+        let mut sent = String::new();
+        client.read_to_string(&mut sent).await.unwrap();
+        // Two ticks in 25 seconds; a command that finishes at once sends none.
+        assert_eq!(
+            sent,
+            "* OK [INPROGRESS (\"A1\" NIL NIL)] Still working\r\n".repeat(2)
+        );
+    }
 }

@@ -204,6 +204,7 @@ pub(crate) fn capability_tokens_with_policy(
         "ID",
         "ENABLE",
         "IDLE",
+        "INPROGRESS",
         "SASL-IR",
         "LITERAL+",
         "LITERAL-",

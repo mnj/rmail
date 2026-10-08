@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use super::{Flow, ImapReader, Invocation, Session, write};
+use super::{Flow, ImapReader, Invocation, Session, with_progress, write};
 use crate::commands::{self, expunge::SelectionEffect};
 use crate::parser;
 
@@ -101,20 +101,24 @@ impl Session {
         args: &str,
         uid: bool,
     ) -> Result<Flow> {
-        let outcome = commands::store::handle(
+        let outcome = with_progress(
+            reader,
             tag,
-            args,
-            &self.mail_root,
-            self.selected(),
-            self.state.saved_search_uids(),
-            uid,
-            commands::store::StoreContext {
-                condstore: self.state.condstore_enabled(),
-                imap4rev2: self.state.imap4rev2_enabled(),
-                uidonly: self.state.uidonly_enabled(),
-            },
+            commands::store::handle(
+                tag,
+                args,
+                &self.mail_root,
+                self.selected(),
+                self.state.saved_search_uids(),
+                uid,
+                commands::store::StoreContext {
+                    condstore: self.state.condstore_enabled(),
+                    imap4rev2: self.state.imap4rev2_enabled(),
+                    uidonly: self.state.uidonly_enabled(),
+                },
+            ),
         )
-        .await;
+        .await?;
         if outcome.condstore_activated {
             self.state.activate_condstore();
         }
@@ -131,18 +135,22 @@ impl Session {
         args: &str,
         uid: bool,
     ) -> Result<Flow> {
-        let outcome = commands::search::handle(
+        let outcome = with_progress(
+            reader,
             tag,
-            args,
-            Some(std::path::Path::new(&self.mail_root)),
-            self.selected(),
-            self.state.saved_search_uids(),
-            uid,
-            self.state.utf8_enabled(),
-            self.state.imap4rev2_enabled(),
-            &self.contexts,
+            commands::search::handle(
+                tag,
+                args,
+                Some(std::path::Path::new(&self.mail_root)),
+                self.selected(),
+                self.state.saved_search_uids(),
+                uid,
+                self.state.utf8_enabled(),
+                self.state.imap4rev2_enabled(),
+                &self.contexts,
+            ),
         )
-        .await;
+        .await?;
         if let Some(saved) = outcome.saved_uids {
             self.state.save_search_uids(saved);
         }
@@ -161,16 +169,20 @@ impl Session {
         args: &str,
         uid: bool,
     ) -> Result<Flow> {
-        let outcome = commands::sort_thread::sort(
+        let outcome = with_progress(
+            reader,
             tag,
-            args,
-            self.selected(),
-            self.state.saved_search_uids(),
-            uid,
-            self.state.imap4rev2_enabled(),
-            &self.contexts,
+            commands::sort_thread::sort(
+                tag,
+                args,
+                self.selected(),
+                self.state.saved_search_uids(),
+                uid,
+                self.state.imap4rev2_enabled(),
+                &self.contexts,
+            ),
         )
-        .await;
+        .await?;
         if let Some(saved) = outcome.saved_uids {
             self.state.save_search_uids(saved);
         }
@@ -189,14 +201,18 @@ impl Session {
         args: &str,
         uid: bool,
     ) -> Result<Flow> {
-        let response = commands::sort_thread::thread(
+        let response = with_progress(
+            reader,
             tag,
-            args,
-            self.selected(),
-            self.state.saved_search_uids(),
-            uid,
+            commands::sort_thread::thread(
+                tag,
+                args,
+                self.selected(),
+                self.state.saved_search_uids(),
+                uid,
+            ),
         )
-        .await
+        .await?
         .encode();
         let name = if uid { "UID THREAD" } else { "THREAD" };
         self.respond(reader, tag, name, response).await
@@ -212,19 +228,23 @@ impl Session {
         uid: bool,
     ) -> Result<Flow> {
         self.sync_quota().await?;
-        let outcome = commands::transfer::handle(
+        let outcome = with_progress(
+            reader,
             tag,
-            name,
-            args,
-            &self.mail_root,
-            self.address(),
-            self.selected(),
-            self.state.saved_search_uids(),
-            uid,
-            self.state.utf8_enabled(),
-            self.state.vanished_enabled(),
+            commands::transfer::handle(
+                tag,
+                name,
+                args,
+                &self.mail_root,
+                self.address(),
+                self.selected(),
+                self.state.saved_search_uids(),
+                uid,
+                self.state.utf8_enabled(),
+                self.state.vanished_enabled(),
+            ),
         )
-        .await;
+        .await?;
         self.report_removed_from_contexts(reader, &outcome.removed_uids)
             .await?;
         if let Some(selected) = self.selected.as_mut() {
