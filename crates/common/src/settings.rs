@@ -787,6 +787,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         OUTBOUND,
     ),
     spec(
+        "security.dane_enabled",
+        "tls",
+        "Outbound DANE",
+        "Authenticate recipient MX hosts with DNSSEC-signed TLSA records (RFC 7672). Requires a resolver that passes DNSSEC records; signed domains are deferred if it strips them.",
+        SettingKind::Bool,
+        OUTBOUND,
+    ),
+    spec(
         "security.greylist_enabled",
         "filtering",
         "Greylisting",

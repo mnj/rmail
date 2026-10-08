@@ -1,12 +1,12 @@
 use anyhow::Context;
 use chrono::Utc;
-use native_tls::TlsConnector as NativeTlsConnector;
 use once_cell::sync::Lazy;
 use rmail_common::tracking::{TrackingEvent, TrackingHub, new_tracking_id};
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{error::Error, fmt};
 use tokio::fs::File;
@@ -14,11 +14,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufR
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinSet;
-use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::error::ResolveErrorKind;
-mod dane_blocking;
-mod tlsa;
+mod dane;
 
 // Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -37,6 +35,9 @@ static OUTBOUND_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
 /// Name sent in EHLO/HELO: `global.hostname` or the system hostname
 /// (RFC 5321 section 4.1.1.1 requires the client's FQDN).
 static HELO_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `security.dane_enabled`: authenticate MX hosts with DNSSEC TLSA records.
+static DANE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn helo_name() -> &'static str {
     HELO_NAME.get_or_init(rmail_common::config::system_hostname)
@@ -121,7 +122,7 @@ struct DestinationKey {
 struct SmtpConnection {
     reader: BufReader<Box<dyn AsyncStream>>,
     capabilities: SmtpCapabilities,
-    encrypted: bool,
+    tls: dane::TlsAuth,
     connection_id: String,
     peer_addr: Option<String>,
     local_addr: Option<String>,
@@ -238,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
             if let Err(error) = rmail_common::settings::record_service_start(&cfg, "outbound") {
                 rmail_common::structured_log!("warn", "outbound", "service_state_failed", { "error": format!("{error:#}") });
             }
+            DANE_ENABLED.store(cfg.security.dane_enabled, Ordering::Relaxed);
             if cfg.security.tls_rpt_enabled
                 && let Some(db_path) = cfg.global.db_path.clone()
             {
@@ -1050,7 +1052,9 @@ async fn queue_failure_notification(
 enum DeliveryNotificationKind<'a> {
     /// Handed to a next hop that does not support DSN (RFC 3461 §6.2.3.3);
     /// a DSN-capable next hop reports success itself.
-    Relayed { remote_mta: &'a str },
+    Relayed {
+        remote_mta: &'a str,
+    },
     Delay,
     Failure,
 }
@@ -2346,6 +2350,8 @@ async fn deliver_to_remote(
         }
     }
 
+    // DANE applies to MX-derived hosts, not to transport-map next hops.
+    let from_dns = targets.is_empty();
     // If transport map didn't provide a next-hop, perform MX lookup.
     if targets.is_empty() {
         let started = Instant::now();
@@ -2411,6 +2417,19 @@ async fn deliver_to_remote(
         }
     }
     let transport_tls_required = message.require_tls || mta_sts_enforced;
+    // RFC 7672 section 2.2.1: MX host names are TLSA base domains only when
+    // the MX RRset is DNSSEC-secure.
+    let mx_secure = if from_dns && DANE_ENABLED.load(Ordering::Relaxed) {
+        match dane::mx_is_secure(domain).await {
+            Ok(secure) => secure,
+            Err(error) => {
+                rmail_common::tlsrpt::record_failure(domain, "tlsa", "", &format!("{error:#}"));
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
 
     // Reuse an idle session for the selected destination when possible. Each
     // connection stays owned by one delivery task at a time, while the worker's
@@ -2422,9 +2441,37 @@ async fn deliver_to_remote(
             host: host.trim_end_matches('.').to_ascii_lowercase(),
             port,
         };
+        let dane_lookup = if mx_secure {
+            match dane::tlsa_for(&key.host, port).await {
+                Ok(lookup) => lookup,
+                Err(error) => {
+                    // A bogus or failed TLSA lookup rules this host out.
+                    rmail_common::tlsrpt::record_failure(
+                        domain,
+                        "tlsa",
+                        &key.host,
+                        &format!("{error:#}"),
+                    );
+                    last_delivery_error = Some(error);
+                    continue;
+                }
+            }
+        } else {
+            dane::DaneLookup::NotApplicable
+        };
+        // DANE takes precedence over MTA-STS (RFC 8461 section 2). REQUIRETLS
+        // needs an authenticated peer, so unusable TLSA records fall back to PKIX.
+        let requirement = match &dane_lookup {
+            dane::DaneLookup::Secure(records) if !records.is_empty() => {
+                dane::TlsRequirement::Dane(records)
+            }
+            _ if transport_tls_required => dane::TlsRequirement::Pkix,
+            dane::DaneLookup::Secure(_) => dane::TlsRequirement::Mandatory,
+            dane::DaneLookup::NotApplicable => dane::TlsRequirement::Opportunistic,
+        };
         let mut fresh_session = true;
         let connection = match connections.take(&key).await {
-            Some(mut connection) if !transport_tls_required || connection.encrypted => {
+            Some(mut connection) if requirement.satisfied_by(connection.tls) => {
                 let pooled_connection_id = connection.connection_id.clone();
                 let mut noop_trace = DeliveryTrace {
                     hub: tracking,
@@ -2455,7 +2502,7 @@ async fn deliver_to_remote(
                             resolver,
                             &key.host,
                             key.port,
-                            transport_tls_required,
+                            requirement,
                             message.require_tls,
                             tracking,
                             tracking_id,
@@ -2469,7 +2516,7 @@ async fn deliver_to_remote(
                     resolver,
                     &key.host,
                     key.port,
-                    transport_tls_required,
+                    requirement,
                     message.require_tls,
                     tracking,
                     tracking_id,
@@ -2478,22 +2525,24 @@ async fn deliver_to_remote(
             }
         };
         // TLS-RPT counts sessions, not messages: a reused connection is not new.
-        // Sessions are reported against the MTA-STS policy, when there is one.
-        if fresh_session
-            && mta_sts_policy
+        // Sessions are reported against the DANE or MTA-STS policy, if any.
+        let report_policy = requirement.report_policy().or_else(|| {
+            mta_sts_policy
                 .as_ref()
                 .is_some_and(|policy| policy.mode != MtaStsMode::None)
-        {
+                .then_some("sts")
+        });
+        if fresh_session && let Some(policy_type) = report_policy {
             match &connection {
-                Ok(connection) if connection.encrypted => {
-                    rmail_common::tlsrpt::record_success(domain, "sts", &key.host);
+                Ok(connection) if connection.tls != dane::TlsAuth::Plaintext => {
+                    rmail_common::tlsrpt::record_success(domain, policy_type, &key.host);
                 }
                 // Only a `testing` policy gets here unencrypted: `enforce`
                 // refuses plaintext above. Testing exists to report this.
                 Ok(_) => {
                     rmail_common::tlsrpt::record_failure(
                         domain,
-                        "sts",
+                        policy_type,
                         &key.host,
                         &format!("remote host {} does not offer STARTTLS", key.host),
                     );
@@ -2503,7 +2552,12 @@ async fn deliver_to_remote(
                     let lower = diagnostic.to_ascii_lowercase();
                     // Refused connections and 4xx greetings are not TLS failures.
                     if lower.contains("tls") || lower.contains("certificate") {
-                        rmail_common::tlsrpt::record_failure(domain, "sts", &key.host, &diagnostic);
+                        rmail_common::tlsrpt::record_failure(
+                            domain,
+                            policy_type,
+                            &key.host,
+                            &diagnostic,
+                        );
                     }
                 }
             }
@@ -2605,7 +2659,7 @@ async fn establish_smtp_connection(
     resolver: &TokioAsyncResolver,
     host: &str,
     port: u16,
-    require_encryption: bool,
+    requirement: dane::TlsRequirement<'_>,
     requiretls_message: bool,
     tracking: &TrackingHub,
     tracking_id: &str,
@@ -2629,15 +2683,13 @@ async fn establish_smtp_connection(
         Some(format!("{host}:{port}")),
         None,
     );
-    let mut encrypted = port == 465;
-    let boxed_stream: Box<dyn AsyncStream> = if encrypted {
-        let native = NativeTlsConnector::builder()
-            .build()
-            .context("building native TLS connector")?;
+    let mut tls = dane::TlsAuth::Plaintext;
+    let boxed_stream: Box<dyn AsyncStream> = if port == 465 {
         let started = Instant::now();
-        let handshake = TokioTlsConnector::from(native).connect(host, stream).await;
+        let handshake = dane::connect(stream, host, requirement).await;
         rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
-        let tls_stream = handshake.context("TLS connect failed (implicit)")?;
+        let (tls_stream, auth) = handshake.context("implicit TLS")?;
+        tls = auth;
         Box::new(tls_stream)
     } else {
         Box::new(stream)
@@ -2681,15 +2733,12 @@ async fn establish_smtp_connection(
             return Err(rejected("STARTTLS", code, response));
         }
         let inner = reader.into_inner();
-        let native = NativeTlsConnector::builder()
-            .build()
-            .context("building native TLS connector")?;
         let started = Instant::now();
-        let handshake = TokioTlsConnector::from(native).connect(host, inner).await;
+        let handshake = dane::connect(inner, host, requirement).await;
         rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
-        let tls_stream = handshake.context("TLS connect failed")?;
+        let (tls_stream, auth) = handshake.context("STARTTLS")?;
         reader = BufReader::new(Box::new(tls_stream));
-        encrypted = true;
+        tls = auth;
         trace.emit("tls", "encrypted", Some(host.to_string()), None);
 
         reader.get_mut().write_all(ehlo.as_bytes()).await?;
@@ -2713,7 +2762,15 @@ async fn establish_smtp_connection(
         }
     }
 
-    if require_encryption && !encrypted {
+    if requirement.needs_tls() && tls == dane::TlsAuth::Plaintext {
+        if matches!(
+            requirement,
+            dane::TlsRequirement::Dane(_) | dane::TlsRequirement::Mandatory
+        ) {
+            return Err(anyhow::anyhow!(
+                "remote host {host} does not offer STARTTLS required by its DANE TLSA records"
+            ));
+        }
         if requiretls_message {
             return Err(permanent_delivery_error(
                 format!("remote host {host} does not offer STARTTLS required by REQUIRETLS"),
@@ -2726,7 +2783,7 @@ async fn establish_smtp_connection(
     Ok(SmtpConnection {
         reader,
         capabilities,
-        encrypted,
+        tls,
         connection_id,
         peer_addr,
         local_addr,
@@ -3175,7 +3232,7 @@ mod tests {
             SmtpConnection {
                 reader: BufReader::new(Box::new(first_client)),
                 capabilities: SmtpCapabilities::default(),
-                encrypted: false,
+                tls: dane::TlsAuth::Plaintext,
                 connection_id: "first".into(),
                 peer_addr: None,
                 local_addr: None,
@@ -3188,7 +3245,7 @@ mod tests {
             SmtpConnection {
                 reader: BufReader::new(Box::new(second_client)),
                 capabilities: SmtpCapabilities::default(),
-                encrypted: false,
+                tls: dane::TlsAuth::Plaintext,
                 connection_id: "second".into(),
                 peer_addr: None,
                 local_addr: None,

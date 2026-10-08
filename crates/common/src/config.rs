@@ -504,6 +504,10 @@ pub struct SecurityConfig {
     /// `_smtp._tls` record.
     #[serde(default = "default_true")]
     pub tls_rpt_enabled: bool,
+    /// Authenticate outbound MX hosts with DNSSEC-signed TLSA records
+    /// (DANE, RFC 7672). Needs a DNS path that passes DNSSEC records.
+    #[serde(default)]
+    pub dane_enabled: bool,
     /// Defer the first delivery attempt from unknown (network, sender,
     /// recipient) triples on unauthenticated SMTP sessions.
     #[serde(default)]
@@ -552,6 +556,7 @@ impl Default for SecurityConfig {
             mta_sts_mode: crate::discovery::MtaStsMode::None,
             mta_sts_max_age_secs: default_mta_sts_max_age_secs(),
             tls_rpt_enabled: true,
+            dane_enabled: false,
             greylist_enabled: false,
             greylist_delay_secs: default_greylist_delay_secs(),
             greylist_persist_interval_secs: default_greylist_persist_interval_secs(),
