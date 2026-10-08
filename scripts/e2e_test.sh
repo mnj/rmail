@@ -17,6 +17,7 @@ trap cleanup EXIT
 rm -rf mail_test
 rm -f config/rmail_test.db
 ./target/debug/rmail_ctl init-db --config config/test.toml
+scripts/dev-settings.sh config/test.toml
 ./target/debug/rmail_ctl add-mailbox user@example.local --password password --config config/test.toml
 
 # start services using prebuilt binaries to avoid compile delays

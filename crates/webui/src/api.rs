@@ -43,8 +43,8 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; img-src 'self' data:;
 pub(crate) struct AdminState {
     pub mail_root: PathBuf,
     pub db_path: Option<String>,
-    /// Credentials from the configuration file; used when the settings
-    /// database holds none (file-only deployments).
+    /// Credentials loaded at startup; the settings database is checked first
+    /// on every login, so later changes take effect without a restart.
     pub file_admin: Option<(String, String)>,
     /// Where the plain-HTTP listener redirects to; `None` keeps the host.
     pub http_redirect_url: Option<String>,
@@ -542,7 +542,6 @@ async fn session_info(State(state): State<Shared>, headers: HeaderMap) -> Respon
         "authenticated": setup_required || user.is_some(),
         "user": user,
         "setup_required": setup_required,
-        "settings_managed": state.db_path.is_some(),
         "password_policy": policy,
     }))
     .into_response()
@@ -906,7 +905,7 @@ async fn settings(State(state): State<Shared>) -> Response {
             blocking(move || settings_view_sync(&db)).await,
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
-        Err(_) => Json(json!({"managed": false})).into_response(),
+        Err(err) => err.into_response(),
     }
 }
 

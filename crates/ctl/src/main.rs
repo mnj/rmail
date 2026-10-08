@@ -43,7 +43,7 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// Add a mailbox to the configured DB or fallback to TOML
+    /// Add a mailbox to the database
     AddMailbox {
         /// mailbox address, e.g., user@example.com
         address: String,
@@ -63,7 +63,7 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// List configured mailboxes (DB or TOML)
+    /// List mailboxes
     List {
         /// optional config path
         #[arg(long)]
@@ -160,13 +160,6 @@ enum SettingsAction {
     Set { key: String, value: String },
     /// Remove a stored setting so its default applies
     Unset { key: String },
-    /// Comment out config-file entries that now live in the database, keeping
-    /// mail_root and db_path (writes a .pre-db backup unless --stdout)
-    TidyConfig {
-        /// Print the rewritten file instead of replacing it
-        #[arg(long)]
-        stdout: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -257,15 +250,8 @@ async fn main() -> Result<()> {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
             let cfg = Config::load(&cfg_path)?;
-            let db_path = cfg.global.db_path.clone().ok_or_else(|| {
-                anyhow::anyhow!("{cfg_path} has no db_path; settings are file-only")
-            })?;
-            let mut conn = rmail_common::settings::open(&db_path)?;
-            if let SettingsAction::TidyConfig { stdout } = action {
-                tidy_config_file(&cfg_path, &conn, stdout)?;
-            } else {
-                run_settings(&mut conn, action)?;
-            }
+            let mut conn = rmail_common::settings::open(&cfg.global.db_path)?;
+            run_settings(&mut conn, action)?;
         }
         Commands::AdminPassword {
             user,
@@ -276,11 +262,7 @@ async fn main() -> Result<()> {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
             let cfg = Config::load(&cfg_path)?;
-            let db_path = cfg.global.db_path.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{cfg_path} has no db_path; set web_admin_password_hash in the file"
-                )
-            })?;
+            let db_path = cfg.global.db_path.clone();
             let password = match password {
                 Some(password) => password,
                 None => {
@@ -326,9 +308,7 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|_| "config/example.toml".to_string())
                 });
                 let cfg = Config::load(&cfg_path)?;
-                cfg.global
-                    .db_path
-                    .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
+                cfg.global.db_path
             };
             rmail_common::db::init_db(&dbp)?;
             println!("Initialized DB at {}", dbp);
@@ -377,8 +357,8 @@ async fn main() -> Result<()> {
                 // ensure directories exist
                 maildir::ensure_maildir(Path::new(&maildir_path))?;
 
-                // If db_path configured, insert into SQLite, otherwise fallback to TOML append
-                if let Some(dbp) = cfg.global.db_path.as_ref() {
+                {
+                    let dbp = &cfg.global.db_path;
                     // ensure DB initialized
                     rmail_common::db::init_db(dbp)?;
                     rmail_common::db::add_mailbox(
@@ -411,9 +391,6 @@ async fn main() -> Result<()> {
                         )?;
                     }
                     println!("Added mailbox {} into DB at {}", address, dbp);
-                } else {
-                    eprintln!("No db_path configured; SQLite DB is required");
-                    std::process::exit(1);
                 }
             } else {
                 eprintln!("Invalid address '{}'", address);
@@ -424,17 +401,11 @@ async fn main() -> Result<()> {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
             let cfg = Config::load(&cfg_path)?;
-            if let Some(dbp) = cfg.global.db_path.as_ref() {
-                // list from DB
-                for m in rmail_common::db::list_mailboxes(dbp)? {
-                    match m.quota_bytes {
-                        Some(limit) => println!("{} quota={} MiB", m.address, limit / 1024 / 1024),
-                        None => println!("{} quota=unlimited", m.address),
-                    }
+            for m in rmail_common::db::list_mailboxes(&cfg.global.db_path)? {
+                match m.quota_bytes {
+                    Some(limit) => println!("{} quota={} MiB", m.address, limit / 1024 / 1024),
+                    None => println!("{} quota=unlimited", m.address),
                 }
-            } else {
-                eprintln!("No db_path configured; SQLite DB is required");
-                std::process::exit(1);
             }
         }
         Commands::SearchReindex {
@@ -501,12 +472,7 @@ async fn main() -> Result<()> {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
             let cfg = Config::load(&cfg_path)?;
-            let dbp = cfg
-                .global
-                .db_path
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
-                .to_string();
+            let dbp = cfg.global.db_path.to_string();
             // Reports are DKIM-signed like other queued mail.
             rmail_common::dkim::use_database(&dbp);
             let domains = rmail_common::db::get_unreported_dmarc_domains(&dbp)?;
@@ -631,11 +597,7 @@ async fn main() -> Result<()> {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
             let cfg = Config::load(&cfg_path)?;
-            let db_path = cfg
-                .global
-                .db_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?;
+            let db_path = cfg.global.db_path.as_str();
             run_dkim(action, std::path::Path::new(db_path))?;
         }
         Commands::Acme { action, config } => {
@@ -736,7 +698,7 @@ async fn run_acme(action: AcmeAction, cfg: &Config) -> Result<()> {
             ),
             None if !cfg.acme.enabled => println!("Automatic certificates are off"),
             None => {
-                let db_path = cfg.global.db_path.as_deref().unwrap_or_default();
+                let db_path = cfg.global.db_path.as_str();
                 let status = acme::load_status(db_path)?;
                 match status.retry_after {
                     Some(at) if at > now_secs() => println!(
@@ -768,9 +730,7 @@ async fn run_acme(action: AcmeAction, cfg: &Config) -> Result<()> {
                 }
                 Err(error) => println!("  {error:#}"),
             }
-            let Some(db_path) = cfg.global.db_path.as_deref() else {
-                return Ok(());
-            };
+            let db_path = cfg.global.db_path.as_str();
             let status = acme::load_status(db_path)?;
             if cfg.acme.enabled {
                 println!("Renewal: {}", acme::renewal_check(cfg, &status).reason);
@@ -932,41 +892,6 @@ fn run_systemctl(action: &str, unit: &str, dry_run: bool) -> Result<()> {
     }
 }
 
-fn tidy_config_file(
-    cfg_path: &str,
-    conn: &rmail_common::settings::Connection,
-    stdout: bool,
-) -> Result<()> {
-    use rmail_common::settings;
-    let text = std::fs::read_to_string(cfg_path).with_context(|| format!("reading {cfg_path}"))?;
-    let file = serde_json::to_value(toml::from_str::<toml::Value>(&text)?)?;
-    let report = settings::tidy_config(&text, &file, &settings::load_all(conn)?);
-    if stdout {
-        print!("{}", report.text);
-        return Ok(());
-    }
-    for key in &report.differing {
-        eprintln!("kept {key}: differs from the database, which takes precedence");
-    }
-    if report.text == text {
-        println!("{cfg_path} is already tidy");
-        return Ok(());
-    }
-    let backup = format!("{cfg_path}.pre-db");
-    if !std::path::Path::new(&backup).exists() {
-        std::fs::copy(cfg_path, &backup).with_context(|| format!("writing {backup}"))?;
-    }
-    let staged = format!("{cfg_path}.tmp");
-    std::fs::write(&staged, &report.text).with_context(|| format!("writing {staged}"))?;
-    std::fs::set_permissions(&staged, std::fs::metadata(cfg_path)?.permissions())?;
-    std::fs::rename(&staged, cfg_path).with_context(|| format!("replacing {cfg_path}"))?;
-    println!(
-        "commented out {} migrated entries in {cfg_path} (backup: {backup})",
-        report.commented
-    );
-    Ok(())
-}
-
 fn run_settings(
     conn: &mut rmail_common::settings::Connection,
     action: SettingsAction,
@@ -988,12 +913,6 @@ fn run_settings(
                         },
                     };
                     println!("  {:<48} {}", setting.spec.key, shown);
-                }
-            }
-            if !view.other.is_empty() {
-                println!("\n[Other stored keys]");
-                for other in &view.other {
-                    println!("  {:<48} {}", other.key, other.value);
                 }
             }
             for service in &view.services {
@@ -1033,7 +952,6 @@ fn run_settings(
                 ),
             }
         }
-        SettingsAction::TidyConfig { .. } => unreachable!("handled by the caller"),
         SettingsAction::Unset { key } => {
             let revision = settings::update(
                 conn,

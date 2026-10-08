@@ -95,7 +95,7 @@ function useNavBadges(): Partial<Record<Page, { count: number; tone: 'warn' | 'e
   const badges: ReturnType<typeof useNavBadges> = {};
   if (queue.data?.failed) badges.delivery = { count: queue.data.failed, tone: 'error', label: `${queue.data.failed} failed` };
   const view = settings.data;
-  const restarts = view && view.managed ? view.services.filter((service) => service.restart_required).length : 0;
+  const restarts = view ? view.services.filter((service) => service.restart_required).length : 0;
   if (restarts) badges.settings = { count: restarts, tone: 'warn', label: `${restarts} service${restarts === 1 ? '' : 's'} need a restart` };
   return badges;
 }
@@ -147,14 +147,6 @@ function LoginScreen({ onLogin }: { onLogin: (session: Session) => void }) {
 }
 
 function SetupScreen({ session, onDone }: { session: Session; onDone: (session: Session) => void }) {
-  if (!session.settings_managed) {
-    return (
-      <AuthScreen title="Finish setting up" subtitle="No admin credentials are configured.">
-        <p>This console is only reachable from this machine until you set <code>web_admin_user</code> and <code>web_admin_password_hash</code> in the configuration file (generate the hash with <code>rmail_ctl hash</code>), or configure a <code>db_path</code> to manage settings here.</p>
-        <button className="button primary" onClick={() => onDone({ ...session, setup_required: false })}>Continue without a password</button>
-      </AuthScreen>
-    );
-  }
   return (
     <AuthScreen title="Create the admin account" subtitle="No admin account exists yet. Choose the credentials you will use to sign in.">
       <AdminCredentialsForm setup session={session} onChanged={(user) => onDone({ ...session, user, authenticated: true, setup_required: false })} />

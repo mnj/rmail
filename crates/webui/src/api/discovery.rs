@@ -342,14 +342,26 @@ async fn set_arc_key(State(state): State<Shared>, body: Bytes) -> Response {
 mod tests {
     use super::*;
 
+    /// A config file `name` with its own database whose hostname is `hostname`.
     fn config_file(dir: &std::path::Path, name: &str, hostname: &str) -> String {
         let path = dir.join(name);
+        let db = dir.join(format!("{name}.db"));
         std::fs::write(
             &path,
             format!(
-                "[global]\nmail_root = \"{}\"\nhostname = \"{hostname}\"\n",
-                dir.display()
+                "[global]\nmail_root = {:?}\ndb_path = {:?}\n",
+                dir.display().to_string(),
+                db.display().to_string()
             ),
+        )
+        .unwrap();
+        let mut conn = rmail_common::settings::open(&db).unwrap();
+        rmail_common::settings::update(
+            &mut conn,
+            &std::collections::BTreeMap::from([(
+                "global.hostname".to_string(),
+                serde_json::json!(hostname),
+            )]),
         )
         .unwrap();
         path.display().to_string()

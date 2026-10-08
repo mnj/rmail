@@ -42,7 +42,6 @@ async fn current_config(state: &Shared) -> Result<Config, ApiError> {
 
 #[derive(Serialize)]
 struct Overview {
-    managed: bool,
     enabled: bool,
     names: Vec<String>,
     names_error: Option<String>,
@@ -60,11 +59,7 @@ struct Overview {
 }
 
 fn build_overview(config: &Config) -> anyhow::Result<Overview> {
-    let db_path = config.global.db_path.clone();
-    let status = match &db_path {
-        Some(db) => acme::load_status(db)?,
-        None => AcmeStatus::default(),
-    };
+    let status = acme::load_status(&config.global.db_path)?;
     let (cert_path, key_path, unset) = acme::certificate_paths(config);
     let tls_configured = !unset;
     let (certificate, certificate_error) = if tls_configured || cert_path.exists() {
@@ -100,7 +95,6 @@ fn build_overview(config: &Config) -> anyhow::Result<Overview> {
         ));
     }
     Ok(Overview {
-        managed: db_path.is_some(),
         enabled,
         names,
         names_error,
@@ -148,12 +142,6 @@ async fn issue(State(state): State<Shared>, body: Bytes) -> Response {
         Ok(config) => config,
         Err(err) => return err.into_response(),
     };
-    if config.global.db_path.is_none() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "automatic certificates need the settings database (global.db_path)",
-        );
-    }
     if !input.dry_run && !config.acme.enabled {
         return error(
             StatusCode::CONFLICT,

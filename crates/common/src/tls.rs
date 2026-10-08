@@ -320,7 +320,10 @@ mod tests {
     use super::*;
 
     fn global(mail_root: &std::path::Path, extra: &str) -> Global {
-        let text = format!("mail_root = \"{}\"\n{extra}", mail_root.display());
+        let text = format!(
+            "mail_root = \"{}\"\ndb_path = \"rmail.db\"\n{extra}",
+            mail_root.display()
+        );
         toml::from_str(&text).unwrap()
     }
 

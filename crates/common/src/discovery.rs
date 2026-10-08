@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn endpoints_prefer_implicit_tls_and_parse_ports() {
         let global: Global = toml::from_str(
-            "mail_root = \"m\"\nhostname = \"mail.example.com\"\n[listeners]\nimaps = [\"[::]:993\"]\nsubmission = [\"0.0.0.0:587\"]\n",
+            "mail_root = \"m\"\ndb_path = \"rmail.db\"\nhostname = \"mail.example.com\"\n[listeners]\nimaps = [\"[::]:993\"]\nsubmission = [\"0.0.0.0:587\"]\n",
         )
         .unwrap();
         let e = ServiceEndpoints::from_global(&global);

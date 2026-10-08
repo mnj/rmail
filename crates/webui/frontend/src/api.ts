@@ -68,7 +68,7 @@ export type PasswordPolicy = {
   require_symbol: boolean;
   forbid_username: boolean;
 };
-export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; settings_managed: boolean; password_policy?: PasswordPolicy };
+export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; password_policy?: PasswordPolicy };
 export type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
 export type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null };
 export type QueueSummary = { queued: number; inflight: number; sent: number; failed: number };
@@ -128,15 +128,10 @@ export type ServiceState = {
   pending_changes: string[];
 };
 
-export type SettingsView =
-  | { managed: false }
-  | {
-      managed: true;
+export type SettingsView = {
       revision: number;
-      imported_from: string | null;
       groups: { id: string; label: string; description: string }[];
       settings: Setting[];
-      other: { key: string; value: unknown }[];
       services: ServiceState[];
       restart_available?: boolean;
     };
@@ -144,7 +139,6 @@ export type SettingsView =
 export type CertificateInfo = { subject: string; names: string[]; issuer: string; not_before: number; not_after: number; serial: string; self_signed: boolean };
 export type AcmeRun = { trigger: string; dry_run: boolean; started_at: number; finished_at: number | null; ok: boolean | null; error: string | null; names: string[]; log: { at: number; message: string }[] };
 export type Certificates = {
-  managed: boolean;
   enabled: boolean;
   names: string[];
   names_error: string | null;
@@ -187,7 +181,6 @@ export type ClassifierStatus = {
   last_cycle: { finished_at: number; duration_ms: number; report: { accounts: number; learned: number; classified: number; suggested: number; moved: number; labeled?: number; awaiting_consent?: number; errors: string[] } } | null;
 };
 export type Organization = {
-  managed: boolean;
   models_dir: string;
   catalog: CatalogModel[];
   installed: InstalledModel[];

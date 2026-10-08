@@ -163,12 +163,7 @@ fn cmd_alias_add(_root: &PathBuf, address: &str, targets: &Vec<String>) -> Resul
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path)?;
-    let dbp = cfg
-        .global
-        .db_path
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
-        .to_string();
+    let dbp = cfg.global.db_path.to_string();
     let addr_lc = address.to_ascii_lowercase();
     let tgt_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
     db::add_alias(&dbp, &addr_lc, &tgt_refs)?;
@@ -180,12 +175,7 @@ fn cmd_alias_remove(_root: &PathBuf, address: &str) -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path)?;
-    let dbp = cfg
-        .global
-        .db_path
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
-        .to_string();
+    let dbp = cfg.global.db_path.to_string();
     let addr_lc = address.to_ascii_lowercase();
     db::remove_alias(&dbp, &addr_lc)?;
     println!("Removed alias {}", address);
@@ -196,12 +186,7 @@ fn cmd_alias_list(_root: &PathBuf) -> Result<()> {
     let cfg_path =
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path)?;
-    let dbp = cfg
-        .global
-        .db_path
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No db_path configured"))?
-        .to_string();
+    let dbp = cfg.global.db_path.to_string();
     let aliases = db::list_aliases(&dbp)?;
     for (addr, targets) in aliases {
         println!("{} -> {}", addr, targets.join(", "));

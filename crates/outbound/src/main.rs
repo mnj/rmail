@@ -241,13 +241,12 @@ async fn main() -> anyhow::Result<()> {
             }
             DANE_ENABLED.store(cfg.security.dane_enabled, Ordering::Relaxed);
             // DSNs and TLS reports are DKIM-signed like any queued mail.
-            if let Some(db_path) = cfg.global.db_path.as_deref() {
-                rmail_common::dkim::use_database(db_path);
-            }
-            if cfg.security.tls_rpt_enabled
-                && let Some(db_path) = cfg.global.db_path.clone()
-            {
-                tls_report_setup = Some((PathBuf::from(db_path), cfg.global.server_hostname()));
+            rmail_common::dkim::use_database(&cfg.global.db_path);
+            if cfg.security.tls_rpt_enabled {
+                tls_report_setup = Some((
+                    PathBuf::from(&cfg.global.db_path),
+                    cfg.global.server_hostname(),
+                ));
             }
             cfg.global.tracking
         }

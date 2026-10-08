@@ -23,26 +23,6 @@ pub struct Global {
     /// `["0.0.0.0:25", "[::]:25"]`.
     #[serde(default)]
     pub listeners: ListenerEndpoints,
-    /// Plain SMTP bind addresses, e.g. ["0.0.0.0:25", "[::]:25"]
-    pub listen_addrs: Option<Vec<String>>,
-    /// Implicit TLS SMTP bind addresses; if unset, smtps_port binds wildcard v4+v6
-    pub smtps_listen_addrs: Option<Vec<String>>,
-    pub smtps_port: Option<u16>,
-    pub submission_port: Option<u16>,
-    /// Explicit message-submission bind addresses; defaults to wildcard v4+v6 for submission_port.
-    pub submission_listen_addrs: Option<Vec<String>>,
-    /// IMAPS bind addresses; if unset, imaps_port binds wildcard v4 only for compatibility
-    pub imaps_listen_addrs: Option<Vec<String>>,
-    pub imaps_port: Option<u16>,
-    /// Plain IMAP bind addresses; if unset, imap_port binds wildcard v4 only for compatibility
-    pub imap_listen_addrs: Option<Vec<String>>,
-    pub imap_port: Option<u16>,
-    /// Web UI bind addresses; if unset, web_port binds 127.0.0.1 only
-    pub web_listen_addrs: Option<Vec<String>>,
-    pub web_port: Option<u16>,
-    /// User webmail bind addresses; if unset, webmail_port binds 127.0.0.1 only
-    pub webmail_listen_addrs: Option<Vec<String>>,
-    pub webmail_port: Option<u16>,
     /// Secret used to sign webmail session cookies.
     pub webmail_session_secret: Option<String>,
     pub tls_cert: Option<String>,
@@ -52,8 +32,9 @@ pub struct Global {
     /// error, warn, info (default) or debug.
     #[serde(default = "default_log_level")]
     pub log_level: Option<String>,
-    /// Optional SQLite database path for mailboxes/catchalls
-    pub db_path: Option<String>,
+    /// The SQLite database that holds mailboxes, routing and every setting
+    /// other than `mail_root` and `db_path`.
+    pub db_path: String,
     /// Optional web admin username for the lightweight web UI
     pub web_admin_user: Option<String>,
     /// Argon2 password hash for administrative web UI access (optional)
@@ -190,7 +171,6 @@ impl Global {
         self.listeners
             .smtp
             .clone()
-            .or_else(|| self.listen_addrs.clone())
             .unwrap_or_else(|| vec!["127.0.0.1:2525".to_string(), "[::1]:2525".to_string()])
     }
 
@@ -199,44 +179,22 @@ impl Global {
     }
 
     pub fn submission_listeners(&self) -> Vec<String> {
-        if let Some(addresses) = self.listeners.submission.clone() {
-            return addresses;
-        }
-        self.submission_port.map_or_else(Vec::new, |port| {
-            self.submission_listen_addrs
-                .clone()
-                .unwrap_or_else(|| vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")])
-        })
+        self.listeners.submission.clone().unwrap_or_default()
     }
 
     pub fn smtps_listeners(&self) -> Vec<String> {
-        if let Some(addresses) = self.listeners.smtps.clone() {
-            return addresses;
-        }
-        self.smtps_port.map_or_else(Vec::new, |port| {
-            self.smtps_listen_addrs
-                .clone()
-                .unwrap_or_else(|| vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")])
-        })
+        self.listeners.smtps.clone().unwrap_or_default()
     }
 
     pub fn imap_listeners(&self) -> Vec<String> {
         self.listeners
             .imap
             .clone()
-            .or_else(|| self.imap_listen_addrs.clone())
-            .unwrap_or_else(|| vec![format!("0.0.0.0:{}", self.imap_port.unwrap_or(143))])
+            .unwrap_or_else(|| vec!["0.0.0.0:143".to_string()])
     }
 
     pub fn imaps_listeners(&self) -> Vec<String> {
-        if let Some(addresses) = self.listeners.imaps.clone() {
-            return addresses;
-        }
-        self.imaps_port.map_or_else(Vec::new, |port| {
-            self.imaps_listen_addrs
-                .clone()
-                .unwrap_or_else(|| vec![format!("0.0.0.0:{port}")])
-        })
+        self.listeners.imaps.clone().unwrap_or_default()
     }
 
     pub fn pop3_listeners(&self) -> Vec<String> {
@@ -255,8 +213,7 @@ impl Global {
         self.listeners
             .admin
             .clone()
-            .or_else(|| self.web_listen_addrs.clone())
-            .unwrap_or_else(|| vec![format!("127.0.0.1:{}", self.web_port.unwrap_or(8080))])
+            .unwrap_or_else(|| vec!["127.0.0.1:8080".to_string()])
     }
 
     pub fn http_listeners(&self) -> Vec<String> {
@@ -267,8 +224,7 @@ impl Global {
         self.listeners
             .webmail
             .clone()
-            .or_else(|| self.webmail_listen_addrs.clone())
-            .unwrap_or_else(|| vec![format!("127.0.0.1:{}", self.webmail_port.unwrap_or(8081))])
+            .unwrap_or_else(|| vec!["127.0.0.1:8081".to_string()])
     }
 }
 
@@ -1030,19 +986,10 @@ impl Config {
         crate::classifier_control::socket_path(Path::new(&self.global.mail_root))
     }
 
-    /// Parse a TOML file as-is, without consulting the settings database.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {
-        let s = fs::read_to_string(path)?;
-        let cfg: Config = toml::from_str(&s)?;
-        Ok(cfg)
-    }
-
     /// Load the effective configuration for a daemon.
     ///
-    /// When the file names a `db_path`, the file only bootstraps `mail_root`
-    /// and `db_path`; every other setting lives in the database (see
-    /// [`crate::settings`]). File values are imported into an empty database
-    /// once. Without a `db_path` the file is used as-is.
+    /// The file only bootstraps `mail_root` and `db_path`; every other
+    /// setting lives in the database (see [`crate::settings`]).
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {
         let path = path.as_ref();
         let text = fs::read_to_string(path)
@@ -1060,7 +1007,9 @@ mod tests {
 
     #[test]
     fn security_defaults_when_absent() {
-        let cfg: Config = toml::from_str("[global]\nmail_root = \"mail\"\n").expect("config");
+        let cfg: Config =
+            toml::from_str("[global]\nmail_root = \"mail\"\ndb_path = \"rmail.db\"\n")
+                .expect("config");
         assert_eq!(
             cfg.security.scanner_failure_action,
             ScannerFailureAction::Tempfail
@@ -1099,6 +1048,7 @@ mod tests {
         let cfg: Config = toml::from_str(
             r#"[global]
 mail_root = "mail"
+db_path = "rmail.db"
 [security.oauth]
 introspection_url = "https://identity.example.test/oauth/introspect"
 client_id = "rmail"
@@ -1121,7 +1071,7 @@ timeout_ms = 2500
     #[test]
     fn tls_policy_parses_ocsp_response_path() {
         let cfg: Config = toml::from_str(
-            "[global]\nmail_root = \"mail\"\n[global.tls]\nocsp_response = \"/run/rmail/ocsp.der\"\n",
+            "[global]\nmail_root = \"mail\"\ndb_path = \"rmail.db\"\n[global.tls]\nocsp_response = \"/run/rmail/ocsp.der\"\n",
         )
         .expect("config");
         assert_eq!(
@@ -1136,6 +1086,7 @@ timeout_ms = 2500
             r#"
 [global]
 mail_root = "mail"
+db_path = "rmail.db"
 
 [security]
 imap_sasl_mechanisms = ["SCRAM-SHA-256"]
@@ -1171,6 +1122,7 @@ rspamd_reject_actions = ["reject"]
             r#"
 [global]
 mail_root = "mail"
+db_path = "rmail.db"
 
 [global.tcp_listener]
 ipv6_only = false
@@ -1198,69 +1150,54 @@ imaps = []
     }
 
     #[test]
-    fn legacy_listener_fields_remain_compatible() {
-        let cfg: Config = toml::from_str(
-            r#"
-[global]
-mail_root = "mail"
-listen_addrs = ["127.0.0.1:2525"]
-submission_port = 2587
-imap_port = 1143
-"#,
-        )
-        .expect("config");
-
-        assert_eq!(cfg.global.smtp_listeners(), ["127.0.0.1:2525"]);
-        assert_eq!(
-            cfg.global.submission_listeners(),
-            ["0.0.0.0:2587", "[::]:2587"]
-        );
-        assert_eq!(cfg.global.imap_listeners(), ["0.0.0.0:1143"]);
-    }
-
-    #[test]
-    fn example_config_imports_into_settings_database() {
+    fn the_file_only_bootstraps_and_settings_come_from_the_database() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rmail.db");
-        let text = include_str!("../../../config/example.toml").replace(
-            "db_path = \"config/rmail.db\"",
-            &format!("db_path = {:?}", db.display().to_string()),
-        );
         let path = dir.path().join("rmail.toml");
-        std::fs::write(&path, text).unwrap();
-        let first = Config::load(&path).expect("first load imports the file");
-        assert_eq!(first.global.smtp_listeners(), ["[::]:25"]);
-        assert_eq!(first.settings_revision, 1);
-        // A file trimmed to the bootstrap keys yields the same configuration.
         std::fs::write(
             &path,
             format!(
-                "[global]\nmail_root = \"mail\"\ndb_path = {:?}\n",
+                "[global]\nmail_root = \"mail\"\ndb_path = {:?}\n[global.listeners]\nsmtp = [\"[::]:25\"]\n",
                 db.display().to_string()
             ),
         )
         .unwrap();
-        let second = Config::load(&path).expect("bootstrap-only load");
-        assert_eq!(second.global.smtp_listeners(), ["[::]:25"]);
+        // Values other than mail_root and db_path are ignored.
+        let config = Config::load(&path).unwrap();
         assert_eq!(
-            second.security.smtp_max_recipients,
-            first.security.smtp_max_recipients
+            config.global.smtp_listeners(),
+            ["127.0.0.1:2525", "[::1]:2525"]
         );
-        assert_eq!(second.global.tls_cert, first.global.tls_cert);
+        let mut conn = crate::settings::open(&db).unwrap();
+        crate::settings::update(
+            &mut conn,
+            &std::collections::BTreeMap::from([(
+                "global.listeners.smtp".to_string(),
+                serde_json::json!(["[::]:25"]),
+            )]),
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.global.smtp_listeners(), ["[::]:25"]);
+        assert_eq!(config.settings_revision, 1);
+
+        std::fs::write(&path, "[global]\nmail_root = \"mail\"\n").unwrap();
+        let error = Config::load(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("db_path"), "{error:#}");
     }
 
     #[test]
-    fn distributed_example_configs_parse() {
-        let example: Config =
-            toml::from_str(include_str!("../../../config/example.toml")).expect("example config");
-        let test: Config =
-            toml::from_str(include_str!("../../../config/test.toml")).expect("test config");
-
-        assert_eq!(example.global.smtp_listeners(), ["[::]:25"]);
-        assert_eq!(example.global.tls.minimum_version, TlsMinimumVersion::Tls12);
-        assert_eq!(example.global.imap_listeners(), ["[::]:143"]);
-        assert_eq!(test.global.smtp_listeners().len(), 2);
-        assert_eq!(test.global.tcp_listener.backlog, 128);
+    fn distributed_example_configs_only_bootstrap() {
+        for text in [
+            include_str!("../../../config/example.toml"),
+            include_str!("../../../config/test.toml"),
+        ] {
+            let file = serde_json::to_value(toml::from_str::<toml::Value>(text).unwrap()).unwrap();
+            let keys = crate::settings::flatten(&file)
+                .into_keys()
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["global.db_path", "global.mail_root"]);
+        }
     }
 }
 

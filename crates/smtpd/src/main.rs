@@ -94,9 +94,7 @@ async fn main() -> Result<()> {
     rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
         .context("security.proxy_protocol_trusted_networks")?;
     let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
-    if let Some(db_path) = cfg.global.db_path.as_deref() {
-        rmail_common::dkim::use_database(db_path);
-    }
+    rmail_common::dkim::use_database(&cfg.global.db_path);
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
         smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
     }
@@ -120,10 +118,7 @@ async fn main() -> Result<()> {
         "smtpd",
     )?;
     // SQLite DB is the authoritative source for mailboxes and catchalls
-    let Some(db_path) = cfg.global.db_path.clone() else {
-        smtp_log!("error", "configuration_invalid", { "field": "global.db_path" });
-        std::process::exit(1);
-    };
+    let db_path = cfg.global.db_path.clone();
     if let Err(e) = rmail_common::db::init_db(&db_path) {
         smtp_log!("error", "database_initialization_failed", { "path": db_path, "error": e.to_string() });
         std::process::exit(1);

@@ -42,22 +42,20 @@ cat > "${demo}/config.toml" <<TOML
 [global]
 mail_root = "mail"
 db_path = "rmail.db"
-log_level = "info"
-tls_cert = "cert.pem"
-tls_key = "key.pem"
-
-[global.listeners]
-smtp = ["127.0.0.1:2525"]
-submission = ["127.0.0.1:2587"]
-imap = ["127.0.0.1:1143"]
-admin = ["127.0.0.1:18080"]
-webmail = ["127.0.0.1:18081"]
 TOML
 
 bin="${root}/target/debug"
 ctl="${bin}/rmail_ctl"
 cd "${demo}"
 "${ctl}" init-db --config config.toml >/dev/null
+demo_setting() { "${ctl}" settings set "$1" "$2" --config config.toml >/dev/null; }
+demo_setting global.tls_cert cert.pem
+demo_setting global.tls_key key.pem
+demo_setting global.listeners.smtp '["127.0.0.1:2525"]'
+demo_setting global.listeners.submission '["127.0.0.1:2587"]'
+demo_setting global.listeners.imap '["127.0.0.1:1143"]'
+demo_setting global.listeners.admin '["127.0.0.1:18080"]'
+demo_setting global.listeners.webmail '["127.0.0.1:18081"]'
 for mailbox in alice@example.com bob@example.com support@example.com ops@example.org; do
   "${ctl}" add-mailbox "${mailbox}" --password Demo-pass-123 --config config.toml >/dev/null
 done

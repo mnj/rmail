@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, FlaskConical, RefreshCw, Save, ServerCog, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, FlaskConical, RefreshCw, Save, ShieldCheck } from 'lucide-react';
 import { api, Certificates, Setting, SettingsView } from '../api';
 import { Empty, ErrorBanner, formatDate, formatRelative, invalidate, Panel, useFeedback, useResource, useUnsavedChanges } from '../ui';
 import { RestartNotice, SettingControl } from './Settings';
@@ -117,19 +117,8 @@ export function CertificatesPage() {
 
   if (overview.error) return <ErrorBanner error={overview.error} />;
   if (!view) return <Empty>Loading certificates…</Empty>;
-  if (!view.managed) {
-    return (
-      <article className="panel callout">
-        <ServerCog size={28} />
-        <div>
-          <h2>Automatic certificates need the settings database</h2>
-          <p>Set <code>db_path</code> in the configuration file to request and renew certificates from Let's Encrypt here.</p>
-        </div>
-      </article>
-    );
-  }
 
-  const settings = settingsView.data && settingsView.data.managed ? settingsView.data.settings.filter((setting) => setting.group === 'acme') : [];
+  const settings = settingsView.data ? settingsView.data.settings.filter((setting) => setting.group === 'acme') : [];
   const byKey = new Map(settings.map((setting) => [setting.key, setting]));
   const value = (key: string) => {
     if (key in drafts) return drafts[key] ?? byKey.get(key)?.default;
