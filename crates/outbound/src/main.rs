@@ -579,15 +579,19 @@ async fn process_claim(
     )
     .await
     {
-        Ok(()) => {
+        Ok(handoff) => {
             emit("delivery", "delivered", Some(fname.clone()), Some(250));
-            if let Err(error) = queue_delivery_notification(
-                &base,
-                &inflight_eml,
-                &control,
-                DeliveryNotificationKind::Success,
-            )
-            .await
+            // RFC 3461 §6.2.3: a DSN-capable next hop now owns success reports.
+            if !handoff.dsn
+                && let Err(error) = queue_delivery_notification(
+                    &base,
+                    &inflight_eml,
+                    &control,
+                    DeliveryNotificationKind::Relayed {
+                        remote_mta: &handoff.remote_mta,
+                    },
+                )
+                .await
             {
                 rmail_common::structured_log!(
                     "error", "outbound", "success_dsn_queue_failed",
@@ -743,7 +747,7 @@ async fn process_file(
     connections: &ConnectionPool,
     tracking: &TrackingHub,
     tracking_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Handoff> {
     let message = inspect_queued_message(path).await?;
     deliver_to_remote(base, path, message, connections, tracking, tracking_id).await
 }
@@ -1043,17 +1047,26 @@ async fn queue_failure_notification(
 }
 
 #[derive(Clone, Copy)]
-enum DeliveryNotificationKind {
-    Success,
+enum DeliveryNotificationKind<'a> {
+    /// Handed to a next hop that does not support DSN (RFC 3461 §6.2.3.3);
+    /// a DSN-capable next hop reports success itself.
+    Relayed { remote_mta: &'a str },
     Delay,
     Failure,
+}
+
+/// The next hop that accepted a message.
+struct Handoff {
+    remote_mta: String,
+    /// The next hop advertised DSN, so NOTIFY/RET/ENVID/ORCPT went with it.
+    dsn: bool,
 }
 
 async fn queue_delivery_notification(
     mail_root: &Path,
     queued_message: &Path,
     control: &rmail_common::outbound::QueueControl,
-    kind: DeliveryNotificationKind,
+    kind: DeliveryNotificationKind<'_>,
 ) -> anyhow::Result<()> {
     let message = inspect_queued_message(queued_message).await?;
     let Some(original_sender) = message.envelope_from else {
@@ -1063,7 +1076,7 @@ async fn queue_delivery_notification(
     };
     let requested = match (message.dsn.notify.as_ref(), kind) {
         (Some(notify), _) if notify.never => false,
-        (Some(notify), DeliveryNotificationKind::Success) => notify.success,
+        (Some(notify), DeliveryNotificationKind::Relayed { .. }) => notify.success,
         (Some(notify), DeliveryNotificationKind::Delay) => notify.delay,
         (Some(notify), DeliveryNotificationKind::Failure) => notify.failure,
         (None, DeliveryNotificationKind::Failure) => true,
@@ -1127,18 +1140,23 @@ fn build_failure_notification(
     final_recipient: &str,
     control: &rmail_common::outbound::QueueControl,
     dsn: &rmail_common::outbound::DsnOptions,
-    kind: DeliveryNotificationKind,
+    kind: DeliveryNotificationKind<'_>,
     return_full: bool,
     returned_content: &[u8],
 ) -> Vec<u8> {
     let date = Utc::now().to_rfc2822();
+    let arrival_date = chrono::DateTime::from_timestamp(control.created_at, 0)
+        .filter(|_| control.created_at > 0)
+        .map_or_else(|| date.clone(), |arrival| arrival.to_rfc2822());
+    // RFC 3464 §2.2.2: the reporting MTA's own name, as sent in EHLO.
+    let reporting_mta = sanitize_header_value(helo_name());
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let boundary = format!("rmail-dsn-{}-{nonce}", std::process::id());
     let status = match kind {
-        DeliveryNotificationKind::Success => "2.0.0",
+        DeliveryNotificationKind::Relayed { .. } => "2.0.0",
         DeliveryNotificationKind::Delay => {
             control.last_enhanced_status.as_deref().unwrap_or("4.4.7")
         }
@@ -1157,17 +1175,17 @@ fn build_failure_notification(
         .as_deref()
         .map(sanitize_header_value)
         .unwrap_or_else(|| match kind {
-            DeliveryNotificationKind::Success => "recipient accepted the message".to_string(),
+            DeliveryNotificationKind::Relayed { .. } => "250 message accepted".to_string(),
             DeliveryNotificationKind::Delay => "delivery is still being retried".to_string(),
             DeliveryNotificationKind::Failure => {
                 "delivery failed without a diagnostic response".to_string()
             }
         });
     let (subject, action, human_message) = match kind {
-        DeliveryNotificationKind::Success => (
-            "Delivery Status Notification (Success)",
-            "delivered",
-            "was delivered successfully.",
+        DeliveryNotificationKind::Relayed { .. } => (
+            "Delivery Status Notification (Relayed)",
+            "relayed",
+            "was relayed to a server that does not send delivery notifications; no further notification will follow.",
         ),
         DeliveryNotificationKind::Delay => (
             "Delivery Status Notification (Delay)",
@@ -1199,13 +1217,19 @@ fn build_failure_notification(
         .map(sanitize_header_value)
         .map(|value| format!("Original-Envelope-Id: {value}\r\n"))
         .unwrap_or_default();
+    let remote_mta = match kind {
+        DeliveryNotificationKind::Relayed { remote_mta } => {
+            format!("Remote-MTA: dns; {}\r\n", sanitize_header_value(remote_mta))
+        }
+        _ => String::new(),
+    };
     let returned_type = if return_full {
         "message/rfc822"
     } else {
         "message/rfc822-headers"
     };
     let mut notification = format!(
-        "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\n\
+        "From: Mail Delivery Subsystem <MAILER-DAEMON@{reporting_mta}>\r\n\
          To: <{sender}>\r\n\
          Subject: {subject}\r\n\
          Date: {date}\r\n\
@@ -1223,14 +1247,15 @@ fn build_failure_notification(
          --{boundary}\r\n\
          Content-Type: message/delivery-status\r\n\
          \r\n\
-         Reporting-MTA: dns; rmail\r\n\
+         Reporting-MTA: dns; {reporting_mta}\r\n\
          {envelope_id}\
-         Arrival-Date: {date}\r\n\
+         Arrival-Date: {arrival_date}\r\n\
          \r\n\
          {original_recipient}\
          Final-Recipient: rfc822; {recipient}\r\n\
          Action: {action}\r\n\
          Status: {status}\r\n\
+         {remote_mta}\
          Diagnostic-Code: smtp; {diagnostic}\r\n\
          \r\n\
          --{boundary}\r\n\
@@ -2279,7 +2304,7 @@ async fn deliver_to_remote(
     connections: &ConnectionPool,
     tracking: &TrackingHub,
     tracking_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Handoff> {
     let recipient = rmail_common::domain::canonicalize_mailbox_address(&message.envelope_to)
         .context("canonicalizing recipient IDN")?;
     let envelope_from = message
@@ -2524,8 +2549,12 @@ async fn deliver_to_remote(
                     Some(recipient.clone()),
                     Some(250),
                 );
+                let handoff = Handoff {
+                    remote_mta: key.host.clone(),
+                    dsn: capabilities.dsn,
+                };
                 connections.recycle(key, connection).await;
-                return Ok(());
+                return Ok(handoff);
             }
             Err(error) => {
                 trace.emit("transaction", "failed", Some(error.to_string()), None);
@@ -2807,6 +2836,29 @@ mod tests {
         assert_eq!(retry_backoff_seconds(1, Some("4.2.2")), 15 * 60);
         assert_eq!(retry_backoff_seconds(1, Some("4.7.0")), 5 * 60);
         assert_eq!(retry_backoff_seconds(2, Some("4.1.0")), 120);
+    }
+
+    #[test]
+    fn relayed_notification_names_both_mtas_and_the_arrival_time() {
+        let mut control = rmail_common::outbound::QueueControl::new(5, 0);
+        control.created_at = 1_700_000_000;
+        let notification = build_failure_notification(
+            "sender@example.test",
+            "user@remote.test",
+            &control,
+            &rmail_common::outbound::DsnOptions::default(),
+            DeliveryNotificationKind::Relayed {
+                remote_mta: "mx.remote.test",
+            },
+            false,
+            b"Subject: original\r\n\r\n",
+        );
+        let notification = String::from_utf8(notification).unwrap();
+        assert!(notification.contains("Action: relayed\r\nStatus: 2.0.0\r\n"));
+        assert!(notification.contains("Remote-MTA: dns; mx.remote.test\r\n"));
+        assert!(notification.contains(&format!("Reporting-MTA: dns; {}\r\n", helo_name())));
+        assert!(!notification.contains("@localhost"));
+        assert!(notification.contains("Arrival-Date: Tue, 14 Nov 2023 22:13:20 +0000\r\n"));
     }
 
     #[test]
