@@ -151,6 +151,11 @@ pub struct ListenerEndpoints {
     pub smtps: Option<Vec<String>>,
     pub imap: Option<Vec<String>>,
     pub imaps: Option<Vec<String>>,
+    /// POP3 (STLS) endpoints, usually port 110, served by the IMAP daemon.
+    /// Empty (disabled) by default.
+    pub pop3: Option<Vec<String>>,
+    /// Implicit-TLS POP3 endpoints, usually port 995. Empty by default.
+    pub pop3s: Option<Vec<String>>,
     /// ManageSieve (RFC 5804) endpoints, usually port 4190, served by the IMAP
     /// daemon. Empty (disabled) by default.
     pub managesieve: Option<Vec<String>>,
@@ -232,6 +237,14 @@ impl Global {
                 .clone()
                 .unwrap_or_else(|| vec![format!("0.0.0.0:{port}")])
         })
+    }
+
+    pub fn pop3_listeners(&self) -> Vec<String> {
+        self.listeners.pop3.clone().unwrap_or_default()
+    }
+
+    pub fn pop3s_listeners(&self) -> Vec<String> {
+        self.listeners.pop3s.clone().unwrap_or_default()
     }
 
     pub fn managesieve_listeners(&self) -> Vec<String> {

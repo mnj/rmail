@@ -16,6 +16,7 @@ pub(crate) struct Outcome {
 pub(crate) async fn handle(
     tag: &str,
     raw_args: &str,
+    mail_root: Option<&std::path::Path>,
     selected: &SelectedMailbox,
     previous_saved_uids: &[u64],
     uid_mode: bool,
@@ -62,8 +63,15 @@ pub(crate) async fn handle(
     let selected = selected.clone();
     let criterion = request.criterion.clone();
     let saved = previous_saved_uids.to_vec();
+    let mail_root = mail_root.map(std::path::Path::to_path_buf);
     let matches = match tokio::task::spawn_blocking(move || {
-        execute(&selected, &criterion, &saved, imap4rev2)
+        execute(
+            &selected,
+            &criterion,
+            &saved,
+            imap4rev2,
+            mail_root.as_deref(),
+        )
     })
     .await
     {
@@ -127,21 +135,85 @@ pub(crate) async fn handle(
     }
 }
 
+/// Messages indexed per SEARCH before the rest are scanned: bounds the first
+/// search of a large mailbox, and later searches finish the job.
+const INDEX_BUDGET: usize = 1000;
+
+/// Index answers for the BODY/TEXT needles of `criterion`, or `None` to scan
+/// (no such needles, no mail root, or any index error: the index is only a cache).
+fn index_lookup(
+    selected: &SelectedMailbox,
+    criterion: &parser::SearchCriterion,
+    mail_root: Option<&std::path::Path>,
+) -> Option<parser::FtsLookup> {
+    use rmail_common::search_index::{Field, SearchIndex};
+    let root = mail_root?;
+    let (body, text) = parser::fts_needles(criterion);
+    if body.is_empty() && text.is_empty() {
+        return None;
+    }
+    let build = || -> anyhow::Result<parser::FtsLookup> {
+        let index = SearchIndex::open(root, &selected.domain, &selected.local)?;
+        let messages: Vec<(u64, std::path::PathBuf)> = selected
+            .msgs
+            .iter()
+            .filter(|(uid, ..)| !selected.is_expunged(*uid))
+            .map(|(uid, path, ..)| (*uid, path.clone()))
+            .collect();
+        index.sync(
+            &selected.mailbox,
+            selected.uidvalidity,
+            &messages,
+            INDEX_BUDGET,
+        )?;
+        let mut lookup = parser::FtsLookup::default();
+        for needle in body {
+            if let Some(hits) = index.query(
+                &selected.mailbox,
+                selected.uidvalidity,
+                Field::Body,
+                &needle,
+            )? {
+                lookup.body.insert(needle, hits);
+            }
+        }
+        for needle in text {
+            if let Some(hits) = index.query(
+                &selected.mailbox,
+                selected.uidvalidity,
+                Field::Text,
+                &needle,
+            )? {
+                lookup.text.insert(needle, hits);
+            }
+        }
+        Ok(lookup)
+    };
+    match build() {
+        Ok(lookup) => Some(lookup),
+        Err(error) => {
+            imap_log!("warn", "search_index_unavailable", { "error": format!("{error:#}") });
+            None
+        }
+    }
+}
+
 fn execute(
     selected: &SelectedMailbox,
     criterion: &parser::SearchCriterion,
     saved_search_uids: &[u64],
     imap4rev2: bool,
+    mail_root: Option<&std::path::Path>,
 ) -> anyhow::Result<Vec<(u64, u64)>> {
     let mut matches = Vec::new();
     let now = chrono::Utc::now().timestamp();
-    let needs_data = parser::search_requires_message_data(criterion);
+    let fts = index_lookup(selected, criterion, mail_root);
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
         // Expunged by another session; the file may already be gone.
         if selected.is_expunged(*uid) {
             continue;
         }
-        let data = if needs_data {
+        let data = if parser::search_requires_message_data_for(criterion, *uid, fts.as_ref()) {
             std::fs::read(path)?
         } else {
             Vec::new()
@@ -164,6 +236,7 @@ fn execute(
             size: selected.sizes.get(uid).copied().unwrap_or(0) as usize,
             email_id: selected.email_ids.get(uid).map_or("", String::as_str),
             data: &data,
+            fts: fts.as_ref(),
         };
         if parser::search_matches(criterion, &message, selected.msgs.len()) {
             matches.push((index as u64 + 1, *uid));
@@ -441,6 +514,7 @@ mod tests {
         let outcome = handle(
             "A1",
             "CHARSET ISO-8859-1 ALL",
+            None,
             &selected,
             &[9],
             false,
@@ -482,7 +556,7 @@ mod tests {
             parser::SearchCriterion::Larger(10_000),
         ]);
         assert_eq!(
-            execute(&selected, &criterion, &[], false).unwrap(),
+            execute(&selected, &criterion, &[], false, None).unwrap(),
             vec![(1, 7)]
         );
         assert!(
@@ -490,9 +564,114 @@ mod tests {
                 &selected,
                 &parser::SearchCriterion::Text("body".to_string()),
                 &[],
-                false
+                false,
+                None
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn indexed_body_and_text_searches_match_the_scan() {
+        use parser::SearchCriterion as C;
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("mail");
+        let write = |name: &str, data: &str| {
+            let path = td.path().join(name);
+            std::fs::write(&path, data).unwrap();
+            path
+        };
+        let messages = [
+            (
+                1u64,
+                "Subject: Quarterly\r\n\r\nThe numbers are in. Caf\u{e9} menu.\r\n",
+            ),
+            (
+                2,
+                "Subject: lunch\r\nFrom: bob@example.org\r\n\r\nno figures here\r\n",
+            ),
+            (3, "Subject: numbers\nX: y\n\nplain LF body NUMBERS\n"),
+        ];
+        let view = |msgs: &[(u64, &str)], paths: &[std::path::PathBuf]| SelectedMailbox {
+            domain: "example.test".to_string(),
+            local: "user".to_string(),
+            mailbox: "INBOX".to_string(),
+            uidvalidity: 5,
+            uidnext: 99,
+            highest_modseq: 1,
+            mailbox_id: "Ftest".to_string(),
+            read_only: false,
+            msgs: msgs
+                .iter()
+                .zip(paths)
+                .map(|((uid, _), path)| (*uid, path.clone(), vec!["\\Seen".to_string()], 1))
+                .collect(),
+            internal_dates: Default::default(),
+            save_dates: Default::default(),
+            sizes: Default::default(),
+            email_ids: Default::default(),
+            recent_uids: Default::default(),
+            expunged: Default::default(),
+        };
+        let paths: Vec<_> = messages
+            .iter()
+            .map(|(uid, data)| write(&format!("m{uid}"), data))
+            .collect();
+        let selected = view(&messages, &paths);
+        let criteria = vec![
+            C::Body("numbers".into()),
+            C::Body("NUMBERS ARE".into()),
+            C::Body("cafe".into()),
+            C::Body("subject".into()),
+            C::Text("subject: lunch".into()),
+            C::Text("bob@example".into()),
+            C::Not(Box::new(C::Body("numbers".into()))),
+            C::Or(Box::new(C::Body("figures".into())), Box::new(C::Seen)),
+            C::And(vec![C::Seen, C::Text("quarterly".into())]),
+            C::And(vec![
+                C::Header("subject".into(), "lunch".into()),
+                C::Body("figures".into()),
+            ]),
+            C::Body("ab".into()),
+            C::Body("nomatchatall".into()),
+        ];
+        for criterion in &criteria {
+            let scanned = execute(&selected, criterion, &[], false, None).unwrap();
+            // Twice: the first call builds the index, the second uses it.
+            for _ in 0..2 {
+                assert_eq!(
+                    execute(&selected, criterion, &[], false, Some(&root)).unwrap(),
+                    scanned,
+                    "{criterion:?}"
+                );
+            }
+        }
+
+        // The index answers without opening covered messages: delete a file and
+        // the indexed search still works while the scan cannot read it.
+        std::fs::remove_file(&paths[0]).unwrap();
+        let criterion = C::Body("numbers".into());
+        assert_eq!(
+            execute(&selected, &criterion, &[], false, Some(&root)).unwrap(),
+            vec![(1, 1), (3, 3)]
+        );
+        assert!(execute(&selected, &criterion, &[], false, None).is_err());
+
+        // A new arrival is indexed on the next search; an expunged message
+        // (gone from the view) drops out.
+        let mut more = messages.to_vec();
+        more.push((4, "Subject: late\r\n\r\nnumbers again\r\n"));
+        let mut more_paths = paths.clone();
+        more_paths.push(write("m4", more[3].1));
+        let mut grown = view(&more[1..], &more_paths[1..]);
+        grown.uidnext = 100;
+        assert_eq!(
+            execute(&grown, &criterion, &[], false, Some(&root)).unwrap(),
+            vec![(2, 3), (3, 4)]
+        );
+        assert_eq!(
+            execute(&grown, &criterion, &[], false, None).unwrap(),
+            vec![(2, 3), (3, 4)]
         );
     }
 }

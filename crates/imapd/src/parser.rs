@@ -925,6 +925,80 @@ pub(crate) struct SearchMessage<'a> {
     pub(crate) size: usize,
     pub(crate) email_id: &'a str,
     pub(crate) data: &'a [u8],
+    /// Full-text index answers for BODY/TEXT; `None` scans `data`.
+    pub(crate) fts: Option<&'a FtsLookup>,
+}
+
+/// Index answers for the BODY and TEXT needles of one SEARCH, keyed by the
+/// needle exactly as it appears in the criterion.
+#[derive(Debug, Default)]
+pub(crate) struct FtsLookup {
+    pub(crate) body: std::collections::HashMap<String, rmail_common::search_index::Hits>,
+    pub(crate) text: std::collections::HashMap<String, rmail_common::search_index::Hits>,
+}
+
+impl FtsLookup {
+    /// `Some(matches)` when the index covers `uid`, `None` when the message
+    /// must be scanned.
+    fn get(&self, text: bool, needle: &str, uid: u64) -> Option<bool> {
+        let map = if text { &self.text } else { &self.body };
+        map.get(needle)?.lookup(uid)
+    }
+}
+
+/// The BODY and TEXT needles of `criterion`.
+pub(crate) fn fts_needles(
+    criterion: &SearchCriterion,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    fn walk(
+        criterion: &SearchCriterion,
+        body: &mut std::collections::BTreeSet<String>,
+        text: &mut std::collections::BTreeSet<String>,
+    ) {
+        match criterion {
+            SearchCriterion::Body(value) => {
+                body.insert(value.clone());
+            }
+            SearchCriterion::Text(value) => {
+                text.insert(value.clone());
+            }
+            SearchCriterion::Not(inner) => walk(inner, body, text),
+            SearchCriterion::Or(left, right) => {
+                walk(left, body, text);
+                walk(right, body, text);
+            }
+            SearchCriterion::And(items) => items.iter().for_each(|item| walk(item, body, text)),
+            _ => {}
+        }
+    }
+    let (mut body, mut text) = Default::default();
+    walk(criterion, &mut body, &mut text);
+    (body, text)
+}
+
+/// Like [`search_requires_message_data`], but a BODY or TEXT test the index
+/// already answers for `uid` does not need the message read.
+pub(crate) fn search_requires_message_data_for(
+    criterion: &SearchCriterion,
+    uid: u64,
+    fts: Option<&FtsLookup>,
+) -> bool {
+    match criterion {
+        SearchCriterion::Body(value) => fts.and_then(|f| f.get(false, value, uid)).is_none(),
+        SearchCriterion::Text(value) => fts.and_then(|f| f.get(true, value, uid)).is_none(),
+        SearchCriterion::Not(inner) => search_requires_message_data_for(inner, uid, fts),
+        SearchCriterion::Or(left, right) => {
+            search_requires_message_data_for(left, uid, fts)
+                || search_requires_message_data_for(right, uid, fts)
+        }
+        SearchCriterion::And(items) => items
+            .iter()
+            .any(|item| search_requires_message_data_for(item, uid, fts)),
+        other => search_requires_message_data(other),
+    }
 }
 
 pub(crate) fn search_requires_message_data(criterion: &SearchCriterion) -> bool {
@@ -1573,10 +1647,14 @@ pub(crate) fn search_matches(
         SearchCriterion::Header(name, value) => crate::mailbox::header_value(msg.data, name)
             .map(|header| normalized_casefold(&header).contains(&normalized_casefold(value)))
             .unwrap_or(false),
-        SearchCriterion::Body(value) => {
-            contains_unicode_casefold(crate::mailbox::body_after_header(msg.data), value)
-        }
-        SearchCriterion::Text(value) => contains_unicode_casefold(msg.data, value),
+        SearchCriterion::Body(value) => match msg.fts.and_then(|f| f.get(false, value, msg.uid)) {
+            Some(indexed) => indexed,
+            None => contains_unicode_casefold(crate::mailbox::body_after_header(msg.data), value),
+        },
+        SearchCriterion::Text(value) => match msg.fts.and_then(|f| f.get(true, value, msg.uid)) {
+            Some(indexed) => indexed,
+            None => contains_unicode_casefold(msg.data, value),
+        },
         SearchCriterion::Not(inner) => !search_matches(inner, msg, total),
         SearchCriterion::Or(left, right) => {
             search_matches(left, msg, total) || search_matches(right, msg, total)
@@ -2398,6 +2476,7 @@ mod tests {
             size: data.len(),
             email_id: "",
             data,
+            fts: None,
         };
 
         assert!(search_matches(

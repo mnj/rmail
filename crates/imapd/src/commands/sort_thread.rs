@@ -209,6 +209,7 @@ fn execute_sort(
                 .unwrap_or(data.len() as u64) as usize,
             email_id: selected.email_ids.get(uid).map_or("", String::as_str),
             data: &data,
+            fts: None,
         };
         if parser::search_matches(&request.search, &message, selected.msgs.len()) {
             records.push(sort::SortRecord::from_message(
@@ -256,6 +257,7 @@ fn execute_thread(
                 .unwrap_or(data.len() as u64) as usize,
             email_id: selected.email_ids.get(uid).map_or("", String::as_str),
             data: &data,
+            fts: None,
         };
         if parser::search_matches(&request.search, &search_message, selected.msgs.len()) {
             messages.push(thread::ThreadMessage::from_message(

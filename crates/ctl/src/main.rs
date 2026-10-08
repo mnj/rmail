@@ -91,6 +91,17 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Discard the full-text search index so the next search rebuilds it
+    SearchReindex {
+        /// Account address; omit when using --all
+        address: Option<String>,
+        /// Reset every account
+        #[arg(long)]
+        all: bool,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Set the admin console username and password
     AdminPassword {
         /// Admin username
@@ -393,6 +404,38 @@ async fn main() -> Result<()> {
                 eprintln!("No db_path configured; SQLite DB is required");
                 std::process::exit(1);
             }
+        }
+        Commands::SearchReindex {
+            address,
+            all,
+            config,
+        } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let root = Path::new(&cfg.global.mail_root);
+            let mut removed = 0usize;
+            match (address, all) {
+                (Some(address), false) => {
+                    let address = rmail_common::domain::canonicalize_mailbox_address(&address)?;
+                    let (local, domain) = address
+                        .rsplit_once('@')
+                        .ok_or_else(|| anyhow::anyhow!("not a mailbox address: {address}"))?;
+                    removed += usize::from(rmail_common::search_index::remove_index(
+                        root, domain, local,
+                    )?);
+                }
+                (None, true) => {
+                    for (domain, local, _) in rmail_common::imap_state::list_accounts(root)? {
+                        removed += usize::from(rmail_common::search_index::remove_index(
+                            root, &domain, &local,
+                        )?);
+                    }
+                }
+                _ => anyhow::bail!("give an account address, or --all (not both)"),
+            }
+            println!("removed {removed} search index(es); they rebuild on the next search");
         }
         Commands::Watch {
             mail_root,

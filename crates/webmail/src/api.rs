@@ -493,6 +493,52 @@ async fn folders(app: State<Shared>, headers: HeaderMap) -> Response {
     }
 }
 
+/// Whether `parsed` matches a webmail search (`needle` is lowercase): the
+/// text the index stores for [`search_index::Field::Decoded`].
+fn searchable(parsed: &rmail_common::mime::ParsedMessage, needle: &str) -> bool {
+    format!(
+        "{} {} {} {} {}",
+        parsed.from, parsed.to, parsed.cc, parsed.subject, parsed.text_body
+    )
+    .to_lowercase()
+    .contains(needle)
+}
+
+/// Messages indexed per search before the rest are scanned.
+const INDEX_BUDGET: usize = 1000;
+
+/// Full-text index answers for `needle` in this folder, or `None` to scan (the
+/// needle is too short for the index, or the index failed: it is only a cache).
+fn decoded_hits(
+    mail_root: &std::path::Path,
+    domain: &str,
+    localpart: &str,
+    info: &imap_state::Folder,
+    messages: &[imap_state::Message],
+    needle: &str,
+) -> Option<rmail_common::search_index::Hits> {
+    use rmail_common::search_index::{Field, SearchIndex, usable_needle};
+    if !usable_needle(Field::Decoded, needle) {
+        return None;
+    }
+    let result = (|| -> anyhow::Result<_> {
+        let index = SearchIndex::open(mail_root, domain, localpart)?;
+        let files: Vec<(u64, std::path::PathBuf)> = messages
+            .iter()
+            .map(|message| (message.uid, message.path.clone()))
+            .collect();
+        index.sync(&info.name, info.uidvalidity, &files, INDEX_BUDGET)?;
+        index.query(&info.name, info.uidvalidity, Field::Decoded, needle)
+    })();
+    match result {
+        Ok(hits) => hits,
+        Err(error) => {
+            webmail_log!("warn", "search_index_unavailable", { "error": format!("{error:#}") });
+            None
+        }
+    }
+}
+
 async fn message_list(
     app: State<Shared>,
     headers: HeaderMap,
@@ -549,18 +595,36 @@ async fn message_list(
                 .filter_map(|message| read(&message).map(|parsed| (message, parsed)))
                 .collect();
             (total, page)
+        } else if let Some(hits) = decoded_hits(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &info,
+            &messages,
+            &needle,
+        ) {
+            // Indexed messages are matched without reading them; the rest are
+            // scanned as below. Only the requested page is then read from disk.
+            let matching: Vec<_> = messages
+                .into_iter()
+                .filter(|message| match hits.lookup(message.uid) {
+                    Some(matches) => matches,
+                    None => read(message).is_some_and(|parsed| searchable(&parsed, &needle)),
+                })
+                .collect();
+            let total = matching.len();
+            let page = matching
+                .into_iter()
+                .skip(query.offset)
+                .take(limit)
+                .filter_map(|message| read(&message).map(|parsed| (message, parsed)))
+                .collect();
+            (total, page)
         } else {
             let matching: Vec<_> = messages
                 .into_iter()
                 .filter_map(|message| read(&message).map(|parsed| (message, parsed)))
-                .filter(|(_, parsed)| {
-                    format!(
-                        "{} {} {} {} {}",
-                        parsed.from, parsed.to, parsed.cc, parsed.subject, parsed.text_body
-                    )
-                    .to_lowercase()
-                    .contains(&needle)
-                })
+                .filter(|(_, parsed)| searchable(parsed, &needle))
                 .collect();
             let total = matching.len();
             (
@@ -2331,5 +2395,69 @@ mod tests {
         assert_eq!(other.status, 404);
         let anonymous = route(req("GET", "/api/organize", b"", None), &state).await;
         assert_eq!(anonymous.status, 401);
+    }
+
+    #[tokio::test]
+    async fn indexed_search_pages_decodes_and_follows_new_mail() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let deliver = |raw: &str| {
+            maildir::deliver(&state.mail_root, "example.test", "user", raw.as_bytes()).unwrap();
+        };
+        for n in 0..5 {
+            deliver(&format!(
+                "From: a@b.test\r\nSubject: Invoice {n}\r\n\r\ntotals {n}"
+            ));
+        }
+        deliver(
+            "From: c@d.test\r\nSubject: Lunch\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nCaf=C3=A9 receipt attached",
+        );
+        deliver("From: e@f.test\r\nSubject: Other\r\n\r\nnothing relevant");
+        let token = sign_session(&state, "user@example.test");
+        let cookie = Some(format!("{SESSION_COOKIE}={token}"));
+        let search = |query: &str| {
+            let state = state.clone();
+            let cookie = cookie.clone();
+            let path = format!("/api/folders/INBOX/messages?{query}");
+            async move {
+                let response = route(req("GET", &path, b"", cookie), &state).await;
+                assert_eq!(response.status, 200);
+                let page: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                (
+                    page["total"].as_u64().unwrap(),
+                    page["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["subject"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+
+        // Newest first; the total counts all matches while the page is a window.
+        let (total, all) = search("q=INVOICE&limit=10").await;
+        assert_eq!(total, 5);
+        assert_eq!(all.len(), 5);
+        let (total, window) = search("q=invoice&limit=2&offset=3").await;
+        assert_eq!(total, 5);
+        assert_eq!(window, all[3..5]);
+        // Text is searched decoded: the quoted-printable body matches "café".
+        assert_eq!(search("q=caf%C3%A9").await, (1, vec!["Lunch".to_string()]));
+        assert_eq!(
+            search("q=totals%203").await,
+            (1, vec!["Invoice 3".to_string()])
+        );
+        // Repeating a search (now served from the index) gives the same answer.
+        assert_eq!(search("q=invoice&limit=10").await, (total, all.clone()));
+        assert!(
+            rmail_common::search_index::index_path(&state.mail_root, "example.test", "user")
+                .exists()
+        );
+        // New mail is found; needles too short for the index still work.
+        deliver("From: g@h.test\r\nSubject: Invoice F\r\n\r\nlate");
+        assert_eq!(search("q=invoice&limit=10").await.0, 6);
+        assert_eq!(search("q=zz").await.0, 0);
+        assert_eq!(search("q=g@").await.0, 1);
     }
 }

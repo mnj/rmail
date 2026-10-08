@@ -224,19 +224,23 @@ pub(crate) async fn refresh_selected_mailbox(
     selected: &SelectedMailbox,
     options: SyncOptions,
 ) -> Result<(SelectedMailbox, Vec<MailboxSyncEvent>)> {
+    // Claim before loading: the claim imports new deliveries, so every
+    // claimed UID is in the loaded view. Claiming after the load could take
+    // a message that arrived in between, which `reconcile` would then drop
+    // from the recent set for good. A later arrival stays recent in storage
+    // and is claimed by the next refresh.
+    let claimed = claim_recent_uids(
+        mail_root,
+        &selected.domain,
+        &selected.local,
+        &selected.mailbox,
+    )
+    .await?;
     let address = format!("{}@{}", selected.local, selected.domain);
     let mut refreshed = load_selected_mailbox(mail_root, &address, &selected.mailbox).await?;
     refreshed.read_only = selected.read_only;
     refreshed.recent_uids = selected.recent_uids.clone();
-    refreshed.recent_uids.extend(
-        claim_recent_uids(
-            mail_root,
-            &refreshed.domain,
-            &refreshed.local,
-            &refreshed.mailbox,
-        )
-        .await?,
-    );
+    refreshed.recent_uids.extend(claimed);
     Ok(reconcile(selected, refreshed, options))
 }
 

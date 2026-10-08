@@ -256,6 +256,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         IMAP,
     ),
     spec(
+        "global.listeners.pop3",
+        "network",
+        "POP3",
+        "POP3 with STLS (port 110) for legacy clients. Reads the INBOX; needs a TLS certificate for password login off loopback.",
+        SettingKind::AddressList,
+        IMAP,
+    ),
+    spec(
+        "global.listeners.pop3s",
+        "network",
+        "POP3S",
+        "Implicit-TLS POP3 (port 995).",
+        SettingKind::AddressList,
+        IMAP,
+    ),
+    spec(
         "global.listeners.managesieve",
         "network",
         "ManageSieve",
