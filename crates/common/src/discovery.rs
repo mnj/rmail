@@ -28,6 +28,22 @@ pub struct ServiceEndpoints {
     pub hostname: String,
     pub imap: Option<Endpoint>,
     pub smtp: Option<Endpoint>,
+    /// The public HTTPS port of webmail, which serves JMAP.
+    pub jmap_port: u16,
+}
+
+/// The port clients reach webmail on: its own when it listens publicly with
+/// TLS, otherwise 443 on the reverse proxy in front of it.
+fn public_web_port(global: &Global) -> u16 {
+    if global.tls.web_http_only {
+        return 443;
+    }
+    global
+        .webmail_listeners()
+        .iter()
+        .filter_map(|address| address.parse::<std::net::SocketAddr>().ok())
+        .find(|address| !address.ip().is_loopback())
+        .map_or(443, |address| address.port())
 }
 
 fn first_port(addresses: &[String]) -> Option<u16> {
@@ -56,6 +72,7 @@ impl ServiceEndpoints {
             hostname: global.server_hostname(),
             imap: pick(global.imaps_listeners(), global.imap_listeners()),
             smtp: pick(global.smtps_listeners(), global.submission_listeners()),
+            jmap_port: public_web_port(global),
         }
     }
 }
@@ -260,6 +277,12 @@ pub fn dns_records(
             purpose: "Message submission discovery (RFC 6186/8314)",
         });
     }
+    records.push(DnsRecord {
+        name: format!("_jmap._tcp.{domain}"),
+        kind: "SRV",
+        value: format!("0 1 {} {host}.", endpoints.jmap_port),
+        purpose: "JMAP service discovery (RFC 8620)",
+    });
     if let Some(policy) = mta_sts_policy(mode, host, max_age_secs) {
         records.push(DnsRecord {
             name: format!("_mta-sts.{domain}"),
@@ -311,6 +334,7 @@ mod tests {
                 port: 587,
                 security: Security::StartTls,
             }),
+            jmap_port: 443,
         }
     }
 
@@ -392,6 +416,7 @@ mod tests {
         let names: Vec<_> = without.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"_imaps._tcp.example.com"));
         assert!(names.contains(&"_submission._tcp.example.com"));
+        assert!(names.contains(&"_jmap._tcp.example.com"));
         assert!(names.contains(&"_smtp._tls.example.com"));
         let with = dns_records(
             "example.com",

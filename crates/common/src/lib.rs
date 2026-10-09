@@ -20,6 +20,7 @@ pub mod domain;
 pub mod greylist;
 pub mod http;
 pub mod imap_state;
+pub mod jmap;
 pub mod mail_auth;
 pub mod maildir;
 pub mod metrics;

@@ -91,7 +91,11 @@ pub fn init_account(maildir_root: &Path, domain: &str, localpart: &str) -> Resul
     Ok(())
 }
 
-fn open_account(maildir_root: &Path, domain: &str, localpart: &str) -> Result<SqliteConnection> {
+pub(crate) fn open_account(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+) -> Result<SqliteConnection> {
     let root = account_maildir(maildir_root, domain, localpart);
     fs::create_dir_all(&root)?;
     let conn = crate::sqlite_pool::connection(&root.join(STATE_DB_FILENAME))?;
@@ -211,6 +215,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_object_ids(conn)?;
+    crate::jmap::store::ensure_schema(conn)?;
     let invalid_uidvalidity_ids = {
         let mut statement = conn
             .prepare("SELECT id FROM folders WHERE uidvalidity <= 0 OR uidvalidity > 4294967295")?;
@@ -1340,12 +1345,6 @@ pub fn transfer_messages_by_uid(
                 format!("moving message {uid} from {source_mailbox} to {destination_mailbox}")
             })?;
             guards.push(FileMutationGuard::moved(source_path, destination_path));
-            let source_modseq = next_modseq(&tx, source_id)?;
-            record_expunge(&tx, source_id, uid, source_modseq)?;
-            tx.execute(
-                "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
-                params![source_id, uid as i64],
-            )?;
         } else {
             fs::copy(&source_path, &destination_path).with_context(|| {
                 format!("copying message {uid} from {source_mailbox} to {destination_mailbox}")
@@ -1371,6 +1370,17 @@ pub fn transfer_messages_by_uid(
                 email_id
             ],
         )?;
+        // The source row goes after the destination row exists, so the
+        // email never has zero copies: JMAP sees a move, not a deletion
+        // and a new email.
+        if move_messages {
+            let source_modseq = next_modseq(&tx, source_id)?;
+            record_expunge(&tx, source_id, uid, source_modseq)?;
+            tx.execute(
+                "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![source_id, uid as i64],
+            )?;
+        }
         mappings.push((uid, destination_uid as u64));
         destination_uid = destination_uid.saturating_add(1);
     }
@@ -2204,7 +2214,7 @@ fn ensure_folder(
     Ok(())
 }
 
-fn folder_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
+pub(crate) fn folder_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
     conn.query_row(
         "SELECT id FROM folders WHERE name = ?1",
         params![name],
@@ -2214,7 +2224,7 @@ fn folder_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
     .map_err(Into::into)
 }
 
-fn get_folder(conn: &Connection, name: &str) -> Result<Option<Folder>> {
+pub(crate) fn get_folder(conn: &Connection, name: &str) -> Result<Option<Folder>> {
     conn.query_row(
         "SELECT name, path, special_use, subscribed, uidvalidity, uidnext, highest_modseq, mailbox_id
          FROM folders WHERE name = ?1",
@@ -2259,7 +2269,7 @@ fn record_expunge(conn: &Connection, folder_id: i64, uid: u64, modseq: u64) -> R
     Ok(())
 }
 
-fn reconcile_folder(
+pub(crate) fn reconcile_folder(
     conn: &Connection,
     maildir_root: &Path,
     domain: &str,
@@ -2455,11 +2465,11 @@ fn list_messages_for_folder(
     Ok(messages)
 }
 
-fn flags_to_text(flags: &[String]) -> Result<String> {
+pub(crate) fn flags_to_text(flags: &[String]) -> Result<String> {
     Ok(serde_json::to_string(flags)?)
 }
 
-fn flags_from_text(text: &str) -> Result<Vec<String>> {
+pub(crate) fn flags_from_text(text: &str) -> Result<Vec<String>> {
     Ok(serde_json::from_str(text).unwrap_or_default())
 }
 
@@ -2596,10 +2606,23 @@ mod tests {
         load_folder(td.path(), "example.test", "user", "INBOX").unwrap();
         // Roll the database back to the pre-OBJECTID schema.
         let conn = Connection::open(state_db_path(td.path(), "example.test", "user")).unwrap();
+        // The JMAP triggers came later and use the ID columns.
+        let jmap_triggers = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'jmap_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for trigger in jmap_triggers {
+            conn.execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+        }
         conn.execute_batch(
             "DROP TRIGGER folders_assign_mailbox_id;
              DROP TRIGGER messages_assign_email_id;
              DROP INDEX idx_folders_mailbox_id;
+             DROP INDEX idx_messages_email_id;
              ALTER TABLE folders DROP COLUMN mailbox_id;
              ALTER TABLE messages DROP COLUMN email_id;
              UPDATE schema_version SET version = 1;",

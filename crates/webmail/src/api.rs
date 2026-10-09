@@ -28,7 +28,7 @@ mod organize;
 const SESSION_COOKIE: &str = "rmail_webmail";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 /// Room for a 10 MiB message as base64 attachments in JSON.
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// State-changing requests must carry this header; browsers cannot add it to
 /// cross-site form posts.
 pub(crate) const CSRF_HEADER: &str = "x-rmail-webmail";
@@ -47,6 +47,13 @@ pub(crate) struct AppState {
     /// Loopback address of this server's submission service; `None` when
     /// no usable submission listener is configured (sending is off).
     pub submission: Option<std::net::SocketAddr>,
+    /// Bearer token validation for JMAP, when OAuth is configured.
+    pub oauth: Option<rmail_common::oauth::OAuthValidator>,
+    /// JMAP clients authenticate every request; recent checks are cached.
+    pub jmap_logins: crate::jmap::LoginCache,
+    /// Becomes true when the server shuts down; long-lived responses (JMAP
+    /// push) end then instead of holding up the shutdown.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 type Shared = Arc<AppState>;
@@ -82,6 +89,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/folders/{folder}/messages/bulk", post(bulk))
         .merge(organize::routes())
         .merge(compose::routes())
+        .merge(crate::jmap::routes())
         .fallback(fallback)
         .layer(middleware::from_fn(reject_cross_site))
         .layer(middleware::from_fn(security_headers))
@@ -861,7 +869,7 @@ impl Location {
 }
 
 /// The prefix of folders other accounts share with the user, as in IMAP.
-const OTHER_USERS: &str = "Other Users/";
+pub(crate) const OTHER_USERS: &str = "Other Users/";
 
 /// Locate a folder of the user's own, or one shared with them that they
 /// may read, named `Other Users/<owner>/<folder>`. Shared folders come from
@@ -1491,6 +1499,9 @@ mod tests {
             throttle: AuthThrottle::default(),
             revoked: websession::RevocationList::default(),
             submission: None,
+            oauth: None,
+            jmap_logins: Default::default(),
+            shutdown: None,
         })
     }
 
@@ -2094,6 +2105,9 @@ mod tests {
             throttle: AuthThrottle::default(),
             revoked: websession::RevocationList::default(),
             submission: Some(address),
+            oauth: None,
+            jmap_logins: Default::default(),
+            shutdown: None,
         });
         let cookie = Some(format!(
             "{SESSION_COOKIE}={}",

@@ -180,7 +180,7 @@ pub fn attachment_data(bytes: &[u8], index: usize) -> Option<(Attachment, Vec<u8
 
 /// A file name safe to offer for download: no directories or control
 /// characters, at most 200 characters.
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     base.chars()
         .filter(|c| !c.is_control())
@@ -205,7 +205,7 @@ fn default_filename(content_type: &str, index: usize) -> String {
 }
 
 /// Split at the first empty line (CRLF or LF).
-fn split_head(bytes: &[u8]) -> (&[u8], &[u8]) {
+pub(crate) fn split_head(bytes: &[u8]) -> (&[u8], &[u8]) {
     let crlf = find(bytes, b"\r\n\r\n").map(|i| (i, 4));
     let lf = find(bytes, b"\n\n").map(|i| (i, 2));
     match (crlf, lf) {
@@ -248,7 +248,7 @@ fn collect_leaves<'a>(
 }
 
 /// The parts between `--boundary` delimiter lines, up to `--boundary--`.
-fn split_multipart<'a>(body: &'a [u8], boundary: &[u8]) -> Vec<&'a [u8]> {
+pub(crate) fn split_multipart<'a>(body: &'a [u8], boundary: &[u8]) -> Vec<&'a [u8]> {
     let mut delimiter = b"--".to_vec();
     delimiter.extend_from_slice(boundary);
     let mut parts = Vec::new();
@@ -321,7 +321,7 @@ fn parse_headers(head: &[u8]) -> HashMap<String, String> {
 /// Parameters of a structured header (`type/sub; a=1; b="x;y"`), with names
 /// lower-cased, quotes removed, and RFC 2231 extended and continued values
 /// (`name*=utf-8''..`, `name*0*=..`) decoded.
-fn header_params(value: &str) -> HashMap<String, String> {
+pub(crate) fn header_params(value: &str) -> HashMap<String, String> {
     let mut raw: Vec<(String, String)> = Vec::new();
     let mut rest = match value.find(';') {
         Some(i) => &value[i + 1..],
@@ -455,14 +455,14 @@ fn percent_decode(text: &str) -> Vec<u8> {
 
 /// Text in `charset` (any label encoding_rs knows; UTF-8 when absent or
 /// unknown), with malformed sequences replaced.
-fn decode_charset(bytes: &[u8], charset: Option<&str>) -> String {
+pub(crate) fn decode_charset(bytes: &[u8], charset: Option<&str>) -> String {
     let encoding = charset
         .and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()))
         .unwrap_or(encoding_rs::UTF_8);
     encoding.decode(bytes).0.into_owned()
 }
 
-fn decode_transfer_bytes(input: &[u8], encoding: &str) -> Vec<u8> {
+pub(crate) fn decode_transfer_bytes(input: &[u8], encoding: &str) -> Vec<u8> {
     if encoding.contains("quoted-printable") {
         decode_quoted_printable(input)
     } else if encoding.contains("base64") {
@@ -527,7 +527,7 @@ fn hex_val(byte: u8) -> Option<u8> {
 
 /// RFC 2047 encoded words in any charset. Whitespace between adjacent
 /// encoded words is dropped, as the RFC requires.
-fn decode_rfc2047_words(input: &str) -> String {
+pub(crate) fn decode_rfc2047_words(input: &str) -> String {
     let mut out = String::new();
     let mut rest = input;
     let mut last_was_word = false;
@@ -575,7 +575,7 @@ fn decode_rfc2047_words(input: &str) -> String {
     out
 }
 
-fn strip_html(input: &str) -> String {
+pub(crate) fn strip_html(input: &str) -> String {
     let input = remove_html_block(input, "head");
     let input = remove_html_block(&input, "style");
     let input = remove_html_block(&input, "script");
@@ -782,7 +782,7 @@ pub fn snippet(input: &str) -> String {
     compact.chars().take(160).collect()
 }
 
-fn html_unescape(input: &str) -> String {
+pub(crate) fn html_unescape(input: &str) -> String {
     input
         .replace("&lt;", "<")
         .replace("&gt;", ">")

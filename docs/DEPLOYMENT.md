@@ -495,6 +495,32 @@ over loopback with SASL `X-RMAIL-WEBMAIL`, presenting a shared secret and acting
 A copy of each sent message (including Bcc) is saved to Sent; replies mark the original
 `\Answered` and forwards `$Forwarded`. Drafts are saved to Drafts and can be reopened and sent.
 
+### JMAP
+
+Webmail also serves JMAP (RFC 8620, RFC 8621) for mail clients that speak it, on the same
+listener: the session resource at `https://<webmail host>/.well-known/jmap` (also
+`/jmap/session`), with the API, uploads, downloads and push under `/jmap/`. Nothing needs
+enabling.
+
+- Clients sign in with HTTP Basic, the account's address and password, on every request.
+  Failures count towards the same lockout as webmail sign-in. A verified password is remembered
+  for 15 minutes, as long as the stored password is unchanged. With `[security.oauth]` configured,
+  Bearer tokens are accepted too.
+- Clients find the server through the `_jmap._tcp.<domain>` SRV record in the domain's suggested
+  DNS records. It names port 443 when webmail listens on loopback or `web_http_only` is set (a
+  reverse proxy in front), otherwise webmail's own port.
+- A reverse proxy must pass `/.well-known/jmap` and `/jmap/` through, and must not buffer
+  `/jmap/eventsource/`: push is a long-lived response (for nginx, `proxy_buffering off` and a
+  `proxy_read_timeout` above 30 minutes, after which the server ends the stream and the client
+  reconnects).
+- Sending uses the submission service as webmail does, so it needs the same loopback submission
+  listener; without one the server does not offer the submission capability. The From address
+  and envelope sender must be the identity's address, and the submission service decides whether
+  the user may send as it.
+- Mailboxes shared with the user appear as one more JMAP account per owner, within the rights
+  granted (see Shared folders).
+- Uploads are limited to webmail's 16 MiB request size and are removed after a day unless used.
+
 ## Mail organization
 
 `rmail_classifier` suggests folders for new INBOX mail. It learns from how each user files their mail.
