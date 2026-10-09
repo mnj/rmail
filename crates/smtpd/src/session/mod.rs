@@ -593,6 +593,11 @@ impl Session {
                 ));
             }
             response.push_str(&format!("250-SIZE {MAX_MESSAGE_BYTES}\r\n"));
+            // RFC 9422: the per-transaction recipient limit enforced at RCPT.
+            response.push_str(&format!(
+                "250-LIMITS RCPTMAX={}\r\n",
+                self.max_recipients.min(999_999)
+            ));
             for extension in [
                 "8BITMIME",
                 "CHUNKING",

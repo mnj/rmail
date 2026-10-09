@@ -822,6 +822,13 @@ async fn envelope_extensions_accept_dsn_and_classify_other_errors() {
             .any(|response| response.starts_with("555 5.5.4 Unsupported RCPT TO parameter"))
     );
     assert!(responses.iter().any(|response| response == "250-DSN\r\n"));
+    // RFC 9422, with the default smtp_max_recipients.
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "250-LIMITS RCPTMAX=100\r\n"),
+        "{responses:?}"
+    );
     assert!(
         responses
             .iter()

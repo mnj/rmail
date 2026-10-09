@@ -150,6 +150,8 @@ struct SmtpConnection {
     connection_id: String,
     peer_addr: Option<String>,
     local_addr: Option<String>,
+    /// MAIL FROM transactions started on this session (RFC 9422 MAILMAX).
+    transactions: u32,
 }
 
 struct DeliveryTrace<'a> {
@@ -221,6 +223,14 @@ impl ConnectionPool {
     }
 
     async fn recycle(&self, key: DestinationKey, connection: SmtpConnection) {
+        // RFC 9422: a session that used up the server's MAILMAX is closed.
+        if connection
+            .capabilities
+            .mail_max
+            .is_some_and(|max| connection.transactions >= max)
+        {
+            return;
+        }
         let mut idle = self.idle.lock().await;
         let total = idle.values().map(Vec::len).sum::<usize>();
         if total >= self.max_total {
@@ -1913,6 +1923,8 @@ struct SmtpCapabilities {
     require_tls: bool,
     dsn: bool,
     auth_plain: bool,
+    /// RFC 9422 LIMITS MAILMAX: transactions the server accepts per session.
+    mail_max: Option<u32>,
 }
 
 fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
@@ -1941,6 +1953,17 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.require_tls = true;
         } else if keyword.eq_ignore_ascii_case("DSN") {
             capabilities.dsn = true;
+        } else if keyword.eq_ignore_ascii_case("LIMITS") {
+            // RFC 9422: malformed or unknown limits are ignored.
+            capabilities.mail_max = line
+                .get(4..)
+                .unwrap_or("")
+                .split_ascii_whitespace()
+                .skip(1)
+                .filter_map(|limit| limit.split_once('='))
+                .find(|(name, _)| name.eq_ignore_ascii_case("MAILMAX"))
+                .and_then(|(_, value)| value.parse::<u32>().ok())
+                .filter(|max| (1..=999_999).contains(max));
         } else if keyword.eq_ignore_ascii_case("AUTH") {
             capabilities.auth_plain = line
                 .get(4..)
@@ -2681,6 +2704,7 @@ async fn deliver_to_remote(
             None,
         );
         let capabilities = connection.capabilities;
+        connection.transactions += 1;
         match smtp_send_file_with_reader(
             &mut connection.reader,
             message_path,
@@ -2910,6 +2934,7 @@ async fn establish_smtp_connection(
         connection_id,
         peer_addr,
         local_addr,
+        transactions: 0,
     })
 }
 
@@ -3085,6 +3110,18 @@ mod tests {
     }
 
     #[test]
+    fn limits_mailmax_is_read_and_bad_values_are_ignored() {
+        let parsed = |limits: &str| {
+            parse_ehlo_capabilities(&format!("250-mx.example.test\r\n250 LIMITS {limits}")).mail_max
+        };
+        assert_eq!(parsed("RCPTMAX=20 MAILMAX=5"), Some(5));
+        assert_eq!(parsed("mailmax=7"), Some(7));
+        assert_eq!(parsed("MAILMAX=0"), None);
+        assert_eq!(parsed("MAILMAX=1234567"), None);
+        assert_eq!(parsed("MAILMAX=x RCPTMAX=3"), None);
+    }
+
+    #[test]
     fn mail_command_handles_null_sender_and_required_content_extensions() {
         let all = SmtpCapabilities {
             eight_bit_mime: true,
@@ -3095,6 +3132,7 @@ mod tests {
             require_tls: true,
             dsn: false,
             auth_plain: false,
+            mail_max: None,
         };
         assert_eq!(
             build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
@@ -3336,6 +3374,7 @@ mod tests {
                 require_tls: false,
                 dsn: false,
                 auth_plain: false,
+                mail_max: None,
             },
             None,
         )
@@ -3362,6 +3401,7 @@ mod tests {
                 connection_id: "first".into(),
                 peer_addr: None,
                 local_addr: None,
+                transactions: 0,
             },
         )
         .await;
@@ -3375,6 +3415,7 @@ mod tests {
                 connection_id: "second".into(),
                 peer_addr: None,
                 local_addr: None,
+                transactions: 0,
             },
         )
         .await;
@@ -3486,6 +3527,7 @@ mod tests {
                 require_tls: false,
                 dsn: false,
                 auth_plain: false,
+                mail_max: None,
             },
         )
         .await

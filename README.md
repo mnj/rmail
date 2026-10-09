@@ -120,6 +120,7 @@ certification results.
 | RFC 3463 / RFC 2034 | Enhanced status codes | 100% | `ENHANCEDSTATUSCODES` is advertised and command, transaction, policy, delivery, TLS, and authentication replies carry class-appropriate enhanced codes. |
 | RFC 2033 | LMTP | 95% | `LHLO` and per-recipient DATA replies over a dedicated local listener that never authenticates or relays; no external conformance testing. |
 | RFC 8314 | Implicit TLS submission (port 465) | 100% | SMTPS listeners run TLS from the first byte; STARTTLS is not offered inside them. |
+| RFC 9422 | `LIMITS` | 100% | `RCPTMAX` advertises the per-transaction recipient limit already enforced at RCPT; the relay honors a next hop's `MAILMAX` by closing pooled sessions that reached it. rMail sets no `MAILMAX` or `RCPTDOMAINMAX` of its own. |
 | RFC 3848 | Received trace protocol identifiers | 100% | Generated trace fields distinguish SMTP, ESMTP, TLS, and authenticated submission with the appropriate protocol token. |
 | RFC 3461 | Delivery Status Notifications | 100% | `DSN`, `RET`, `ENVID`, `NOTIFY`, and `ORCPT` are implemented with private queue metadata and loop-safe success/failure reports. |
 | RFC 8689 | `REQUIRETLS` | 100% | Advertised and accepted only on TLS sessions; submission, durable queue metadata, relay advertisement checks, and downgrade-resistant TLS enforcement are implemented. |
@@ -173,7 +174,7 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 - **IMAP `ACL`** (RFC 4314) and shared mailboxes; there is a single personal namespace.
 - **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and `URLAUTH`
   (RFC 4467) with BURL (RFC 4468).
-- **SMTP `LIMITS`** (RFC 9422), `MT-PRIORITY` (RFC 6710), `DELIVERBY` (RFC 2852),
+- **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
   `FUTURERELEASE` (RFC 4865) and `ETRN` (RFC 1985).
 - **Outbound command pipelining** to the next hop.
 - **DMARC failure reports** (RFC 6591 / `ruf`) and **ARF abuse feedback** (RFC 5965).
