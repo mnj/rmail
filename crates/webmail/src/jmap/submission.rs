@@ -559,14 +559,22 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
         };
         match submit(ctx, &account, object) {
             Ok(record) => {
-                // The mail is gone already; failing to keep the record must
-                // not hide that, or a retrying client would send it twice.
                 if let Err(error) = record_submission(ctx, &account, &record) {
                     webmail_log!("error", "jmap_submission_not_recorded", {
                         "user": ctx.user.address,
                         "submission": record.id,
                         "error": format!("{error:?}"),
                     });
+                    // A held message has not gone anywhere yet: take it back
+                    // and report the failure. Mail already sent cannot be,
+                    // and hiding the send would make a retrying client send
+                    // it twice, so that is reported as created.
+                    if let Some(hold_id) = &record.hold_id
+                        && rmail_common::hold::cancel(&ctx.app.mail_root, hold_id).unwrap_or(false)
+                    {
+                        not_created.insert(creation_id, super::server_fail(format!("{error:?}")));
+                        continue;
+                    }
                 }
                 ctx.created_ids
                     .insert(creation_id.clone(), record.id.clone());

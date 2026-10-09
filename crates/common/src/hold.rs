@@ -7,6 +7,12 @@
 //! as the user who sent it (`local_submit`), so local and remote recipients,
 //! rate limits, signing and filters are treated exactly as for mail sent
 //! then. A permanent refusal leaves a notice in the sender's inbox.
+//!
+//! Release is at least once, like the outbound queue: an entry is claimed
+//! (`<id>.sending`) before it is submitted and the claim removed right after
+//! the submission service accepts it. A worker stopped in between returns
+//! the claim at its next start and submits again, so a crash in that
+//! moment can send a duplicate but never loses a message.
 
 use std::path::{Path, PathBuf};
 
