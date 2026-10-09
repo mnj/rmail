@@ -114,6 +114,7 @@ pub(crate) async fn handle(
     tag: &str,
     raw_args: &str,
     mail_root: &str,
+    db_path: Option<&str>,
     address: &str,
     utf8_accept: bool,
     selected_mailbox: Option<&str>,
@@ -126,6 +127,7 @@ pub(crate) async fn handle(
             prefix,
             parts,
             mail_root,
+            db_path,
             address,
             utf8_accept,
             selected_mailbox,
@@ -173,33 +175,17 @@ pub(crate) async fn handle(
         }
     };
 
-    let root = mail_root.to_string();
-    let domain_for_check = domain.clone();
-    let local_for_check = local.clone();
-    let mailbox_for_check = mailbox_name.clone();
-    let exists = match tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::folder_exists(
-            Path::new(&root),
-            &domain_for_check,
-            &local_for_check,
-            &mailbox_for_check,
-        )
-    })
-    .await
-    {
-        Ok(Ok(exists)) => exists,
-        Ok(Err(error)) => {
-            write_response(reader, unavailable(tag, error)).await?;
-            return Ok(failure());
-        }
-        Err(error) => {
-            write_response(reader, unavailable(tag, error)).await?;
-            return Ok(failure());
-        }
-    };
+    let destination =
+        match resolve_destination(tag, mail_root, db_path, address, &mailbox_name).await {
+            Ok(destination) => destination,
+            Err(response) => {
+                write_response(reader, response).await?;
+                return Ok(failure());
+            }
+        };
     if !request.non_sync {
-        if !exists {
-            write_response(reader, missing_mailbox(tag)).await?;
+        if let Some(refusal) = destination.refusal.clone() {
+            write_response(reader, refusal).await?;
             return Ok(failure());
         }
         let continuation = Response::new()
@@ -216,7 +202,12 @@ pub(crate) async fn handle(
     let mut current = Payload::Literal(request);
     let mut staged = Vec::new();
     loop {
-        let staged_path = create_append_stage(mail_root, &domain, &local).await?;
+        let staged_path = create_append_stage(
+            mail_root,
+            &destination.target.domain,
+            &destination.target.local,
+        )
+        .await?;
         let (request, inline_continuation) = match current {
             Payload::Literal(request) => {
                 if let Err(error) =
@@ -333,9 +324,9 @@ pub(crate) async fn handle(
             return Ok(failure());
         }
         if !next.non_sync {
-            if !exists {
+            if let Some(refusal) = destination.refusal.clone() {
                 remove_staged_appends(&staged).await;
-                write_response(reader, missing_mailbox(tag)).await?;
+                write_response(reader, refusal).await?;
                 return Ok(failure());
             }
             let w = reader.get_mut();
@@ -359,19 +350,24 @@ pub(crate) async fn handle(
         .await?;
         return Ok(failure());
     }
+    if let Some(refusal) = destination.refusal {
+        remove_staged_appends(&staged).await;
+        write_response(reader, refusal).await?;
+        return Ok(failure());
+    }
     let root = mail_root.to_string();
     let cleanup_paths = staged
         .iter()
         .map(|item| item.path.clone())
         .collect::<Vec<_>>();
-    let mailbox_for_task = mailbox_name.clone();
+    let target = destination.target;
     let append = tokio::task::spawn_blocking(move || {
         rmail_common::imap_state::publish_staged_appends(
             Path::new(&root),
-            &domain,
-            &local,
-            &mailbox_for_task,
-            staged,
+            &target.domain,
+            &target.local,
+            &target.mailbox,
+            permitted_flags(staged, target.rights),
         )
     })
     .await?;
@@ -465,6 +461,7 @@ async fn handle_catenate(
     prefix: &str,
     initial_parts: &str,
     mail_root: &str,
+    db_path: Option<&str>,
     address: &str,
     utf8_accept: bool,
     selected_mailbox: Option<&str>,
@@ -491,36 +488,21 @@ async fn handle_catenate(
             return Ok(failure());
         }
     };
-    let root = mail_root.to_string();
-    let check_root = root.clone();
-    let check_domain = domain.clone();
-    let check_local = local.clone();
-    let check_mailbox = mailbox_name.clone();
-    let exists = tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::folder_exists(
-            Path::new(&check_root),
-            &check_domain,
-            &check_local,
-            &check_mailbox,
-        )
-    })
-    .await??;
-    if !exists {
-        write_response(reader, missing_mailbox(tag)).await?;
+    let destination =
+        match resolve_destination(tag, mail_root, db_path, address, &mailbox_name).await {
+            Ok(destination) => destination,
+            Err(response) => {
+                write_response(reader, response).await?;
+                return Ok(failure());
+            }
+        };
+    if let Some(refusal) = destination.refusal {
+        write_response(reader, refusal).await?;
         return Ok(failure());
     }
-
-    let stage_root = root.clone();
-    let stage_domain = domain.clone();
-    let stage_local = local.clone();
-    let staged_path = tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::append_staging_path(
-            Path::new(&stage_root),
-            &stage_domain,
-            &stage_local,
-        )
-    })
-    .await??;
+    let target = destination.target;
+    let root = mail_root.to_string();
+    let staged_path = create_append_stage(mail_root, &target.domain, &target.local).await?;
 
     let result = stream_catenate_parts(
         reader,
@@ -572,7 +554,7 @@ async fn handle_catenate(
                     return Ok(failure());
                 }
             };
-            let path = create_append_stage(mail_root, &domain, &local).await?;
+            let path = create_append_stage(mail_root, &target.domain, &target.local).await?;
             match stream_catenate_parts(
                 reader,
                 next_parts,
@@ -631,7 +613,7 @@ async fn handle_catenate(
             w.write_all(b"+ Ready for literal data\r\n").await?;
             w.flush().await?;
         }
-        let path = create_append_stage(mail_root, &domain, &local).await?;
+        let path = create_append_stage(mail_root, &target.domain, &target.local).await?;
         if let Err(error) =
             stream_literal_to_stage(reader, &path, next.literal_len, next.utf8).await
         {
@@ -670,14 +652,13 @@ async fn handle_catenate(
         .iter()
         .map(|item| item.path.clone())
         .collect::<Vec<_>>();
-    let mailbox_for_task = mailbox_name.clone();
     let append = tokio::task::spawn_blocking(move || {
         rmail_common::imap_state::publish_staged_appends(
             Path::new(&root),
-            &domain,
-            &local,
-            &mailbox_for_task,
-            staged,
+            &target.domain,
+            &target.local,
+            &target.mailbox,
+            permitted_flags(staged, target.rights),
         )
     })
     .await?;
@@ -987,6 +968,15 @@ async fn resolve_catenate_url(
     let domain = domain.to_string();
     let local = local.to_string();
     tokio::task::spawn_blocking(move || {
+        // Loading a folder creates it, so check it exists first.
+        if !rmail_common::imap_state::folder_exists(
+            Path::new(&root),
+            &domain,
+            &local,
+            &parsed.mailbox,
+        )? {
+            anyhow::bail!("mailbox does not exist");
+        }
         let (folder, messages) = rmail_common::imap_state::load_folder(
             Path::new(&root),
             &domain,
@@ -1098,6 +1088,80 @@ fn failure() -> Outcome {
 
 fn bad(tag: &str, text: &str) -> Response {
     Response::new().status(StatusLine::tagged(tag, Status::Bad, text))
+}
+
+/// Where an APPEND goes, and the reply refusing it when the mailbox is
+/// missing (or hidden) or the user lacks the insert right. A refused APPEND
+/// with a non-synchronizing literal still reads the literal first.
+struct Destination {
+    target: crate::shared::Target,
+    refusal: Option<Response>,
+}
+
+async fn resolve_destination(
+    tag: &str,
+    mail_root: &str,
+    db_path: Option<&str>,
+    address: &str,
+    mailbox_name: &str,
+) -> std::result::Result<Destination, Response> {
+    let root = mail_root.to_string();
+    let db = db_path.map(str::to_string);
+    let lookup_address = address.to_string();
+    let name = mailbox_name.to_string();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let root = Path::new(&root);
+        let target =
+            crate::shared::resolve(root, db.as_deref().map(Path::new), &lookup_address, &name)?;
+        let exists = if target.is_shared() {
+            target.mailbox_id.is_some()
+        } else {
+            rmail_common::imap_state::folder_exists(
+                root,
+                &target.domain,
+                &target.local,
+                &target.mailbox,
+            )?
+        };
+        anyhow::Ok((target, exists))
+    })
+    .await;
+    let (mut target, exists) = match resolved {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => return Err(unavailable(tag, error)),
+        Err(error) => return Err(unavailable(tag, error)),
+    };
+    let refusal =
+        if !exists || !target.visible() {
+            Some(missing_mailbox(tag))
+        } else if !target.rights.contains(rmail_common::acl::Rights::INSERT) {
+            Some(Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"),
+            ))
+        } else {
+            None
+        };
+    if refusal.is_some() {
+        // A refused APPEND may still read a non-synchronizing literal; it
+        // is staged in the user's own account, never under a name the
+        // client chose.
+        if let Ok((local, domain)) = mailbox::address_parts(address) {
+            (target.domain, target.local) = (domain, local);
+        }
+    }
+    Ok(Destination { target, refusal })
+}
+
+/// Drop the flags the rights do not allow setting (RFC 4314 section 4).
+fn permitted_flags(
+    mut staged: Vec<rmail_common::imap_state::StagedAppend>,
+    rights: rmail_common::acl::Rights,
+) -> Vec<rmail_common::imap_state::StagedAppend> {
+    for item in &mut staged {
+        item.flags
+            .retain(|flag| crate::shared::permitted_flag(rights, flag));
+    }
+    staged
 }
 
 fn missing_mailbox(tag: &str) -> Response {

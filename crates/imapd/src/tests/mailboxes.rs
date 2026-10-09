@@ -1465,7 +1465,7 @@ async fn geary_account_probe_gets_inbox_special_use_and_namespace() {
     assert!(
         namespace
             .iter()
-            .any(|l| l == "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n")
+            .any(|l| l == "* NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) NIL\r\n")
     );
 
     let _logout = read_until_contains(&mut reader, "A006 OK").await;

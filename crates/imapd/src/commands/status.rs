@@ -9,6 +9,7 @@ pub(crate) fn handle(
     tag: &str,
     raw_args: &str,
     mail_root: &Path,
+    db_path: Option<&Path>,
     address: &str,
     utf8_accept: bool,
     selected_mailbox: Option<&str>,
@@ -21,12 +22,22 @@ pub(crate) fn handle(
         Ok(name) => name,
         Err(_) => return bad(tag, "Invalid mailbox name"),
     };
-    let (local, domain) = match mailbox::address_parts(address) {
-        Ok(parts) => parts,
+    let target = match crate::shared::resolve(mail_root, db_path, address, &mailbox_name) {
+        Ok(target) => target,
         Err(error) => return unavailable(tag, error),
     };
+    if !target.visible() || (target.is_shared() && target.mailbox_id.is_none()) {
+        return Response::new().status(
+            StatusLine::tagged(tag, Status::No, "No such mailbox").with_code("NONEXISTENT"),
+        );
+    }
+    if !target.rights.contains(rmail_common::acl::Rights::READ) {
+        return Response::new()
+            .status(StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"));
+    }
+    let (local, domain, storage_name) = (&target.local, &target.domain, &target.mailbox);
     let summary =
-        match rmail_common::imap_state::folder_summary(mail_root, &domain, &local, &mailbox_name) {
+        match rmail_common::imap_state::folder_summary(mail_root, domain, local, storage_name) {
             Ok(Some(summary)) => summary,
             Ok(None) => {
                 return Response::new().status(
@@ -37,20 +48,24 @@ pub(crate) fn handle(
         };
 
     let recent =
-        match rmail_common::imap_state::recent_count(mail_root, &domain, &local, &mailbox_name) {
+        match rmail_common::imap_state::recent_count(mail_root, domain, local, storage_name) {
             Ok(recent) => recent,
             Err(error) => return unavailable(tag, error),
         };
     let values = status_values(&summary, recent, &request.items);
     let mut completion = StatusLine::tagged(tag, Status::Ok, "STATUS completed");
-    if selected_mailbox.is_some_and(|selected| selected.eq_ignore_ascii_case(&summary.folder.name))
-    {
+    let name = if target.is_shared() {
+        mailbox_name.as_str()
+    } else {
+        summary.folder.name.as_str()
+    };
+    if selected_mailbox.is_some_and(|selected| selected.eq_ignore_ascii_case(name)) {
         completion = completion.with_code("CLIENTBUG");
     }
     Response::new()
         .data(format!(
             "STATUS {} ({})",
-            mailbox::quote_wire_mailbox_name(&summary.folder.name, utf8_accept),
+            mailbox::quote_wire_mailbox_name(name, utf8_accept),
             values.join(" ")
         ))
         .status(completion)
@@ -122,6 +137,7 @@ mod tests {
             "A1",
             "Missing (MESSAGES UIDNEXT)",
             temp.path(),
+            None,
             "user@example.test",
             false,
             None,
@@ -146,6 +162,7 @@ mod tests {
             "A1",
             "INBOX (SIZE MESSAGES RECENT)",
             temp.path(),
+            None,
             "user@example.test",
             false,
             Some("inbox"),
@@ -162,6 +179,7 @@ mod tests {
             "A1",
             "INBOX (\"MESSAGES\")",
             temp.path(),
+            None,
             "user@example.test",
             false,
             None,

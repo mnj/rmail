@@ -1,5 +1,8 @@
 use std::path::Path;
 
+use rmail_common::acl::Rights;
+use rmail_common::imap_state::MailboxRef;
+
 use crate::{
     commands::search::compress_ids,
     mailbox::{self, SelectedMailbox},
@@ -18,6 +21,7 @@ pub(crate) async fn handle(
     command_name: &str,
     raw_args: &str,
     mail_root: &str,
+    db_path: Option<&str>,
     address: &str,
     selected: &SelectedMailbox,
     saved_uids: &[u64],
@@ -69,21 +73,83 @@ pub(crate) async fn handle(
         );
     }
     let root = mail_root.to_string();
-    let domain = selected.domain.clone();
-    let local = selected.local.clone();
+    let db = db_path.map(str::to_string);
+    let lookup_address = address.to_string();
+    let lookup_name = destination.clone();
+    let target = match tokio::task::spawn_blocking(move || {
+        crate::shared::resolve(
+            Path::new(&root),
+            db.as_deref().map(Path::new),
+            &lookup_address,
+            &lookup_name,
+        )
+    })
+    .await
+    {
+        Ok(Ok(target)) => target,
+        Ok(Err(error)) => return failure(storage_error(tag, command_name, error)),
+        Err(error) => return failure(storage_error(tag, command_name, error)),
+    };
+    if !target.visible() || (target.is_shared() && target.mailbox_id.is_none()) {
+        return failure(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Destination mailbox does not exist")
+                    .with_code("TRYCREATE"),
+            ),
+        );
+    }
+    if !target.rights.contains(Rights::INSERT)
+        || (move_messages
+            && !selected
+                .rights
+                .contains(Rights::DELETE_MESSAGES.union(Rights::EXPUNGE)))
+    {
+        return failure(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"),
+            ),
+        );
+    }
+    let root = mail_root.to_string();
+    let source_domain = selected.domain.clone();
+    let source_local = selected.local.clone();
     let source_mailbox = selected.mailbox.clone();
-    let destination_for_task = destination.clone();
+    let task_target = target.clone();
     let transfer_uids = source_uids.clone();
     let mappings = match tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::transfer_messages_by_uid(
-            Path::new(&root),
-            &domain,
-            &local,
-            &source_mailbox,
-            &transfer_uids,
-            &destination_for_task,
-            move_messages,
-        )
+        let root = Path::new(&root);
+        let same_account = task_target.domain == source_domain && task_target.local == source_local;
+        if same_account && task_target.rights == Rights::ALL {
+            rmail_common::imap_state::transfer_messages_by_uid(
+                root,
+                &source_domain,
+                &source_local,
+                &source_mailbox,
+                &transfer_uids,
+                &task_target.mailbox,
+                move_messages,
+            )
+        } else {
+            // Between accounts, or into a shared mailbox whose rights limit
+            // the flags that may be set.
+            let rights = task_target.rights;
+            rmail_common::imap_state::transfer_messages_between_accounts(
+                root,
+                MailboxRef {
+                    domain: &source_domain,
+                    localpart: &source_local,
+                    mailbox: &source_mailbox,
+                },
+                &transfer_uids,
+                MailboxRef {
+                    domain: &task_target.domain,
+                    localpart: &task_target.local,
+                    mailbox: &task_target.mailbox,
+                },
+                move_messages,
+                |flag| crate::shared::permitted_flag(rights, flag),
+            )
+        }
     })
     .await
     {
@@ -91,18 +157,13 @@ pub(crate) async fn handle(
         Ok(Err(error)) => return failure(storage_operation_error(tag, command_name, error)),
         Err(error) => return failure(storage_error(tag, command_name, error)),
     };
-    let (local, domain) = match mailbox::address_parts(address) {
-        Ok(parts) => parts,
-        Err(error) => return failure(storage_error(tag, command_name, error)),
-    };
     let root = mail_root.to_string();
-    let destination_for_summary = destination.clone();
     let destination_summary = match tokio::task::spawn_blocking(move || {
         rmail_common::imap_state::folder_summary(
             Path::new(&root),
-            &domain,
-            &local,
-            &destination_for_summary,
+            &target.domain,
+            &target.local,
+            &target.mailbox,
         )
     })
     .await
@@ -270,6 +331,7 @@ mod tests {
             "MOVE",
             "1:2 Archive",
             temp.path().to_str().unwrap(),
+            None,
             "user@example.test",
             &selected,
             &[],

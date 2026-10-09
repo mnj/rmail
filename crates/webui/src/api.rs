@@ -105,6 +105,7 @@ pub(crate) fn router(state: Shared) -> Router {
                 .patch(update_account)
                 .delete(delete_account),
         )
+        .route("/api/sharing", get(sharing).delete(delete_sharing))
         .route("/api/routing", get(routing))
         .route("/api/routing/alias", post(save_alias).delete(delete_alias))
         .route(
@@ -920,6 +921,89 @@ async fn delete_transport(State(state): State<Shared>, body: Bytes) -> Response 
         blocking(move || {
             if !rmail_common::transport::delete_route(std::path::Path::new(&db), &input.domain)? {
                 anyhow::bail!("no route for {}", input.domain);
+            }
+            Ok(json!({"result": "ok"}))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Every folder an account shares with another (IMAP ACL grants).
+async fn sharing(State(state): State<Shared>) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let root = state.mail_root.clone();
+    outcome(
+        blocking(move || {
+            let db = std::path::Path::new(&db);
+            let mut folders = std::collections::HashMap::new();
+            let mut shares = Vec::new();
+            for (owner, mailbox_id, grantee, rights) in rmail_common::acl::all_grants(db)? {
+                let names = match folders.entry(owner.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let names = match owner.split_once('@') {
+                            Some((local, domain)) => {
+                                rmail_common::imap_state::list_folders(&root, domain, local)
+                                    .unwrap_or_default()
+                            }
+                            None => Vec::new(),
+                        };
+                        entry.insert(names)
+                    }
+                };
+                // Grants on folders deleted since are not shown.
+                let Some(folder) = names.iter().find(|f| f.mailbox_id == mailbox_id) else {
+                    continue;
+                };
+                shares.push(json!({
+                    "owner": owner,
+                    "folder": folder.name,
+                    "mailbox_id": mailbox_id,
+                    "grantee": grantee,
+                    "rights": rights.to_string(),
+                }));
+            }
+            Ok(shares)
+        })
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+#[derive(Deserialize)]
+struct SharingDelete {
+    owner: String,
+    mailbox_id: String,
+    grantee: String,
+}
+
+/// Stop sharing a folder with one account.
+async fn delete_sharing(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: SharingDelete = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            if !rmail_common::acl::delete_rights(
+                std::path::Path::new(&db),
+                &input.owner,
+                &input.mailbox_id,
+                &input.grantee,
+            )? {
+                anyhow::bail!(
+                    "{} does not share that folder with {}",
+                    input.owner,
+                    input.grantee
+                );
             }
             Ok(json!({"result": "ok"}))
         })

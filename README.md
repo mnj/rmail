@@ -172,7 +172,6 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 ## Not yet supported
 
 - **JMAP** (RFC 8620, RFC 8621).
-- **IMAP `ACL`** (RFC 4314) and shared mailboxes; there is a single personal namespace.
 - **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and `URLAUTH`
   (RFC 4467) with BURL (RFC 4468).
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
@@ -199,7 +198,8 @@ or conformance-validation gaps.
 | RFC 9051 | IMAP4rev2 core | 90% | Dual-advertised; after `ENABLE IMAP4rev2` the session uses UTF-8, omits `RECENT`/`\Recent`, answers SEARCH with ESEARCH, and includes the mailbox LIST line in SELECT. `STATUS DELETED` is supported, and RENAME returns LIST responses with `OLDNAME` for the renamed mailbox and its children. No external rev2 conformance certification yet. |
 | RFC 2595 | IMAP `STARTTLS` and `LOGINDISABLED` | 95% | A real TLS upgrade and resumed IMAP session are integration-tested, but not yet against an external conformance harness. |
 | RFC 2177 | `IDLE` | 100% | Implemented with mailbox synchronization, keepalives, fragmented `DONE`, and bounded input. |
-| RFC 2342 | `NAMESPACE` | 100% | Complete for rMail's single personal Maildir namespace. |
+| RFC 2342 | `NAMESPACE` | 100% | The personal namespace and an `Other Users/` namespace holding mailboxes other accounts share with the user. |
+| RFC 4314 | `ACL` and `RIGHTS=kxte` | 90% | `SETACL` (with `+`/`-` changes), `DELETEACL`, `GETACL`, `LISTRIGHTS` and `MYRIGHTS`. Every command checks the rights it needs; a mailbox the user may neither list nor read answers like a missing one. Grants follow a RENAME and are inherited by child mailboxes created inside a shared one. Identifiers are accounts on the server only: no `anyone`, no negative rights; `p` is recorded but unused. Flags, including `\Seen`, are shared by everyone with access. METADATA, NOTIFY and REPLACE work within the user's own account only. |
 | RFC 2971 | `ID` | 100% | Includes strict argument and size validation. |
 | RFC 4315 | `UIDPLUS` | 100% | `APPENDUID`, `COPYUID`, and `UID EXPUNGE` are implemented. |
 | RFC 3502 | `MULTIAPPEND` | 100% | Streamed literal and CATENATE messages publish atomically with ordered `APPENDUID` sets and rollback on any failure. |

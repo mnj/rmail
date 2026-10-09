@@ -240,6 +240,7 @@ impl Session {
                 name,
                 args,
                 &self.mail_root,
+                self.db_path.as_deref(),
                 self.address(),
                 self.selected(),
                 self.state.saved_search_uids(),
@@ -278,6 +279,7 @@ impl Session {
             args,
             commands::replace::Context {
                 mail_root: &self.mail_root,
+                db_path: self.db_path.as_deref(),
                 address: self.address(),
                 selected: self.selected(),
                 uid_mode: uid,

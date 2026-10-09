@@ -174,6 +174,11 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
         | Command::SetQuota
         | Command::GetMetadata
         | Command::SetMetadata
+        | Command::SetAcl
+        | Command::DeleteAcl
+        | Command::GetAcl
+        | Command::ListRights
+        | Command::MyRights
         | Command::Notify
         | Command::Subscribe { .. }
         | Command::Enable
@@ -425,6 +430,7 @@ mod tests {
 }
 use crate::parser::{self, Command, UidCommand};
 use crate::response::{Status, StatusLine};
+pub(crate) mod acl;
 pub(crate) mod append;
 pub(crate) mod authenticate;
 pub(crate) mod basic;

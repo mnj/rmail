@@ -64,6 +64,7 @@ impl Session {
             call.command,
             call.args,
             &self.mail_root,
+            self.db_path.as_deref(),
             self.address(),
             self.state.utf8_enabled(),
         )
@@ -85,6 +86,31 @@ impl Session {
             self.state.utf8_enabled(),
         )
         .encode();
+        self.respond(reader, call.tag, &call.name, response).await
+    }
+
+    /// SETACL, DELETEACL, GETACL, LISTRIGHTS and MYRIGHTS (RFC 4314).
+    pub(super) async fn acl(&self, reader: &mut ImapReader, call: &Invocation<'_>) -> Result<Flow> {
+        let command = call.command.clone();
+        let root = self.mail_root.clone();
+        let db_path = self.db_path.clone();
+        let address = self.address().to_string();
+        let args = call.args.to_string();
+        let tag = call.tag.to_string();
+        let utf8_accept = self.state.utf8_enabled();
+        let response = tokio::task::spawn_blocking(move || {
+            commands::acl::handle(
+                &tag,
+                &command,
+                &args,
+                Path::new(&root),
+                db_path.as_deref().map(Path::new),
+                &address,
+                utf8_accept,
+            )
+            .encode()
+        })
+        .await?;
         self.respond(reader, call.tag, &call.name, response).await
     }
 
@@ -136,10 +162,7 @@ impl Session {
         };
         let mut response = response::Response::new();
         if status {
-            let selected = self
-                .selected
-                .as_ref()
-                .map(|mailbox| mailbox.mailbox.as_str());
+            let selected = self.selected.as_ref().map(|mailbox| mailbox.name.as_str());
             for line in notify::initial_status(&snapshot, selected, self.notify_format()) {
                 response = response.data(line);
             }
@@ -216,11 +239,13 @@ impl Session {
             call.tag,
             call.args,
             &self.mail_root,
+            self.db_path.as_deref(),
             self.address(),
             self.state.utf8_enabled(),
-            self.selected
-                .as_ref()
-                .map(|mailbox| mailbox.mailbox.as_str()),
+            // CATENATE URLs without a mailbox refer to the selected one; a
+            // shared one's name is not in the user's account, so such URLs
+            // cannot reach it.
+            self.selected.as_ref().map(|mailbox| mailbox.name.as_str()),
             self.auth_policy.message_limit(),
         )
         .await?;
@@ -240,6 +265,7 @@ impl Session {
     ) -> Result<Flow> {
         let operation = call.name.clone();
         let root = self.mail_root.clone();
+        let db_path = self.db_path.clone();
         let address = self.address().to_string();
         let args = call.args.to_string();
         let tag = call.tag.to_string();
@@ -250,6 +276,7 @@ impl Session {
                 &operation,
                 &args,
                 Path::new(&root),
+                db_path.as_deref().map(Path::new),
                 &address,
                 utf8_accept,
             )
@@ -274,6 +301,7 @@ impl Session {
             _ => unreachable!("dispatch only routes mailbox management commands here"),
         };
         let root = self.mail_root.clone();
+        let db_path = self.db_path.clone();
         let address = self.address().to_string();
         let args = call.args.to_string();
         let tag = call.tag.to_string();
@@ -285,6 +313,7 @@ impl Session {
                 &tag,
                 &args,
                 Path::new(&root),
+                db_path.as_deref().map(Path::new),
                 &address,
                 utf8_accept,
                 imap4rev2,
@@ -297,26 +326,36 @@ impl Session {
                 if self
                     .selected
                     .as_ref()
-                    .is_some_and(|selected| selected.mailbox.eq_ignore_ascii_case(name))
+                    .is_some_and(|selected| selected.name.eq_ignore_ascii_case(name))
                 {
                     self.clear_selection();
                 }
             }
             SelectionEffect::Renamed { .. } => {
-                let destination = self.selected.as_ref().and_then(|selected| {
-                    outcome
-                        .selection_effect
-                        .renamed_selection(&selected.mailbox)
+                let renamed = self.selected.as_ref().and_then(|selected| {
+                    let destination = outcome.selection_effect.renamed_selection(&selected.name)?;
+                    // A RENAME stays within one account, so a shared
+                    // mailbox keeps its owner.
+                    let storage_name = match crate::shared::split_shared_name(&destination) {
+                        Some((_, rest)) => rest.to_string(),
+                        None => destination.clone(),
+                    };
+                    Some((
+                        format!("{}@{}", selected.local, selected.domain),
+                        storage_name,
+                        destination,
+                        selected.rights,
+                        selected.read_only,
+                    ))
                 });
-                if let Some(destination) = destination {
-                    self.selected = Some(
-                        mailbox::load_selected_mailbox(
-                            &self.mail_root,
-                            self.address(),
-                            &destination,
-                        )
-                        .await?,
-                    );
+                if let Some((owner, storage_name, destination, rights, read_only)) = renamed {
+                    let mut reloaded =
+                        mailbox::load_selected_mailbox(&self.mail_root, &owner, &storage_name)
+                            .await?;
+                    reloaded.name = destination.clone();
+                    reloaded.rights = rights;
+                    reloaded.read_only = read_only;
+                    self.selected = Some(reloaded);
                     self.state.selected_mailbox = Some(destination);
                 }
             }
@@ -337,6 +376,7 @@ impl Session {
             &call.name,
             call.args,
             &self.mail_root,
+            self.db_path.as_deref(),
             self.address(),
             self.state.utf8_enabled(),
             self.state.feature_enabled("CONDSTORE"),
@@ -352,10 +392,7 @@ impl Session {
         // Updating contexts belong to the previous selection.
         self.contexts.clear();
         self.selected = outcome.selected;
-        self.state.selected_mailbox = self
-            .selected
-            .as_ref()
-            .map(|mailbox| mailbox.mailbox.clone());
+        self.state.selected_mailbox = self.selected.as_ref().map(|mailbox| mailbox.name.clone());
         self.respond(reader, call.tag, &call.name, outcome.response.encode())
             .await
     }
@@ -366,19 +403,18 @@ impl Session {
         call: &Invocation<'_>,
     ) -> Result<Flow> {
         let root = self.mail_root.clone();
+        let db_path = self.db_path.clone();
         let address = self.address().to_string();
         let args = call.args.to_string();
         let tag = call.tag.to_string();
         let utf8_accept = self.state.utf8_enabled();
-        let selected = self
-            .selected
-            .as_ref()
-            .map(|mailbox| mailbox.mailbox.clone());
+        let selected = self.selected.as_ref().map(|mailbox| mailbox.name.clone());
         let response = tokio::task::spawn_blocking(move || {
             commands::status::handle(
                 &tag,
                 &args,
                 Path::new(&root),
+                db_path.as_deref().map(Path::new),
                 &address,
                 utf8_accept,
                 selected.as_deref(),

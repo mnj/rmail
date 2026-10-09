@@ -72,6 +72,20 @@ pub(crate) async fn handle(
         .filter(|flag| !flag.eq_ignore_ascii_case("\\Recent"))
         .cloned()
         .collect::<Vec<_>>();
+    // RFC 4314 section 4: a STORE succeeds if the rights allow changing any
+    // of the requested flags, and fails if they allow none.
+    if !requested_flags.is_empty()
+        && !requested_flags
+            .iter()
+            .any(|flag| crate::shared::permitted_flag(selected.rights, flag))
+    {
+        return Outcome {
+            condstore_activated,
+            ..outcome(Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"),
+            ))
+        };
+    }
     for (sequence, uid, current_flags, modseq) in targets {
         // Messages expunged by another session keep their sequence number
         // until the expunge is reported; there is nothing left to store.
@@ -88,7 +102,12 @@ pub(crate) async fn handle(
         updates.push((
             sequence,
             uid,
-            apply_operation(current_flags, request.mode, &requested_flags),
+            apply_permitted(
+                current_flags,
+                request.mode,
+                &requested_flags,
+                selected.rights,
+            ),
         ));
     }
     let flag_updates = updates
@@ -247,6 +266,36 @@ fn uid_targets(
         .collect()
 }
 
+/// Apply a STORE, leaving alone the flags the rights do not allow changing
+/// (RFC 4314 section 4: a STORE succeeds if any requested flag may change).
+fn apply_permitted(
+    existing: Vec<String>,
+    mode: StoreMode,
+    requested: &[String],
+    rights: rmail_common::acl::Rights,
+) -> Vec<String> {
+    if rights == rmail_common::acl::Rights::ALL {
+        return apply_operation(existing, mode, requested);
+    }
+    let permitted = |flag: &String| crate::shared::permitted_flag(rights, flag);
+    let fixed = existing
+        .iter()
+        .filter(|flag| !permitted(flag))
+        .cloned()
+        .collect::<Vec<_>>();
+    let requested = requested
+        .iter()
+        .filter(|flag| permitted(flag))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut flags = apply_operation(existing, mode, &requested);
+    flags.retain(|flag| permitted(flag));
+    flags.extend(fixed);
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
 fn apply_operation(existing: Vec<String>, mode: StoreMode, requested: &[String]) -> Vec<String> {
     let mut flags = match mode {
         StoreMode::Replace => requested.to_vec(),
@@ -280,6 +329,26 @@ fn outcome(response: Response) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_changes_only_the_flags_the_rights_allow() {
+        let rights = rmail_common::acl::Rights::parse("lrs").unwrap();
+        let existing = vec!["\\Flagged".to_string()];
+        let requested = vec!["\\Seen".to_string(), "\\Deleted".to_string()];
+        assert_eq!(
+            apply_permitted(existing.clone(), StoreMode::Replace, &requested, rights),
+            vec!["\\Flagged".to_string(), "\\Seen".to_string()]
+        );
+        assert_eq!(
+            apply_permitted(
+                existing,
+                StoreMode::Remove,
+                &["\\Flagged".to_string()],
+                rights
+            ),
+            vec!["\\Flagged".to_string()]
+        );
+    }
 
     #[test]
     fn flag_modes_are_deterministic() {

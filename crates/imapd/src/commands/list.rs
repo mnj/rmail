@@ -1,9 +1,13 @@
+use std::collections::HashMap;
 use std::path::Path;
+
+use rmail_common::acl::Rights;
 
 use crate::{
     commands::status::status_values,
     mailbox, parser,
     response::{Response, Status, StatusLine},
+    shared,
 };
 
 pub(crate) fn handle(
@@ -11,6 +15,7 @@ pub(crate) fn handle(
     command_name: &str,
     raw_args: &str,
     mail_root: &Path,
+    db_path: Option<&Path>,
     address: &str,
     utf8_accept: bool,
 ) -> Response {
@@ -54,11 +59,24 @@ pub(crate) fn handle(
         Ok(parts) => parts,
         Err(error) => return unavailable(tag, command_name, error),
     };
-    let summaries =
+    let mut summaries =
         match rmail_common::imap_state::list_folder_summaries(mail_root, &domain, &local) {
             Ok(summaries) => summaries,
             Err(error) => return unavailable(tag, command_name, error),
         };
+    // Mailboxes in the user's own account named like the shared namespace
+    // are shadowed by it.
+    summaries.retain(|summary| !shared::is_shared_name(&summary.folder.name));
+    let listed = match shared::listable(mail_root, db_path, address) {
+        Ok(listed) => listed,
+        Err(error) => return unavailable(tag, command_name, error),
+    };
+    let nodes = shared::hierarchy_nodes(&listed);
+    let mut shared_targets = HashMap::new();
+    for entry in listed {
+        shared_targets.insert(entry.summary.folder.name.clone(), entry.target);
+        summaries.push(entry.summary);
+    }
     let subscriptions =
         match rmail_common::imap_state::list_subscriptions(mail_root, &domain, &local) {
             Ok(subscriptions) => subscriptions,
@@ -72,6 +90,20 @@ pub(crate) fn handle(
         && request.patterns.iter().any(String::is_empty)
     {
         response = response.data("LIST (\\Noselect \\HasChildren) \"/\" \"\"");
+    }
+    // The namespace root and owner nodes hold no messages (RFC 2342).
+    if !lsub && !request.selection.subscribed && !request.selection.special_use {
+        for node in nodes.iter().filter(|node| matches_patterns(&request, node)) {
+            let children = if request.returns.children {
+                " \\HasChildren"
+            } else {
+                ""
+            };
+            response = response.data(format!(
+                "{command_name} (\\Noselect{children}) \"/\" {}",
+                mailbox::quote_wire_mailbox_name(node, utf8_accept)
+            ));
+        }
     }
     for summary in &summaries {
         if request.selection.remote {
@@ -109,12 +141,19 @@ pub(crate) fn handle(
             ));
         }
         response = response.data(data);
-        if !request.returns.status.is_empty() {
+        let shared_target = shared_targets.get(&summary.folder.name);
+        if !request.returns.status.is_empty()
+            && shared_target.is_none_or(|target| target.rights.contains(Rights::READ))
+        {
+            let (status_domain, status_local, status_name) = match shared_target {
+                Some(target) => (&target.domain, &target.local, &target.mailbox),
+                None => (&domain, &local, &summary.folder.name),
+            };
             let recent = match rmail_common::imap_state::recent_count(
                 mail_root,
-                &domain,
-                &local,
-                &summary.folder.name,
+                status_domain,
+                status_local,
+                status_name,
             ) {
                 Ok(recent) => recent,
                 Err(error) => return unavailable(tag, command_name, error),
@@ -126,6 +165,7 @@ pub(crate) fn handle(
             ));
         }
         if !request.returns.metadata.is_empty()
+            && shared_target.is_none()
             && let Some(data) = crate::commands::metadata::list_metadata(
                 mail_root,
                 &domain,
@@ -265,6 +305,7 @@ mod tests {
                 "LSUB",
                 "\"\" \"Ghost\"",
                 temp.path(),
+                None,
                 "user@example.test",
                 false,
             )
@@ -277,6 +318,7 @@ mod tests {
                 "LIST",
                 "(SUBSCRIBED) \"\" \"Ghost\" RETURN (SUBSCRIBED)",
                 temp.path(),
+                None,
                 "user@example.test",
                 false,
             )

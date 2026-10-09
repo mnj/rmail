@@ -1,6 +1,7 @@
 //! IMAP session tests driving `process_stream` over in-memory streams.
 //! Shared helpers live here; tests are grouped by area in the submodules.
 
+mod acl;
 mod append;
 mod auth;
 mod autologout;

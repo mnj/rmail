@@ -88,7 +88,8 @@ pub(crate) async fn uid_expunge(
 }
 
 pub(crate) async fn close(tag: &str, mail_root: &str, selected: &SelectedMailbox) -> Outcome {
-    if selected.read_only {
+    // RFC 4314 section 4: without the expunge right CLOSE only closes.
+    if selected.read_only || !selected.rights.contains(rmail_common::acl::Rights::EXPUNGE) {
         return Outcome {
             response: completed(tag, "CLOSE"),
             selection_effect: SelectionEffect::Clear,
@@ -112,6 +113,13 @@ async fn run(
             Status::No,
             "Mailbox is read-only",
         )));
+    }
+    if !selected.rights.contains(rmail_common::acl::Rights::EXPUNGE) {
+        return failure(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"),
+            ),
+        );
     }
     let mut deleted = selected
         .msgs

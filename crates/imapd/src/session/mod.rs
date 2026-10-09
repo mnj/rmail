@@ -605,6 +605,11 @@ impl Session {
                 self.quota(reader, call).await
             }
             Command::GetMetadata | Command::SetMetadata => self.metadata(reader, call).await,
+            Command::SetAcl
+            | Command::DeleteAcl
+            | Command::GetAcl
+            | Command::ListRights
+            | Command::MyRights => self.acl(reader, call).await,
             Command::Notify => self.notify(reader, call).await,
             Command::CancelUpdate => {
                 let response =

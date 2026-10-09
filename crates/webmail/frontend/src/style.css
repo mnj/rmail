@@ -119,6 +119,15 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .folder:hover .folder-actions, .folder:focus-within .folder-actions { display: flex; }
 .folder-actions button { border: 0; background: none; color: var(--sidebar-muted); padding: 4px; border-radius: 5px; display: grid; }
 .folder-actions button:hover { color: #fff; background: var(--sidebar-active); }
+.folder-group { margin: 14px 10px 4px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--sidebar-muted); }
+.folder-name.shared span { display: grid; line-height: 1.25; }
+.folder-name.shared span small { font-size: 11px; color: var(--sidebar-muted); overflow: hidden; text-overflow: ellipsis; }
+.share-add { display: flex; flex-wrap: wrap; gap: 8px; }
+.share-add input { flex: 1 1 200px; min-width: 0; border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 10px; background: var(--surface); color: var(--text); }
+.share-add select, .share-list select { border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 8px; background: var(--surface); color: var(--text); }
+.share-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.share-list li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
+.share-who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .new-folder, .sidebar-link { display: flex; align-items: center; gap: 10px; border: 0; background: none; color: var(--sidebar-muted); padding: 8px 10px; border-radius: 7px; text-align: left; }
 .new-folder:hover, .sidebar-link:hover { color: #fff; background: var(--sidebar-hover); }
 .sidebar-foot { display: grid; gap: 6px; border-top: 1px solid var(--sidebar-active); padding-top: 10px; }

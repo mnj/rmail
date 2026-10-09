@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use rmail_common::acl::Rights;
 use tokio::io::{AsyncReadExt, BufReader};
 
 use super::append::{
@@ -45,6 +46,7 @@ pub(crate) struct Replaced {
 
 pub(crate) struct Context<'a> {
     pub(crate) mail_root: &'a str,
+    pub(crate) db_path: Option<&'a str>,
     pub(crate) address: &'a str,
     pub(crate) selected: &'a SelectedMailbox,
     pub(crate) uid_mode: bool,
@@ -164,18 +166,37 @@ pub(crate) async fn handle(
         Ok(target) => target,
         Err(_) => return reject(reader, literal, bad(tag, "Invalid mailbox name")).await,
     };
+    // CATENATE URLs name the user's own messages.
     let (local, domain) = match mailbox::address_parts(context.address) {
         Ok(parts) => parts,
         Err(error) => return reject(reader, literal, unavailable(tag, name, error)).await,
     };
-    match target_exists(context.mail_root, &domain, &local, &target).await {
-        Ok(true) => {}
-        Ok(false) => return reject(reader, literal, missing_mailbox(tag)).await,
+    let destination = match resolve_target(&context, &target).await {
+        Ok(Some(destination)) => destination,
+        Ok(None) => return reject(reader, literal, missing_mailbox(tag)).await,
         Err(error) => return reject(reader, literal, unavailable(tag, name, error)).await,
+    };
+    let selected = context.selected;
+    if destination.domain != selected.domain || destination.local != selected.local {
+        let response = Response::new().status(
+            StatusLine::tagged(tag, Status::No, "Cannot replace into another account")
+                .with_code("CANNOT"),
+        );
+        return reject(reader, literal, response).await;
+    }
+    if !destination.rights.contains(Rights::INSERT)
+        || !selected
+            .rights
+            .contains(Rights::DELETE_MESSAGES.union(Rights::EXPUNGE))
+    {
+        let response = Response::new()
+            .status(StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"));
+        return reject(reader, literal, response).await;
     }
 
     // Read the new message into a staging file.
-    let staged_path = create_append_stage(context.mail_root, &domain, &local).await?;
+    let staged_path =
+        create_append_stage(context.mail_root, &selected.domain, &selected.local).await?;
     let request = match payload {
         Payload::Literal(request) => {
             if !request.non_sync {
@@ -223,7 +244,7 @@ pub(crate) async fn handle(
                 context.mail_root,
                 &domain,
                 &local,
-                Some(context.selected.mailbox.as_str()),
+                Some(context.selected.name.as_str()),
             )
             .await
             {
@@ -245,18 +266,22 @@ pub(crate) async fn handle(
 
     let root = context.mail_root.to_string();
     let source = context.selected.mailbox.clone();
-    let target_for_task = target.clone();
+    let target_for_task = destination.mailbox.clone();
+    let target_is_selected = same_mailbox(&destination.mailbox, &selected.mailbox);
     let cleanup_path = staged_path.clone();
+    let mut flags = request.flags;
+    flags.retain(|flag| crate::shared::permitted_flag(destination.rights, flag));
     let staged = rmail_common::imap_state::StagedAppend {
         path: staged_path,
-        flags: request.flags,
+        flags,
         internal_date: bounded_internal_date(request.internal_date),
     };
+    let (storage_domain, storage_local) = (selected.domain.clone(), selected.local.clone());
     let result = tokio::task::spawn_blocking(move || {
         rmail_common::imap_state::replace_message(
             Path::new(&root),
-            &domain,
-            &local,
+            &storage_domain,
+            &storage_local,
             &source,
             source_uid,
             &target_for_task,
@@ -271,7 +296,7 @@ pub(crate) async fn handle(
                 uidvalidity: outcome.uidvalidity,
                 uid: outcome.uid,
                 expunged_uid: outcome.expunged.then_some(source_uid),
-                target_is_selected: same_mailbox(&target, &context.selected.mailbox),
+                target_is_selected,
             }));
         }
         Ok(Err(error)) => error,
@@ -337,13 +362,29 @@ fn same_mailbox(left: &str, right: &str) -> bool {
     left == right || (left.eq_ignore_ascii_case("INBOX") && right.eq_ignore_ascii_case("INBOX"))
 }
 
-async fn target_exists(mail_root: &str, domain: &str, local: &str, target: &str) -> Result<bool> {
-    let root = mail_root.to_string();
-    let domain = domain.to_string();
-    let local = local.to_string();
-    let target = target.to_string();
+/// The REPLACE target, or `None` when it does not exist or is hidden.
+async fn resolve_target(
+    context: &Context<'_>,
+    name: &str,
+) -> Result<Option<crate::shared::Target>> {
+    let root = context.mail_root.to_string();
+    let db = context.db_path.map(str::to_string);
+    let address = context.address.to_string();
+    let name = name.to_string();
     tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::folder_exists(Path::new(&root), &domain, &local, &target)
+        let root = Path::new(&root);
+        let target = crate::shared::resolve(root, db.as_deref().map(Path::new), &address, &name)?;
+        let exists = if target.is_shared() {
+            target.mailbox_id.is_some() && target.visible()
+        } else {
+            rmail_common::imap_state::folder_exists(
+                root,
+                &target.domain,
+                &target.local,
+                &target.mailbox,
+            )?
+        };
+        Ok(exists.then_some(target))
     })
     .await?
 }

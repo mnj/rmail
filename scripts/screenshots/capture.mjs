@@ -91,6 +91,18 @@ async function signIn(page) {
   await page.click('text=This week: Rust 2024');
   await page.waitForTimeout(900);
   await shot(page, 'webmail-remote-blocked');
+  // A folder Bob shares with Alice, and sharing one of hers.
+  await page.click('text=Team Projects');
+  await page.waitForSelector('text=Migration runbook v3');
+  await page.waitForTimeout(400);
+  await shot(page, 'webmail-shared');
+  await page.hover('.folder:has-text("Inbox")');
+  await page.click('button[aria-label="Share Inbox"]');
+  await page.fill('input[aria-label="Address to share with"]', 'bob@example.com');
+  await page.click('.share-add button');
+  await page.waitForSelector('.share-list li');
+  await shot(page, 'webmail-share-dialog');
+  await page.keyboard.press('Escape');
   await ctx.close();
 }
 

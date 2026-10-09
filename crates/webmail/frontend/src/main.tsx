@@ -3,13 +3,13 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  ReplyAll, Search, Send, Sparkles, Star, Sun, Tag, Trash2, X,
+  ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X,
 } from 'lucide-react';
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import {
-  Api, ApiError, Attachment, Folder, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
-  formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sortFolders, splitAddress,
+  Api, ApiError, Attachment, Folder, Grant, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
+  can, formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sharedFolderName, sortFolders, splitAddress,
 } from './types';
 import './style.css';
 
@@ -79,6 +79,7 @@ function IconButton({ label, onClick, children, disabled, active, className }: {
 }
 
 function folderIcon(folder: Folder) {
+  if (folder.owner) return Users;
   if (folder.name === 'INBOX') return Inbox;
   switch (folder.special_use) {
     case '\\Sent': return Send;
@@ -90,7 +91,82 @@ function folderIcon(folder: Folder) {
   }
 }
 
-const folderLabel = (folder: Folder) => (folder.name === 'INBOX' ? 'Inbox' : folder.name);
+const folderLabel = (folder: Folder) => (folder.owner ? sharedFolderName(folder) : folder.name === 'INBOX' ? 'Inbox' : folder.name);
+
+/** Whether a bulk action is possible in `folder`: always in the user's own folders, by the rights in a shared one. */
+function allowed(folder: Folder | undefined, action: string) {
+  if (!folder?.owner) return true;
+  switch (action) {
+    case 'mark_read': case 'mark_unread': return can(folder, 's');
+    case 'flag': case 'unflag': return can(folder, 'w');
+    case 'delete': return can(folder, 't') && can(folder, 'e');
+    default: return false;
+  }
+}
+
+const accessLabel: Record<string, string> = { read: 'Can read', edit: 'Can read and change' };
+
+/** Who one of the user's own folders is shared with, and changes to that. */
+function ShareDialog({ api, folder, onClose }: { api: Api; folder: string; onClose: () => void }) {
+  const [grants, setGrants] = useState<Grant[] | null>(null);
+  const [address, setAddress] = useState('');
+  const [access, setAccess] = useState<'read' | 'edit'>('read');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const base = `/api/folders/${encodeURIComponent(folder)}/sharing`;
+  const load = useCallback(() => api<Grant[]>(base).then(setGrants).catch((err) => setError((err as Error).message)), [api, base]);
+  useEffect(() => { load(); }, [load]);
+  async function change(who: string, next: string) {
+    setBusy(true);
+    setError('');
+    try {
+      await api(base, { method: 'PUT', body: JSON.stringify({ address: who, access: next }) });
+      await load();
+      return true;
+    } catch (err) {
+      setError((err as Error).message);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function add(event: React.FormEvent) {
+    event.preventDefault();
+    if (await change(address.trim(), access)) setAddress('');
+  }
+  return (
+    <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
+      <section className="dialog" role="dialog" aria-label={`Share ${folder}`}>
+        <header><h2>Share {folder === 'INBOX' ? 'Inbox' : folder}</h2><IconButton label="Close" onClick={onClose}><X size={16} /></IconButton></header>
+        <p className="dialog-intro">People on this server you share with see the folder under “Shared with me” in webmail and under Other Users in mail apps. Read and starred marks are shared with them.</p>
+        <form className="share-add" onSubmit={add}>
+          <input aria-label="Address to share with" placeholder="colleague@example.com" value={address} onChange={(e) => setAddress(e.target.value)} />
+          <select aria-label="Access" value={access} onChange={(e) => setAccess(e.target.value as 'read' | 'edit')}>
+            <option value="read">{accessLabel.read}</option>
+            <option value="edit">{accessLabel.edit}</option>
+          </select>
+          <button className="primary" disabled={busy || !address.trim()}>Share</button>
+        </form>
+        {error && <p className="error">{error}</p>}
+        {grants === null ? <p className="muted">Loading…</p> : grants.length === 0 ? <p className="muted">Not shared with anyone.</p> : (
+          <ul className="share-list">
+            {grants.map((grant) => (
+              <li key={grant.address}>
+                <span className="share-who" title={grant.address}>{grant.address}</span>
+                <select aria-label={`Access for ${grant.address}`} value={grant.access ?? ''} disabled={busy} onChange={(e) => change(grant.address, e.target.value)}>
+                  {!grant.access && <option value="">Custom ({grant.rights})</option>}
+                  <option value="read">{accessLabel.read}</option>
+                  <option value="edit">{accessLabel.edit}</option>
+                </select>
+                <IconButton label={`Stop sharing with ${grant.address}`} disabled={busy} onClick={() => change(grant.address, 'none')}><X size={14} /></IconButton>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
 
 function LabelChips({ labels, onRemove }: { labels: Label[]; onRemove?: (label: Label) => void }) {
   if (!labels.length) return null;
@@ -290,6 +366,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [organizing, setOrganizing] = useState(false);
   const [prompt, setPrompt] = useState<React.ComponentProps<typeof PromptDialog> | null>(null);
   const [rawFor, setRawFor] = useState<number | null>(null);
+  const [sharing, setSharing] = useState<string | null>(null);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [notice, setNotice] = useState('');
@@ -368,7 +445,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
     setView('message');
     setMoreOpen(false);
     setMoveOpen(false);
-    if (!hasFlag(message.flags, '\\Seen')) {
+    if (!hasFlag(message.flags, '\\Seen') && can(current, 's')) {
       await api(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`, { method: 'PATCH', body: JSON.stringify({ seen: true }) });
       setMessages((list) => list.map((m) => (m.uid === message.uid ? { ...m, flags: [...m.flags, '\\Seen'] } : m)));
       loadFolders().catch(() => undefined);
@@ -384,6 +461,10 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   /** Apply a bulk action; moves remove the messages from the list and select the next one. */
   async function act(action: string, uids: number[], target?: string) {
     if (!uids.length) return;
+    if (!allowed(current, action)) {
+      flash('Not possible in this shared folder');
+      return;
+    }
     const removes = ['archive', 'delete', 'junk', 'move'].includes(action);
     const next = removes && selected && uids.includes(selected.uid) ? messages.filter((m) => !uids.includes(m.uid))[Math.max(0, selectedIndex)] : undefined;
     try {
@@ -489,7 +570,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         case '#': case 'Delete': act('delete', uids); break;
         case '!': act('junk', uids); break;
         case 's': if (selected) act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid]); break;
-        case 'u': if (selected) { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); } break;
+        case 'u': if (selected && allowed(current, 'mark_unread')) { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); } break;
         case 'c': if (canSend) { event.preventDefault(); setCompose({}); } break;
         case 'r': if (canSend && selected) { event.preventDefault(); setCompose(replySeed(selected, folder, address, false)); } break;
         case 'a': if (canSend && selected) { event.preventDefault(); setCompose(replySeed(selected, folder, address, true)); } break;
@@ -508,6 +589,9 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   });
 
   const allChecked = messages.length > 0 && checked.length === messages.length;
+  const shared = !!current?.owner;
+  const ownFolders = folders.filter((f) => !f.owner);
+  const sharedFolders = folders.filter((f) => f.owner);
 
   const moveMenu = (uids: number[]) => (
     <div className="menu" role="menu">
@@ -527,23 +611,32 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span title={address}>{address}</span></div></div>
         {canSend && <button className="compose-button" onClick={() => { setCompose({}); setView('list'); }}><PenSquare size={16} />Compose</button>}
         <nav aria-label="Folders">
-          {folders.map((f) => {
+          {ownFolders.map((f) => {
             const Icon = folderIcon(f);
             return (
               <div key={f.name} className={`folder ${f.name === folder ? 'active' : ''}`}>
                 <button className="folder-name" onClick={() => chooseFolder(f.name)} aria-current={f.name === folder ? 'page' : undefined}>
                   <Icon size={16} /><span>{folderLabel(f)}</span>{f.unread > 0 && <small className="count">{f.unread}</small>}
                 </button>
-                {isUserFolder(f) && (
-                  <span className="folder-actions">
+                <span className="folder-actions">
+                  <button aria-label={`Share ${folderLabel(f)}`} title="Share" onClick={() => setSharing(f.name)}><Share2 size={12} /></button>
+                  {isUserFolder(f) && <>
                     <button aria-label={`Rename ${f.name}`} title="Rename" onClick={() => renameFolder(f.name)}><Pencil size={12} /></button>
                     <button aria-label={`Delete ${f.name}`} title="Delete" onClick={() => deleteFolder(f.name)}><Trash2 size={12} /></button>
-                  </span>
-                )}
+                  </>}
+                </span>
               </div>
             );
           })}
           <button className="new-folder" onClick={newFolder}><FolderPlus size={15} />New folder</button>
+          {sharedFolders.length > 0 && <h3 className="folder-group">Shared with me</h3>}
+          {sharedFolders.map((f) => (
+            <div key={f.name} className={`folder ${f.name === folder ? 'active' : ''}`}>
+              <button className="folder-name shared" onClick={() => chooseFolder(f.name)} aria-current={f.name === folder ? 'page' : undefined} title={`${sharedFolderName(f)}, shared by ${f.owner}${can(f, 'w') || can(f, 't') ? '' : ' (read only)'}`}>
+                <Users size={16} /><span>{folderLabel(f)}<small>{f.owner}</small></span>{f.unread > 0 && <small className="count">{f.unread}</small>}
+              </button>
+            </div>
+          ))}
         </nav>
         <div className="sidebar-foot">
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
@@ -567,16 +660,20 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           {checked.length > 0 ? (
             <div className="bulk">
               <span>{checked.length} selected</span>
-              <IconButton label="Archive (e)" onClick={() => act('archive', checked)}><Archive size={16} /></IconButton>
-              <IconButton label="Delete (#)" onClick={() => act('delete', checked)}><Trash2 size={16} /></IconButton>
-              <IconButton label="Junk (!)" onClick={() => act('junk', checked)}><AlertOctagon size={16} /></IconButton>
-              <span className="menu-anchor">
-                <IconButton label="Move to…" onClick={() => setMoveOpen(!moveOpen)}><FolderInput size={16} /></IconButton>
-                {moveOpen && moveMenu(checked)}
-              </span>
-              <IconButton label="Mark read" onClick={() => act('mark_read', checked)}><MailOpen size={16} /></IconButton>
-              <IconButton label="Mark unread" onClick={() => act('mark_unread', checked)}><Mail size={16} /></IconButton>
-              <IconButton label="Star" onClick={() => act('flag', checked)}><Star size={16} /></IconButton>
+              {!shared && <IconButton label="Archive (e)" onClick={() => act('archive', checked)}><Archive size={16} /></IconButton>}
+              {allowed(current, 'delete') && <IconButton label="Delete (#)" onClick={() => act('delete', checked)}><Trash2 size={16} /></IconButton>}
+              {!shared && <>
+                <IconButton label="Junk (!)" onClick={() => act('junk', checked)}><AlertOctagon size={16} /></IconButton>
+                <span className="menu-anchor">
+                  <IconButton label="Move to…" onClick={() => setMoveOpen(!moveOpen)}><FolderInput size={16} /></IconButton>
+                  {moveOpen && moveMenu(checked)}
+                </span>
+              </>}
+              {allowed(current, 'mark_read') && <>
+                <IconButton label="Mark read" onClick={() => act('mark_read', checked)}><MailOpen size={16} /></IconButton>
+                <IconButton label="Mark unread" onClick={() => act('mark_unread', checked)}><Mail size={16} /></IconButton>
+              </>}
+              {allowed(current, 'flag') && <IconButton label="Star" onClick={() => act('flag', checked)}><Star size={16} /></IconButton>}
             </div>
           ) : (
             <strong className="folder-title">{activeQuery ? `Results for “${activeQuery}”` : current ? folderLabel(current) : folder}</strong>
@@ -592,7 +689,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
             return (
               <div key={m.uid} role="listitem" className={`row ${unread ? 'unread' : ''} ${selected?.uid === m.uid ? 'selected' : ''} ${checked.includes(m.uid) ? 'checked' : ''}`}>
                 <input type="checkbox" aria-label={`Select ${m.subject || 'message'}`} checked={checked.includes(m.uid)} onChange={(e) => setChecked(e.target.checked ? [...checked, m.uid] : checked.filter((id) => id !== m.uid))} />
-                <button className={`star ${starred ? 'on' : ''}`} aria-label={starred ? 'Unstar' : 'Star'} aria-pressed={starred} onClick={() => act(starred ? 'unflag' : 'flag', [m.uid])}><Star size={15} /></button>
+                <button className={`star ${starred ? 'on' : ''}`} aria-label={starred ? 'Unstar' : 'Star'} aria-pressed={starred} disabled={!allowed(current, 'flag')} onClick={() => act(starred ? 'unflag' : 'flag', [m.uid])}><Star size={15} /></button>
                 <button className="row-main" onClick={() => openMessage(m).catch((err) => flash((err as Error).message))}>
                   <span className="from" title={from.address}>{from.name || '(unknown)'}</span>
                   <span className="date">{m.has_attachments && <Paperclip size={12} aria-label="Has attachments" />}{formatListDate(m.internal_date)}</span>
@@ -601,7 +698,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
                 </button>
                 {(m.labels?.length || m.suggestion) ? (
                   <div className="row-extra">
-                    <LabelChips labels={m.labels || []} onRemove={(label) => removeLabel(m.uid, label)} />
+                    <LabelChips labels={m.labels || []} onRemove={can(current, 'w') ? (label) => removeLabel(m.uid, label) : undefined} />
                     {m.suggestion && <div className="suggestion-chip"><button className="chip-move" onClick={() => resolveSuggestion(m.uid, 'accept')} title={`Suggested from ${methodLabel[m.suggestion.method]}`}><FolderInput size={12} />{m.suggestion.folder}</button><button className="chip-dismiss" onClick={() => resolveSuggestion(m.uid, 'dismiss')} aria-label="Not this folder" title="Not this folder"><X size={12} /></button></div>}
                   </div>
                 ) : null}
@@ -626,15 +723,17 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
                   <IconButton label="Forward (f)" onClick={() => setCompose(forwardSeed(selected, folder))}><Forward size={16} /></IconButton>
                   <span className="divider" />
                 </>)}
-              <IconButton label="Archive (e)" onClick={() => act('archive', [selected.uid])}><Archive size={16} /></IconButton>
-              <IconButton label="Delete (#)" onClick={() => act('delete', [selected.uid])}><Trash2 size={16} /></IconButton>
-              <IconButton label="Junk (!)" onClick={() => act('junk', [selected.uid])}><AlertOctagon size={16} /></IconButton>
-              <span className="menu-anchor">
-                <IconButton label="Move to…" onClick={() => { setMoveOpen(!moveOpen); setMoreOpen(false); }}><FolderInput size={16} /></IconButton>
-                {moveOpen && !checked.length && moveMenu([selected.uid])}
-              </span>
-              <IconButton label={hasFlag(selected.flags, '\\Flagged') ? 'Unstar (s)' : 'Star (s)'} active={hasFlag(selected.flags, '\\Flagged')} onClick={() => act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid])}><Star size={16} /></IconButton>
-              <IconButton label="Mark unread (u)" onClick={() => { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); }}><Mail size={16} /></IconButton>
+              {!shared && <IconButton label="Archive (e)" onClick={() => act('archive', [selected.uid])}><Archive size={16} /></IconButton>}
+              {allowed(current, 'delete') && <IconButton label="Delete (#)" onClick={() => act('delete', [selected.uid])}><Trash2 size={16} /></IconButton>}
+              {!shared && <>
+                <IconButton label="Junk (!)" onClick={() => act('junk', [selected.uid])}><AlertOctagon size={16} /></IconButton>
+                <span className="menu-anchor">
+                  <IconButton label="Move to…" onClick={() => { setMoveOpen(!moveOpen); setMoreOpen(false); }}><FolderInput size={16} /></IconButton>
+                  {moveOpen && !checked.length && moveMenu([selected.uid])}
+                </span>
+              </>}
+              {allowed(current, 'flag') && <IconButton label={hasFlag(selected.flags, '\\Flagged') ? 'Unstar (s)' : 'Star (s)'} active={hasFlag(selected.flags, '\\Flagged')} onClick={() => act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid])}><Star size={16} /></IconButton>}
+              {allowed(current, 'mark_unread') && <IconButton label="Mark unread (u)" onClick={() => { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); }}><Mail size={16} /></IconButton>}
               <span className="spacer" />
               <span className="menu-anchor">
                 <IconButton label="More" onClick={() => { setMoreOpen(!moreOpen); setMoveOpen(false); }}><MoreHorizontal size={16} /></IconButton>
@@ -651,7 +750,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
                 <div className="suggestion-banner"><FolderInput size={16} /><span>Suggested folder: <strong>{selectedListItem.suggestion.folder}</strong>, based on {methodLabel[selectedListItem.suggestion.method]}.</span><button onClick={() => resolveSuggestion(selected.uid, 'accept')}>Move</button><button onClick={() => resolveSuggestion(selected.uid, 'dismiss')}>Not this</button></div>
               )}
               <h1 className="subject-line">{selected.subject || '(no subject)'}</h1>
-              <LabelChips labels={selected.labels} onRemove={(label) => removeLabel(selected.uid, label)} />
+              <LabelChips labels={selected.labels} onRemove={can(current, 'w') ? (label) => removeLabel(selected.uid, label) : undefined} />
               <div className="message-head">
                 <div className="avatar" aria-hidden="true">{(splitAddress(selected.from).name || '?').charAt(0).toUpperCase()}</div>
                 <div className="head-text">
@@ -661,7 +760,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
                 </div>
                 <time className="muted small" title={selected.date}>{formatFullDate(selected.internal_date)}</time>
               </div>
-              <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} />
+              {!shared && <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} />}
               {selected.html_body && selected.has_remote_content && <div className="remote-banner"><ImageIcon size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}
               {selected.html_body
                 ? <iframe className="html-message" title="Message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} />
@@ -687,6 +786,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {notice && <div className="toast" role="status">{notice}</div>}
       {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} />}
       {prompt && <PromptDialog {...prompt} />}
+      {sharing !== null && <ShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
       {rawFor !== null && <RawDialog api={api} folder={folder} uid={rawFor} onClose={() => setRawFor(null)} />}
     </main>
   );

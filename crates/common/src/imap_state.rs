@@ -724,6 +724,21 @@ pub fn folder_exists(
         && mailbox_dir(maildir_root, domain, localpart, &name)?.is_dir())
 }
 
+/// The folder named `mailbox`, if it exists.
+pub fn find_folder(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    mailbox: &str,
+) -> Result<Option<Folder>> {
+    let name = normalize_mailbox_name(mailbox)?;
+    let conn = open_account(maildir_root, domain, localpart)?;
+    if !mailbox_dir(maildir_root, domain, localpart, &name)?.is_dir() {
+        return Ok(None);
+    }
+    get_folder(&conn, &name)
+}
+
 /// A SETMETADATA request that would take the account past its entry limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataTooMany {
@@ -1114,6 +1129,100 @@ impl Drop for FileMutationGuard {
             None => {}
         }
     }
+}
+
+/// One mailbox of one account.
+#[derive(Debug, Clone, Copy)]
+pub struct MailboxRef<'a> {
+    pub domain: &'a str,
+    pub localpart: &'a str,
+    pub mailbox: &'a str,
+}
+
+/// COPY or MOVE between two accounts (a shared mailbox and one of the
+/// user's own). The messages are copied into the destination as one atomic
+/// APPEND batch with their INTERNALDATE and the flags `keep_flag` accepts;
+/// MOVE then expunges them from the source. Returns (source UID,
+/// destination UID) pairs; UIDs that no longer exist are skipped.
+pub fn transfer_messages_between_accounts(
+    maildir_root: &Path,
+    source: MailboxRef<'_>,
+    uids: &[u64],
+    destination: MailboxRef<'_>,
+    move_messages: bool,
+    keep_flag: impl Fn(&str) -> bool,
+) -> Result<Vec<(u64, u64)>> {
+    let (_, messages) = load_folder(
+        maildir_root,
+        source.domain,
+        source.localpart,
+        source.mailbox,
+    )?;
+    let by_uid = messages
+        .iter()
+        .map(|message| (message.uid, message))
+        .collect::<HashMap<_, _>>();
+    let mut requested = uids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+    requested.retain(|uid| by_uid.contains_key(uid));
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut staged = Vec::with_capacity(requested.len());
+    let stage = |staged: &mut Vec<StagedAppend>, message: &Message| -> Result<()> {
+        let path = append_staging_path(maildir_root, destination.domain, destination.localpart)?;
+        fs::copy(&message.path, &path).context("copying message to the destination account")?;
+        staged.push(StagedAppend {
+            path,
+            flags: message
+                .flags
+                .iter()
+                .filter(|flag| !flag.eq_ignore_ascii_case("\\Recent") && keep_flag(flag))
+                .cloned()
+                .collect(),
+            internal_date: Some((message.internaldate, message.internaldate_tz)),
+        });
+        Ok(())
+    };
+    let mut result = requested
+        .iter()
+        .try_for_each(|uid| stage(&mut staged, by_uid[uid]));
+    let paths = staged
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let published = match result {
+        Ok(()) => publish_staged_appends(
+            maildir_root,
+            destination.domain,
+            destination.localpart,
+            destination.mailbox,
+            staged,
+        ),
+        Err(error) => Err(error),
+    };
+    let destination_uids = match published {
+        Ok((_, destination_uids)) => destination_uids,
+        Err(error) => {
+            for path in paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
+    if move_messages {
+        result = delete_messages_by_uid(
+            maildir_root,
+            source.domain,
+            source.localpart,
+            source.mailbox,
+            &requested,
+        )
+        .map(|_| ());
+        result.context("removing moved messages from the source mailbox")?;
+    }
+    Ok(requested.into_iter().zip(destination_uids).collect())
 }
 
 pub fn transfer_messages_by_uid(

@@ -86,6 +86,15 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Mailbox sharing (IMAP ACL): which folders an account shares, and
+    /// with whom
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// DKIM signing keys and the ARC sealing key, stored in the database
     Dkim {
         #[command(subcommand)]
@@ -195,6 +204,20 @@ enum TransportAction {
     Reject { domain: String, reply: String },
     /// Remove DOMAIN's route; its mail goes to the MX hosts again
     Remove { domain: String },
+}
+
+#[derive(Subcommand)]
+enum ShareAction {
+    /// Folders ADDRESS shares, and folders shared with it
+    List { address: String },
+    /// Give GRANTEE exactly RIGHTS (RFC 4314 letters, e.g. lr to read, lrswite
+    /// to read and change) on OWNER's FOLDER; `none` stops sharing
+    Set {
+        owner: String,
+        folder: String,
+        grantee: String,
+        rights: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -634,6 +657,17 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&cfg_path)?;
             run_transport(action, std::path::Path::new(&cfg.global.db_path))?;
         }
+        Commands::Share { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            run_share(
+                action,
+                std::path::Path::new(&cfg.global.mail_root),
+                std::path::Path::new(&cfg.global.db_path),
+            )?;
+        }
         Commands::Dkim { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
@@ -648,6 +682,69 @@ async fn main() -> Result<()> {
             });
             let cfg = Config::load(&cfg_path)?;
             run_acme(action, &cfg).await?;
+        }
+    }
+    Ok(())
+}
+
+fn run_share(
+    action: ShareAction,
+    mail_root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    use rmail_common::{acl, imap_state};
+    let account = |address: &str| -> Result<(String, String)> {
+        let address = rmail_common::domain::canonicalize_mailbox_address(address)?;
+        if !rmail_common::db::mailbox_exists(db_path, &address)? {
+            anyhow::bail!("no mailbox {address}");
+        }
+        let (local, domain) = address.split_once('@').context("invalid address")?;
+        Ok((local.to_string(), domain.to_string()))
+    };
+    match action {
+        ShareAction::List { address } => {
+            let (local, domain) = account(&address)?;
+            let folders = imap_state::list_folders(mail_root, &domain, &local)?;
+            let grants = acl::granted_by(db_path, &address)?;
+            let mut shown = false;
+            for (mailbox_id, grantee, rights) in &grants {
+                // Grants left on folders that no longer exist are skipped.
+                if let Some(folder) = folders.iter().find(|f| &f.mailbox_id == mailbox_id) {
+                    println!("shares   {:<24} with {grantee} ({rights})", folder.name);
+                    shown = true;
+                }
+            }
+            for shared in acl::shared_mailboxes(mail_root, db_path, &address)? {
+                println!(
+                    "receives {:<24} from {} ({})",
+                    shared.folder.name, shared.owner, shared.rights
+                );
+                shown = true;
+            }
+            if !shown {
+                println!("Nothing shared by or with {address}.");
+            }
+        }
+        ShareAction::Set {
+            owner,
+            folder,
+            grantee,
+            rights,
+        } => {
+            let (local, domain) = account(&owner)?;
+            let found = imap_state::find_folder(mail_root, &domain, &local, &folder)?
+                .with_context(|| format!("{owner} has no folder {folder}"))?;
+            let rights = if rights == "none" {
+                acl::Rights::NONE
+            } else {
+                acl::Rights::parse(&rights)?
+            };
+            acl::set_rights(db_path, &owner, &found.mailbox_id, &grantee, rights)?;
+            if rights.is_empty() {
+                println!("{folder} of {owner} is no longer shared with {grantee}");
+            } else {
+                println!("{grantee} now has {rights} on {folder} of {owner}");
+            }
         }
     }
     Ok(())

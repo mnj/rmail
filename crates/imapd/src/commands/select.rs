@@ -1,3 +1,5 @@
+use rmail_common::acl::Rights;
+
 use crate::{
     commands::search::compress_ids,
     mailbox::{self, SelectedMailbox},
@@ -17,6 +19,7 @@ pub(crate) async fn handle(
     command_name: &str,
     raw_args: &str,
     mail_root: &str,
+    db_path: Option<&str>,
     address: &str,
     utf8_accept: bool,
     condstore_enabled: bool,
@@ -45,45 +48,74 @@ pub(crate) async fn handle(
         Ok(name) => name,
         Err(_) => return failure(bad(tag, "Invalid mailbox name".to_string())),
     };
-    let (local, domain) = match mailbox::address_parts(address) {
-        Ok(parts) => parts,
-        Err(error) => return failure(unavailable(tag, command_name, error)),
-    };
     let root = mail_root.to_string();
+    let db = db_path.map(str::to_string);
+    let lookup_address = address.to_string();
     let lookup_name = mailbox_name.clone();
-    let (lookup_domain, lookup_local) = (domain.clone(), local.clone());
-    let exists = match tokio::task::spawn_blocking(move || {
-        rmail_common::imap_state::folder_exists(
-            std::path::Path::new(&root),
-            &lookup_domain,
-            &lookup_local,
+    let resolved = tokio::task::spawn_blocking(move || {
+        let root = std::path::Path::new(&root);
+        let target = crate::shared::resolve(
+            root,
+            db.as_deref().map(std::path::Path::new),
+            &lookup_address,
             &lookup_name,
-        )
+        )?;
+        let exists = if target.is_shared() {
+            target.mailbox_id.is_some()
+        } else {
+            rmail_common::imap_state::folder_exists(
+                root,
+                &target.domain,
+                &target.local,
+                &target.mailbox,
+            )?
+        };
+        anyhow::Ok((target, exists))
     })
-    .await
-    {
-        Ok(Ok(exists)) => exists,
+    .await;
+    let target = match resolved {
+        Ok(Ok((target, true))) if target.visible() => target,
+        Ok(Ok(_)) => {
+            return failure(
+                Response::new().status(
+                    StatusLine::tagged(tag, Status::No, "Mailbox does not exist")
+                        .with_code("NONEXISTENT"),
+                ),
+            );
+        }
         Ok(Err(error)) => return failure(unavailable(tag, command_name, error)),
         Err(error) => return failure(unavailable(tag, command_name, error)),
     };
-    if !exists {
-        return failure(Response::new().status(
-            StatusLine::tagged(tag, Status::No, "Mailbox does not exist").with_code("NONEXISTENT"),
-        ));
+    if !target.rights.contains(Rights::READ) {
+        return failure(
+            Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"),
+            ),
+        );
     }
+    let (domain, local) = (target.domain.clone(), target.local.clone());
     // Claim before loading so every claimed UID is in the loaded view (see
     // `refresh_selected_mailbox`).
     let recent_uids =
-        match mailbox::claim_recent_uids(mail_root, &domain, &local, &mailbox_name).await {
+        match mailbox::claim_recent_uids(mail_root, &domain, &local, &target.mailbox).await {
             Ok(uids) => uids.into_iter().collect(),
             Err(error) => return failure(unavailable(tag, command_name, error)),
         };
-    let mut selected = match mailbox::load_selected_mailbox(mail_root, address, &mailbox_name).await
-    {
-        Ok(selected) => selected,
-        Err(error) => return failure(unavailable(tag, command_name, error)),
-    };
-    let read_only = command_name == "EXAMINE";
+    let owner = format!("{local}@{domain}");
+    let mut selected =
+        match mailbox::load_selected_mailbox(mail_root, &owner, &target.mailbox).await {
+            Ok(selected) => selected,
+            Err(error) => return failure(unavailable(tag, command_name, error)),
+        };
+    if target.is_shared() {
+        selected.name = mailbox_name.clone();
+    }
+    selected.rights = target.rights;
+    // RFC 4314 section 4: without a right to change anything the mailbox
+    // is opened read-only.
+    let read_only = command_name == "EXAMINE"
+        || !(crate::shared::may_change_flags(target.rights)
+            || target.rights.contains(Rights::EXPUNGE));
     selected.read_only = read_only;
     selected.recent_uids = recent_uids;
     let condstore_requested = request.condstore || condstore_enabled;
@@ -114,8 +146,10 @@ pub(crate) async fn handle(
         )
     } else {
         response.status(
-            StatusLine::untagged(Status::Ok, "Flags permitted")
-                .with_code("PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)"),
+            StatusLine::untagged(Status::Ok, "Flags permitted").with_code(format!(
+                "PERMANENTFLAGS ({})",
+                crate::shared::permanent_flags(target.rights)
+            )),
         )
     };
     response = response.data(format!("{} EXISTS", selected.msgs.len()));
@@ -123,10 +157,11 @@ pub(crate) async fn handle(
         // RFC 9051 §6.3.2: a LIST response for the mailbox is required;
         // RECENT no longer exists.
         let root = mail_root.to_string();
+        let db = db_path.map(str::to_string);
         let address = address.to_string();
         let list_args = format!(
             "\"\" {}",
-            mailbox::quote_wire_mailbox_name(&selected.mailbox, true)
+            mailbox::quote_wire_mailbox_name(&selected.name, true)
         );
         let listed = tokio::task::spawn_blocking(move || {
             crate::commands::list::handle(
@@ -134,6 +169,7 @@ pub(crate) async fn handle(
                 "LIST",
                 &list_args,
                 std::path::Path::new(&root),
+                db.as_deref().map(std::path::Path::new),
                 &address,
                 true,
             )
@@ -303,6 +339,7 @@ mod tests {
             "SELECT",
             "Missing",
             temp.path().to_str().unwrap(),
+            None,
             "user@example.test",
             false,
             false,
@@ -327,6 +364,7 @@ mod tests {
             "EXAMINE",
             "INBOX",
             temp.path().to_str().unwrap(),
+            None,
             "user@example.test",
             false,
             false,

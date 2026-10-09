@@ -227,6 +227,27 @@ operations cannot overrun a limit through a check-then-write race. SMTP reports 
 IMAP reports `[OVERQUOTA]`; IMAP clients can inspect usage with GETQUOTA/GETQUOTAROOT. MOVE does
 not consume additional quota.
 
+## Shared folders
+
+Users can share a folder with other accounts on the server. In webmail the share button next to a
+folder offers "Can read" and "Can read and change" (mark, flag, add and delete messages, never
+move them out); mail apps that support IMAP ACL (RFC 4314) can grant any rights with SETACL. The
+recipient sees the folder under "Shared with me" in webmail and under `Other Users/<owner>/` in
+mail apps. Flags such as read and starred are shared by everyone with access, and messages added
+to a shared folder count towards the owner's quota.
+
+Grants are kept in the database and follow a folder across renames. Administrators see every
+share on the admin portal's Mailboxes page and can revoke them there or from the CLI:
+
+```bash
+rmail_ctl share list user@example.com
+rmail_ctl share set user@example.com Projects colleague@example.com lr     # read
+rmail_ctl share set user@example.com Projects colleague@example.com lrswite # read and change
+rmail_ctl share set user@example.com Projects colleague@example.com none   # stop sharing
+```
+
+Deleting a folder or a mailbox removes its grants.
+
 ## Live SMTP watch and message tracking
 
 `rmail_smtpd` and `rmail_outbound` publish protocol events over Unix datagram sockets beneath the

@@ -98,7 +98,7 @@ async fn append_preserves_literal_bytes_returns_appenduid_and_requires_existing_
     assert!(
         non_sync_missing_lines
             .iter()
-            .any(|l| l.contains("APPEND failed"))
+            .any(|l| l.contains("Mailbox does not exist"))
     );
     assert!(
         non_sync_missing_lines

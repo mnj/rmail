@@ -1,8 +1,11 @@
 use std::path::Path;
 
+use rmail_common::acl::Rights;
+
 use crate::{
     mailbox, parser,
     response::{Response, Status, StatusLine},
+    shared,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +75,7 @@ pub(crate) fn handle(
     tag: &str,
     raw_args: &str,
     mail_root: &Path,
+    db_path: Option<&Path>,
     address: &str,
     utf8_accept: bool,
     imap4rev2: bool,
@@ -114,49 +118,105 @@ pub(crate) fn handle(
         Ok(names) => names,
         Err(_) => return Outcome::response(bad(tag, "Invalid mailbox name")),
     };
-    let (local, domain) = match mailbox::address_parts(address) {
-        Ok(parts) => parts,
+    if operation == Operation::Subscribe || operation == Operation::Unsubscribe {
+        // Subscriptions are the user's own list of names, shared or not.
+        let (local, domain) = match mailbox::address_parts(address) {
+            Ok(parts) => parts,
+            Err(error) => return Outcome::response(storage_failure(tag, command, error, None)),
+        };
+        return match rmail_common::maildir::set_mailbox_subscription(
+            mail_root,
+            &domain,
+            &local,
+            &names[0],
+            operation == Operation::Subscribe,
+        ) {
+            Ok(()) => Outcome::response(completed(tag, command)),
+            Err(error) => Outcome::response(storage_failure(tag, command, error, None)),
+        };
+    }
+    let targets = match names
+        .iter()
+        .map(|name| shared::resolve(mail_root, db_path, address, name))
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(targets) => targets,
         Err(error) => return Outcome::response(storage_failure(tag, command, error, None)),
+    };
+    if let Some(refusal) = check_rights(
+        operation,
+        tag,
+        mail_root,
+        db_path,
+        address,
+        &names,
+        &targets,
+        !special_uses.is_empty(),
+    ) {
+        return Outcome::response(refusal);
+    }
+    let target = &targets[0];
+    let (domain, local) = (&target.domain, &target.local);
+    // Remembered before DELETE so the grants on it can be dropped.
+    let deleted_id = match operation {
+        Operation::Delete => {
+            rmail_common::imap_state::find_folder(mail_root, domain, local, &target.mailbox)
+                .ok()
+                .flatten()
+                .map(|folder| folder.mailbox_id)
+        }
+        _ => None,
     };
 
     let result = match operation {
         Operation::Create => match special_uses.first() {
             Some(special_use) => rmail_common::imap_state::create_folder_with_special_use(
                 mail_root,
-                &domain,
-                &local,
-                &names[0],
+                domain,
+                local,
+                &target.mailbox,
                 Some(special_use),
             ),
-            None => rmail_common::maildir::create_mailbox(mail_root, &domain, &local, &names[0]),
+            None => {
+                rmail_common::maildir::create_mailbox(mail_root, domain, local, &target.mailbox)
+                    .and_then(|()| inherit_acl(mail_root, db_path, target))
+            }
         },
         Operation::Delete => {
-            rmail_common::maildir::delete_mailbox(mail_root, &domain, &local, &names[0])
+            rmail_common::maildir::delete_mailbox(mail_root, domain, local, &target.mailbox)
         }
-        Operation::Rename => {
-            rmail_common::maildir::rename_mailbox(mail_root, &domain, &local, &names[0], &names[1])
-        }
-        Operation::Subscribe | Operation::Unsubscribe => {
-            rmail_common::maildir::set_mailbox_subscription(
-                mail_root,
-                &domain,
-                &local,
-                &names[0],
-                operation == Operation::Subscribe,
-            )
-        }
+        Operation::Rename => rmail_common::maildir::rename_mailbox(
+            mail_root,
+            domain,
+            local,
+            &target.mailbox,
+            &targets[1].mailbox,
+        ),
+        Operation::Subscribe | Operation::Unsubscribe => unreachable!("handled above"),
     };
+    if result.is_ok()
+        && let (Some(db_path), Some(mailbox_id)) = (db_path, &deleted_id)
+    {
+        let owner = format!("{local}@{domain}");
+        if let Err(error) = rmail_common::acl::forget_mailbox(db_path, &owner, mailbox_id) {
+            rmail_common::structured_log!("warn", "imapd", "acl_cleanup_failed", { "owner": owner, "mailbox_id": mailbox_id, "error": error.to_string() });
+        }
+    }
 
     match result {
         Ok(()) => Outcome {
             response: match operation {
-                Operation::Create => created(tag, mail_root, &domain, &local, &names[0]),
+                Operation::Create => created(tag, mail_root, domain, local, &target.mailbox),
                 Operation::Rename if imap4rev2 => renamed(
                     tag,
                     mail_root,
-                    &domain,
-                    &local,
-                    (&names[0], &names[1]),
+                    domain,
+                    local,
+                    (&target.mailbox, &targets[1].mailbox),
+                    target
+                        .owner
+                        .as_deref()
+                        .map(|owner| shared::shared_name(owner, "")),
                     utf8_accept,
                 ),
                 _ => completed(tag, command),
@@ -180,6 +240,92 @@ pub(crate) fn handle(
             Outcome::response(storage_failure(tag, command, error, code))
         }
     }
+}
+
+/// Refuse CREATE, DELETE and RENAME the rights do not allow (RFC 4314
+/// section 4): CREATE needs `k` on the parent, DELETE `x`, RENAME `x` on the
+/// source and `k` on the new parent. A RENAME stays within one account, and
+/// the user's own mailboxes cannot take names in the shared namespace.
+#[allow(clippy::too_many_arguments)]
+fn check_rights(
+    operation: Operation,
+    tag: &str,
+    mail_root: &Path,
+    db_path: Option<&Path>,
+    address: &str,
+    names: &[String],
+    targets: &[shared::Target],
+    special_use: bool,
+) -> Option<Response> {
+    let refuse = |code: &str, text: &str| {
+        Some(Response::new().status(StatusLine::tagged(tag, Status::No, text).with_code(code)))
+    };
+    let missing = |target: &shared::Target| {
+        target.is_shared() && (target.mailbox_id.is_none() || !target.visible())
+    };
+    let may_create = |target: &shared::Target| {
+        shared::may_create(mail_root, db_path, address, target).unwrap_or(false)
+    };
+    let new_name = match operation {
+        Operation::Create => Some(0),
+        Operation::Rename => Some(1),
+        _ => None,
+    };
+    if let Some(index) = new_name {
+        let target = &targets[index];
+        if (!target.is_shared() && shared::is_shared_name(&names[index]))
+            || (target.is_shared() && target.mailbox.is_empty())
+        {
+            return refuse("CANNOT", "Names under \"Other Users\" are reserved");
+        }
+        if target.is_shared() {
+            if target.mailbox_id.is_some() && target.visible() {
+                return refuse("ALREADYEXISTS", "Mailbox already exists");
+            }
+            if special_use || !may_create(target) {
+                return refuse("NOPERM", "Permission denied");
+            }
+        }
+    }
+    if matches!(operation, Operation::Delete | Operation::Rename) {
+        let source = &targets[0];
+        if missing(source) {
+            return refuse("NONEXISTENT", "Mailbox does not exist");
+        }
+        if !source.rights.contains(Rights::DELETE_MAILBOX) {
+            return refuse("NOPERM", "Permission denied");
+        }
+    }
+    if operation == Operation::Rename && targets[0].owner != targets[1].owner {
+        return refuse("CANNOT", "Cannot rename a mailbox into another account");
+    }
+    None
+}
+
+/// A mailbox created inside a shared mailbox gets its parent's grants, so
+/// the user who created it (and everyone else the parent is shared with)
+/// can still reach it.
+fn inherit_acl(
+    mail_root: &Path,
+    db_path: Option<&Path>,
+    target: &shared::Target,
+) -> anyhow::Result<()> {
+    let (Some(db_path), Some(owner)) = (db_path, &target.owner) else {
+        return Ok(());
+    };
+    let Some((parent, _)) = target.mailbox.rsplit_once('/') else {
+        return Ok(());
+    };
+    let find = |name: &str| {
+        rmail_common::imap_state::find_folder(mail_root, &target.domain, &target.local, name)
+    };
+    let (Some(parent), Some(child)) = (find(parent)?, find(&target.mailbox)?) else {
+        return Ok(());
+    };
+    for (grantee, rights) in rmail_common::acl::entries(db_path, owner, &parent.mailbox_id)? {
+        rmail_common::acl::set_rights(db_path, owner, &child.mailbox_id, &grantee, rights)?;
+    }
+    Ok(())
 }
 
 fn completed(tag: &str, command: &str) -> Response {
@@ -217,6 +363,7 @@ fn renamed(
     domain: &str,
     local: &str,
     (source, destination): (&str, &str),
+    shared_prefix: Option<String>,
     utf8_accept: bool,
 ) -> Response {
     let mut response = Response::new();
@@ -230,6 +377,11 @@ fn renamed(
     if let (Ok((source, destination)), Ok(folders)) = (normalized, folders) {
         let prefix = format!("{destination}/");
         for folder in &folders {
+            // In another account only the renamed mailbox is reported: its
+            // children may not be visible to the user.
+            if shared_prefix.is_some() && folder.name != destination {
+                continue;
+            }
             let old_name = if folder.name == destination {
                 source.clone()
             } else if let Some(suffix) = folder.name.strip_prefix(&prefix) {
@@ -246,10 +398,11 @@ fn renamed(
             } else {
                 "\\HasNoChildren"
             };
+            let prefix = shared_prefix.as_deref().unwrap_or("");
             response = response.data(format!(
                 "LIST ({children}) \"/\" {} (\"OLDNAME\" ({}))",
-                mailbox::quote_wire_mailbox_name(&folder.name, utf8_accept),
-                mailbox::quote_wire_mailbox_name(&old_name, utf8_accept)
+                mailbox::quote_wire_mailbox_name(&format!("{prefix}{}", folder.name), utf8_accept),
+                mailbox::quote_wire_mailbox_name(&format!("{prefix}{old_name}"), utf8_accept)
             ));
         }
     }
@@ -286,6 +439,7 @@ mod tests {
             "A1",
             "Projects",
             temp.path(),
+            None,
             address,
             false,
             false,
@@ -308,6 +462,7 @@ mod tests {
             "A2",
             "Projects",
             temp.path(),
+            None,
             address,
             false,
             false,
@@ -321,6 +476,7 @@ mod tests {
             "A3",
             "Projects Renamed",
             temp.path(),
+            None,
             address,
             false,
             false,
@@ -339,6 +495,7 @@ mod tests {
             "A4",
             "Renamed",
             temp.path(),
+            None,
             address,
             false,
             false,
@@ -358,6 +515,7 @@ mod tests {
             "A1",
             "OnlyOneName",
             temp.path(),
+            None,
             "user@example.test",
             false,
             false,

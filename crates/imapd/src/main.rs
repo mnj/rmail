@@ -33,6 +33,7 @@ mod parser;
 mod pop3;
 mod response;
 mod session;
+mod shared;
 mod sort;
 mod state;
 #[cfg(test)]

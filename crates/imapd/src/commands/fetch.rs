@@ -147,7 +147,9 @@ pub(crate) async fn handle(
     if limited.is_some() {
         targets.sort_unstable_by_key(|target| target.sequence);
     }
-    let mark_seen = fetch_marks_seen(&request.items) && !selected.read_only;
+    let mark_seen = fetch_marks_seen(&request.items)
+        && !selected.read_only
+        && selected.rights.contains(rmail_common::acl::Rights::SEEN);
     let seen_updates = if mark_seen {
         targets
             .iter_mut()

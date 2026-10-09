@@ -14,7 +14,13 @@ const FETCH_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) struct SelectedMailbox {
     pub(crate) domain: String,
     pub(crate) local: String,
+    /// The mailbox name in the storing account (see `domain` and `local`).
     pub(crate) mailbox: String,
+    /// The name the client selected, which differs from `mailbox` for a
+    /// mailbox shared by another account.
+    pub(crate) name: String,
+    /// The user's RFC 4314 rights on the mailbox.
+    pub(crate) rights: rmail_common::acl::Rights,
     pub(crate) uidvalidity: u64,
     pub(crate) uidnext: u64,
     pub(crate) highest_modseq: u64,
@@ -196,7 +202,9 @@ pub(crate) async fn load_selected_mailbox(
         Ok(SelectedMailbox {
             domain: domain_c,
             local: local_c,
+            name: mailbox.clone(),
             mailbox,
+            rights: rmail_common::acl::Rights::ALL,
             uidvalidity: folder.uidvalidity,
             uidnext: folder.uidnext,
             highest_modseq: folder.highest_modseq,
@@ -239,6 +247,8 @@ pub(crate) async fn refresh_selected_mailbox(
     let address = format!("{}@{}", selected.local, selected.domain);
     let mut refreshed = load_selected_mailbox(mail_root, &address, &selected.mailbox).await?;
     refreshed.read_only = selected.read_only;
+    refreshed.name = selected.name.clone();
+    refreshed.rights = selected.rights;
     refreshed.recent_uids = selected.recent_uids.clone();
     refreshed.recent_uids.extend(claimed);
     Ok(reconcile(selected, refreshed, options))
@@ -393,7 +403,7 @@ pub(crate) fn quote_wire_mailbox_name(name: &str, utf8_accept: bool) -> String {
 }
 
 pub(crate) fn selected_mailbox_for_log(selected: &Option<SelectedMailbox>) -> &str {
-    selected.as_ref().map(|s| s.mailbox.as_str()).unwrap_or("-")
+    selected.as_ref().map(|s| s.name.as_str()).unwrap_or("-")
 }
 
 pub(crate) fn first_unseen(sel: &SelectedMailbox) -> u64 {

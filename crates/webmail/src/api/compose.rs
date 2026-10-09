@@ -121,16 +121,13 @@ fn outgoing(
         });
     }
     for stored in input.stored_attachments {
+        // Forwarded attachments may come from a folder shared with the user.
+        let location = super::locate(state, session, &stored.folder)?;
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &super::stored_folder(
-                &state.mail_root,
-                &session.domain,
-                &session.localpart,
-                &stored.folder,
-            )?,
+            &location.domain,
+            &location.localpart,
+            &location.folder,
         )?;
         let message = messages
             .into_iter()
@@ -243,7 +240,11 @@ async fn send(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
             let drafts = special_folder(root, domain, local, "\\Drafts", "Drafts")?;
             let _ = imap_state::delete_message_by_uid(root, domain, local, &drafts, uid);
         }
-        if let Some(source) = source {
+        // Marking the original needs the write right in a shared folder.
+        if let Some(source) = source
+            && let Ok(location) = super::locate(&state, &session, &source.folder)
+            && location.rights.contains(rmail_common::acl::Rights::WRITE)
+        {
             let flag = if source.kind == "forward" {
                 "$Forwarded"
             } else {
@@ -251,9 +252,9 @@ async fn send(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
             };
             let _ = rmail_common::classifier_store::set_keyword(
                 root,
-                domain,
-                local,
-                &super::stored_folder(root, domain, local, &source.folder)?,
+                &location.domain,
+                &location.localpart,
+                &location.folder,
                 source.uid,
                 flag,
                 true,

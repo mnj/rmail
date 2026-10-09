@@ -202,6 +202,16 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             updated_at INTEGER NOT NULL
         ) WITHOUT ROWID;
 
+        -- Mailbox sharing (see acl.rs): rights is a bit set of RFC 4314 rights.
+        CREATE TABLE IF NOT EXISTS mailbox_acl (
+            owner TEXT NOT NULL,
+            mailbox_id TEXT NOT NULL,
+            grantee TEXT NOT NULL,
+            rights INTEGER NOT NULL,
+            PRIMARY KEY (owner, mailbox_id, grantee)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS mailbox_acl_grantee ON mailbox_acl (grantee);
+
         -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
         CREATE TABLE IF NOT EXISTS greylist (
             key TEXT PRIMARY KEY,
@@ -281,6 +291,10 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
     let address = crate::domain::canonicalize_mailbox_address(address)?;
     let conn = Connection::open(path)?;
     conn.execute("DELETE FROM mailboxes WHERE address = ?1", params![address])?;
+    conn.execute(
+        "DELETE FROM mailbox_acl WHERE owner = ?1 OR grantee = ?1",
+        params![address],
+    )?;
     Ok(())
 }
 

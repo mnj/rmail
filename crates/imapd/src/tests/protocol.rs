@@ -71,6 +71,8 @@ fn capability_advertises_starttls_and_login_policy() {
             "SASL-IR",
             "LITERAL+",
             "LITERAL-",
+            "ACL",
+            "RIGHTS=kxte",
             "UIDPLUS",
             "MULTIAPPEND",
             "CATENATE",
