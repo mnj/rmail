@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
-import { Account, api } from '../api';
+import { Account, FolderShare, api } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
@@ -57,6 +57,50 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
         </Field>
       </form>
     </Modal>
+  );
+}
+
+/** What RFC 4314 rights amount to, in words. */
+function describeRights(rights: string) {
+  const changes = ['w', 'i', 't', 'e'].some((right) => rights.includes(right));
+  const access = changes ? 'Read and change' : rights.includes('s') ? 'Read, marks as read' : 'Read only';
+  return `${access}${rights.includes('a') ? ', can reshare' : ''}`;
+}
+
+function SharingPanel() {
+  const { run, confirm } = useFeedback();
+  const shares = useResource(() => api<FolderShare[]>('/api/sharing'), [], undefined, 'sharing');
+  async function revoke(share: FolderShare) {
+    const ok = await confirm({
+      title: `Stop sharing ${share.folder}?`,
+      message: <>{share.grantee} loses access to {share.owner}'s folder {share.folder}. Its messages are not changed.</>,
+      confirmLabel: 'Stop sharing',
+      danger: true,
+    });
+    if (ok && await run(() => api('/api/sharing', 'DELETE', { owner: share.owner, mailbox_id: share.mailbox_id, grantee: share.grantee }), `${share.folder} is no longer shared with ${share.grantee}`)) shares.reload();
+  }
+  return (
+    <Panel title="Shared folders" subtitle="Folders users share from webmail or their mail app (IMAP ACL)">
+      <ErrorBanner error={shares.error} />
+      {shares.data && shares.data.length > 0 && (
+        <div className="tableScroll">
+          <table>
+            <thead><tr><th>Folder</th><th>Shared with</th><th>Access</th><th><span className="visuallyHidden">Actions</span></th></tr></thead>
+            <tbody>
+              {shares.data.map((share) => (
+                <tr key={`${share.owner} ${share.mailbox_id} ${share.grantee}`}>
+                  <td><strong>{share.folder === 'INBOX' ? 'Inbox' : share.folder}</strong><small>{share.owner}</small></td>
+                  <td>{share.grantee}</td>
+                  <td><span className="pill" title={`RFC 4314 rights: ${share.rights}`}>{describeRights(share.rights)}</span></td>
+                  <td className="rowActions"><IconButton danger label={`Stop sharing ${share.folder} with ${share.grantee}`} onClick={() => revoke(share)}><Trash2 size={15} /></IconButton></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {shares.data !== null && shares.data.length === 0 && <Empty>No folders are shared. Users share folders from webmail or with any IMAP client that supports ACL.</Empty>}
+    </Panel>
   );
 }
 
@@ -137,6 +181,7 @@ export function AccountsPage() {
         </div>
         {accounts.data !== null && rows.length === 0 && <Empty>{filter ? 'No mailboxes match the filter.' : 'No mailboxes yet. Create the first one to start receiving mail.'}</Empty>}
       </Panel>
+      <SharingPanel />
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={accounts.reload} />}
     </>
   );

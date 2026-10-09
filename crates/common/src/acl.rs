@@ -209,6 +209,45 @@ pub fn entries(db_path: &Path, owner: &str, mailbox_id: &str) -> Result<Vec<(Str
     Ok(rows)
 }
 
+/// Every grant on the server, as (owner, mailbox ID, grantee, rights).
+pub fn all_grants(db_path: &Path) -> Result<Vec<(String, String, String, Rights)>> {
+    let conn = open(db_path)?;
+    let mut statement = conn.prepare(
+        "SELECT owner, mailbox_id, grantee, rights FROM mailbox_acl
+         ORDER BY owner, mailbox_id, grantee",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                Rights(row.get::<_, u16>(3)? & Rights::ALL.0),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every grant `owner` has made, as (mailbox ID, grantee, rights).
+pub fn granted_by(db_path: &Path, owner: &str) -> Result<Vec<(String, String, Rights)>> {
+    let conn = open(db_path)?;
+    let mut statement = conn.prepare(
+        "SELECT mailbox_id, grantee, rights FROM mailbox_acl WHERE owner = ?1
+         ORDER BY mailbox_id, grantee",
+    )?;
+    let rows = statement
+        .query_map(params![canonical(owner)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                Rights(row.get::<_, u16>(2)? & Rights::ALL.0),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Every mailbox other accounts share with `account`.
 pub fn shared_with(db_path: &Path, account: &str) -> Result<Vec<Share>> {
     let conn = open(db_path)?;

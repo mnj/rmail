@@ -6,6 +6,7 @@ admin console 18080) and the demo password below. Standard library only.
 """
 
 import http.cookiejar
+import imaplib
 import json
 import smtplib
 import ssl
@@ -114,5 +115,20 @@ for to, subject in [
     ("marcus@contoso.test", "IMAP rollout checklist"),
 ]:
     submit(message("alice@example.com", to, subject, "Thanks — see my notes inline.\n\nAlice"))
+
+# Bob shares a folder with Alice over IMAP (RFC 4314 SETACL); it shows under
+# "Shared with me" in her webmail.
+imap = imaplib.IMAP4("127.0.0.1", 1143)
+imap.starttls(ssl_context=TLS)
+imap.login("bob@example.com", PASSWORD)
+imap.create("Team Projects")
+for subject, body in [
+    ("Migration runbook v3", "Steps for the cut-over weekend, with rollback points marked."),
+    ("Vendor shortlist", "Three vendors made the shortlist; notes on each are below."),
+]:
+    m = message('"Bob Hansen" <bob@example.com>', "bob@example.com", subject, body)
+    imap.append("Team Projects", None, None, m.as_bytes())
+imap._simple_command("SETACL", '"Team Projects"', "alice@example.com", "lrs")
+imap.logout()
 
 print("seeded demo data")

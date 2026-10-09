@@ -1,6 +1,8 @@
 // Shapes returned by the webmail API, and small helpers shared by the views.
 
-export type Folder = { name: string; special_use: string | null; messages: number; unread: number };
+/** `owner` and `rights` (RFC 4314 letters) are set on folders other accounts share with the user. */
+export type Folder = { name: string; special_use: string | null; messages: number; unread: number; owner?: string; rights?: string };
+export type Grant = { address: string; rights: string; access: 'read' | 'edit' | null };
 export type Suggestion = { folder: string; score: number; method: 'sender' | 'knn' | 'llm' };
 export type Label = { name: string; keyword: string; description: string; origin?: 'user' | 'starter' | 'ai' };
 export type Message = {
@@ -90,8 +92,14 @@ const specialOrder: Record<string, number> = { '\\Drafts': 1, '\\Sent': 2, '\\Ar
 
 /** INBOX first, then special-use folders in a fixed order, then the user's folders alphabetically. */
 export function sortFolders(folders: Folder[]): Folder[] {
-  const rank = (f: Folder) => (f.name === 'INBOX' ? 0 : f.special_use ? specialOrder[f.special_use] ?? 6 : 7);
+  const rank = (f: Folder) => (f.owner ? 8 : f.name === 'INBOX' ? 0 : f.special_use ? specialOrder[f.special_use] ?? 6 : 7);
   return [...folders].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
 }
 
-export const isUserFolder = (f: Folder) => f.name !== 'INBOX' && !f.special_use;
+export const isUserFolder = (f: Folder) => f.name !== 'INBOX' && !f.special_use && !f.owner;
+
+/** Whether the user holds an RFC 4314 right in a folder; always in their own. */
+export const can = (f: Folder | undefined, right: string) => !f?.rights || f.rights.includes(right);
+
+/** A shared folder's name without the `Other Users/<owner>/` prefix. */
+export const sharedFolderName = (f: Folder) => (f.owner ? f.name.slice(`Other Users/${f.owner}/`.length) : f.name);

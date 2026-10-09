@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use rmail_common::acl::{self, Rights};
 use rmail_common::http::Peer;
 use rmail_common::throttle::AuthThrottle;
 use rmail_common::{auth, db, imap_state, websession};
@@ -59,6 +60,10 @@ pub(crate) fn router(state: Shared) -> Router {
         .route(
             "/api/folders/{folder}",
             axum::routing::patch(rename_folder).delete(delete_folder),
+        )
+        .route(
+            "/api/folders/{folder}/sharing",
+            get(folder_sharing).put(change_folder_sharing),
         )
         .route("/api/folders/{folder}/messages", get(message_list))
         .route(
@@ -358,6 +363,12 @@ pub(crate) struct FolderResponse {
     pub special_use: Option<String>,
     pub messages: usize,
     pub unread: usize,
+    /// The account that shared this folder with the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The user's RFC 4314 rights in a shared folder, e.g. `lrs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rights: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -473,24 +484,178 @@ async fn folders(app: State<Shared>, headers: HeaderMap) -> Response {
         Err(status) => return status.into_response(),
     };
     let result = blocking(move || {
-        imap_state::list_folder_summaries(&state.mail_root, &session.domain, &session.localpart)
+        let mut folders = imap_state::list_folder_summaries(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+        )?
+        .into_iter()
+        .filter(|summary| {
+            !summary
+                .folder
+                .name
+                .starts_with(OTHER_USERS.trim_end_matches('/'))
+        })
+        .map(|summary| FolderResponse {
+            name: summary.folder.name,
+            special_use: summary.folder.special_use,
+            messages: summary.messages,
+            unread: summary.unseen,
+            owner: None,
+            rights: None,
+        })
+        .collect::<Vec<_>>();
+        for shared in acl::shared_mailboxes(&state.mail_root, &state.db_path, &session.address)? {
+            if !shared.rights.contains(Rights::READ) {
+                continue;
+            }
+            let Some(summary) = imap_state::folder_summary(
+                &state.mail_root,
+                &shared.domain,
+                &shared.localpart,
+                &shared.folder.name,
+            )?
+            else {
+                continue;
+            };
+            folders.push(FolderResponse {
+                name: format!("{OTHER_USERS}{}/{}", shared.owner, shared.folder.name),
+                special_use: None,
+                messages: summary.messages,
+                unread: summary.unseen,
+                owner: Some(shared.owner),
+                rights: Some(shared.rights.to_string()),
+            });
+        }
+        Ok(folders)
     })
     .await;
     match result {
-        Ok(summaries) => Json(
-            summaries
-                .into_iter()
-                .map(|summary| FolderResponse {
-                    name: summary.folder.name,
-                    special_use: summary.folder.special_use,
-                    messages: summary.messages,
-                    unread: summary.unseen,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(folders) => Json(folders).into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+/// Sharing presets offered by webmail, as RFC 4314 rights.
+const SHARING_PRESETS: &[(&str, &str)] = &[("read", "lr"), ("edit", "lrswite")];
+
+#[derive(Serialize)]
+struct Grant {
+    address: String,
+    rights: String,
+    /// The preset the rights match, if any.
+    access: Option<&'static str>,
+}
+
+#[derive(Deserialize)]
+struct SharingChange {
+    address: String,
+    /// `read`, `edit` or `none` (stop sharing).
+    access: String,
+}
+
+/// Who the user's own folder is shared with.
+async fn folder_sharing(
+    app: State<Shared>,
+    headers: HeaderMap,
+    Path(folder): Path<String>,
+) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    let result = blocking(move || {
+        let Some(id) = own_folder_id(&state, &session, &folder)? else {
+            return Ok(None);
+        };
+        let grants = acl::entries(&state.db_path, &session.address, &id)?
+            .into_iter()
+            .map(|(address, rights)| {
+                let rights = rights.to_string();
+                let access = SHARING_PRESETS
+                    .iter()
+                    .find(|(_, preset)| {
+                        Rights::parse(preset).is_ok_and(|preset| preset.to_string() == rights)
+                    })
+                    .map(|(name, _)| *name);
+                Grant {
+                    address,
+                    rights,
+                    access,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(grants))
+    })
+    .await;
+    match result {
+        Ok(Some(grants)) => Json(grants).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+/// Share the user's own folder with another account, change its access or
+/// stop sharing it.
+async fn change_folder_sharing(
+    app: State<Shared>,
+    headers: HeaderMap,
+    Path(folder): Path<String>,
+    body: Bytes,
+) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    let Ok(input) = serde_json::from_slice::<SharingChange>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let rights = match input.access.as_str() {
+        "none" => Rights::NONE,
+        access => match SHARING_PRESETS.iter().find(|(name, _)| *name == access) {
+            Some((_, rights)) => Rights::parse(rights).expect("presets are valid"),
+            None => return (StatusCode::BAD_REQUEST, "unknown access").into_response(),
+        },
+    };
+    let result = blocking(move || {
+        let Some(id) = own_folder_id(&state, &session, &folder)? else {
+            return Ok(Err(StatusCode::NOT_FOUND.into_response()));
+        };
+        Ok(
+            match acl::set_rights(
+                &state.db_path,
+                &session.address,
+                &id,
+                input.address.trim(),
+                rights,
+            ) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response())
+                }
+            },
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(response)) => response,
+        Err(error) => internal_error(error),
+    }
+}
+
+/// The MAILBOXID of the user's own folder `name`.
+fn own_folder_id(state: &AppState, session: &Session, name: &str) -> Result<Option<String>> {
+    let Ok(name) = stored_folder(&state.mail_root, &session.domain, &session.localpart, name)
+    else {
+        return Ok(None);
+    };
+    Ok(
+        imap_state::find_folder(&state.mail_root, &session.domain, &session.localpart, &name)?
+            .map(|folder| folder.mailbox_id),
+    )
 }
 
 /// Whether `parsed` matches a webmail search (`needle` is lowercase): the
@@ -553,19 +718,15 @@ async fn message_list(
     let needle = query.q.trim().to_lowercase();
     let limit = query.limit.clamp(1, 200);
     let result = blocking(move || {
-        let folder = stored_folder(
-            &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &folder,
-        )?;
+        let location = locate(&state, &session, &folder)?;
+        let folder = location.folder.clone();
         let (info, mut messages) = imap_state::load_folder(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &folder,
         )?;
-        let mut suggestions = if info.name == "INBOX" {
+        let mut suggestions = if info.name == "INBOX" && !location.is_shared() {
             organize::pending_for_inbox(
                 &state.mail_root,
                 &session.domain,
@@ -597,8 +758,8 @@ async fn message_list(
             (total, page)
         } else if let Some(hits) = decoded_hits(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &info,
             &messages,
             &needle,
@@ -682,6 +843,90 @@ pub(crate) fn stored_folder(
         .ok_or_else(|| anyhow::anyhow!("no such folder"))
 }
 
+/// Where a folder named by a request is stored, and the user's rights there.
+pub(crate) struct Location {
+    pub domain: String,
+    pub localpart: String,
+    pub folder: String,
+    pub rights: Rights,
+}
+
+impl Location {
+    pub(crate) fn is_shared(&self) -> bool {
+        self.rights != Rights::ALL
+    }
+}
+
+/// The prefix of folders other accounts share with the user, as in IMAP.
+const OTHER_USERS: &str = "Other Users/";
+
+/// Locate a folder of the user's own, or one shared with them that they
+/// may read, named `Other Users/<owner>/<folder>`. Shared folders come from
+/// the owner's grants, never from the request alone.
+pub(crate) fn locate(state: &AppState, session: &Session, requested: &str) -> Result<Location> {
+    if let Some((owner, name)) = requested
+        .strip_prefix(OTHER_USERS)
+        .and_then(|rest| rest.split_once('/'))
+    {
+        let shared = acl::find_shared(
+            &state.mail_root,
+            &state.db_path,
+            &session.address,
+            owner,
+            name,
+        )?
+        .filter(|shared| shared.rights.contains(Rights::READ))
+        .ok_or_else(|| anyhow::anyhow!("no such folder"))?;
+        return Ok(Location {
+            domain: shared.domain,
+            localpart: shared.localpart,
+            folder: shared.folder.name,
+            rights: shared.rights,
+        });
+    }
+    Ok(Location {
+        domain: session.domain.clone(),
+        localpart: session.localpart.clone(),
+        folder: stored_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            requested,
+        )?,
+        rights: Rights::ALL,
+    })
+}
+
+/// Bulk actions in a shared folder: flags as the rights allow, and delete
+/// (into the owner's Trash) with the delete and expunge rights. Messages
+/// are not moved between accounts here.
+fn bulk_shared(
+    root: &std::path::Path,
+    location: &Location,
+    input: &BulkRequest,
+) -> Result<Result<(), &'static str>> {
+    let needed = match input.action.as_str() {
+        "mark_read" | "mark_unread" => Rights::SEEN,
+        "flag" | "unflag" => Rights::WRITE,
+        "delete" => Rights::DELETE_MESSAGES.union(Rights::EXPUNGE),
+        _ => return Ok(Err("not possible in a shared folder")),
+    };
+    if !location.rights.contains(needed) {
+        return Ok(Err("not allowed in this shared folder"));
+    }
+    let (domain, local, folder) = (&location.domain, &location.localpart, &location.folder);
+    for uid in &input.uids {
+        match input.action.as_str() {
+            "mark_read" => update_flag(root, domain, local, folder, *uid, "\\Seen", true)?,
+            "mark_unread" => update_flag(root, domain, local, folder, *uid, "\\Seen", false)?,
+            "flag" => update_flag(root, domain, local, folder, *uid, "\\Flagged", true)?,
+            "unflag" => update_flag(root, domain, local, folder, *uid, "\\Flagged", false)?,
+            _ => imap_state::delete_or_trash_message_by_uid(root, domain, local, folder, *uid)?,
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// The labels among `labels` whose keyword is in `flags`.
 fn labels_for(
     labels: &[rmail_common::classifier_store::Label],
@@ -714,16 +959,12 @@ async fn message_detail(
     };
     let allow_remote = query.remote_content.as_deref() == Some("1");
     let result = blocking(move || {
-        let folder = stored_folder(
-            &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &folder,
-        )?;
+        let location = locate(&state, &session, &folder)?;
+        let folder = location.folder.clone();
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &folder,
         )?;
         let message = messages
@@ -787,20 +1028,21 @@ async fn patch_message(
         return (StatusCode::BAD_REQUEST, "invalid keyword").into_response();
     }
     let result = blocking(move || {
-        let folder = stored_folder(
-            &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &folder,
-        )?;
+        let location = locate(&state, &session, &folder)?;
+        let folder = location.folder.clone();
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &folder,
         )?;
+        if (input.seen.is_some() && !location.rights.contains(Rights::SEEN))
+            || (!input.keywords.is_empty() && !location.rights.contains(Rights::WRITE))
+        {
+            return Ok(Some(StatusCode::FORBIDDEN));
+        }
         let Some(message) = messages.into_iter().find(|message| message.uid == uid) else {
-            return Ok(false);
+            return Ok(Some(StatusCode::NOT_FOUND));
         };
         let mut flags = message.flags;
         if let Some(seen) = input.seen {
@@ -811,18 +1053,18 @@ async fn patch_message(
         }
         imap_state::set_uid_flags(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &folder,
             uid,
             flags,
         )?;
-        Ok(true)
+        Ok(None)
     })
     .await;
     match result {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(status)) => status.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -851,12 +1093,11 @@ async fn bulk(
         return (StatusCode::BAD_REQUEST, "too many messages").into_response();
     }
     let result = blocking(move || {
-        let folder = stored_folder(
-            &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &folder,
-        )?;
+        let location = locate(&state, &session, &folder)?;
+        let folder = location.folder.clone();
+        if location.is_shared() {
+            return bulk_shared(&state.mail_root, &location, &input);
+        }
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         // Destinations come from the account's folder list, never the request.
         let folders = imap_state::list_folders(root, domain, local)?;
@@ -943,16 +1184,12 @@ async fn attachment(
     };
     let inline_requested = query.inline.as_deref() == Some("1");
     let result = blocking(move || {
-        let folder = stored_folder(
-            &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &folder,
-        )?;
+        let location = locate(&state, &session, &folder)?;
+        let folder = location.folder.clone();
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &folder,
         )?;
         let message = messages
@@ -1018,16 +1255,12 @@ async fn raw_message(
         return StatusCode::NOT_FOUND.into_response();
     };
     let result = blocking(move || {
-        let folder = stored_folder(
-            &state.mail_root,
-            &session.domain,
-            &session.localpart,
-            &folder,
-        )?;
+        let location = locate(&state, &session, &folder)?;
+        let folder = location.folder.clone();
         let (_, messages) = imap_state::load_folder(
             &state.mail_root,
-            &session.domain,
-            &session.localpart,
+            &location.domain,
+            &location.localpart,
             &folder,
         )?;
         let message = messages
@@ -1092,7 +1325,10 @@ struct FolderName {
 fn valid_new_folder(name: &str) -> Option<String> {
     let name = name.trim();
     let normalized = rmail_common::maildir::normalize_mailbox_name(name).ok()?;
-    (!normalized.eq_ignore_ascii_case("INBOX") && normalized.chars().count() <= 200)
+    // Names under "Other Users" are where shared folders appear.
+    (!normalized.eq_ignore_ascii_case("INBOX")
+        && !normalized.starts_with(OTHER_USERS.trim_end_matches('/'))
+        && normalized.chars().count() <= 200)
         .then_some(normalized)
 }
 
@@ -1181,7 +1417,11 @@ async fn delete_folder(
         let Some(current) = own_folder(root, domain, local, &folder)? else {
             return Ok(false);
         };
+        let id = imap_state::find_folder(root, domain, local, &current)?.map(|f| f.mailbox_id);
         imap_state::delete_folder(root, domain, local, &current)?;
+        if let Some(id) = id {
+            acl::forget_mailbox(&state.db_path, &session.address, &id)?;
+        }
         Ok(true)
     })
     .await;
@@ -1384,6 +1624,176 @@ mod tests {
         let inbox = folders.iter().find(|f| f.name == "INBOX").unwrap();
         assert_eq!(inbox.messages, 1);
         assert_eq!(inbox.unread, 1);
+    }
+
+    #[tokio::test]
+    async fn folders_shared_by_another_account_follow_its_grants() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        db::add_mailbox(
+            &state.db_path,
+            "friend@example.test",
+            Some("plain:secret"),
+            None,
+            None,
+        )
+        .unwrap();
+        imap_state::create_folder(&state.mail_root, "example.test", "user", "Projects").unwrap();
+        imap_state::append_message(
+            &state.mail_root,
+            "example.test",
+            "user",
+            "Projects",
+            b"From: a@example.test\r\nSubject: plan\r\n\r\nthe plan",
+            Vec::new(),
+        )
+        .unwrap();
+        let owner = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let friend = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "friend@example.test")
+        ));
+        let call = |method: &'static str, path: &str, body: &str, cookie: &Option<String>| {
+            let request = req(method, path, body.as_bytes(), cookie.clone());
+            let state = state.clone();
+            async move { route(request, &state).await }
+        };
+        let shared = "/api/folders/Other%20Users%2Fuser%40example.test%2FProjects";
+        assert_eq!(
+            call("GET", &format!("{shared}/messages"), "", &friend)
+                .await
+                .status,
+            404
+        );
+
+        let share = |access: &str, address: &str| {
+            format!(r#"{{"address":"{address}","access":"{access}"}}"#)
+        };
+        assert_eq!(
+            call(
+                "PUT",
+                "/api/folders/Projects/sharing",
+                &share("read", "nobody@example.test"),
+                &owner
+            )
+            .await
+            .status,
+            422
+        );
+        assert_eq!(
+            call(
+                "PUT",
+                "/api/folders/Projects/sharing",
+                &share("read", "friend@example.test"),
+                &owner
+            )
+            .await
+            .status,
+            204
+        );
+        let grants = call("GET", "/api/folders/Projects/sharing", "", &owner).await;
+        assert_eq!(
+            String::from_utf8(grants.body).unwrap(),
+            r#"[{"address":"friend@example.test","rights":"lr","access":"read"}]"#
+        );
+        // The grantee cannot see who else the owner's folders are shared with.
+        assert_eq!(
+            call("GET", &format!("{shared}/sharing"), "", &friend)
+                .await
+                .status,
+            404
+        );
+
+        let folders = call("GET", "/api/folders", "", &friend).await;
+        let folders: Vec<FolderResponse> = serde_json::from_slice(&folders.body).unwrap();
+        let listed = folders
+            .iter()
+            .find(|folder| folder.name == "Other Users/user@example.test/Projects")
+            .unwrap();
+        assert_eq!(listed.owner.as_deref(), Some("user@example.test"));
+        assert_eq!(listed.rights.as_deref(), Some("lr"));
+        assert_eq!(listed.messages, 1);
+
+        let page = call("GET", &format!("{shared}/messages"), "", &friend).await;
+        let page: MessagePage = serde_json::from_slice(&page.body).unwrap();
+        let uid = page.messages[0].uid;
+        let detail = call("GET", &format!("{shared}/messages/{uid}"), "", &friend).await;
+        assert_eq!(detail.status, 200);
+        // Read access changes nothing.
+        let seen = call(
+            "PATCH",
+            &format!("{shared}/messages/{uid}"),
+            r#"{"seen":true}"#,
+            &friend,
+        );
+        assert_eq!(seen.await.status, 403);
+        let bulk = |action: &str| format!(r#"{{"action":"{action}","uids":[{uid}]}}"#);
+        let flagged = call(
+            "POST",
+            &format!("{shared}/messages/bulk"),
+            &bulk("flag"),
+            &friend,
+        );
+        assert_eq!(flagged.await.status, 422);
+
+        // Edit access allows marking and deleting, never moving out.
+        assert_eq!(
+            call(
+                "PUT",
+                "/api/folders/Projects/sharing",
+                &share("edit", "friend@example.test"),
+                &owner
+            )
+            .await
+            .status,
+            204
+        );
+        let seen = call(
+            "PATCH",
+            &format!("{shared}/messages/{uid}"),
+            r#"{"seen":true}"#,
+            &friend,
+        );
+        assert_eq!(seen.await.status, 204);
+        let moved = call(
+            "POST",
+            &format!("{shared}/messages/bulk"),
+            &bulk("archive"),
+            &friend,
+        );
+        assert_eq!(moved.await.status, 422);
+        let (_, messages) =
+            imap_state::load_folder(&state.mail_root, "example.test", "user", "Projects").unwrap();
+        assert!(messages[0].flags.iter().any(|flag| flag == "\\Seen"));
+
+        assert_eq!(
+            call(
+                "PUT",
+                "/api/folders/Projects/sharing",
+                &share("none", "friend@example.test"),
+                &owner
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            call("GET", &format!("{shared}/messages"), "", &friend)
+                .await
+                .status,
+            404
+        );
+        // Own folders cannot take names where shared folders appear.
+        let created = call(
+            "POST",
+            "/api/folders",
+            r#"{"name":"Other Users/x"}"#,
+            &friend,
+        );
+        assert_eq!(created.await.status, 422);
     }
 
     #[tokio::test]
