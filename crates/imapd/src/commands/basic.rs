@@ -8,7 +8,7 @@ pub(crate) fn capability(tag: &str, capabilities: &str) -> Response {
 
 pub(crate) fn namespace(tag: &str) -> Response {
     Response::new()
-        .data("NAMESPACE ((\"\" \"/\")) NIL NIL")
+        .data("NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) NIL")
         .status(StatusLine::tagged(tag, Status::Ok, "NAMESPACE completed"))
 }
 
@@ -46,7 +46,7 @@ mod tests {
         );
         assert_eq!(
             namespace("A2").encode(),
-            "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\nA2 OK NAMESPACE completed\r\n"
+            "* NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) NIL\r\nA2 OK NAMESPACE completed\r\n"
         );
     }
 

@@ -842,7 +842,7 @@ impl Notifier {
                 return Ok(());
             }
         };
-        let selected_name = selected.as_ref().map(|mailbox| mailbox.mailbox.as_str());
+        let selected_name = selected.as_ref().map(|mailbox| mailbox.name.as_str());
         let lines = diff(&self.spec, &self.snapshot, &snapshot, selected_name, format);
         self.snapshot = snapshot;
         if lines.is_empty() {

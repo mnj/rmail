@@ -4,6 +4,7 @@
 // Grouping them solely to satisfy lint thresholds would obscure their call sites.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod acl;
 pub mod acme;
 pub mod auth;
 pub mod classifier_control;

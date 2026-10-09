@@ -558,6 +558,8 @@ mod tests {
             domain: "example.test".to_string(),
             local: "user".to_string(),
             mailbox: "INBOX".to_string(),
+            name: "INBOX".to_string(),
+            rights: rmail_common::acl::Rights::ALL,
             uidvalidity: 1,
             uidnext: uids.last().map_or(1, |uid| uid + 1),
             highest_modseq: 1,

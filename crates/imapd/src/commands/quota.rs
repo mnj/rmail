@@ -8,6 +8,7 @@ pub(crate) fn handle(
     command: &Command,
     args: &str,
     mail_root: &str,
+    db_path: Option<&str>,
     address: &str,
     utf8_accept: bool,
 ) -> Response {
@@ -60,6 +61,35 @@ pub(crate) fn handle(
                 Ok(name) => name,
                 Err(_) => return bad(tag, "Invalid mailbox name"),
             };
+            if crate::shared::is_shared_name(&mailbox_name) {
+                // The owner's quota is not the user's to see; a shared
+                // mailbox has no quota root for them (RFC 9208 section 4.3).
+                return match crate::shared::resolve(
+                    Path::new(mail_root),
+                    db_path.map(Path::new),
+                    address,
+                    &mailbox_name,
+                ) {
+                    Ok(target) if target.visible() && target.mailbox_id.is_some() => {
+                        Response::new()
+                            .data(format!(
+                                "QUOTAROOT {}",
+                                mailbox::quote_wire_mailbox_name(&mailbox_name, utf8_accept)
+                            ))
+                            .status(StatusLine::tagged(
+                                tag,
+                                Status::Ok,
+                                "GETQUOTAROOT completed",
+                            ))
+                    }
+                    Ok(_) => Response::new().status(StatusLine::tagged(
+                        tag,
+                        Status::No,
+                        "Mailbox does not exist",
+                    )),
+                    Err(error) => unavailable(tag, &error.to_string()),
+                };
+            }
             match rmail_common::imap_state::folder_exists(
                 Path::new(mail_root),
                 &domain,
