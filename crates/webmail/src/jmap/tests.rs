@@ -16,7 +16,7 @@ use crate::api::{AppState, router};
 
 const USER: &str = "user@example.test";
 const FRIEND: &str = "friend@example.test";
-const USING: &[&str] = &[super::CORE, super::MAIL, super::SUBMISSION];
+const USING: &[&str] = &[super::CORE, super::MAIL, super::SUBMISSION, super::VACATION];
 
 fn state(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) -> Arc<AppState> {
     let db_path = td.path().join("accounts.sqlite");
@@ -766,4 +766,72 @@ async fn submission_sends_the_draft_and_files_it_as_sent() {
         ]))
         .await;
     assert_eq!(responses[1][1]["notCreated"]["s"]["type"], "forbiddenFrom");
+}
+
+#[tokio::test]
+async fn vacation_response_is_a_singleton_that_delivery_reads() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td, None);
+    let client = Client::new(&state, USER);
+    let initial = client.one("VacationResponse/get", json!({})).await;
+    assert_eq!(initial["list"][0]["id"], "singleton");
+    assert_eq!(initial["list"][0]["isEnabled"], false);
+
+    let set = client
+        .one(
+            "VacationResponse/set",
+            json!({
+                "update": {"singleton": {
+                    "isEnabled": true,
+                    "fromDate": "2026-12-20T00:00:00Z",
+                    "toDate": "2027-01-04T00:00:00Z",
+                    "subject": "Away",
+                    "textBody": "Back in January.",
+                }},
+                "create": {"x": {"isEnabled": true}},
+                "destroy": ["singleton"],
+            }),
+        )
+        .await;
+    assert!(set["updated"].get("singleton").is_some(), "{set}");
+    assert_eq!(set["notCreated"]["x"]["type"], "singleton");
+    assert_eq!(set["notDestroyed"]["singleton"]["type"], "singleton");
+    assert_ne!(set["oldState"], set["newState"]);
+
+    let fetched = client
+        .one(
+            "VacationResponse/get",
+            json!({"ids": ["singleton", "other"]}),
+        )
+        .await;
+    assert_eq!(fetched["list"][0]["fromDate"], "2026-12-20T00:00:00Z");
+    assert_eq!(fetched["list"][0]["textBody"], "Back in January.");
+    assert_eq!(fetched["notFound"], json!(["other"]));
+    let stored = db::get_vacation_response(&state.db_path, USER).unwrap();
+    assert!(stored.enabled);
+    assert!(
+        stored.active_at(
+            chrono::DateTime::parse_from_rfc3339("2026-12-25T12:00:00Z")
+                .unwrap()
+                .timestamp()
+        )
+    );
+    assert!(
+        !stored.active_at(
+            chrono::DateTime::parse_from_rfc3339("2027-01-05T00:00:00Z")
+                .unwrap()
+                .timestamp()
+        )
+    );
+
+    let invalid = client
+        .one(
+            "VacationResponse/set",
+            json!({"update": {"singleton": {"fromDate": "soon"}}}),
+        )
+        .await;
+    assert_eq!(
+        invalid["notUpdated"]["singleton"]["type"],
+        "invalidProperties"
+    );
 }

@@ -2515,6 +2515,128 @@ async fn sieve_vacation_skips_bulk_mail_and_null_senders() {
     assert!(queued_eml(&td).is_empty());
 }
 
+async fn deliver_plain(
+    setup: impl FnOnce(&std::path::Path),
+    messages: &[(&str, &str)],
+) -> (Vec<String>, tempfile::TempDir) {
+    let (td, mail_root, db_path) = setup_mailbox();
+    setup(&db_path);
+    let mut input = String::from("EHLO localhost\r\n");
+    for (from, headers_and_body) in messages {
+        input.push_str(&format!(
+            "MAIL FROM:<{from}>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n{headers_and_body}\r\n.\r\n"
+        ));
+    }
+    input.push_str("QUIT\r\n");
+    run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn jmap_vacation_response_replies_without_a_sieve_script() {
+    let message = "From: a@remote.test\r\nTo: user@example.test\r\nSubject: ping\r\n\r\nb";
+    let (responses, td) = deliver_plain(
+        |db| {
+            rmail_common::db::set_vacation_response(
+                db,
+                "user@example.test",
+                &rmail_common::db::VacationResponse {
+                    enabled: true,
+                    subject: Some("Out of office".to_string()),
+                    text_body: Some("Back on Monday.".to_string()),
+                    html_body: Some("<p>Back on Monday.</p>".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        },
+        &[("a@remote.test", message), ("a@remote.test", message)],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 2, "{responses:?}");
+    assert_eq!(inbox(&td), 2);
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "one reply per sender: {queued:?}");
+    assert!(queued[0].contains("Subject: Out of office\r\n"));
+    assert!(queued[0].contains("multipart/alternative"));
+    assert!(queued[0].contains("<p>Back on Monday.</p>"));
+}
+
+#[tokio::test]
+async fn jmap_vacation_response_respects_its_dates_and_sieve_filing() {
+    let future = chrono::Utc::now().timestamp() + 86_400;
+    let (_, td) = deliver_plain(
+        |db| {
+            rmail_common::db::set_vacation_response(
+                db,
+                "user@example.test",
+                &rmail_common::db::VacationResponse {
+                    enabled: true,
+                    from_date: Some(future),
+                    text_body: Some("Away".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        },
+        &[(
+            "a@remote.test",
+            "From: a@remote.test\r\nTo: user@example.test\r\nSubject: x\r\n\r\nb",
+        )],
+    )
+    .await;
+    assert!(queued_eml(&td).is_empty(), "not before fromDate");
+
+    // With a filing script the reply still goes out and the filing holds.
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::put_sieve_script(
+        &db_path,
+        "user@example.test",
+        "main",
+        "require \"fileinto\"; fileinto \"Archive\";",
+    )
+    .unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, "user@example.test", Some("main")).unwrap();
+    rmail_common::db::set_vacation_response(
+        &db_path,
+        "user@example.test",
+        &rmail_common::db::VacationResponse {
+            enabled: true,
+            text_body: Some("Away".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (_, td) = run_prepared_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@remote.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nFrom: a@remote.test\r\nTo: user@example.test\r\n\r\nb\r\n.\r\nQUIT\r\n".to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path.clone(),
+    )
+    .await;
+    assert_eq!(inbox(&td), 0);
+    assert_eq!(queued_eml(&td).len(), 1);
+    assert_eq!(
+        rmail_common::db::get_active_sieve_script(&db_path, "user@example.test")
+            .unwrap()
+            .as_deref(),
+        Some("require \"fileinto\"; fileinto \"Archive\";")
+    );
+}
+
 #[tokio::test]
 async fn greylisting_defers_unknown_triples_but_not_submission_or_loopback() {
     let security = || SecurityConfig {

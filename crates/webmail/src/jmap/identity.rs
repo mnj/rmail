@@ -63,7 +63,7 @@ pub(crate) fn own_account(
     if !account.is_personal() {
         return Err(MethodError::with(
             "accountNotSupportedByMethod",
-            "shared accounts have no identities or submissions",
+            "shared accounts have no identities, submissions or vacation response",
         ));
     }
     Ok(account)

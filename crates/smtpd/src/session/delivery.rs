@@ -147,6 +147,9 @@ impl Session {
                 )
                 .await
         {
+            if stored {
+                self.jmap_vacation(mail_root, rcpt, data).await;
+            }
             return stored;
         }
         let started = Instant::now();
@@ -163,17 +166,73 @@ impl Session {
                     .map(|(_uidvalidity, uid)| Some(uid)),
             )
         };
-        self.finish_local(
-            mail_root,
-            rcpt,
-            folder,
-            result,
-            data.len(),
-            started,
-            dmarc,
-            report,
-        )
+        let stored = self
+            .finish_local(
+                mail_root,
+                rcpt,
+                folder,
+                result,
+                data.len(),
+                started,
+                dmarc,
+                report,
+            )
+            .await;
+        if stored && !quarantine {
+            self.jmap_vacation(mail_root, rcpt, data).await;
+        }
+        stored
+    }
+
+    /// Answer with the account's JMAP vacation response (RFC 8621 section
+    /// 8) when it is on. It runs next to the account's own Sieve script and
+    /// follows Sieve vacation's rules (RFC 5230): one reply per sender per
+    /// week, none to lists, automated mail or the account itself.
+    async fn jmap_vacation(&self, mail_root: &Path, rcpt: &str, data: &Bytes) {
+        let Some(db_path) = self.db_path.clone() else {
+            return;
+        };
+        let account = rcpt.to_string();
+        let Ok(Ok(response)) = tokio::task::spawn_blocking(move || {
+            rmail_common::db::get_vacation_response(&db_path, &account)
+        })
         .await
+        else {
+            return;
+        };
+        if !response.active_at(chrono::Utc::now().timestamp()) {
+            return;
+        }
+        let text = response.text_body.clone().unwrap_or_default();
+        let (reason, mime) = match &response.html_body {
+            None => (text, false),
+            Some(html) => {
+                let boundary = format!("=_vacation_{:032x}", rand::random::<u128>());
+                (
+                    format!(
+                        "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n\
+                         --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                         Content-Transfer-Encoding: 8bit\r\n\r\n{text}\r\n\
+                         --{boundary}\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Transfer-Encoding: 8bit\r\n\r\n{html}\r\n--{boundary}--\r\n"
+                    ),
+                    true,
+                )
+            }
+        };
+        let vacation = rmail_sieve::Vacation {
+            reason,
+            subject: response.subject.clone(),
+            from: None,
+            days: 7,
+            addresses: Vec::new(),
+            mime,
+            handle: Some("jmap-vacation-response".to_string()),
+        };
+        let message =
+            rmail_sieve::Message::new(data, self.tx.mail_from.as_deref().unwrap_or(""), rcpt);
+        self.sieve_vacation(mail_root, rcpt, &vacation, &message)
+            .await;
     }
 
     /// Record the outcome of one local store in the delivery report, metrics

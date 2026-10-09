@@ -519,6 +519,10 @@ enabling.
   the user may send as it.
 - Mailboxes shared with the user appear as one more JMAP account per owner, within the rights
   granted (see Shared folders).
+- A client's vacation response (out of office) is kept in the database and answered at delivery,
+  alongside the account's own Sieve script rather than replacing it. It follows Sieve vacation's
+  rules: one reply per sender per week, and none to lists, automated mail or the user's own
+  address.
 - Uploads are limited to webmail's 16 MiB request size and are removed after a day unless used.
 
 ## Mail organization

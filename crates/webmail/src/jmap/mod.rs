@@ -44,6 +44,7 @@ mod query;
 mod snippet;
 mod submission;
 mod thread;
+mod vacation;
 
 #[cfg(test)]
 mod tests;
@@ -51,6 +52,7 @@ mod tests;
 pub(crate) const CORE: &str = "urn:ietf:params:jmap:core";
 pub(crate) const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub(crate) const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
+pub(crate) const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 
 const MAX_CALLS_IN_REQUEST: usize = 64;
 pub(crate) const MAX_OBJECTS_IN_GET: usize = 1000;
@@ -453,6 +455,9 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
     for account in accounts {
         let mut capabilities = Map::new();
         capabilities.insert(MAIL.to_string(), mail_account_capabilities(account));
+        if account.is_personal() {
+            capabilities.insert(VACATION.to_string(), json!({}));
+        }
         if account.is_personal() && can_send {
             capabilities.insert(
                 SUBMISSION.to_string(),
@@ -487,6 +492,8 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
         }),
     );
     capabilities.insert(MAIL.to_string(), json!({}));
+    capabilities.insert(VACATION.to_string(), json!({}));
+    primary.insert(VACATION.to_string(), json!(own));
     if can_send {
         capabilities.insert(SUBMISSION.to_string(), json!({}));
         primary.insert(SUBMISSION.to_string(), json!(own));
@@ -724,6 +731,7 @@ fn method_capability(name: &str) -> &'static str {
     match name.split('/').next().unwrap_or_default() {
         "Core" => CORE,
         "Identity" | "EmailSubmission" => SUBMISSION,
+        "VacationResponse" => VACATION,
         _ => MAIL,
     }
 }
@@ -758,6 +766,8 @@ fn call_method(ctx: &mut Ctx, name: &str, args: Map<String, Value>) -> MethodRes
         "EmailSubmission/query" => submission::query(ctx, args),
         "EmailSubmission/queryChanges" => query::cannot_calculate(ctx, args),
         "EmailSubmission/set" => submission::set(ctx, args),
+        "VacationResponse/get" => vacation::get(ctx, args),
+        "VacationResponse/set" => vacation::set(ctx, args),
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
@@ -859,7 +869,7 @@ pub(crate) fn process(ctx: &mut Ctx, request: &Value) -> Result<Value, (&'static
         let capability = capability
             .as_str()
             .ok_or((NOT_REQUEST, "using holds a non-string".to_string()))?;
-        let known = [CORE, MAIL].contains(&capability)
+        let known = [CORE, MAIL, VACATION].contains(&capability)
             || (capability == SUBMISSION && ctx.app.submission.is_some());
         if !known {
             return Err((
