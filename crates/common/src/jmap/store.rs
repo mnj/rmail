@@ -817,6 +817,19 @@ pub fn threads(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Vec<
     Ok(out)
 }
 
+/// The EMAILID of the message `uid` in `folder`.
+pub fn email_id_at(conn: &Connection, folder: &str, uid: u64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT m.email_id FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE f.name = ?1 AND m.uid = ?2",
+            params![folder, uid as i64],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Open the account's state database (creating the account if needed).
 pub fn open(
     maildir_root: &Path,

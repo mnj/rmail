@@ -20,6 +20,7 @@ macro_rules! webmail_log {
 
 mod api;
 mod assets;
+mod jmap;
 mod submit;
 
 #[tokio::main]
@@ -58,6 +59,14 @@ async fn main() -> Result<()> {
         throttle: AuthThrottle::default(),
         revoked: websession::RevocationList::default(),
         submission: submit::local_submission_address(&cfg.global.submission_listeners()),
+        oauth: match &cfg.security.oauth {
+            Some(oauth) => Some(
+                rmail_common::oauth::OAuthValidator::new(oauth.clone())
+                    .context("configuring OAuth token validation")?,
+            ),
+            None => None,
+        },
+        jmap_logins: Default::default(),
     });
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),

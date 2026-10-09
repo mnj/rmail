@@ -12,6 +12,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 rmail_common = { path = "../common" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures-util = { version = "0.3", default-features = false }
+hmac = "0.12"
+rusqlite = "0.29"
+sha2 = "0.10"
 
 [dev-dependencies]
 rmail_common = { path = "../common", features = ["insecure-plaintext-passwords"] }

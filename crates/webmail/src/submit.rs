@@ -89,6 +89,26 @@ pub async fn submit(
     recipients: &[String],
     data: &[u8],
 ) -> anyhow::Result<()> {
+    submit_as(address, mail_root, user, user, recipients, data).await
+}
+
+/// Submit `data` as the signed-in `user` with envelope sender `mail_from`
+/// (an alias of theirs, say); the submission service decides whether the
+/// user may use it.
+pub async fn submit_as(
+    address: SocketAddr,
+    mail_root: &Path,
+    user: &str,
+    mail_from: &str,
+    recipients: &[String],
+    data: &[u8],
+) -> anyhow::Result<()> {
+    // Addresses go into SMTP commands; a line break would start another.
+    for address in std::iter::once(mail_from).chain(recipients.iter().map(String::as_str)) {
+        if !envelope_address(address) {
+            return Err(Refused(format!("invalid envelope address {address:?}")).into());
+        }
+    }
     let key = {
         let mail_root = mail_root.to_path_buf();
         tokio::task::spawn_blocking(move || {
@@ -117,10 +137,13 @@ pub async fn submit(
         if code != 235 {
             anyhow::bail!("submission service refused webmail's credential: {code} {text}");
         }
-        let utf8 = !user.is_ascii() || recipients.iter().any(|r| !r.is_ascii());
+        let utf8 = !mail_from.is_ascii() || recipients.iter().any(|r| !r.is_ascii());
         client
             .expect(
-                &format!("MAIL FROM:<{user}>{}", if utf8 { " SMTPUTF8" } else { "" }),
+                &format!(
+                    "MAIL FROM:<{mail_from}>{}",
+                    if utf8 { " SMTPUTF8" } else { "" }
+                ),
                 250,
                 "sender refused",
             )
@@ -164,6 +187,16 @@ pub async fn submit(
         .map_err(|_| anyhow::anyhow!("submission service timed out"))?
 }
 
+/// An address that can stand between `<` and `>` in MAIL or RCPT.
+fn envelope_address(address: &str) -> bool {
+    !address.is_empty()
+        && address.len() <= 320
+        && address.contains('@')
+        && !address
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +217,13 @@ mod tests {
         );
         assert_eq!(pick(&["192.0.2.5:587"]), None);
         assert_eq!(pick(&[]), None);
+    }
+
+    #[test]
+    fn envelope_addresses_cannot_carry_commands() {
+        assert!(envelope_address("a@example.test"));
+        assert!(!envelope_address("a@example.test>\r\nRCPT TO:<b@x.test"));
+        assert!(!envelope_address("a b@example.test"));
+        assert!(!envelope_address(""));
     }
 }
