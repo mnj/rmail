@@ -483,6 +483,19 @@ async fn main() -> anyhow::Result<()> {
 /// Release scheduled messages (RFC 4865 FUTURERELEASE, JMAP delayed send)
 /// when their time comes; see `rmail_common::hold`.
 async fn release_held_task(base: PathBuf, submission: std::net::SocketAddr) {
+    let root = base.clone();
+    match tokio::task::spawn_blocking(move || rmail_common::hold::recover(&root)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(recovered)) => rmail_common::structured_log!(
+            "info", "outbound", "held_recovered", { "messages": recovered }
+        ),
+        Ok(Err(error)) => rmail_common::structured_log!(
+            "error", "outbound", "held_recovery_failed", { "error": format!("{error:#}") }
+        ),
+        Err(error) => rmail_common::structured_log!(
+            "error", "outbound", "held_recovery_failed", { "error": error.to_string() }
+        ),
+    }
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     loop {
         interval.tick().await;

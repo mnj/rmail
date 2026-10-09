@@ -309,7 +309,7 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
     )?;
     conn.execute(
         "DELETE FROM vacation_responses WHERE account = ?1",
-        params![address],
+        params![address.to_ascii_lowercase()],
     )?;
     Ok(())
 }

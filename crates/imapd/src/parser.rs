@@ -1017,32 +1017,43 @@ pub(crate) fn mentions_thread_id(criterion: &SearchCriterion) -> bool {
     }
 }
 
+/// Whether THREADID keys were resolved into thread members.
+pub(crate) fn resolved_thread_ids(criterion: &SearchCriterion) -> bool {
+    match criterion {
+        SearchCriterion::ThreadMembers(_) => true,
+        SearchCriterion::Not(inner) => resolved_thread_ids(inner),
+        SearchCriterion::Or(left, right) => resolved_thread_ids(left) || resolved_thread_ids(right),
+        SearchCriterion::And(items) => items.iter().any(resolved_thread_ids),
+        _ => false,
+    }
+}
+
 /// Replace each THREADID key by the members of its thread.
 pub(crate) fn resolve_thread_ids(
     criterion: SearchCriterion,
-    members: &dyn Fn(&str) -> Vec<String>,
-) -> SearchCriterion {
-    match criterion {
+    members: &dyn Fn(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<SearchCriterion> {
+    Ok(match criterion {
         SearchCriterion::ThreadId(id) => {
-            let mut ids = members(&id);
+            let mut ids = members(&id)?;
             ids.sort();
             SearchCriterion::ThreadMembers(ids)
         }
         SearchCriterion::Not(inner) => {
-            SearchCriterion::Not(Box::new(resolve_thread_ids(*inner, members)))
+            SearchCriterion::Not(Box::new(resolve_thread_ids(*inner, members)?))
         }
         SearchCriterion::Or(left, right) => SearchCriterion::Or(
-            Box::new(resolve_thread_ids(*left, members)),
-            Box::new(resolve_thread_ids(*right, members)),
+            Box::new(resolve_thread_ids(*left, members)?),
+            Box::new(resolve_thread_ids(*right, members)?),
         ),
         SearchCriterion::And(items) => SearchCriterion::And(
             items
                 .into_iter()
                 .map(|item| resolve_thread_ids(item, members))
-                .collect(),
+                .collect::<anyhow::Result<_>>()?,
         ),
         other => other,
-    }
+    })
 }
 
 pub(crate) fn search_requires_message_data_for(

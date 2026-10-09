@@ -2648,6 +2648,36 @@ async fn jmap_vacation_response_replies_without_a_sieve_script() {
 }
 
 #[tokio::test]
+async fn jmap_vacation_response_is_quiet_for_mail_the_script_discards() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::put_sieve_script(&db_path, "user@example.test", "main", "discard;").unwrap();
+    rmail_common::db::set_active_sieve_script(&db_path, "user@example.test", Some("main")).unwrap();
+    rmail_common::db::set_vacation_response(
+        &db_path,
+        "user@example.test",
+        &rmail_common::db::VacationResponse {
+            enabled: true,
+            text_body: Some("Away".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (responses, td) = run_prepared_session(
+        b"EHLO localhost\r\nMAIL FROM:<a@remote.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nFrom: a@remote.test\r\nTo: user@example.test\r\n\r\nb\r\n.\r\nQUIT\r\n".to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    assert!(queued_eml(&td).is_empty(), "no reply for discarded mail");
+}
+
+#[tokio::test]
 async fn jmap_vacation_response_respects_its_dates_and_sieve_filing() {
     let future = chrono::Utc::now().timestamp() + 86_400;
     let (_, td) = deliver_plain(

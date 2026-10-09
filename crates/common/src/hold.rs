@@ -72,7 +72,10 @@ pub fn hold(mail_root: &Path, mut held: Held, data: &[u8]) -> Result<Held> {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // `<id>.eml.tmp`, `<id>.json.tmp`: one temp file per target.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -99,6 +102,45 @@ pub fn cancel(mail_root: &Path, id: &str) -> Result<bool> {
     let _ = std::fs::remove_file(eml);
     Ok(true)
 }
+
+/// Return claims a stopped worker left behind (`<id>.sending`) to the
+/// waiting entries, so their messages are released after all. Call before
+/// the first `release_due` of a worker.
+pub fn recover(mail_root: &Path) -> Result<usize> {
+    let dir = held_dir(mail_root);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut recovered = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sending") {
+            continue;
+        }
+        let json = path.with_extension("json");
+        if !json.exists() {
+            std::fs::rename(&path, &json)?;
+            recovered += 1;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(recovered)
+}
+
+/// How many messages `user` has waiting (to bound what one user can hold).
+pub fn count_for(mail_root: &Path, user: &str) -> Result<usize> {
+    Ok(due(mail_root, i64::MAX)?
+        .iter()
+        .filter(|held| held.user.eq_ignore_ascii_case(user))
+        .count())
+}
+
+/// The most messages one user may have waiting. The submission caps apply
+/// when they are released; this keeps a user from piling up a backlog.
+pub const MAX_HELD_PER_USER: usize = 200;
 
 /// Held messages whose time has come.
 pub fn due(mail_root: &Path, at: i64) -> Result<Vec<Held>> {
@@ -242,9 +284,22 @@ pub async fn release_due(mail_root: &Path, submission: std::net::SocketAddr) -> 
             Err(error) => {
                 held.release_at = now() + RETRY_SECONDS;
                 held.last_error = Some(format!("{error:#}"));
-                let text = serde_json::to_string(&held)?;
-                tokio::fs::write(&claimed, text).await?;
-                tokio::fs::rename(&claimed, &json).await?;
+                // Put the entry back for a later pass; if even that fails
+                // the claim stays and `recover` returns it at the next start.
+                let requeued = serde_json::to_vec(&held)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|text| write_atomic(&json, &text));
+                match requeued {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&claimed).await;
+                    }
+                    Err(requeue_error) => {
+                        crate::structured_log!("error", "outbound", "held_requeue_failed", {
+                            "id": held.id,
+                            "error": format!("{requeue_error:#}"),
+                        });
+                    }
+                }
                 crate::structured_log!("warn", "outbound", "held_message_retry", {
                     "id": held.id,
                     "error": format!("{error:#}"),
@@ -360,5 +415,17 @@ mod tests {
         assert!(!cancel(dir.path(), &later.id).unwrap());
         assert!(get(dir.path(), &later.id).unwrap().is_none());
         assert!(cancel(dir.path(), "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn claims_left_by_a_stopped_worker_are_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = hold(dir.path(), held(now() - 1), b"Subject: x\r\n\r\nx").unwrap();
+        let (_, json) = paths(dir.path(), &entry.id).unwrap();
+        std::fs::rename(&json, json.with_extension("sending")).unwrap();
+        assert!(due(dir.path(), now()).unwrap().is_empty());
+        assert_eq!(recover(dir.path()).unwrap(), 1);
+        assert_eq!(due(dir.path(), now()).unwrap().len(), 1);
+        assert_eq!(count_for(dir.path(), "USER@example.test").unwrap(), 1);
     }
 }

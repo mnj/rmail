@@ -134,9 +134,12 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
         let mut response = db::get_vacation_response(&ctx.app.db_path, &account.owner)?;
         match apply(&mut response, patch) {
             Ok(()) => {
-                db::set_vacation_response(&ctx.app.db_path, &account.owner, &response)?;
+                // The change is logged first: if saving then fails, clients
+                // only fetch an unchanged object, while the other order
+                // could leave a saved change no client hears about.
                 let conn = ctx.open(&account)?;
                 store::log_change(&conn, "VacationResponse", SINGLETON, false, false)?;
+                db::set_vacation_response(&ctx.app.db_path, &account.owner, &response)?;
                 updated.insert(id, Value::Null);
             }
             Err(error) => {

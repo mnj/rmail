@@ -34,6 +34,14 @@ pub(crate) fn is_forwarded_recipient(
         .is_some_and(|generation| *generation == transaction_generation)
 }
 
+/// What running the account's Sieve script did with a message.
+struct SieveOutcome {
+    /// The message was handled (stored, forwarded or discarded).
+    stored: bool,
+    /// It was stored in one of the account's own mailboxes.
+    kept: bool,
+}
+
 impl Session {
     pub(super) async fn deliver(
         &self,
@@ -134,7 +142,7 @@ impl Session {
         report: &mut DeliveryReport,
     ) -> bool {
         if !quarantine
-            && let Some(stored) = self
+            && let Some(outcome) = self
                 .deliver_with_sieve(
                     mail_root,
                     rcpt,
@@ -147,10 +155,12 @@ impl Session {
                 )
                 .await
         {
-            if stored {
+            // No out-of-office reply for mail the script discarded or only
+            // forwarded elsewhere.
+            if outcome.kept {
                 self.jmap_vacation(mail_root, rcpt, data).await;
             }
-            return stored;
+            return outcome.stored;
         }
         let started = Instant::now();
         let (folder, result) = if quarantine {
@@ -295,7 +305,7 @@ impl Session {
         data: &Bytes,
         dmarc: &Option<String>,
         report: &mut DeliveryReport,
-    ) -> Option<bool> {
+    ) -> Option<SieveOutcome> {
         use rmail_sieve::{Action, Message, Script};
 
         let db_path = self.db_path.clone()?;
@@ -323,6 +333,9 @@ impl Session {
         };
 
         let mut stored = false;
+        // Stored in one of the account's own mailboxes (not discarded or
+        // only forwarded).
+        let mut kept = false;
         // Redirecting to oneself is a keep, unless the script already keeps.
         let keeps = actions
             .iter()
@@ -343,7 +356,7 @@ impl Session {
                         data,
                         Vec::new(),
                     );
-                    stored |= self
+                    let local = self
                         .finish_local(
                             mail_root,
                             rcpt,
@@ -355,6 +368,8 @@ impl Session {
                             report,
                         )
                         .await;
+                    stored |= local;
+                    kept |= local;
                 }
                 Action::Keep { flags } => {
                     let result = self.sieve_store(
@@ -366,7 +381,7 @@ impl Session {
                         data,
                         flags,
                     );
-                    stored |= self
+                    let local = self
                         .finish_local(
                             mail_root,
                             rcpt,
@@ -378,6 +393,8 @@ impl Session {
                             report,
                         )
                         .await;
+                    stored |= local;
+                    kept |= local;
                 }
                 Action::FileInto { folder, flags } => {
                     let mut target = folder.clone();
@@ -409,7 +426,7 @@ impl Session {
                             flags,
                         );
                     }
-                    stored |= self
+                    let local = self
                         .finish_local(
                             mail_root,
                             rcpt,
@@ -421,6 +438,8 @@ impl Session {
                             report,
                         )
                         .await;
+                    stored |= local;
+                    kept |= local;
                 }
                 Action::Discard => {
                     report.any_accepted = true;
@@ -459,7 +478,7 @@ impl Session {
                 }
             }
         }
-        Some(stored)
+        Some(SieveOutcome { stored, kept })
     }
 
     fn sieve_store(

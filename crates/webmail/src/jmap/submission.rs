@@ -449,6 +449,11 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
                 ));
             }
         }
+        if rmail_common::hold::count_for(&mail_root, &user).map_err(super::server_fail)?
+            >= rmail_common::hold::MAX_HELD_PER_USER
+        {
+            return Err(set_error("forbiddenToSend", "too many scheduled messages"));
+        }
         let held = rmail_common::hold::hold(
             &mail_root,
             rmail_common::hold::Held {
@@ -608,20 +613,31 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
             );
             continue;
         }
-        // Cancelling works only while the message is still held.
-        let cancelled = record.undo_status == "pending"
-            && record.hold_id.as_deref().is_some_and(|hold_id| {
-                rmail_common::hold::cancel(&ctx.app.mail_root, hold_id).unwrap_or(false)
-            });
-        if !cancelled {
+        // Cancelling works only while the message is still held. The record
+        // says `canceled` before the hold goes, so a failure in between can
+        // never leave a cancelled message looking sent.
+        let Some(hold_id) = record
+            .hold_id
+            .as_deref()
+            .filter(|_| record.undo_status == "pending")
+        else {
             not_updated.insert(id, set_error("cannotUnsend", "the message has been sent"));
             continue;
-        }
+        };
         let conn = ctx.open(&account)?;
         conn.execute(
             "UPDATE jmap_submissions SET undo_status = 'canceled' WHERE id = ?1",
             params![id],
         )?;
+        if !rmail_common::hold::cancel(&ctx.app.mail_root, hold_id).unwrap_or(false) {
+            // Released meanwhile: it was sent after all.
+            conn.execute(
+                "UPDATE jmap_submissions SET undo_status = 'final' WHERE id = ?1",
+                params![id],
+            )?;
+            not_updated.insert(id, set_error("cannotUnsend", "the message has been sent"));
+            continue;
+        }
         store::log_change(&conn, "EmailSubmission", &id, false, false)?;
         updated.insert(id, Value::Null);
     }

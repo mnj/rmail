@@ -77,6 +77,18 @@ async fn email_ids_follow_messages_across_copy_and_move() {
         .command(&format!("Q0 SEARCH THREADID {first_thread}"), "Q0 OK")
         .await;
     assert_eq!(thread_search[0].trim_end(), "* SEARCH 1");
+    // Thread membership is fixed when the search runs, so it cannot back
+    // an updating context.
+    let update = session
+        .command(
+            &format!("Q9 SEARCH RETURN (UPDATE) THREADID {first_thread}"),
+            "Q9 OK",
+        )
+        .await;
+    assert!(
+        update.iter().any(|line| line.contains("[NOUPDATE \"Q9\"]")),
+        "{update:?}"
+    );
 
     let search = session
         .command(&format!("Q1 SEARCH EMAILID {second}"), "Q1 OK")

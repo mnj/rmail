@@ -543,9 +543,9 @@ pub(crate) fn cancel_update(tag: &str, args: &str, contexts: &mut UpdateContexts
 }
 
 /// The untagged `NO [NOUPDATE "tag"]` of RFC 5267 §4.3.1.
-pub(crate) fn refused(tag: &str) -> StatusLine {
+pub(crate) fn refused(tag: &str, reason: &str) -> StatusLine {
     let escaped = tag.replace('\\', "\\\\").replace('"', "\\\"");
-    StatusLine::untagged(Status::No, "Too many update contexts")
+    StatusLine::untagged(Status::No, reason.to_string())
         .with_code(format!("NOUPDATE \"{escaped}\""))
 }
 

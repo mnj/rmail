@@ -100,7 +100,7 @@ pub(crate) async fn sort(
     let mut update_context = None;
     if update {
         if contexts.is_full() {
-            response = response.status(context::refused(tag));
+            response = response.status(context::refused(tag, "Too many update contexts"));
         } else {
             update_context = Some(UpdateContext::new(
                 tag,
