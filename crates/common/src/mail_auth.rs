@@ -15,6 +15,21 @@ pub struct AuthenticationResults {
     pub dmarc: Option<String>,
     pub arc: Option<String>,
     pub header_from: Option<String>,
+    /// The DMARC policy domain, when it asks for reports (rua or ruf).
+    pub dmarc_domain: Option<String>,
+    /// Set when the policy's `fo` tag asks for a failure report (RFC 6591).
+    pub failure_report: Option<FailureReportRequest>,
+}
+
+/// A DMARC failure report the policy domain asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureReportRequest {
+    pub domain: String,
+    /// `mailto:` destinations with their size limits (0 for none), before the
+    /// external-destination check.
+    pub recipients: Vec<(String, usize)>,
+    pub dkim_aligned: bool,
+    pub spf_aligned: bool,
 }
 
 fn authenticator() -> Result<&'static MessageAuthenticator> {
@@ -128,6 +143,26 @@ pub async fn analyze_message(
         .await;
     crate::metrics::observe_dns_duration(started.elapsed());
     let dmarc = Some(dmarc_disposition(&dmarc_output).to_string());
+    let dmarc_domain = dmarc_output
+        .requested_reports()
+        .then(|| dmarc_output.domain().to_ascii_lowercase());
+    let failure_report = dmarc_output
+        .failure_report()
+        .and(dmarc_output.dmarc_record())
+        .map(|record| FailureReportRequest {
+            domain: dmarc_output.domain().to_ascii_lowercase(),
+            recipients: record
+                .ruf()
+                .iter()
+                .filter_map(|uri| {
+                    uri.uri()
+                        .strip_prefix("mailto:")
+                        .map(|address| (address.to_string(), uri.max_size()))
+                })
+                .collect(),
+            dkim_aligned: dmarc_output.dkim_result() == &DmarcResult::Pass,
+            spf_aligned: dmarc_output.spf_result() == &DmarcResult::Pass,
+        });
 
     Ok(AuthenticationResults {
         dkim,
@@ -135,6 +170,8 @@ pub async fn analyze_message(
         dmarc,
         arc,
         header_from: message.from.first().cloned(),
+        dmarc_domain,
+        failure_report,
     })
 }
 
@@ -213,12 +250,65 @@ pub async fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
     let Ok(record) = record else {
         return Ok(Vec::new());
     };
-    Ok(record
+    let addresses = record
         .rua()
         .iter()
         .filter_map(|uri| uri.uri.strip_prefix("mailto:"))
         .map(str::to_string)
-        .collect())
+        .collect::<Vec<_>>();
+    Ok(authorized_report_destinations(&domain, addresses).await)
+}
+
+/// RFC 7489 section 7.1: report addresses outside the policy domain's
+/// organization are used only when that domain publishes
+/// `<policy domain>._report._dmarc.<destination domain>` with `v=DMARC1`.
+pub async fn authorized_report_destinations(
+    policy_domain: &str,
+    addresses: Vec<String>,
+) -> Vec<String> {
+    let mut authorized = Vec::new();
+    for address in addresses.into_iter().take(10) {
+        let Some((_, destination)) = address.rsplit_once('@') else {
+            continue;
+        };
+        let destination = destination.to_ascii_lowercase();
+        let policy = policy_domain.to_ascii_lowercase();
+        // Same organization, approximated without a public suffix list: one
+        // domain is the other or a subdomain of it.
+        let related = destination == policy
+            || destination.ends_with(&format!(".{policy}"))
+            || policy.ends_with(&format!(".{destination}"));
+        if related || external_destination_allows(&policy, &destination).await {
+            authorized.push(address);
+        }
+    }
+    authorized
+}
+
+async fn external_destination_allows(policy_domain: &str, destination: &str) -> bool {
+    let Ok(resolver) = authenticator() else {
+        return false;
+    };
+    let name = format!("{policy_domain}._report._dmarc.{destination}.");
+    let started = std::time::Instant::now();
+    let lookup = resolver.resolver().txt_lookup(name).await;
+    crate::metrics::observe_dns_duration(started.elapsed());
+    lookup.is_ok_and(|lookup| {
+        lookup.answers().iter().any(|record| {
+            let mail_auth::hickory_resolver::proto::rr::RData::TXT(txt) = &record.data else {
+                return false;
+            };
+            let text = txt
+                .txt_data
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .map(char::from)
+                .collect::<String>();
+            text.split(';')
+                .next()
+                .is_some_and(|version| version.trim().eq_ignore_ascii_case("v=DMARC1"))
+        })
+    })
 }
 
 /// Retrieve the published DMARC policy for a domain, if one exists.
@@ -547,5 +637,108 @@ GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
         .await
         .unwrap();
         assert!(matches!(output, Cow::Borrowed(_)));
+    }
+}
+
+/// What a DMARC failure report (RFC 6591) says about one message.
+pub struct FailureReport<'a> {
+    pub request: &'a FailureReportRequest,
+    pub reporting_mta: &'a str,
+    pub recipient: &'a str,
+    pub source_ip: Option<IpAddr>,
+    pub original_mail_from: Option<&'a str>,
+    pub arrival: chrono::DateTime<chrono::Utc>,
+    pub dkim: Option<&'a str>,
+    pub spf: Option<&'a str>,
+    /// The original message; only its header section is included.
+    pub message: &'a [u8],
+}
+
+/// An `auth-failure` feedback report (RFC 5965 / RFC 6591) carrying the
+/// original header section only, never the body.
+pub fn failure_report_message(report: &FailureReport<'_>) -> Vec<u8> {
+    let request = report.request;
+    let header_end = report
+        .message
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(report.message.len(), |end| end + 2);
+    let headers = String::from_utf8_lossy(&report.message[..header_end]);
+    let clean = |value: &str| value.replace(['\r', '\n'], " ");
+    let alignment = match (request.dkim_aligned, request.spf_aligned) {
+        (true, true) => "dkim, spf",
+        (true, false) => "dkim",
+        (false, true) => "spf",
+        (false, false) => "none",
+    };
+    let boundary = format!("rmail-arf-{}", crate::tracking::new_tracking_id("b"));
+    let mut feedback = format!(
+        "Feedback-Type: auth-failure\r\nUser-Agent: rMail\r\nVersion: 1\r\n\
+         Arrival-Date: {}\r\nReporting-MTA: dns; {}\r\nAuth-Failure: dmarc\r\n\
+         Reported-Domain: {}\r\nIdentity-Alignment: {alignment}\r\n\
+         Authentication-Results: {}; dmarc=fail header.from={}; dkim={}; spf={}\r\n",
+        report.arrival.to_rfc2822(),
+        clean(report.reporting_mta),
+        clean(&request.domain),
+        clean(report.reporting_mta),
+        clean(&request.domain),
+        clean(report.dkim.unwrap_or("none")),
+        clean(report.spf.unwrap_or("none")),
+    );
+    if let Some(ip) = report.source_ip {
+        feedback.push_str(&format!("Source-IP: {ip}\r\n"));
+    }
+    if let Some(from) = report.original_mail_from {
+        feedback.push_str(&format!("Original-Mail-From: <{}>\r\n", clean(from)));
+    }
+    format!(
+        "From: <postmaster@{mta}>\r\nTo: <{to}>\r\n\
+         Subject: DMARC failure report for {domain}\r\nDate: {date}\r\n\
+         Auto-Submitted: auto-generated\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type=feedback-report; boundary=\"{boundary}\"\r\n\r\n\
+         --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+         A message claiming to be from {domain} failed DMARC at {mta}.\r\n\r\n\
+         --{boundary}\r\nContent-Type: message/feedback-report\r\n\r\n{feedback}\r\n\
+         --{boundary}\r\nContent-Type: text/rfc822-headers\r\n\r\n{headers}\r\n\
+         --{boundary}--\r\n",
+        mta = clean(report.reporting_mta),
+        to = clean(report.recipient),
+        domain = clean(&request.domain),
+        date = chrono::Utc::now().to_rfc2822(),
+    )
+    .into_bytes()
+}
+
+#[cfg(test)]
+mod failure_report_tests {
+    use super::*;
+
+    #[test]
+    fn failure_reports_are_arf_with_headers_only() {
+        let request = FailureReportRequest {
+            domain: "example.org".into(),
+            recipients: vec![("ruf@example.org".into(), 0)],
+            dkim_aligned: false,
+            spf_aligned: true,
+        };
+        let message = failure_report_message(&FailureReport {
+            request: &request,
+            reporting_mta: "mx.receiver.test",
+            recipient: "ruf@example.org",
+            source_ip: Some("192.0.2.9".parse().unwrap()),
+            original_mail_from: Some("bounce@example.org"),
+            arrival: chrono::Utc::now(),
+            dkim: Some("fail"),
+            spf: Some("pass"),
+            message: b"From: ceo@example.org\r\nSubject: wire money\r\n\r\nsecret body\r\n",
+        });
+        let text = String::from_utf8(message).unwrap();
+        assert!(text.contains("report-type=feedback-report"));
+        assert!(text.contains("Feedback-Type: auth-failure\r\n"));
+        assert!(text.contains("Auth-Failure: dmarc\r\n"));
+        assert!(text.contains("Identity-Alignment: spf\r\n"));
+        assert!(text.contains("Source-IP: 192.0.2.9\r\n"));
+        assert!(text.contains("Subject: wire money\r\n"));
+        assert!(!text.contains("secret body"));
     }
 }

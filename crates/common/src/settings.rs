@@ -816,6 +816,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.dmarc_failure_reports",
+        "filtering",
+        "DMARC failure reports",
+        "Send failure reports (RFC 6591) to domains whose DMARC policy asks for them (ruf, fo). Each report includes the failing message's headers but not its body; at most 10 per domain per hour.",
+        SettingKind::Bool,
+        SMTP,
+    ),
+    spec(
         "security.srs_domain",
         "filtering",
         "SRS domain",

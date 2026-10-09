@@ -129,6 +129,9 @@ impl Session {
         metrics::add_bytes_received(data.len() as u64);
         session_log!(self, "info", "message_received", { "message_id": self.message_id, "bytes": data.len(), "recipient_count": self.tx.rcpts.len() });
         let auth = self.authenticate_sender(&data).await;
+        if self.service == SmtpService::Mta && self.authenticated_user.is_none() {
+            self.report_dmarc(&auth, &data).await;
+        }
         if self.enforce_dmarc && auth.dmarc.as_deref() == Some("reject") {
             return self
                 .fail_message(reader, "554 5.7.1 Message rejected by DMARC policy")
@@ -252,6 +255,98 @@ impl Session {
                         Scan::Reject("451 4.7.1 Message scanner unavailable")
                     }
                 }
+            }
+        }
+    }
+
+    /// Record the DMARC result for aggregate reports and, when enabled and
+    /// asked for, queue failure reports (RFC 6591).
+    async fn report_dmarc(&self, auth: &AuthenticationResults, data: &Bytes) {
+        let (Some(db_path), Some(domain)) = (self.db_path.clone(), auth.dmarc_domain.clone())
+        else {
+            return;
+        };
+        let event = (
+            db_path,
+            domain,
+            auth.header_from.clone(),
+            self.tx.mail_from.clone(),
+            self.peer.map(|peer| peer.ip().to_string()),
+            auth.dkim.clone(),
+            auth.spf.clone(),
+            auth.dmarc.clone(),
+        );
+        let recorded = tokio::task::spawn_blocking(move || {
+            let (db, domain, from, envelope, ip, dkim, spf, dmarc) = event;
+            rmail_common::db::add_dmarc_event(
+                db,
+                &domain,
+                from.as_deref(),
+                envelope.as_deref(),
+                ip.as_deref(),
+                dkim.as_deref(),
+                spf.as_deref(),
+                dmarc.as_deref(),
+                None,
+            )
+        })
+        .await;
+        if !matches!(recorded, Ok(Ok(_))) {
+            session_log!(self, "warn", "dmarc_event_record_failed", { "message_id": self.message_id });
+        }
+
+        let Some(request) = auth.failure_report.as_ref() else {
+            return;
+        };
+        if !self.security.dmarc_failure_reports
+            || auth.dmarc.as_deref() == Some("pass")
+            || !crate::limits::failure_report_allowed(&request.domain)
+        {
+            return;
+        }
+        let candidates = request
+            .recipients
+            .iter()
+            .map(|(address, _)| address.clone())
+            .collect();
+        let authorized =
+            rmail_common::mail_auth::authorized_report_destinations(&request.domain, candidates)
+                .await;
+        let mail_root = std::path::PathBuf::from(&self.mail_root);
+        for recipient in authorized {
+            let message = rmail_common::mail_auth::failure_report_message(
+                &rmail_common::mail_auth::FailureReport {
+                    request,
+                    reporting_mta: crate::server_hostname(),
+                    recipient: &recipient,
+                    source_ip: self.peer.map(|peer| peer.ip()),
+                    original_mail_from: self
+                        .tx
+                        .mail_from
+                        .as_deref()
+                        .filter(|from| !from.is_empty()),
+                    arrival: chrono::Utc::now(),
+                    dkim: auth.dkim.as_deref(),
+                    spf: auth.spf.as_deref(),
+                    message: data,
+                },
+            );
+            // ruf may carry a size limit (e.g. mailto:a@b!10k).
+            let max_size = request
+                .recipients
+                .iter()
+                .find(|(address, _)| *address == recipient)
+                .map_or(0, |(_, size)| *size);
+            if max_size > 0 && message.len() > max_size {
+                continue;
+            }
+            let mail_root = mail_root.clone();
+            let queued = tokio::task::spawn_blocking(move || {
+                rmail_common::outbound::queue_outbound(&mail_root, &recipient, &message, None)
+            })
+            .await;
+            if !matches!(queued, Ok(Ok(_))) {
+                session_log!(self, "warn", "dmarc_failure_report_queue_failed", { "message_id": self.message_id, "domain": request.domain });
             }
         }
     }

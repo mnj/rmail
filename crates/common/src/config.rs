@@ -491,6 +491,10 @@ pub struct SecurityConfig {
     /// server. Empty disables SRS.
     #[serde(default)]
     pub srs_domain: String,
+    /// Send DMARC failure reports (RFC 6591) to domains whose policy asks for
+    /// them. They carry the failing message's headers.
+    #[serde(default)]
+    pub dmarc_failure_reports: bool,
     #[serde(default = "default_dnsbl_timeout_ms")]
     pub dnsbl_timeout_ms: u64,
 }
@@ -534,6 +538,7 @@ impl Default for SecurityConfig {
             proxy_protocol_trusted_networks: Vec::new(),
             imap_message_limit: 0,
             srs_domain: String::new(),
+            dmarc_failure_reports: false,
             dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }

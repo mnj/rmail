@@ -128,7 +128,7 @@ certification results.
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 95% | Both extensions are advertised together. The receiver supports exact-octet, multi-command BDAT transactions, LAST and zero-length chunks, cumulative SIZE enforcement with stream-preserving drains, DATA/BDAT state exclusion, and BODY=BINARYMIME validation. Relay capability negotiation selects binary-safe BDAT and requires both extensions for binary content; external conformance corpus testing remains. |
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
 | RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
-| RFC 7489 | DMARC policy | 90% | Alignment, policy outcomes, quarantine, optional rejection, and aggregate RUA report generation are implemented; failure (`ruf`, RFC 6591) reports are not implemented. |
+| RFC 7489 / RFC 6591 | DMARC policy and reports | 90% | Alignment, policy outcomes, quarantine and optional rejection are implemented. Every unauthenticated inbound evaluation for a domain that asks for reports is recorded for aggregate (`rua`) reports, and opt-in failure reports (`security.dmarc_failure_reports`, honoring `fo` and `ruf` size limits) carry the headers but never the body, at most 10 per domain per hour. External report destinations must authorize themselves (section 7.1); organizational domains are approximated without a public suffix list. |
 | RFC 8617 | ARC verification and sealing | 85% | Inbound ARC chains are verified and forwarded mail (aliases, catchalls) is sealed once per message; sealing uses `rsa-sha256` keys only. |
 | RFC 3464 / RFC 6522 | DSN message format | 95% | Success, delay, and failure reports from the receiver and the relay are `multipart/report` with `message/delivery-status`; corpus testing against other MTAs' parsers remains. |
 | RFC 5782 | DNSBL client | 90% | Unauthenticated inbound clients are checked against configured blocklists with cached results; lookups fail open on timeouts. IPv6 lookups follow the RFC's nibble format; per-list return-code filtering is basic. |
@@ -177,7 +177,7 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
   (RFC 4467) with BURL (RFC 4468).
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
   `FUTURERELEASE` (RFC 4865) and `ETRN` (RFC 1985).
-- **DMARC failure reports** (RFC 6591 / `ruf`) and **ARF abuse feedback** (RFC 5965).
+- **ARF abuse feedback** (RFC 5965) beyond DMARC failure reports.
 
 ## IMAP standards support
 
