@@ -25,6 +25,8 @@ use crate::api::AppState;
 
 const POLL: Duration = Duration::from_secs(3);
 const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+/// Polls that may fail in a row before the stream ends.
+const MAX_FAILURES: u32 = 5;
 const TYPES: &[&str] = &[
     "Mailbox",
     "Email",
@@ -81,6 +83,8 @@ struct Stream {
     started: Instant,
     last_event: Instant,
     done: bool,
+    /// Polls that failed in a row.
+    failures: u32,
 }
 
 pub(crate) async fn event_source(
@@ -134,6 +138,7 @@ pub(crate) async fn event_source(
         started: Instant::now(),
         last_event: Instant::now(),
         done: false,
+        failures: 0,
     };
     let events = stream::unfold(stream, |mut stream| async move {
         loop {
@@ -155,7 +160,7 @@ pub(crate) async fn event_source(
             let task_state = stream.state.clone();
             let task_user = stream.user.clone();
             let known = stream.known.clone();
-            let Ok((current, delivered)) = blocking(move || {
+            let polled = blocking(move || {
                 let current = states(&task_state, &task_user)?;
                 let delivered = current
                     .iter()
@@ -169,9 +174,25 @@ pub(crate) async fn event_source(
                     .collect::<Vec<_>>();
                 Ok((current, delivered))
             })
-            .await
-            else {
-                continue;
+            .await;
+            let (current, delivered) = match polled {
+                Ok(polled) => {
+                    stream.failures = 0;
+                    polled
+                }
+                Err(error) => {
+                    webmail_log!("warn", "jmap_push_poll_failed", {
+                        "user": stream.user.address,
+                        "error": format!("{error:#}"),
+                    });
+                    // A stream that cannot see changes must not look
+                    // healthy; ending it makes the client reconnect.
+                    stream.failures += 1;
+                    if stream.failures >= MAX_FAILURES {
+                        return None;
+                    }
+                    continue;
+                }
             };
             let mut changed = Map::new();
             for (id, snapshot) in &current {

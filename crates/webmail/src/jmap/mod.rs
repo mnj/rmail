@@ -905,6 +905,34 @@ pub(crate) fn process(ctx: &mut Ctx, request: &Value) -> Result<Value, (&'static
     Ok(response)
 }
 
+/// Whether a browser sent the request on behalf of another site. A browser
+/// attaches cached Basic credentials even to a cross-site form post, so
+/// such requests are refused before authentication (native clients send
+/// neither header).
+pub(crate) fn from_another_site(headers: &HeaderMap) -> bool {
+    let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    if let Some(site) = text("sec-fetch-site")
+        && !matches!(site, "same-origin" | "none")
+    {
+        return true;
+    }
+    if let Some(origin) = text("origin") {
+        let origin_host = origin.split_once("://").map(|(_, host)| host);
+        if origin_host.is_none() || origin_host != text("host") {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn cross_site_refusal() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "cross-site requests are not accepted",
+    )
+        .into_response()
+}
+
 async fn api(
     app: State<Shared>,
     Extension(peer): Extension<Peer>,
@@ -912,6 +940,22 @@ async fn api(
     body: Bytes,
 ) -> Response {
     let state = app.0;
+    if from_another_site(&headers) {
+        return cross_site_refusal();
+    }
+    // HTML forms cannot send this type, so a form can never pose as a
+    // JMAP request (RFC 8620 section 3.3 requires it anyway).
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    if !json {
+        return problem(
+            "urn:ietf:params:jmap:error:notJSON",
+            "the request must be application/json",
+        );
+    }
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
         Err(response) => return *response,

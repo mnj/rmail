@@ -269,11 +269,24 @@ pub fn log_change(
         if destroyed { "1" } else { "0" },
         false,
     );
-    for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        if statement.contains("?1") {
-            conn.execute(statement, params![id])?;
-        } else {
-            conn.execute(statement, [])?;
+    // One savepoint, so the row gets the sequence number this call took
+    // even when another writer bumps it meanwhile.
+    conn.execute_batch("SAVEPOINT jmap_log_change")?;
+    let logged = (|| -> Result<()> {
+        for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            if statement.contains("?1") {
+                conn.execute(statement, params![id])?;
+            } else {
+                conn.execute(statement, [])?;
+            }
+        }
+        Ok(())
+    })();
+    match logged {
+        Ok(()) => conn.execute_batch("RELEASE jmap_log_change")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK TO jmap_log_change; RELEASE jmap_log_change");
+            return Err(error);
         }
     }
     Ok(())
@@ -908,10 +921,47 @@ mod tests {
         assert_eq!(rows[0].copies.len(), 2);
         assert!(rows[0].has_flag("\\seen"));
 
+        // Moving keeps the email and its thread: an update, not a deletion
+        // and a new email (both the single and the batch move).
+        let before_move = state(&conn).unwrap();
+        let thread_before = rows[0].thread_id.clone();
+        for folder in ["Moved", "Later"] {
+            imap_state::create_folder(&root, "example.test", "user", folder).unwrap();
+        }
+        let moved =
+            imap_state::move_message_by_uid(&root, "example.test", "user", "Archive", 1, "Moved")
+                .unwrap()
+                .unwrap();
+        let later = imap_state::transfer_messages_by_uid(
+            &root,
+            "example.test",
+            "user",
+            "INBOX",
+            &[1],
+            "Later",
+            true,
+        )
+        .unwrap()[0]
+            .1;
+        sync_account(&root, "example.test", "user").unwrap();
+        let after_move = changes(&conn, "Email", before_move, None).unwrap().unwrap();
+        assert_eq!(after_move.updated, vec![email_id.clone()]);
+        assert!(after_move.created.is_empty() && after_move.destroyed.is_empty());
+        let threads_moved = changes(&conn, "Thread", before_move, None)
+            .unwrap()
+            .unwrap();
+        assert!(threads_moved.created.is_empty() && threads_moved.destroyed.is_empty());
+        assert_eq!(
+            emails(&conn, &root, "example.test", "user", None).unwrap()[0].thread_id,
+            thread_before
+        );
+
         // Removing every copy destroys the email and its thread.
         let before_delete = state(&conn).unwrap();
-        imap_state::delete_messages_by_uid(&root, "example.test", "user", "INBOX", &[1]).unwrap();
-        imap_state::delete_messages_by_uid(&root, "example.test", "user", "Archive", &[1]).unwrap();
+        imap_state::delete_messages_by_uid(&root, "example.test", "user", "Moved", &[moved])
+            .unwrap();
+        imap_state::delete_messages_by_uid(&root, "example.test", "user", "Later", &[later])
+            .unwrap();
         let deleted = changes(&conn, "Email", before_delete, None)
             .unwrap()
             .unwrap();

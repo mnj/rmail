@@ -1345,12 +1345,6 @@ pub fn transfer_messages_by_uid(
                 format!("moving message {uid} from {source_mailbox} to {destination_mailbox}")
             })?;
             guards.push(FileMutationGuard::moved(source_path, destination_path));
-            let source_modseq = next_modseq(&tx, source_id)?;
-            record_expunge(&tx, source_id, uid, source_modseq)?;
-            tx.execute(
-                "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
-                params![source_id, uid as i64],
-            )?;
         } else {
             fs::copy(&source_path, &destination_path).with_context(|| {
                 format!("copying message {uid} from {source_mailbox} to {destination_mailbox}")
@@ -1376,6 +1370,17 @@ pub fn transfer_messages_by_uid(
                 email_id
             ],
         )?;
+        // The source row goes after the destination row exists, so the
+        // email never has zero copies: JMAP sees a move, not a deletion
+        // and a new email.
+        if move_messages {
+            let source_modseq = next_modseq(&tx, source_id)?;
+            record_expunge(&tx, source_id, uid, source_modseq)?;
+            tx.execute(
+                "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![source_id, uid as i64],
+            )?;
+        }
         mappings.push((uid, destination_uid as u64));
         destination_uid = destination_uid.saturating_add(1);
     }

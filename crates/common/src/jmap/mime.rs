@@ -142,6 +142,10 @@ fn parse_part(
     next_id: &mut usize,
 ) -> BodyPart {
     let (head, body) = split_head(bytes);
+    // The body is always the tail of `bytes`, which lies inside `base`; a
+    // part without a blank line has an empty body that is not a slice of
+    // `base` at all, so its position comes from `bytes`, never from it.
+    let body_start = offset_of(base, bytes) + (bytes.len() - body.len());
     let headers = parse_header_fields(head);
     let content_type_header = header(&headers, "Content-Type").map(unfold);
     let content_type = content_type_header
@@ -203,7 +207,7 @@ fn parse_part(
         language,
         location,
         size: 0,
-        body: offset_of(base, body)..offset_of(base, body) + body.len(),
+        body: body_start..body_start + body.len(),
         encoding,
         sub_parts: Vec::new(),
     };
@@ -739,6 +743,22 @@ JVBERi0x\r\n\
         assert_eq!(lists.attachments, ["3"]);
         assert!(has_attachment(&root, &lists));
         assert_eq!(preview(MESSAGE, &root, &lists, 256), "Hello there");
+    }
+
+    #[test]
+    fn parts_without_a_body_do_not_panic() {
+        // Header-only message, and a multipart child without a blank line.
+        let header_only = b"Subject: x\r\nFrom: a@x.test";
+        let root = parse(header_only);
+        assert_eq!(root.body, header_only.len()..header_only.len());
+        assert!(root.decoded(header_only).is_empty());
+        let message = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n--b--\r\n";
+        let root = parse(message);
+        for leaf in root.leaves() {
+            assert!(leaf.body.end <= message.len());
+            let _ = leaf.text(message);
+        }
+        let _ = crate::jmap::store::summarize(message);
     }
 
     #[test]

@@ -105,6 +105,9 @@ pub(crate) async fn upload(
     body: Bytes,
 ) -> Response {
     let state = app.0;
+    if super::from_another_site(&headers) {
+        return super::cross_site_refusal();
+    }
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
         Err(response) => return *response,

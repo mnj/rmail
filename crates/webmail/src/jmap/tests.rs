@@ -57,10 +57,27 @@ async fn send(
     auth: Option<&str>,
     body: Vec<u8>,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    send_with(state, method, path, auth, body, &[]).await
+}
+
+async fn send_with(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    body: Vec<u8>,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
         .header(header::HOST, "mail.example.test");
+    if path.starts_with("/jmap/api") {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
     if let Some(auth) = auth {
         builder = builder.header(header::AUTHORIZATION, auth);
     }
@@ -212,6 +229,35 @@ async fn request_errors_follow_rfc_8620() {
     .await;
     assert_eq!(status, 400);
     assert!(String::from_utf8_lossy(&body).contains("unknownCapability"));
+
+    // A browser's cross-site form post never reaches authentication.
+    let request =
+        json!({"using": [super::CORE], "methodCalls": [["Core/echo", {}, "x"]]}).to_string();
+    for headers in [
+        &[("sec-fetch-site", "cross-site")][..],
+        &[("origin", "https://evil.example")][..],
+    ] {
+        let (status, _, _) = send_with(
+            &state,
+            "POST",
+            "/jmap/api/",
+            Some(&auth),
+            request.clone().into_bytes(),
+            headers,
+        )
+        .await;
+        assert_eq!(status, 403);
+    }
+    let (status, _, _) = send_with(
+        &state,
+        "POST",
+        "/jmap/api/",
+        Some(&auth),
+        request.clone().into_bytes(),
+        &[("origin", "http://mail.example.test")],
+    )
+    .await;
+    assert_eq!(status, 200);
 
     let client = Client::new(&state, USER);
     let responses = client

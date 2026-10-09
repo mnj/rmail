@@ -164,23 +164,35 @@ pub(crate) fn query(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
             matching.push(record);
         }
     }
+    let mut comparators = Vec::new();
     if let Some(sort) = args.get("sort").and_then(Value::as_array) {
-        for comparator in sort.iter().rev() {
+        for comparator in sort {
+            let property = comparator.get("property").and_then(Value::as_str);
+            if !matches!(property, Some("emailId" | "threadId" | "sentAt")) {
+                return Err(MethodError::new("unsupportedSort"));
+            }
             let ascending = comparator
                 .get("isAscending")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            match comparator.get("property").and_then(Value::as_str) {
-                Some("emailId") => matching.sort_by(|a, b| a.email_id.cmp(&b.email_id)),
-                Some("threadId") => matching.sort_by(|a, b| a.thread_id.cmp(&b.thread_id)),
-                Some("sentAt") => matching.sort_by_key(|record| record.send_at),
-                _ => return Err(MethodError::new("unsupportedSort")),
-            }
-            if !ascending {
-                matching.reverse();
-            }
+            comparators.push((property.unwrap_or_default().to_string(), ascending));
         }
     }
+    // Each key in turn; a descending key reverses its own comparison only.
+    matching.sort_by(|a, b| {
+        for (property, ascending) in &comparators {
+            let order = match property.as_str() {
+                "emailId" => a.email_id.cmp(&b.email_id),
+                "threadId" => a.thread_id.cmp(&b.thread_id),
+                _ => a.send_at.cmp(&b.send_at),
+            };
+            let order = if *ascending { order } else { order.reverse() };
+            if order.is_ne() {
+                return order;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
     let ids = matching.iter().map(|record| record.id.clone()).collect();
     let mut response = query::page(ids, &args)?;
     response["accountId"] = json!(account.id);
@@ -388,6 +400,25 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
     })
 }
 
+fn record_submission(ctx: &Ctx, account: &Account, record: &Record) -> Result<(), MethodError> {
+    let conn = ctx.open(account)?;
+    conn.execute(
+        "INSERT INTO jmap_submissions(id, identity_id, email_id, thread_id, envelope, send_at, delivery_status)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            record.id,
+            record.identity_id,
+            record.email_id,
+            record.thread_id,
+            record.envelope.to_string(),
+            record.send_at,
+            record.delivery_status.to_string(),
+        ],
+    )?;
+    store::log_change(&conn, "EmailSubmission", &record.id, true, false)?;
+    Ok(())
+}
+
 pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
     let account = own_account(ctx, &args)?;
     let old_state = check_if_in_state(ctx, &account, &args)?;
@@ -407,21 +438,15 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
         };
         match submit(ctx, &account, object) {
             Ok(record) => {
-                let conn = ctx.open(&account)?;
-                conn.execute(
-                    "INSERT INTO jmap_submissions(id, identity_id, email_id, thread_id, envelope, send_at, delivery_status)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        record.id,
-                        record.identity_id,
-                        record.email_id,
-                        record.thread_id,
-                        record.envelope.to_string(),
-                        record.send_at,
-                        record.delivery_status.to_string(),
-                    ],
-                )?;
-                store::log_change(&conn, "EmailSubmission", &record.id, true, false)?;
+                // The mail is gone already; failing to keep the record must
+                // not hide that, or a retrying client would send it twice.
+                if let Err(error) = record_submission(ctx, &account, &record) {
+                    webmail_log!("error", "jmap_submission_not_recorded", {
+                        "user": ctx.user.address,
+                        "submission": record.id,
+                        "error": format!("{error:?}"),
+                    });
+                }
                 ctx.created_ids
                     .insert(creation_id.clone(), record.id.clone());
                 sent.push((
