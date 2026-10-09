@@ -816,6 +816,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.srs_domain",
+        "filtering",
+        "SRS domain",
+        "Rewrite the envelope sender of mail forwarded by aliases, catchalls and Sieve redirects into this domain (Sender Rewriting Scheme), so SPF passes at the next hop, and return bounces to the original sender. The domain's MX and SPF must point at this server. Empty disables SRS.",
+        SettingKind::Text,
+        SMTP,
+    ),
+    spec(
         "security.imap_message_limit",
         "limits",
         "IMAP message limit",
@@ -1465,6 +1473,10 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
         crate::domain::canonicalize_domain(hostname.trim()).map_err(|error| {
             anyhow!("global.hostname: {hostname:?} is not a valid domain name ({error})")
         })?;
+    }
+    if !config.security.srs_domain.is_empty() {
+        crate::domain::canonicalize_domain(config.security.srs_domain.trim())
+            .map_err(|error| anyhow!("security.srs_domain: {error:#}"))?;
     }
     let limit = config.security.imap_message_limit;
     if limit > 0 && limit < 1000 {

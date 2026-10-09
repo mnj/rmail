@@ -486,6 +486,11 @@ pub struct SecurityConfig {
     /// Zero (the default) means no limit and the extension is not advertised.
     #[serde(default)]
     pub imap_message_limit: usize,
+    /// Rewrite the envelope sender of forwarded mail into this domain (SRS),
+    /// so SPF passes at the next hop. Its MX and SPF must point at this
+    /// server. Empty disables SRS.
+    #[serde(default)]
+    pub srs_domain: String,
     #[serde(default = "default_dnsbl_timeout_ms")]
     pub dnsbl_timeout_ms: u64,
 }
@@ -528,6 +533,7 @@ impl Default for SecurityConfig {
             dnsbl_zones: Vec::new(),
             proxy_protocol_trusted_networks: Vec::new(),
             imap_message_limit: 0,
+            srs_domain: String::new(),
             dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }

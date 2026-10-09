@@ -33,6 +33,7 @@ pub mod scanner;
 pub mod search_index;
 pub mod settings;
 pub mod sqlite_pool;
+pub mod srs;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod throttle;

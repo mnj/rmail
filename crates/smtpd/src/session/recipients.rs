@@ -132,6 +132,26 @@ impl Session {
             return Decision::Reject(b"550 5.1.3 Bad destination address\r\n");
         };
 
+        // A bounce to an address SRS rewrote goes back to the original sender.
+        let srs_domain = self.security.srs_domain.trim();
+        if !srs_domain.is_empty()
+            && domain.eq_ignore_ascii_case(srs_domain)
+            && let Some((local, _)) = address.rsplit_once('@')
+            && rmail_common::srs::is_srs(local)
+        {
+            return match rmail_common::srs::reverse(local, crate::srs_key()) {
+                Ok(_) if room == 0 => Decision::Reject(TOO_MANY_RECIPIENTS),
+                Ok(original) => Decision::Accept {
+                    targets: vec![original],
+                    forwarded: true,
+                },
+                Err(error) => {
+                    session_log!(self, "info", "srs_rejected", { "rcpt": address, "reason": format!("{error:#}") });
+                    Decision::Reject(b"550 5.1.1 Invalid or expired return address\r\n")
+                }
+            };
+        }
+
         let alias = self
             .lookup(address, "alias", {
                 let db_path = db_path.clone();

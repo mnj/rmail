@@ -140,6 +140,22 @@ Relay credentials are sent with AUTH PLAIN and only over TLS; a relay that offer
 used. MTA-STS and DANE apply to MX delivery only, while REQUIRETLS messages still need TLS to the
 relay.
 
+## Forwarding and SRS
+
+Aliases, catchalls and Sieve `redirect` that point at other servers forward mail with ARC sealing.
+The next hop still checks SPF against the original envelope sender, which fails for most senders.
+Set an SRS domain to rewrite that sender (Sender Rewriting Scheme):
+
+```bash
+rmail_ctl settings set security.srs_domain fwd.example.com
+```
+
+Forwarded mail then leaves with a sender like `SRS0=HHHH=TT=example.org=alice@fwd.example.com`,
+and bounces to it within 21 days go back to `alice@example.org`. The SRS domain needs an MX
+pointing at this server and an SPF record that authorizes it (for example `v=spf1 mx -all`).
+Senders in hosted domains and null senders are not rewritten. The signing key is generated on
+first start and kept in the settings database.
+
 ## LMTP local delivery
 
 LMTP is disabled by default. Enable a TCP endpoint with, for example,

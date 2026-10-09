@@ -64,6 +64,13 @@ pub(crate) const STARTTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 static SERVER_HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Domain announced in greetings, EHLO/HELO replies and Received headers.
+/// The HMAC key for SRS addresses (see `rmail_common::srs`).
+static SRS_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+pub(crate) fn srs_key() -> &'static [u8] {
+    SRS_KEY.get().map_or(&[], Vec::as_slice)
+}
+
 pub(crate) fn server_hostname() -> &'static str {
     SERVER_HOSTNAME.get_or_init(rmail_common::config::system_hostname)
 }
@@ -119,6 +126,10 @@ async fn main() -> Result<()> {
     )?;
     // SQLite DB is the authoritative source for mailboxes and catchalls
     let db_path = cfg.global.db_path.clone();
+    let srs_key = rmail_common::settings::open(&db_path)
+        .and_then(|mut conn| rmail_common::settings::internal_secret(&mut conn, "srs_key"))
+        .context("loading the SRS key")?;
+    let _ = SRS_KEY.set(srs_key.into_bytes());
     if let Err(e) = rmail_common::db::init_db(&db_path) {
         smtp_log!("error", "database_initialization_failed", { "path": db_path, "error": e.to_string() });
         std::process::exit(1);

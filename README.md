@@ -122,6 +122,7 @@ certification results.
 | RFC 8314 | Implicit TLS submission (port 465) | 100% | SMTPS listeners run TLS from the first byte; STARTTLS is not offered inside them. |
 | RFC 9422 | `LIMITS` | 100% | `RCPTMAX` advertises the per-transaction recipient limit already enforced at RCPT; the relay honors a next hop's `MAILMAX` by closing pooled sessions that reached it. rMail sets no `MAILMAX` or `RCPTDOMAINMAX` of its own. |
 | RFC 3848 | Received trace protocol identifiers | 100% | Generated trace fields distinguish SMTP, ESMTP, TLS, and authenticated submission with the appropriate protocol token. |
+| SRS (draft) | Sender Rewriting Scheme | 100% | With `security.srs_domain`, forwarded mail gets an `SRS0`/`SRS1` envelope sender keyed with a generated secret; bounces to it within 21 days are verified and returned to the original sender. Hosted and null senders are not rewritten. |
 | RFC 3461 | Delivery Status Notifications | 100% | `DSN`, `RET`, `ENVID`, `NOTIFY`, and `ORCPT` are implemented with private queue metadata and loop-safe success/failure reports. |
 | RFC 8689 | `REQUIRETLS` | 100% | Advertised and accepted only on TLS sessions; submission, durable queue metadata, relay advertisement checks, and downgrade-resistant TLS enforcement are implemented. |
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 95% | Both extensions are advertised together. The receiver supports exact-octet, multi-command BDAT transactions, LAST and zero-length chunks, cumulative SIZE enforcement with stream-preserving drains, DATA/BDAT state exclusion, and BODY=BINARYMIME validation. Relay capability negotiation selects binary-safe BDAT and requires both extensions for binary content; external conformance corpus testing remains. |
@@ -177,7 +178,6 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
   `FUTURERELEASE` (RFC 4865) and `ETRN` (RFC 1985).
 - **DMARC failure reports** (RFC 6591 / `ruf`) and **ARF abuse feedback** (RFC 5965).
-- **Sender Rewriting Scheme** for forwarded mail; ARC sealing is the only SPF mitigation.
 
 ## IMAP standards support
 
