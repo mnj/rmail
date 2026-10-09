@@ -528,7 +528,7 @@ async fn session_resource(
     .await
     {
         Ok(accounts) => json_response(&session_object(&state, &user, &accounts, &base)),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => internal_response(format!("{error:#}")),
     }
 }
 
@@ -595,14 +595,36 @@ impl MethodError {
 
 impl From<anyhow::Error> for MethodError {
     fn from(error: anyhow::Error) -> Self {
-        Self::with("serverFail", format!("{error:#}"))
+        log_internal(format!("{error:#}"));
+        Self::with("serverFail", INTERNAL_ERROR)
     }
 }
 
 impl From<rusqlite::Error> for MethodError {
     fn from(error: rusqlite::Error) -> Self {
-        Self::with("serverFail", error.to_string())
+        log_internal(&error);
+        Self::with("serverFail", INTERNAL_ERROR)
     }
+}
+
+/// What clients are told about an internal failure; the detail (paths,
+/// database errors) goes to the log only.
+pub(crate) const INTERNAL_ERROR: &str = "internal server error";
+
+pub(crate) fn log_internal(detail: impl std::fmt::Display) {
+    webmail_log!("error", "jmap_internal_error", { "error": detail.to_string() });
+}
+
+/// A 500 response for an internal failure, logged.
+pub(crate) fn internal_response(detail: impl std::fmt::Display) -> Response {
+    log_internal(detail);
+    (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR).into_response()
+}
+
+/// A `serverFail` SetError for an internal failure, logged.
+pub(crate) fn server_fail(detail: impl std::fmt::Display) -> Value {
+    log_internal(detail);
+    set_error("serverFail", INTERNAL_ERROR)
 }
 
 pub(crate) type MethodResult = Result<Vec<(String, Value)>, MethodError>;
@@ -981,7 +1003,7 @@ async fn api(
     match outcome {
         Ok(Ok(response)) => json_response(&response),
         Ok(Err((kind, detail))) => problem(kind, &detail),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => internal_response(format!("{error:#}")),
     }
 }
 

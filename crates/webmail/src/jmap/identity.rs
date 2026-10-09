@@ -250,9 +250,9 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![id, fields.0, email.to_ascii_lowercase(), fields.1, fields.2, fields.3, fields.4],
             )
-            .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .map_err(|error| super::server_fail(error.to_string()))?;
             store::log_change(&conn, "Identity", &id, true, false)
-                .map_err(|error| set_error("serverFail", error.to_string()))?;
+                .map_err(|error| super::server_fail(error.to_string()))?;
             Ok(id)
         })();
         match outcome {
@@ -294,7 +294,7 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                     },
                 )
                 .optional()
-                .map_err(|error| set_error("serverFail", error.to_string()))?
+                .map_err(|error| super::server_fail(error.to_string()))?
                 .ok_or_else(|| set_error("notFound", "no such identity"))?;
             apply(&mut fields, patch, false)?;
             conn.execute(
@@ -302,9 +302,9 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                      text_signature = ?5, html_signature = ?6 WHERE id = ?1",
                 params![id, fields.0, fields.1, fields.2, fields.3, fields.4],
             )
-            .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .map_err(|error| super::server_fail(error.to_string()))?;
             store::log_change(&conn, "Identity", &id, false, false)
-                .map_err(|error| set_error("serverFail", error.to_string()))?;
+                .map_err(|error| super::server_fail(error.to_string()))?;
             Ok(())
         })();
         match outcome {

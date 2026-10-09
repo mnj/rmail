@@ -403,7 +403,7 @@ impl Setter<'_> {
                 })?;
                 let views = self
                     .views()
-                    .map_err(|error| set_error("serverFail", format!("{error:?}")))?;
+                    .map_err(|error| super::server_fail(format!("{error:?}")))?;
                 let parent = views
                     .iter()
                     .find(|view| view.row.mailbox_id == id)
@@ -484,13 +484,13 @@ impl Setter<'_> {
         }
         let views = self
             .views()
-            .map_err(|error| set_error("serverFail", format!("{error:?}")))?;
+            .map_err(|error| super::server_fail(format!("{error:?}")))?;
         let conn = self
             .ctx
             .open(&self.account)
-            .map_err(|error| set_error("serverFail", format!("{error:?}")))?;
+            .map_err(|error| super::server_fail(format!("{error:?}")))?;
         let exists = store::mailboxes(&conn)
-            .map_err(|error| set_error("serverFail", error.to_string()))?
+            .map_err(|error| super::server_fail(error.to_string()))?
             .iter()
             .any(|row| row.name.eq_ignore_ascii_case(&full));
         drop(conn);
@@ -510,7 +510,7 @@ impl Setter<'_> {
             &full,
             special_use,
         )
-        .map_err(|error| set_error("serverFail", error.to_string()))?;
+        .map_err(|error| super::server_fail(error.to_string()))?;
         let subscribe = object
             .get("isSubscribed")
             .and_then(Value::as_bool)
@@ -524,15 +524,15 @@ impl Setter<'_> {
                 &full,
                 subscribe,
             )
-            .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .map_err(|error| super::server_fail(error.to_string()))?;
         }
         let folder =
             imap_state::find_folder(&root, &self.account.domain, &self.account.localpart, &full)
-                .map_err(|error| set_error("serverFail", error.to_string()))?
-                .ok_or_else(|| set_error("serverFail", "the new mailbox vanished"))?;
+                .map_err(|error| super::server_fail(error.to_string()))?
+                .ok_or_else(|| super::server_fail("the new mailbox vanished"))?;
         if self.account.shared.is_some() {
             self.inherit_grants(&full, &folder.mailbox_id)
-                .map_err(|error| set_error("serverFail", error.to_string()))?;
+                .map_err(|error| super::server_fail(error.to_string()))?;
             // The user now sees the new mailbox with the parent's rights.
             if let Some(parent) = parent_id.and_then(|id| self.ctx.resolve_id(id)) {
                 let rights = self.account.rights(&parent);
@@ -597,7 +597,7 @@ impl Setter<'_> {
     fn update(&mut self, id: &str, patch: &Map<String, Value>) -> Result<(), Value> {
         let views = self
             .views()
-            .map_err(|error| set_error("serverFail", format!("{error:?}")))?;
+            .map_err(|error| super::server_fail(format!("{error:?}")))?;
         let view = views
             .iter()
             .find(|view| view.row.mailbox_id == id)
@@ -724,7 +724,7 @@ impl Setter<'_> {
                 &view.row.name,
                 &full,
             )
-            .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .map_err(|error| super::server_fail(error.to_string()))?;
         }
         if let Some(subscribe) = subscribe
             && !self.account.is_personal()
@@ -739,7 +739,7 @@ impl Setter<'_> {
         } else if let Some(subscribe) = subscribe {
             let name =
                 imap_state::list_folders(&root, &self.account.domain, &self.account.localpart)
-                    .map_err(|error| set_error("serverFail", error.to_string()))?
+                    .map_err(|error| super::server_fail(error.to_string()))?
                     .into_iter()
                     .find(|folder| folder.mailbox_id == id)
                     .map(|folder| folder.name)
@@ -751,7 +751,7 @@ impl Setter<'_> {
                 &name,
                 subscribe,
             )
-            .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .map_err(|error| super::server_fail(error.to_string()))?;
         }
         Ok(())
     }
@@ -760,9 +760,9 @@ impl Setter<'_> {
         let conn = self
             .ctx
             .open(&self.account)
-            .map_err(|error| set_error("serverFail", format!("{error:?}")))?;
+            .map_err(|error| super::server_fail(format!("{error:?}")))?;
         let rows =
-            store::mailboxes(&conn).map_err(|error| set_error("serverFail", error.to_string()))?;
+            store::mailboxes(&conn).map_err(|error| super::server_fail(error.to_string()))?;
         drop(conn);
         let row = rows
             .iter()
@@ -804,9 +804,9 @@ impl Setter<'_> {
             &self.account.localpart,
             &row.name,
         )
-        .map_err(|error| set_error("serverFail", error.to_string()))?;
+        .map_err(|error| super::server_fail(error.to_string()))?;
         acl::forget_mailbox(&self.ctx.app.db_path, &self.account.owner, id)
-            .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .map_err(|error| super::server_fail(error.to_string()))?;
         Ok(())
     }
 }

@@ -258,7 +258,7 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
             )
         })?;
     let identity = identities(ctx, account)
-        .map_err(|error| set_error("serverFail", format!("{error:?}")))?
+        .map_err(|error| super::server_fail(format!("{error:?}")))?
         .into_iter()
         .find(|identity| identity.id == identity_id)
         .ok_or_else(|| {
@@ -272,7 +272,7 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
             set_error_properties("invalidProperties", "emailId is required", &["emailId"])
         })?;
     let row = visible_emails(ctx, account, Some(std::slice::from_ref(&email_id)))
-        .map_err(|error| set_error("serverFail", format!("{error:?}")))?
+        .map_err(|error| super::server_fail(format!("{error:?}")))?
         .into_iter()
         .next()
         .ok_or_else(|| set_error("invalidEmail", "no such email"))?;
@@ -373,7 +373,7 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
         } else if error.downcast_ref::<crate::submit::Refused>().is_some() {
             set_error("forbiddenToSend", text)
         } else {
-            set_error("serverFail", text)
+            super::server_fail(text)
         });
     }
     let mut delivery_status = Map::new();

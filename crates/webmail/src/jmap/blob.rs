@@ -160,7 +160,7 @@ pub(crate) async fn upload(
             response
         }
         Ok(None) => (StatusCode::NOT_FOUND, "no such account").into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => super::internal_response(format!("{error:#}")),
     }
 }
 
@@ -225,6 +225,6 @@ pub(crate) async fn download(
             response
         }
         Ok(None) => (StatusCode::NOT_FOUND, "no such blob").into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => super::internal_response(format!("{error:#}")),
     }
 }

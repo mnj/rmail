@@ -120,13 +120,7 @@ pub(crate) async fn event_source(
             .into_iter()
             .map(|(id, snapshot)| (id, (snapshot.state, snapshot.seq)))
             .collect(),
-        Err(error) => {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                error.to_string(),
-            )
-                .into_response();
-        }
+        Err(error) => return super::internal_response(format!("{error:#}")),
     };
     let stream = Stream {
         state,

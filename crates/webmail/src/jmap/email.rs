@@ -965,7 +965,7 @@ fn storage_error(error: anyhow::Error) -> Value {
     {
         set_error("overQuota", "the account's storage quota is exceeded")
     } else {
-        set_error("serverFail", format!("{error:#}"))
+        super::server_fail(format!("{error:#}"))
     }
 }
 
@@ -1017,10 +1017,10 @@ fn store_message(
     }
     let conn = ctx
         .open(account)
-        .map_err(|error| set_error("serverFail", format!("{error:?}")))?;
+        .map_err(|error| super::server_fail(format!("{error:?}")))?;
     store::email_id_at(&conn, &first.row.name, uid)
-        .map_err(|error| set_error("serverFail", error.to_string()))?
-        .ok_or_else(|| set_error("serverFail", "the stored message has no id"))
+        .map_err(|error| super::server_fail(error.to_string()))?
+        .ok_or_else(|| super::server_fail("the stored message has no id"))
 }
 
 /// Which flags `rights` allow setting (RFC 4314 section 4).
@@ -1442,7 +1442,7 @@ pub(crate) fn import(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                 .resolve_id(blob_id)
                 .unwrap_or_else(|| blob_id.to_string());
             let data = blob::blob_bytes(ctx, &account, &blob_id)
-                .map_err(|error| set_error("serverFail", format!("{error:?}")))?
+                .map_err(|error| super::server_fail(format!("{error:?}")))?
                 .ok_or_else(|| set_error("blobNotFound", "no such blob"))?;
             let targets = target_mailboxes(
                 ctx,
@@ -1521,7 +1521,7 @@ pub(crate) fn copy(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                 set_error_properties("invalidProperties", "id is required", &["id"])
             })?;
             let source = visible_emails(ctx, &from, Some(&[source_id.to_string()]))
-                .map_err(|error| set_error("serverFail", format!("{error:?}")))?
+                .map_err(|error| super::server_fail(format!("{error:?}")))?
                 .into_iter()
                 .next()
                 .ok_or_else(|| set_error("notFound", "no such email"))?;
