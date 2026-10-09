@@ -72,6 +72,20 @@ pub(crate) async fn handle(
         .filter(|flag| !flag.eq_ignore_ascii_case("\\Recent"))
         .cloned()
         .collect::<Vec<_>>();
+    // RFC 4314 section 4: a STORE succeeds if the rights allow changing any
+    // of the requested flags, and fails if they allow none.
+    if !requested_flags.is_empty()
+        && !requested_flags
+            .iter()
+            .any(|flag| crate::shared::permitted_flag(selected.rights, flag))
+    {
+        return Outcome {
+            condstore_activated,
+            ..outcome(Response::new().status(
+                StatusLine::tagged(tag, Status::No, "Permission denied").with_code("NOPERM"),
+            ))
+        };
+    }
     for (sequence, uid, current_flags, modseq) in targets {
         // Messages expunged by another session keep their sequence number
         // until the expunge is reported; there is nothing left to store.

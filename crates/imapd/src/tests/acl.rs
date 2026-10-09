@@ -229,6 +229,13 @@ async fn owner_shares_a_mailbox_and_rights_limit_what_the_grantee_can_do() {
         stored.to_ascii_lowercase().contains("flags (\\seen)"),
         "{stored}"
     );
+    // A STORE the rights allow none of fails rather than reporting success.
+    assert!(
+        friend
+            .run("STORE 1 +FLAGS (\\Flagged)")
+            .await
+            .ends_with("NO [NOPERM]")
+    );
     assert!(
         friend
             .run(&format!("APPEND {SHARED} (\\Flagged) {{5+}}\r\nhello"))

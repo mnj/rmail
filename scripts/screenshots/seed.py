@@ -121,13 +121,13 @@ for to, subject in [
 imap = imaplib.IMAP4("127.0.0.1", 1143)
 imap.starttls(ssl_context=TLS)
 imap.login("bob@example.com", PASSWORD)
-imap.create("Team Projects")
+imap.create('"Team Projects"')
 for subject, body in [
     ("Migration runbook v3", "Steps for the cut-over weekend, with rollback points marked."),
     ("Vendor shortlist", "Three vendors made the shortlist; notes on each are below."),
 ]:
     m = message('"Bob Hansen" <bob@example.com>', "bob@example.com", subject, body)
-    imap.append("Team Projects", None, None, m.as_bytes())
+    imap.append('"Team Projects"', None, None, m.as_bytes())
 imap._simple_command("SETACL", '"Team Projects"', "alice@example.com", "lrs")
 imap.logout()
 

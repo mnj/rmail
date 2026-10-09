@@ -849,11 +849,14 @@ pub(crate) struct Location {
     pub localpart: String,
     pub folder: String,
     pub rights: Rights,
+    /// The folder belongs to another account. A grant may hold every right,
+    /// so this cannot be told from `rights`.
+    pub shared: bool,
 }
 
 impl Location {
     pub(crate) fn is_shared(&self) -> bool {
-        self.rights != Rights::ALL
+        self.shared
     }
 }
 
@@ -882,6 +885,7 @@ pub(crate) fn locate(state: &AppState, session: &Session, requested: &str) -> Re
             localpart: shared.localpart,
             folder: shared.folder.name,
             rights: shared.rights,
+            shared: true,
         });
     }
     Ok(Location {
@@ -894,6 +898,7 @@ pub(crate) fn locate(state: &AppState, session: &Session, requested: &str) -> Re
             requested,
         )?,
         rights: Rights::ALL,
+        shared: false,
     })
 }
 
