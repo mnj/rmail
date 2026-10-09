@@ -2124,13 +2124,21 @@ async fn mta_sts_policy_for_domain(
     Some(policy)
 }
 
-async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> Vec<String> {
+/// Where a domain wants its TLS reports (RFC 8460 section 3).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TlsReportTargets {
+    mail: Vec<String>,
+    https: Vec<String>,
+}
+
+async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> TlsReportTargets {
     let started = Instant::now();
     let lookup_result = resolver.txt_lookup(format!("_smtp._tls.{domain}")).await;
     rmail_common::metrics::observe_dns_duration(started.elapsed());
     let Ok(lookup) = lookup_result else {
-        return Vec::new();
+        return TlsReportTargets::default();
     };
+    let mut https = Vec::new();
     let valid_records = lookup
         .iter()
         .filter_map(|record| {
@@ -2148,6 +2156,18 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
                 } else if let Some((name, addresses)) = field.split_once('=')
                     && name.eq_ignore_ascii_case("rua")
                 {
+                    // RFC 8460 section 5.4: https: targets get the report POSTed.
+                    https.extend(
+                        addresses
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|uri| {
+                                uri.get(..8)
+                                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+                            })
+                            .filter_map(|uri| reqwest::Url::parse(uri).ok())
+                            .map(String::from),
+                    );
                     recipients.extend(addresses.split(',').filter_map(|uri| {
                         uri.trim()
                             .strip_prefix("mailto:")
@@ -2163,8 +2183,9 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
         })
         .collect::<Vec<_>>();
     if valid_records.len() != 1 {
-        return Vec::new();
+        return TlsReportTargets::default();
     }
+    https.truncate(10);
     let candidates = valid_records.into_iter().flatten().take(10);
     let mut authorized = Vec::new();
     for recipient in candidates {
@@ -2198,7 +2219,25 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
             authorized.push(recipient);
         }
     }
-    authorized
+    TlsReportTargets {
+        mail: authorized,
+        https,
+    }
+}
+
+/// POST a gzipped report to an https: rua target; any 2xx is success.
+async fn post_tls_report(url: &str, gz: &[u8]) -> anyhow::Result<()> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/tlsrpt+gzip")
+        .body(gz.to_vec())
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// Flush TLS-RPT counters every few minutes and send each finished UTC day's
@@ -2268,7 +2307,7 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
                 _ => continue,
             }
         };
-        let recipients = tls_report_recipients(resolver, &domain).await;
+        let targets = tls_report_recipients(resolver, &domain).await;
         let mut queued_copies = 0usize;
         if let Some((report_id, json)) = rmail_common::tlsrpt::build_report(
             "rMail",
@@ -2276,10 +2315,19 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
             &day,
             &domain,
             &rows,
-        ) && !recipients.is_empty()
+        ) && !(targets.mail.is_empty() && targets.https.is_empty())
             && let Ok(gz) = rmail_common::tlsrpt::gzip(&json)
         {
-            for recipient in recipients {
+            for url in &targets.https {
+                match post_tls_report(url, &gz).await {
+                    Ok(()) => queued_copies += 1,
+                    Err(error) => rmail_common::structured_log!(
+                        "warn", "outbound", "tls_report_post_failed",
+                        { "domain": domain, "day": day, "url": url, "error": format!("{error:#}") }
+                    ),
+                }
+            }
+            for recipient in targets.mail {
                 let message = rmail_common::tlsrpt::build_message(
                     &format!("noreply-tls-rpt@{hostname}"),
                     &recipient,
@@ -3591,5 +3639,56 @@ mod tests {
         );
         // The credentials never went out.
         assert_eq!(server.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn tls_reports_post_gzip_and_treat_errors_as_failures() {
+        use tokio::io::AsyncReadExt;
+        async fn serve(listener: tokio::net::TcpListener, status: &'static str) -> String {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, body)) = text.split_once("\r\n\r\n")
+                    && head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_string)
+                        })
+                        .and_then(|length| length.trim().parse::<usize>().ok())
+                        .is_some_and(|length| body.len() >= length)
+                {
+                    break;
+                }
+            }
+            stream
+                .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tlsrpt", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve(listener, "201 Created"));
+        post_tls_report(&url, b"gzdata").await.unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /tlsrpt "), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/tlsrpt+gzip")
+        );
+        assert!(request.ends_with("gzdata"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tlsrpt", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve(listener, "500 Internal Server Error"));
+        assert!(post_tls_report(&url, b"gzdata").await.is_err());
+        server.await.unwrap();
     }
 }

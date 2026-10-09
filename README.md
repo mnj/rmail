@@ -153,7 +153,7 @@ methodology as the tables above.
 | RFC 8689 | `REQUIRETLS` (client) | 95% | Messages marked REQUIRETLS are delivered only over verified TLS to a host advertising REQUIRETLS, and bounce otherwise. |
 | RFC 8461 | MTA-STS (sending) | 90% | Policies are fetched over HTTPS, size-bounded and cached; `enforce` requires a matching MX and verified TLS, `testing` logs mismatches and delivers. Cache is in memory, so policies are refetched after a restart. |
 | RFC 8461 | MTA-STS (publishing) | 95% | `mta-sts.<domain>/.well-known/mta-sts.txt` is served from the admin console's HTTP listener with a content-derived `_mta-sts` policy id. |
-| RFC 8460 | SMTP TLS reporting | 85% | Delivery TLS successes and failures are aggregated per policy domain and sent daily as gzipped JSON (`application/tlsrpt+gzip`). Only `mailto:` `rua` targets are supported; `https:` report upload is not. |
+| RFC 8460 | SMTP TLS reporting | 95% | Delivery TLS successes and failures are aggregated per policy domain (`sts` and `tlsa`) and sent daily as gzipped JSON (`application/tlsrpt+gzip`), by mail to `mailto:` targets and by HTTPS POST to `https:` targets. |
 | RFC 7672 | DANE for SMTP | 85% | Opt-in with `security.dane_enabled`. DNSSEC status comes from the AD bit of a validating recursive resolver. DANE-TA(2) and DANE-EE(3) are verified, unusable-only TLSA RRsets make TLS mandatory, failed TLSA lookups rule the host out, and DANE takes precedence over MTA-STS. MX hosts behind CNAMEs use the original name as TLSA base. |
 | RFC 6376 / RFC 8463 | DKIM signing | 100% | Every key of a sender domain signs, so RSA (`rsa-sha256`) and Ed25519 (`ed25519-sha256`) signatures go out side by side. Keys live in the database. |
 | RFC 6186 | SRV service discovery | 90% | One IMAP and one submission SRV record (`_imaps`/`_submissions` when implicit TLS listeners exist, otherwise `_imap`/`_submission`) are included in the suggested DNS records; the opposite variant is not offered, and records are suggestions the operator must publish. |
@@ -176,7 +176,6 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 - **SMTP `LIMITS`** (RFC 9422), `MT-PRIORITY` (RFC 6710), `DELIVERBY` (RFC 2852),
   `FUTURERELEASE` (RFC 4865) and `ETRN` (RFC 1985).
 - **Outbound command pipelining** to the next hop.
-- **TLS-RPT `https:` report upload** (only `mailto:` targets are used).
 - **DMARC failure reports** (RFC 6591 / `ruf`) and **ARF abuse feedback** (RFC 5965).
 - **Sender Rewriting Scheme** for forwarded mail; ARC sealing is the only SPF mitigation.
 
