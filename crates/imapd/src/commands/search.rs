@@ -236,28 +236,29 @@ fn execute_limited(
     let mut matches = Vec::new();
     let now = chrono::Utc::now().timestamp();
     let fts = index_lookup(selected, criterion, mail_root);
-    // RFC 9738: examine at most `message_limit` messages, newest first, and
-    // name the lowest UID examined so the client can continue below it.
-    let live = selected
+    // RFC 9738: examine at most `message_limit` messages, the highest UIDs
+    // first, and name the lowest UID examined so the client can continue
+    // below it. Mailbox order follows file names, not UIDs, so the window is
+    // chosen by UID and the mailbox order kept for sequence numbers.
+    let mut live = selected
         .msgs
         .iter()
-        .filter(|(uid, _, _, _)| !selected.is_expunged(*uid))
-        .count();
-    let mut skip = message_limit.map_or(0, |limit| live.saturating_sub(limit));
+        .map(|(uid, _, _, _)| *uid)
+        .filter(|uid| !selected.is_expunged(*uid))
+        .collect::<Vec<_>>();
+    let mut lowest_examined = 0;
     let mut limited = None;
+    if let Some(limit) = message_limit.filter(|limit| live.len() > *limit) {
+        live.sort_unstable();
+        lowest_examined = live.get(live.len() - limit).copied().unwrap_or(u64::MAX);
+        if limit > 0 {
+            limited = Some(format!("MESSAGELIMIT {limit} {lowest_examined}"));
+        }
+    }
     for (index, (uid, path, flags, _)) in selected.msgs.iter().enumerate() {
         // Expunged by another session; the file may already be gone.
-        if selected.is_expunged(*uid) {
+        if selected.is_expunged(*uid) || *uid < lowest_examined {
             continue;
-        }
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
-        if limited.is_none()
-            && let Some(limit) = message_limit.filter(|limit| live > *limit)
-        {
-            limited = Some(format!("MESSAGELIMIT {limit} {uid}"));
         }
         let data = if parser::search_requires_message_data_for(criterion, *uid, fts.as_ref()) {
             std::fs::read(path)?
@@ -578,6 +579,41 @@ mod tests {
             outcome.response.encode(),
             "A1 NO [BADCHARSET (US-ASCII UTF-8)] Unsupported charset\r\n"
         );
+    }
+
+    #[test]
+    fn message_limit_keeps_the_highest_uids_whatever_the_mailbox_order() {
+        let missing = std::path::PathBuf::from("/definitely/missing/rmail-message.eml");
+        let message = |uid| (uid, missing.clone(), Vec::new(), 1);
+        let selected = SelectedMailbox {
+            domain: "example.test".to_string(),
+            local: "user".to_string(),
+            mailbox: "INBOX".to_string(),
+            uidvalidity: 1,
+            uidnext: 10,
+            highest_modseq: 1,
+            mailbox_id: "Ftest".to_string(),
+            read_only: false,
+            // File-name order need not be UID order.
+            msgs: vec![message(9), message(2), message(5), message(7)],
+            internal_dates: Default::default(),
+            save_dates: Default::default(),
+            sizes: Default::default(),
+            email_ids: Default::default(),
+            recent_uids: Default::default(),
+            expunged: Default::default(),
+        };
+        let (matches, code) = execute_limited(
+            &selected,
+            &parser::SearchCriterion::All,
+            &[],
+            false,
+            None,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(matches, vec![(1, 9), (4, 7)]);
+        assert_eq!(code.as_deref(), Some("MESSAGELIMIT 2 7"));
     }
 
     #[test]

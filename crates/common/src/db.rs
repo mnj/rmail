@@ -24,8 +24,10 @@ pub struct Mailbox {
 use serde_json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Make the database readable by its owner only: it holds password hashes,
-/// DKIM private keys and relay passwords. SQLite gives the `-wal` and `-shm`
+/// Make a database readable by its owner only: they hold password hashes,
+/// DKIM private keys, relay passwords, message text and connection
+/// metadata. Pooled connections and the tracking database apply it when
+/// they open a file; settings::open does too. SQLite gives the `-wal` and `-shm`
 /// files it creates the database's mode, and existing ones are fixed here.
 pub fn restrict_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -52,11 +54,21 @@ pub fn restrict_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// [`restrict_permissions`], logging instead of failing: a database the
+/// process may use but does not own (an operator's tool, say) stays usable.
+pub fn restrict_permissions_or_warn(path: &Path) {
+    if let Err(error) = restrict_permissions(path) {
+        crate::structured_log!("warn", "sqlite", "permissions_not_restricted", {
+            "path": path.display().to_string(),
+            "error": format!("{error:#}"),
+        });
+    }
+}
+
 /// Initialize SQLite DB schema if not present
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
     let conn = Connection::open(path)?;
-    restrict_permissions(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(
         r#"

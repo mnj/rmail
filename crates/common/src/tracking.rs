@@ -364,6 +364,7 @@ fn valid_watcher_path(path: &Path, watch_dir: &Path) -> bool {
 
 fn open_tracking_db(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
+    crate::db::restrict_permissions_or_warn(path);
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;

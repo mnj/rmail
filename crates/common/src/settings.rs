@@ -1190,7 +1190,7 @@ pub fn open(db_path: impl AsRef<Path>) -> Result<Connection> {
     let db_path = db_path.as_ref();
     let conn = Connection::open(db_path)
         .with_context(|| format!("opening settings database {}", db_path.display()))?;
-    crate::db::restrict_permissions(db_path)?;
+    crate::db::restrict_permissions_or_warn(db_path);
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     ensure_schema(&conn)?;
     Ok(conn)
