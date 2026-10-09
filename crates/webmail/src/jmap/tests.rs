@@ -521,6 +521,19 @@ async fn shared_mailboxes_are_a_separate_account_within_the_grants() {
     assert_eq!(list[0]["name"], "Team");
     assert_eq!(list[0]["myRights"]["mayReadItems"], true);
     assert_eq!(list[0]["myRights"]["maySetSeen"], false);
+    // The owner's subscriptions are not the grantee's to change.
+    assert_eq!(list[0]["isSubscribed"], true);
+    let subscriptions =
+        || imap_state::list_subscriptions(&state.mail_root, "example.test", "friend").unwrap();
+    let before = subscriptions();
+    let refused = client
+        .one("Mailbox/set", json!({"accountId": shared, "update": {team.mailbox_id.clone(): {"isSubscribed": false}}}))
+        .await;
+    assert_eq!(
+        refused["notUpdated"][&team.mailbox_id]["type"],
+        "invalidProperties"
+    );
+    assert_eq!(subscriptions(), before);
 
     let all = client
         .one("Email/query", json!({"accountId": shared}))

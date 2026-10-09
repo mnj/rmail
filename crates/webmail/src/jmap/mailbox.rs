@@ -134,6 +134,12 @@ pub(crate) fn views(ctx: &Ctx, account: &Account) -> Result<Vec<View>, MethodErr
     let rows = store::mailboxes(&conn)?
         .into_iter()
         .filter(|row| account.lists(&row.mailbox_id))
+        .map(|mut row| {
+            // Subscriptions are the owner's; a grantee's shared mailboxes
+            // are always subscribed.
+            row.subscribed |= !account.is_personal();
+            row
+        })
         .collect::<Vec<_>>();
     let by_name = rows
         .iter()
@@ -508,15 +514,18 @@ impl Setter<'_> {
         let subscribe = object
             .get("isSubscribed")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        imap_state::set_subscription(
-            &root,
-            &self.account.domain,
-            &self.account.localpart,
-            &full,
-            subscribe,
-        )
-        .map_err(|error| set_error("serverFail", error.to_string()))?;
+            .unwrap_or(false)
+            || !self.account.is_personal();
+        if self.account.is_personal() {
+            imap_state::set_subscription(
+                &root,
+                &self.account.domain,
+                &self.account.localpart,
+                &full,
+                subscribe,
+            )
+            .map_err(|error| set_error("serverFail", error.to_string()))?;
+        }
         let folder =
             imap_state::find_folder(&root, &self.account.domain, &self.account.localpart, &full)
                 .map_err(|error| set_error("serverFail", error.to_string()))?
@@ -717,7 +726,17 @@ impl Setter<'_> {
             )
             .map_err(|error| set_error("serverFail", error.to_string()))?;
         }
-        if let Some(subscribe) = subscribe {
+        if let Some(subscribe) = subscribe
+            && !self.account.is_personal()
+        {
+            if !subscribe {
+                return Err(set_error_properties(
+                    "invalidProperties",
+                    "shared mailboxes are always subscribed",
+                    &["isSubscribed"],
+                ));
+            }
+        } else if let Some(subscribe) = subscribe {
             let name =
                 imap_state::list_folders(&root, &self.account.domain, &self.account.localpart)
                     .map_err(|error| set_error("serverFail", error.to_string()))?
@@ -767,6 +786,17 @@ impl Setter<'_> {
         }
         if row.total_emails > 0 && !remove_emails {
             return Err(set_error("mailboxHasEmail", "the mailbox is not empty"));
+        }
+        if row.total_emails > 0
+            && !self
+                .account
+                .rights(id)
+                .contains(Rights::DELETE_MESSAGES.union(Rights::EXPUNGE))
+        {
+            return Err(set_error(
+                "forbidden",
+                "no permission to remove the mailbox's emails",
+            ));
         }
         imap_state::delete_folder(
             &self.ctx.mail_root(),

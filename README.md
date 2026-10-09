@@ -31,6 +31,8 @@ screenshots of every page, and a quick start.
   settings, logs, Prometheus metrics and readiness checks.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
   layout.
+- **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
+  search, sending and push.
 - **Operations**: structured JSON logs, live `rmail_ctl watch`, per-message tracking, built-in
   ACME certificates (Let's Encrypt over HTTP or DNS, renewed and hot-reloaded), and `.deb`
   packages for amd64 and arm64 published on every merge.
@@ -171,7 +173,6 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 
 ## Not yet supported
 
-- **JMAP** (RFC 8620, RFC 8621).
 - **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and `URLAUTH`
   (RFC 4467) with BURL (RFC 4468).
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
@@ -252,6 +253,18 @@ deprecated draft `SNIPPET=FUZZY` dialect is available as a compatibility alias
 for RFC 8970 previews. RFC 3502 `MULTIAPPEND` provides atomic streamed batch appends and
 ordered `APPENDUID` sets. RFC 8970 `PREVIEW`, including its `LAZY` priority
 modifier, is supported.
+
+## JMAP standards support
+
+Webmail serves JMAP next to its own API, on the same listener: the session resource at
+`/.well-known/jmap`, requests at `/jmap/api/`. Clients sign in with HTTP Basic (the account
+address and password) or, with OAuth introspection configured, a Bearer token. The suggested DNS
+records include `_jmap._tcp` for discovery.
+
+| RFC | Feature | Estimated compliance | Remaining limitation |
+| --- | --- | ---: | --- |
+| RFC 8620 | JMAP core | 90% | Session resource, `Core/echo`, result references (with `*`), creation ids across calls, request and method errors, blob upload and download, and push over an event source (with `ping` and `closeafter`). State strings come from a per-account change log, so `/changes` sees every change, whatever made it (IMAP, delivery, webmail, Sieve). `/queryChanges` always answers `cannotCalculateChanges` and clients query again. Push subscriptions (`PushSubscription`, web push) and `Blob/copy` are not implemented. Destroyed objects are remembered for 60 days; older states must resynchronize. |
+| RFC 8621 | JMAP mail and submission | 90% | `Mailbox`, `Email`, `Thread`, `SearchSnippet`, `Identity` and `EmailSubmission` with their `get`, `changes`, `query` and `set` methods, plus `Email/import`, `Email/copy` and `Email/parse`. Emails with one EMAILID in several folders are one Email, keywords are the IMAP flags, threads follow Message-ID, In-Reply-To and References. Mail is sent at once through the submission service (`maxDelayedSend` 0, so nothing can be cancelled); delivery status is what that service reports, not later DSNs. `VacationResponse` is not offered; Sieve vacation covers it. Mailbox `sortOrder` follows the role and is not stored. Shared mailboxes (RFC 4314 grants) appear as one more account per owner, limited to the user's rights. |
 
 Repeatable storage and queue performance workloads are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,
