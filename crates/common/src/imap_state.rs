@@ -360,7 +360,7 @@ fn enforce_storage_quota(conn: &Connection, requested: u64) -> Result<()> {
     Ok(())
 }
 
-fn add_column_if_missing(
+pub(crate) fn add_column_if_missing(
     conn: &Connection,
     table: &str,
     column: &str,

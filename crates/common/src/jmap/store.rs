@@ -119,10 +119,20 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             thread_id TEXT NOT NULL,
             envelope TEXT NOT NULL,
             send_at INTEGER NOT NULL,
-            delivery_status TEXT NOT NULL
+            delivery_status TEXT NOT NULL,
+            undo_status TEXT NOT NULL DEFAULT 'final',
+            hold_id TEXT
         );
         ",
     )?;
+    // Scheduled sending (pending submissions) came after the table.
+    imap_state::add_column_if_missing(
+        conn,
+        "jmap_submissions",
+        "undo_status",
+        "TEXT NOT NULL DEFAULT 'final'",
+    )?;
+    imap_state::add_column_if_missing(conn, "jmap_submissions", "hold_id", "TEXT")?;
     let email_created = |row: &str| {
         format!(
             "NOT EXISTS (SELECT 1 FROM messages o WHERE o.email_id = {row}.email_id AND o.id != {row}.id)"

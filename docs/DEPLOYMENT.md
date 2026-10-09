@@ -492,6 +492,13 @@ over loopback with SASL `X-RMAIL-WEBMAIL`, presenting a shared secret and acting
   `[::]:587`) or loopback address in `listeners.submission`. Without one, sending is off and webmail
   hides Compose. Restart webmail after changing the submission listeners.
 
+Scheduled sending (SMTP `FUTURERELEASE`, JMAP delayed send) keeps messages in
+`<mail_root>/outbound/held/` until their release time, up to 30 days ahead. The outbound worker
+then submits each one to the submission service as its sender, the same way webmail does, so it
+needs the same loopback submission listener; without one, neither form of scheduling is offered. A
+message refused at release (an address that no longer exists, say) is reported to the sender in
+their inbox.
+
 A copy of each sent message (including Bcc) is saved to Sent; replies mark the original
 `\Answered` and forwards `$Forwarded`. Drafts are saved to Drafts and can be reopened and sent.
 

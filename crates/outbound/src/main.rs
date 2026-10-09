@@ -264,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&sent_dir).await?;
     tokio::fs::create_dir_all(&failed_dir).await?;
     let mut tls_report_setup: Option<(PathBuf, String)> = None;
+    let mut submission_address = None;
     let tracking_config = match std::env::var("RMAIL_CONFIG") {
         Ok(path) => {
             let cfg = rmail_common::config::Config::load(&path)
@@ -277,6 +278,11 @@ async fn main() -> anyhow::Result<()> {
             // DSNs and TLS reports are DKIM-signed like any queued mail.
             rmail_common::dkim::use_database(&cfg.global.db_path);
             let _ = DB_PATH.set(PathBuf::from(&cfg.global.db_path));
+            // Scheduled messages are released through the submission
+            // service, as their senders' own submissions.
+            submission_address = rmail_common::local_submit::local_submission_address(
+                &cfg.global.submission_listeners(),
+            );
             if cfg.security.tls_rpt_enabled {
                 tls_report_setup = Some((
                     PathBuf::from(&cfg.global.db_path),
@@ -336,6 +342,8 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
+    let release_handle =
+        submission_address.map(|address| tokio::spawn(release_held_task(base.clone(), address)));
     let tls_report_db = tls_report_setup.as_ref().map(|(path, _)| path.clone());
     let tls_report_handle = tls_report_setup
         .map(|(db_path, hostname)| tokio::spawn(tls_report_task(base.clone(), db_path, hostname)));
@@ -459,6 +467,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = tls_report_handle {
         handle.abort();
     }
+    if let Some(handle) = release_handle {
+        handle.abort();
+    }
     if let Some(db_path) = tls_report_db
         && let Err(error) = rmail_common::tlsrpt::flush(&db_path)
     {
@@ -467,6 +478,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Release scheduled messages (RFC 4865 FUTURERELEASE, JMAP delayed send)
+/// when their time comes; see `rmail_common::hold`.
+async fn release_held_task(base: PathBuf, submission: std::net::SocketAddr) {
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        if let Err(error) = rmail_common::hold::release_due(&base, submission).await {
+            rmail_common::structured_log!(
+                "error", "outbound", "held_release_failed", { "error": format!("{error:#}") }
+            );
+        }
+    }
 }
 
 fn positive_env(name: &str, default: usize) -> usize {

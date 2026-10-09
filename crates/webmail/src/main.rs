@@ -21,7 +21,7 @@ macro_rules! webmail_log {
 mod api;
 mod assets;
 mod jmap;
-mod submit;
+use rmail_common::local_submit as submit;
 
 #[tokio::main]
 async fn main() -> Result<()> {

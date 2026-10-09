@@ -461,7 +461,18 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
         if account.is_personal() && can_send {
             capabilities.insert(
                 SUBMISSION.to_string(),
-                json!({"maxDelayedSend": 0, "submissionExtensions": {}}),
+                json!({
+                    "maxDelayedSend": rmail_common::hold::MAX_HOLD_SECONDS,
+                    "submissionExtensions": {
+                        "FUTURERELEASE": [
+                            rmail_common::hold::MAX_HOLD_SECONDS.to_string(),
+                            utc_date(
+                                chrono::Utc::now().timestamp()
+                                    + rmail_common::hold::MAX_HOLD_SECONDS,
+                            ),
+                        ],
+                    },
+                }),
             );
         }
         account_map.insert(

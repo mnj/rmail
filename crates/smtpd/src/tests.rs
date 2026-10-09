@@ -495,6 +495,82 @@ async fn submission_option_enforces_visible_from_for_data_and_bdat() {
 }
 
 #[tokio::test]
+async fn futurerelease_holds_submitted_mail_until_its_time() {
+    crate::enable_future_release();
+    let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+    let input = format!(
+        "EHLO localhost\r\n{auth}\
+         MAIL FROM:<user@example.test> HOLDFOR=3600\r\nRCPT TO:<someone@remote.test>\r\n\
+         RCPT TO:<user@example.test>\r\nDATA\r\nFrom: user@example.test\r\nSubject: later\r\n\r\nbody\r\n.\r\n\
+         MAIL FROM:<user@example.test> HOLDFOR=999999999\r\n\
+         MAIL FROM:<user@example.test> HOLDFOR=1 HOLDUNTIL=2030-01-01T00:00:00Z\r\n\
+         MAIL FROM:<user@example.test> REQUIRETLS HOLDFOR=60\r\nQUIT\r\n"
+    );
+    let (responses, td) = run_session_with_policy(
+        input.into_bytes(),
+        16 * 1024,
+        SecurityConfig::default(),
+        true,
+        SmtpService::Submission,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250-FUTURERELEASE 2592000 ")),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.0.0 Message held until"))
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("501 5.5.4 Release time is beyond"))
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("501 5.5.2 Syntax"))
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("501 5.5.4 FUTURERELEASE cannot"))
+    );
+    // Nothing is delivered or queued until the release.
+    assert_eq!(inbox(&td), 0);
+    assert!(queued_eml(&td).is_empty());
+    let mail_root = td.path().join("mail");
+    assert!(
+        rmail_common::hold::due(&mail_root, chrono::Utc::now().timestamp())
+            .unwrap()
+            .is_empty()
+    );
+    let held = rmail_common::hold::due(&mail_root, chrono::Utc::now().timestamp() + 7200).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].user, "user@example.test");
+    assert_eq!(
+        held[0].recipients,
+        ["someone@remote.test", "user@example.test"]
+    );
+
+    // The MTA service does not offer it.
+    let (responses, _) = run_session_with_policy(
+        b"EHLO localhost\r\nMAIL FROM:<a@remote.test> HOLDFOR=60\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+    )
+    .await;
+    assert!(!responses.iter().any(|line| line.contains("FUTURERELEASE")));
+    assert!(responses.iter().any(|line| line.starts_with("555 5.5.4")));
+}
+
+#[tokio::test]
 async fn command_rate_limit_closes_abusive_sessions() {
     let security = SecurityConfig {
         smtp_max_commands_per_minute: 2,

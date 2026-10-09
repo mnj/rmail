@@ -127,6 +127,7 @@ certification results.
 | SRS (draft) | Sender Rewriting Scheme | 100% | With `security.srs_domain`, forwarded mail gets an `SRS0`/`SRS1` envelope sender keyed with a generated secret; bounces to it within 21 days are verified and returned to the original sender. Hosted and null senders are not rewritten. |
 | RFC 3461 | Delivery Status Notifications | 100% | `DSN`, `RET`, `ENVID`, `NOTIFY`, and `ORCPT` are implemented with private queue metadata and loop-safe success/failure reports. |
 | RFC 8689 | `REQUIRETLS` | 100% | Advertised and accepted only on TLS sessions; submission, durable queue metadata, relay advertisement checks, and downgrade-resistant TLS enforcement are implemented. |
+| RFC 4865 | `FUTURERELEASE` | 90% | Offered on submission when a loopback submission listener exists. `HOLDFOR`/`HOLDUNTIL` (up to 30 days) hold the message; the outbound worker submits it again as the sender at the release time, so recipients, limits, signing and filters apply then. A refusal at release leaves a notice in the sender's inbox. Cannot be combined with `REQUIRETLS`; DSN parameters are not carried to the release. |
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 95% | Both extensions are advertised together. The receiver supports exact-octet, multi-command BDAT transactions, LAST and zero-length chunks, cumulative SIZE enforcement with stream-preserving drains, DATA/BDAT state exclusion, and BODY=BINARYMIME validation. Relay capability negotiation selects binary-safe BDAT and requires both extensions for binary content; external conformance corpus testing remains. |
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
 | RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
@@ -175,8 +176,7 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 
 - **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and `URLAUTH`
   (RFC 4467) with BURL (RFC 4468).
-- **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
-  `FUTURERELEASE` (RFC 4865) and `ETRN` (RFC 1985).
+- **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852) and `ETRN` (RFC 1985).
 - **ARF abuse feedback** (RFC 5965) beyond DMARC failure reports.
 
 ## IMAP standards support
@@ -264,7 +264,7 @@ records include `_jmap._tcp` for discovery.
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
 | RFC 8620 | JMAP core | 90% | Session resource, `Core/echo`, result references (with `*`), creation ids across calls, request and method errors, blob upload and download, and push over an event source (with `ping` and `closeafter`). State strings come from a per-account change log, so `/changes` sees every change, whatever made it (IMAP, delivery, webmail, Sieve). `/queryChanges` always answers `cannotCalculateChanges` and clients query again. Push subscriptions (`PushSubscription`, web push) and `Blob/copy` are not implemented. Destroyed objects are remembered for 60 days; older states must resynchronize. |
-| RFC 8621 | JMAP mail and submission | 90% | `Mailbox`, `Email`, `Thread`, `SearchSnippet`, `Identity` and `EmailSubmission` with their `get`, `changes`, `query` and `set` methods, plus `Email/import`, `Email/copy` and `Email/parse`. Emails with one EMAILID in several folders are one Email, keywords are the IMAP flags, threads follow Message-ID, In-Reply-To and References. Mail is sent at once through the submission service (`maxDelayedSend` 0, so nothing can be cancelled); delivery status is what that service reports, not later DSNs. `VacationResponse` (RFC 8621 section 8) is answered at delivery next to the account's own Sieve script, with Sieve vacation's rules (one reply per sender per week, none to lists or automated mail). Mailbox `sortOrder` follows the role and is not stored. Shared mailboxes (RFC 4314 grants) appear as one more account per owner, limited to the user's rights. |
+| RFC 8621 | JMAP mail and submission | 90% | `Mailbox`, `Email`, `Thread`, `SearchSnippet`, `Identity` and `EmailSubmission` with their `get`, `changes`, `query` and `set` methods, plus `Email/import`, `Email/copy` and `Email/parse`. Emails with one EMAILID in several folders are one Email, keywords are the IMAP flags, threads follow Message-ID, In-Reply-To and References. Mail goes through the submission service; with `HOLDUNTIL`/`HOLDFOR` in the envelope (up to `maxDelayedSend`, 30 days) it is held and stays `pending`, cancellable by setting `undoStatus` to `canceled`, until it is released. Delivery status is what that service reports, not later DSNs. `VacationResponse` (RFC 8621 section 8) is answered at delivery next to the account's own Sieve script, with Sieve vacation's rules (one reply per sender per week, none to lists or automated mail). Mailbox `sortOrder` follows the role and is not stored. Shared mailboxes (RFC 4314 grants) appear as one more account per owner, limited to the user's rights. |
 
 Repeatable storage and queue performance workloads are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,

@@ -13,6 +13,16 @@ pub(crate) struct MailFromArgs {
     /// for a decoded mailbox.
     pub(crate) auth_mailbox: Option<Option<String>>,
     pub(crate) has_esmtp_parameters: bool,
+    /// RFC 4865 FUTURERELEASE: HOLDFOR or HOLDUNTIL.
+    pub(crate) hold: Option<HoldRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldRequest {
+    /// HOLDFOR: seconds from now.
+    For(i64),
+    /// HOLDUNTIL: a Unix time.
+    Until(i64),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -340,6 +350,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut dsn_envelope_id = None;
     let mut dsn_return = None;
     let mut auth_value: Option<String> = None;
+    let mut hold = None;
     for parameter in params.split_whitespace() {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
@@ -379,6 +390,25 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
                 return Err(EnvelopeError::Syntax);
             }
             auth_value = Some(decode_xtext(value).map_err(|_| EnvelopeError::Syntax)?);
+        } else if name.eq_ignore_ascii_case("HOLDFOR") {
+            // RFC 4865: 1*9DIGIT seconds; only one of HOLDFOR/HOLDUNTIL.
+            if hold.is_some()
+                || value.is_empty()
+                || value.len() > 9
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(EnvelopeError::Syntax);
+            }
+            hold = Some(HoldRequest::For(
+                value.parse().map_err(|_| EnvelopeError::Syntax)?,
+            ));
+        } else if name.eq_ignore_ascii_case("HOLDUNTIL") {
+            if hold.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            let until =
+                chrono::DateTime::parse_from_rfc3339(value).map_err(|_| EnvelopeError::Syntax)?;
+            hold = Some(HoldRequest::Until(until.timestamp()));
         } else if name.eq_ignore_ascii_case("RET") {
             if dsn_return.is_some() {
                 return Err(EnvelopeError::Syntax);
@@ -421,6 +451,7 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
         dsn_return,
         auth_mailbox,
         has_esmtp_parameters: !params.is_empty(),
+        hold,
     })
 }
 
@@ -633,6 +664,7 @@ mod tests {
                 dsn_return: None,
                 auth_mailbox: None,
                 has_esmtp_parameters: true,
+                hold: None,
             })
         );
         assert!(
@@ -689,6 +721,7 @@ mod tests {
                 dsn_return: None,
                 auth_mailbox: None,
                 has_esmtp_parameters: true,
+                hold: None,
             })
         );
     }

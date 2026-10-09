@@ -113,6 +113,12 @@ impl Session {
             return Ok(Flow::Continue);
         }
 
+        // RFC 4865: a held message is submitted again, as its sender, when
+        // its release time comes; scanning and delivery happen then.
+        if let Some(release_at) = self.tx.release_at {
+            return self.hold_message(reader, data, release_at).await;
+        }
+
         let mut quarantine = false;
         if self.security.scanners_enabled() {
             match self.scan(data.clone()).await {
@@ -394,6 +400,47 @@ impl Session {
 
     /// Final reply. LMTP answers once per accepted RCPT, aggregating alias
     /// targets back to the address the client used.
+    async fn hold_message(
+        &mut self,
+        reader: &mut SmtpReader,
+        data: Bytes,
+        release_at: i64,
+    ) -> Result<Flow> {
+        let user = self.authenticated_user.clone().unwrap_or_default();
+        let held = rmail_common::hold::Held {
+            id: String::new(),
+            mail_from: self.tx.mail_from.clone().unwrap_or_else(|| user.clone()),
+            user,
+            recipients: self.tx.given_rcpts.clone(),
+            release_at,
+            submission_id: None,
+            last_error: None,
+        };
+        let mail_root = std::path::PathBuf::from(&self.mail_root);
+        let stored =
+            tokio::task::spawn_blocking(move || rmail_common::hold::hold(&mail_root, held, &data))
+                .await;
+        match stored {
+            Ok(Ok(held)) => {
+                session_log!(self, "info", "message_held", { "message_id": self.message_id, "hold_id": held.id, "release_at": release_at, "recipient_count": held.recipients.len() });
+                let status = format!(
+                    "250 2.0.0 Message held until {}",
+                    chrono::DateTime::from_timestamp(release_at, 0)
+                        .unwrap_or_default()
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                );
+                self.complete_message(reader, &status).await?;
+            }
+            _ => {
+                session_log!(self, "error", "message_hold_failed", { "message_id": self.message_id });
+                self.complete_message(reader, "451 4.3.0 Could not hold the message")
+                    .await?;
+            }
+        }
+        self.abort_transaction();
+        Ok(Flow::Continue)
+    }
+
     async fn finish_message(&self, reader: &mut SmtpReader, report: &DeliveryReport) -> Result<()> {
         let writer = reader.get_mut();
         if self.service == SmtpService::Lmtp {

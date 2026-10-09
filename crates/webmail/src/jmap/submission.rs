@@ -1,8 +1,10 @@
 //! EmailSubmission objects (RFC 8621 section 7): sending a stored email
 //! through this server's submission service, as webmail does.
 //!
-//! Mail is sent at once (`maxDelayedSend` is 0), so every submission is
-//! `final` and cannot be cancelled. Records are kept in the user's own
+//! Mail is sent at once unless the envelope's `mailFrom` carries the RFC
+//! 4865 `HOLDUNTIL`/`HOLDFOR` parameters: then it is held
+//! (`rmail_common::hold`), `pending` until the outbound worker releases it,
+//! and can be cancelled by setting `undoStatus` to `canceled` until then. Records are kept in the user's own
 //! account for `/get`, `/changes` and `/query`.
 
 use rmail_common::jmap::{
@@ -40,6 +42,9 @@ struct Record {
     envelope: Value,
     send_at: i64,
     delivery_status: Value,
+    /// `final`, `pending` (held) or `canceled`.
+    undo_status: String,
+    hold_id: Option<String>,
 }
 
 impl Record {
@@ -51,7 +56,7 @@ impl Record {
             "threadId": self.thread_id,
             "envelope": self.envelope,
             "sendAt": utc_date(self.send_at),
-            "undoStatus": "final",
+            "undoStatus": self.undo_status,
             "deliveryStatus": self.delivery_status,
             "dsnBlobIds": [],
             "mdnBlobIds": [],
@@ -65,7 +70,8 @@ impl Record {
 fn records(ctx: &Ctx, account: &Account) -> Result<Vec<Record>, MethodError> {
     let conn = ctx.open(account)?;
     let mut statement = conn.prepare(
-        "SELECT id, identity_id, email_id, thread_id, envelope, send_at, delivery_status
+        "SELECT id, identity_id, email_id, thread_id, envelope, send_at, delivery_status,
+                undo_status, hold_id
          FROM jmap_submissions ORDER BY send_at, id",
     )?;
     let rows = statement
@@ -79,10 +85,68 @@ fn records(ctx: &Ctx, account: &Account) -> Result<Vec<Record>, MethodError> {
                 send_at: row.get(5)?,
                 delivery_status: serde_json::from_str(&row.get::<_, String>(6)?)
                     .unwrap_or(Value::Null),
+                undo_status: row.get(7)?,
+                hold_id: row.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // A held message the outbound worker released is no longer pending,
+    // even if it could not update the record.
+    let mut rows = rows;
+    for record in &mut rows {
+        if record.undo_status == "pending"
+            && let Some(hold_id) = &record.hold_id
+            && matches!(
+                rmail_common::hold::get(&ctx.app.mail_root, hold_id),
+                Ok(None)
+            )
+        {
+            record.undo_status = "final".to_string();
+        }
+    }
     Ok(rows)
+}
+
+/// The release time the envelope's `mailFrom` parameters ask for (RFC 4865
+/// HOLDUNTIL/HOLDFOR), checked against the FUTURERELEASE maximum.
+fn release_time(envelope: Option<&Value>) -> Result<Option<i64>, Value> {
+    let invalid =
+        |description: &str| set_error_properties("invalidProperties", description, &["envelope"]);
+    let Some(parameters) = envelope
+        .and_then(|envelope| envelope.get("mailFrom"))
+        .and_then(|from| from.get("parameters"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut release = None;
+    for (name, value) in parameters {
+        let value = value.as_str().unwrap_or_default();
+        let at = if name.eq_ignore_ascii_case("HOLDFOR") {
+            let seconds = value
+                .parse::<i64>()
+                .ok()
+                .filter(|seconds| *seconds >= 0 && value.len() <= 9)
+                .ok_or_else(|| invalid("HOLDFOR must be a number of seconds"))?;
+            now + seconds
+        } else if name.eq_ignore_ascii_case("HOLDUNTIL") {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map_err(|_| invalid("HOLDUNTIL must be a date-time"))?
+                .timestamp()
+        } else {
+            return Err(invalid("unsupported mailFrom parameter"));
+        };
+        if release.replace(at).is_some() {
+            return Err(invalid("give HOLDFOR or HOLDUNTIL, not both"));
+        }
+    }
+    if let Some(at) = release
+        && at - now > rmail_common::hold::MAX_HOLD_SECONDS
+    {
+        return Err(invalid("the release time is beyond maxDelayedSend"));
+    }
+    Ok(release.filter(|at| *at > now))
 }
 
 pub(crate) fn get(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
@@ -142,7 +206,7 @@ pub(crate) fn query(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                         "identityIds" => in_list(&record.identity_id),
                         "emailIds" => in_list(&record.email_id),
                         "threadIds" => in_list(&record.thread_id),
-                        "undoStatus" => value.as_str() == Some("final"),
+                        "undoStatus" => value.as_str() == Some(record.undo_status.as_str()),
                         "before" => value
                             .as_str()
                             .and_then(super::parse_utc_date)
@@ -355,9 +419,62 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
             "the From address must be the identity's address",
         ));
     }
+    let release_at = release_time(object.get("envelope"))?;
     let message = without_bcc(&data);
     let mail_root = ctx.mail_root();
     let user = ctx.user.address.clone();
+    let id = new_id("S");
+    let envelope = json!({
+        "mailFrom": {
+            "email": mail_from,
+            "parameters": object
+                .get("envelope")
+                .and_then(|envelope| envelope.get("mailFrom"))
+                .and_then(|from| from.get("parameters"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        "rcptTo": recipients
+            .iter()
+            .map(|email| json!({"email": email, "parameters": null}))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(release_at) = release_at {
+        // Held: the outbound worker submits it as this user at release.
+        for address in std::iter::once(&mail_from).chain(&recipients) {
+            if address.contains(['\r', '\n', '<', '>', ' ']) || !address.contains('@') {
+                return Err(set_error(
+                    "invalidRecipients",
+                    format!("invalid address {address:?}"),
+                ));
+            }
+        }
+        let held = rmail_common::hold::hold(
+            &mail_root,
+            rmail_common::hold::Held {
+                id: String::new(),
+                user,
+                mail_from,
+                recipients,
+                release_at,
+                submission_id: Some(id.clone()),
+                last_error: None,
+            },
+            &message,
+        )
+        .map_err(super::server_fail)?;
+        return Ok(Record {
+            id,
+            identity_id,
+            email_id,
+            thread_id: row.thread_id,
+            envelope,
+            send_at: release_at,
+            delivery_status: Value::Null,
+            undo_status: "pending".to_string(),
+            hold_id: Some(held.id),
+        });
+    }
     let sent = tokio::runtime::Handle::current().block_on(crate::submit::submit_as(
         submission_address,
         &mail_root,
@@ -384,27 +501,24 @@ fn submit(ctx: &mut Ctx, account: &Account, object: &Map<String, Value>) -> Resu
         );
     }
     Ok(Record {
-        id: new_id("S"),
+        id,
         identity_id,
         email_id,
         thread_id: row.thread_id,
-        envelope: json!({
-            "mailFrom": {"email": mail_from, "parameters": null},
-            "rcptTo": recipients
-                .iter()
-                .map(|email| json!({"email": email, "parameters": null}))
-                .collect::<Vec<_>>(),
-        }),
+        envelope,
         send_at: chrono::Utc::now().timestamp(),
         delivery_status: Value::Object(delivery_status),
+        undo_status: "final".to_string(),
+        hold_id: None,
     })
 }
 
 fn record_submission(ctx: &Ctx, account: &Account, record: &Record) -> Result<(), MethodError> {
     let conn = ctx.open(account)?;
     conn.execute(
-        "INSERT INTO jmap_submissions(id, identity_id, email_id, thread_id, envelope, send_at, delivery_status)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO jmap_submissions(id, identity_id, email_id, thread_id, envelope, send_at,
+             delivery_status, undo_status, hold_id)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             record.id,
             record.identity_id,
@@ -413,6 +527,8 @@ fn record_submission(ctx: &Ctx, account: &Account, record: &Record) -> Result<()
             record.envelope.to_string(),
             record.send_at,
             record.delivery_status.to_string(),
+            record.undo_status,
+            record.hold_id,
         ],
     )?;
     store::log_change(&conn, "EmailSubmission", &record.id, true, false)?;
@@ -456,7 +572,7 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
                 ));
                 created.insert(
                     creation_id,
-                    json!({"id": record.id, "threadId": record.thread_id, "sendAt": utc_date(record.send_at), "undoStatus": "final"}),
+                    json!({"id": record.id, "threadId": record.thread_id, "sendAt": utc_date(record.send_at), "undoStatus": record.undo_status}),
                 );
             }
             Err(error) => {
@@ -464,20 +580,50 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
             }
         }
     }
+    let mut updated = Map::new();
     let mut not_updated = Map::new();
-    for (id, _) in args
+    let existing = records(ctx, &account)?;
+    for (id, patch) in args
         .get("update")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default()
     {
-        not_updated.insert(
-            id,
-            set_error(
-                "cannotUnsend",
-                "mail is sent at once and cannot be cancelled",
-            ),
-        );
+        let id = ctx.resolve_id(&id).unwrap_or(id);
+        let Some(record) = existing.iter().find(|record| record.id == id) else {
+            not_updated.insert(id, set_error("notFound", "no such submission"));
+            continue;
+        };
+        let cancel = patch.as_object().is_some_and(|patch| {
+            patch.len() == 1 && patch.get("undoStatus").and_then(Value::as_str) == Some("canceled")
+        });
+        if !cancel {
+            not_updated.insert(
+                id,
+                set_error_properties(
+                    "invalidProperties",
+                    "only undoStatus can be set, to canceled",
+                    &["undoStatus"],
+                ),
+            );
+            continue;
+        }
+        // Cancelling works only while the message is still held.
+        let cancelled = record.undo_status == "pending"
+            && record.hold_id.as_deref().is_some_and(|hold_id| {
+                rmail_common::hold::cancel(&ctx.app.mail_root, hold_id).unwrap_or(false)
+            });
+        if !cancelled {
+            not_updated.insert(id, set_error("cannotUnsend", "the message has been sent"));
+            continue;
+        }
+        let conn = ctx.open(&account)?;
+        conn.execute(
+            "UPDATE jmap_submissions SET undo_status = 'canceled' WHERE id = ?1",
+            params![id],
+        )?;
+        store::log_change(&conn, "EmailSubmission", &id, false, false)?;
+        updated.insert(id, Value::Null);
     }
     let mut destroyed = Vec::new();
     let mut not_destroyed = Map::new();
@@ -507,7 +653,7 @@ pub(crate) fn set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
             "oldState": old_state,
             "newState": new_state,
             "created": null_if_empty(created),
-            "updated": Value::Null,
+            "updated": null_if_empty(updated),
             "destroyed": if destroyed.is_empty() { Value::Null } else { json!(destroyed) },
             "notCreated": null_if_empty(not_created),
             "notUpdated": null_if_empty(not_updated),

@@ -67,6 +67,20 @@ static SERVER_HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new()
 /// The HMAC key for SRS addresses (see `rmail_common::srs`).
 static SRS_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
+/// Whether scheduled messages can be released: the outbound worker hands
+/// them back to a submission listener on loopback (`rmail_common::hold`),
+/// so FUTURERELEASE is offered only when there is one.
+static FUTURE_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn future_release() -> bool {
+    FUTURE_RELEASE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn enable_future_release() {
+    FUTURE_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn srs_key() -> &'static [u8] {
     SRS_KEY.get().map_or(&[], Vec::as_slice)
 }
@@ -101,6 +115,11 @@ async fn main() -> Result<()> {
     rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
         .context("security.proxy_protocol_trusted_networks")?;
     let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
+    FUTURE_RELEASE.store(
+        rmail_common::local_submit::local_submission_address(&cfg.global.submission_listeners())
+            .is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     rmail_common::dkim::use_database(&cfg.global.db_path);
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
         smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });

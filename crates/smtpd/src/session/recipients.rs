@@ -55,6 +55,7 @@ impl Session {
             self.lmtp_recipient_groups
                 .push((self.generation, address.clone(), targets.clone()));
         }
+        self.tx.given_rcpts.push(address.clone());
         for target in targets {
             if forwarded {
                 self.forwarded_recipient
