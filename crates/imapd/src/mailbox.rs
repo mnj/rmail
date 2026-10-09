@@ -1216,6 +1216,28 @@ fn bodystructure_response(data: &[u8]) -> String {
 
 /// The start of a FETCH response up to its opening parenthesis: `* seq
 /// FETCH (`, or `* uid UIDFETCH (` once UIDONLY is enabled (RFC 9586).
+/// The THREADID (RFC 8474) of each email, when `requested` asks for it.
+pub(crate) async fn thread_ids_for(
+    mail_root: &str,
+    selected: &SelectedMailbox,
+    requested: &[String],
+    email_ids: Vec<String>,
+) -> HashMap<String, String> {
+    if !requested.iter().any(|item| item == "THREADID") || email_ids.is_empty() {
+        return HashMap::new();
+    }
+    let root = PathBuf::from(mail_root);
+    let domain = selected.domain.clone();
+    let local = selected.local.clone();
+    tokio::task::spawn_blocking(move || {
+        rmail_common::jmap::store::thread_ids(&root, &domain, &local, &email_ids)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default()
+}
+
 pub(crate) fn fetch_response_prefix(seq: usize, uid: u64, uidonly: bool) -> String {
     if uidonly {
         format!("* {uid} UIDFETCH (")
@@ -1233,6 +1255,7 @@ pub(crate) async fn write_fetch_response(
     internal_date: (i64, i32),
     save_date: i64,
     email_id: &str,
+    thread_id: Option<&str>,
     path: PathBuf,
     requested: &[String],
     _raw_spec: &str,
@@ -1359,9 +1382,11 @@ pub(crate) async fn write_fetch_response(
         attrs.push(format!("EMAILID ({email_id})"));
     }
     if include_threadid {
-        // RFC 8474 §5.2: THREADID is NIL when the server does not assign
-        // permanent thread identifiers.
-        attrs.push("THREADID NIL".to_string());
+        // RFC 8474 §5.2: the JMAP thread, or NIL when it is not known.
+        match thread_id {
+            Some(thread_id) => attrs.push(format!("THREADID ({thread_id})")),
+            None => attrs.push("THREADID NIL".to_string()),
+        }
     }
     for item in binary_size_items {
         match extract_binary_section(data.as_deref().unwrap_or_default(), item) {
@@ -1649,6 +1674,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
             (0, 0),
             0,
             "",
+            None,
             path,
             &["PREVIEW (LAZY)".to_string(), "UID".to_string()],
             "(PREVIEW (LAZY) UID)",
@@ -1688,6 +1714,7 @@ Content-Type: multipart/alternative; boundary=inner\r\n\r\n\
             (0, 0),
             0,
             "",
+            None,
             path,
             &["SNIPPET (LAZY=FUZZY)".to_string(), "UID".to_string()],
             "(SNIPPET (LAZY=FUZZY) UID)",

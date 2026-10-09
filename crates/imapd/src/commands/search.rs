@@ -60,6 +60,43 @@ pub(crate) async fn handle(
         return response(StatusLine::tagged(tag, Status::Bad, "Tag reuse"));
     }
 
+    let mut request = request;
+    if parser::mentions_thread_id(&request.criterion)
+        && let Some(root) = mail_root
+    {
+        // RFC 8474 §6: THREADID names a JMAP thread; find its emails.
+        let root = root.to_path_buf();
+        let domain = selected.domain.clone();
+        let local = selected.local.clone();
+        let criterion = request.criterion.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            parser::resolve_thread_ids(criterion, &|thread| {
+                rmail_common::jmap::store::thread_members(&root, &domain, &local, thread)
+            })
+        })
+        .await;
+        match resolved {
+            Ok(Ok(criterion)) => request.criterion = criterion,
+            // An unknown thread would match nothing, and NOT THREADID
+            // everything: a failed lookup must not answer either way.
+            Ok(Err(error)) => {
+                return response(
+                    StatusLine::tagged(tag, Status::No, format!("SEARCH failed: {error:#}"))
+                        .with_code("UNAVAILABLE"),
+                );
+            }
+            Err(error) => {
+                return response(
+                    StatusLine::tagged(tag, Status::No, format!("SEARCH task failed: {error}"))
+                        .with_code("UNAVAILABLE"),
+                );
+            }
+        }
+    }
+    // Thread membership is resolved once, so a context could not follow
+    // emails that join the thread later (RFC 5267 lets the server decline).
+    let thread_search = parser::mentions_thread_id(&request.criterion)
+        || parser::resolved_thread_ids(&request.criterion);
     let view = selected;
     let selected = selected.clone();
     let criterion = request.criterion.clone();
@@ -113,7 +150,12 @@ pub(crate) async fn handle(
     let mut update_context = None;
     if update {
         if contexts.is_full() {
-            result = result.status(context::refused(tag));
+            result = result.status(context::refused(tag, "Too many update contexts"));
+        } else if thread_search {
+            result = result.status(context::refused(
+                tag,
+                "THREADID searches cannot be kept up to date",
+            ));
         } else {
             update_context = Some(UpdateContext::new(
                 tag,

@@ -34,6 +34,7 @@ const TYPES: &[&str] = &[
     "Thread",
     "Identity",
     "EmailSubmission",
+    "VacationResponse",
 ];
 
 /// An account's state now.
@@ -196,7 +197,9 @@ pub(crate) async fn event_source(
                 let mut types = Map::new();
                 for kind in &stream.types {
                     let skip = match kind.as_str() {
-                        "Identity" | "EmailSubmission" => !snapshot.account.is_personal(),
+                        "Identity" | "EmailSubmission" | "VacationResponse" => {
+                            !snapshot.account.is_personal()
+                        }
                         "EmailDelivery" => !delivered.contains(id),
                         _ => false,
                     };

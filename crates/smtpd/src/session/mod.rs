@@ -73,6 +73,11 @@ struct Transaction {
     auth_submitter: Option<String>,
     dsn: DsnOptions,
     rcpts: Vec<String>,
+    /// The RCPT addresses as given, before alias expansion; a held message
+    /// is submitted to these when it is released.
+    given_rcpts: Vec<String>,
+    /// RFC 4865: when a held message is to be released (Unix time).
+    release_at: Option<i64>,
     bdat_buffer: Vec<u8>,
     bdat_started: bool,
 }
@@ -88,6 +93,8 @@ impl Default for Transaction {
             auth_submitter: None,
             dsn: DsnOptions::default(),
             rcpts: Vec::new(),
+            given_rcpts: Vec::new(),
+            release_at: None,
             bdat_buffer: Vec::new(),
             bdat_started: false,
         }
@@ -532,6 +539,8 @@ impl Session {
     /// start over with MAIL.
     fn abort_transaction(&mut self) {
         self.tx.rcpts.clear();
+        self.tx.given_rcpts.clear();
+        self.tx.release_at = None;
         self.tx.mail_from = None;
         self.tx.active = false;
         self.tx.bdat_buffer.clear();
@@ -611,6 +620,17 @@ impl Session {
             // RFC 8689: REQUIRETLS is only offered on TLS-protected sessions.
             if self.encrypted {
                 response.push_str("250-REQUIRETLS\r\n");
+            }
+            // RFC 4865: messages from authenticated senders may be held.
+            if self.service == SmtpService::Submission && crate::future_release() {
+                let latest = chrono::Utc::now().timestamp() + rmail_common::hold::MAX_HOLD_SECONDS;
+                response.push_str(&format!(
+                    "250-FUTURERELEASE {} {}\r\n",
+                    rmail_common::hold::MAX_HOLD_SECONDS,
+                    chrono::DateTime::from_timestamp(latest, 0)
+                        .unwrap_or_default()
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                ));
             }
             response.push_str("250 ENHANCEDSTATUSCODES\r\n");
             response
@@ -795,6 +815,41 @@ impl Session {
             )
             .await;
         }
+        let release_at = match parsed.hold {
+            None => None,
+            Some(hold) => {
+                if self.service != SmtpService::Submission || !crate::future_release() {
+                    return reply(reader, b"555 5.5.4 Unsupported MAIL FROM parameter\r\n").await;
+                }
+                if self.authenticated_user.is_none() {
+                    return reply(
+                        reader,
+                        b"530 5.7.0 Authentication required to hold messages\r\n",
+                    )
+                    .await;
+                }
+                if parsed.require_tls {
+                    return reply(
+                        reader,
+                        b"501 5.5.4 FUTURERELEASE cannot be combined with REQUIRETLS\r\n",
+                    )
+                    .await;
+                }
+                let now = chrono::Utc::now().timestamp();
+                let release_at = match hold {
+                    protocol::HoldRequest::For(seconds) => now + seconds,
+                    protocol::HoldRequest::Until(at) => at,
+                };
+                if release_at - now > rmail_common::hold::MAX_HOLD_SECONDS {
+                    return reply(
+                        reader,
+                        b"501 5.5.4 Release time is beyond the FUTURERELEASE maximum\r\n",
+                    )
+                    .await;
+                }
+                Some(release_at)
+            }
+        };
         if parsed.auth_mailbox.is_some() && !self.auth_supported() {
             return reply(
                 reader,
@@ -821,6 +876,7 @@ impl Session {
         self.tx.body = parsed.body;
         self.tx.smtp_utf8 = parsed.smtp_utf8;
         self.tx.require_tls = parsed.require_tls;
+        self.tx.release_at = release_at;
         // RFC 4954 section 5: an AUTH= mailbox from a client that is not
         // authenticated (or that names someone else) is not trusted and is
         // handled as AUTH=<>, so it is never propagated.

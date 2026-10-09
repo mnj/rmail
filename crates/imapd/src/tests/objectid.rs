@@ -67,10 +67,28 @@ async fn email_ids_follow_messages_across_copy_and_move() {
     let fetch = session
         .command("F1 FETCH 1:2 (UID EMAILID THREADID)", "F1 OK")
         .await;
-    assert!(fetch[0].contains("THREADID NIL"), "{fetch:?}");
     let first = object_id(&fetch[0], "EMAILID").to_string();
     let second = object_id(&fetch[1], "EMAILID").to_string();
     assert_ne!(first, second);
+    // THREADID is the email's JMAP thread.
+    let first_thread = object_id(&fetch[0], "THREADID").to_string();
+    assert!(first_thread.starts_with('T'), "{fetch:?}");
+    let thread_search = session
+        .command(&format!("Q0 SEARCH THREADID {first_thread}"), "Q0 OK")
+        .await;
+    assert_eq!(thread_search[0].trim_end(), "* SEARCH 1");
+    // Thread membership is fixed when the search runs, so it cannot back
+    // an updating context.
+    let update = session
+        .command(
+            &format!("Q9 SEARCH RETURN (UPDATE) THREADID {first_thread}"),
+            "Q9 OK",
+        )
+        .await;
+    assert!(
+        update.iter().any(|line| line.contains("[NOUPDATE \"Q9\"]")),
+        "{update:?}"
+    );
 
     let search = session
         .command(&format!("Q1 SEARCH EMAILID {second}"), "Q1 OK")
@@ -84,9 +102,12 @@ async fn email_ids_follow_messages_across_copy_and_move() {
     session.command("K1 COPY 1 Other", "K1 OK").await;
     session.command("M1 MOVE 2 Other", "M1 OK").await;
     session.command("S2 SELECT Other", "S2 OK").await;
-    let fetch = session.command("F2 FETCH 1:2 EMAILID", "F2 OK").await;
+    let fetch = session
+        .command("F2 FETCH 1:2 (EMAILID THREADID)", "F2 OK")
+        .await;
     assert_eq!(object_id(&fetch[0], "EMAILID"), first);
     assert_eq!(object_id(&fetch[1], "EMAILID"), second);
+    assert_eq!(object_id(&fetch[0], "THREADID"), first_thread);
     session.finish().await;
 }
 

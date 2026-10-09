@@ -165,6 +165,18 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             PRIMARY KEY (account, sender, reply_key)
         ) WITHOUT ROWID;
 
+        -- The JMAP VacationResponse (RFC 8621 section 8) per account; delivery
+        -- answers with it next to the account's own Sieve script.
+        CREATE TABLE IF NOT EXISTS vacation_responses (
+            account TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL,
+            from_date INTEGER,
+            to_date INTEGER,
+            subject TEXT,
+            text_body TEXT,
+            html_body TEXT
+        );
+
         -- tlsrpt_counts aggregates outbound TLS outcomes per UTC day (see tlsrpt.rs).
         CREATE TABLE IF NOT EXISTS tlsrpt_counts (
             day TEXT NOT NULL,
@@ -294,6 +306,10 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM mailbox_acl WHERE owner = ?1 OR grantee = ?1",
         params![address],
+    )?;
+    conn.execute(
+        "DELETE FROM vacation_responses WHERE account = ?1",
+        params![address.to_ascii_lowercase()],
     )?;
     Ok(())
 }
@@ -521,6 +537,77 @@ pub fn delete_sieve_script<P: AsRef<Path>>(path: P, account: &str, name: &str) -
         params![account.to_ascii_lowercase(), name],
     )?;
     Ok(changed == 1)
+}
+
+/// An account's JMAP vacation response (RFC 8621 section 8).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VacationResponse {
+    pub enabled: bool,
+    /// Unix times; replies are sent from `from_date` until before `to_date`.
+    pub from_date: Option<i64>,
+    pub to_date: Option<i64>,
+    pub subject: Option<String>,
+    pub text_body: Option<String>,
+    pub html_body: Option<String>,
+}
+
+impl VacationResponse {
+    /// Whether replies go out at `now`.
+    pub fn active_at(&self, now: i64) -> bool {
+        self.enabled
+            && self.from_date.is_none_or(|from| now >= from)
+            && self.to_date.is_none_or(|to| now < to)
+    }
+}
+
+/// The account's vacation response (disabled when never set).
+pub fn get_vacation_response<P: AsRef<Path>>(path: P, account: &str) -> Result<VacationResponse> {
+    use rusqlite::OptionalExtension;
+    let conn = Connection::open(path)?;
+    let row = conn
+        .query_row(
+            "SELECT enabled, from_date, to_date, subject, text_body, html_body
+             FROM vacation_responses WHERE account = ?1",
+            params![account.to_ascii_lowercase()],
+            |row| {
+                Ok(VacationResponse {
+                    enabled: row.get::<_, i64>(0)? != 0,
+                    from_date: row.get(1)?,
+                    to_date: row.get(2)?,
+                    subject: row.get(3)?,
+                    text_body: row.get(4)?,
+                    html_body: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row.unwrap_or_default())
+}
+
+pub fn set_vacation_response<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    response: &VacationResponse,
+) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "INSERT INTO vacation_responses (account, enabled, from_date, to_date, subject, text_body, html_body)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(account) DO UPDATE SET enabled = excluded.enabled,
+             from_date = excluded.from_date, to_date = excluded.to_date,
+             subject = excluded.subject, text_body = excluded.text_body,
+             html_body = excluded.html_body",
+        params![
+            account.to_ascii_lowercase(),
+            i64::from(response.enabled),
+            response.from_date,
+            response.to_date,
+            response.subject,
+            response.text_body,
+            response.html_body,
+        ],
+    )?;
+    Ok(())
 }
 
 /// True when a vacation reply may be sent now: records the send atomically,

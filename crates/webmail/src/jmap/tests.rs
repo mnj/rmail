@@ -16,7 +16,7 @@ use crate::api::{AppState, router};
 
 const USER: &str = "user@example.test";
 const FRIEND: &str = "friend@example.test";
-const USING: &[&str] = &[super::CORE, super::MAIL, super::SUBMISSION];
+const USING: &[&str] = &[super::CORE, super::MAIL, super::SUBMISSION, super::VACATION];
 
 fn state(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) -> Arc<AppState> {
     let db_path = td.path().join("accounts.sqlite");
@@ -766,4 +766,175 @@ async fn submission_sends_the_draft_and_files_it_as_sent() {
         ]))
         .await;
     assert_eq!(responses[1][1]["notCreated"]["s"]["type"], "forbiddenFrom");
+}
+
+#[tokio::test]
+async fn vacation_response_is_a_singleton_that_delivery_reads() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td, None);
+    let client = Client::new(&state, USER);
+    let initial = client.one("VacationResponse/get", json!({})).await;
+    assert_eq!(initial["list"][0]["id"], "singleton");
+    assert_eq!(initial["list"][0]["isEnabled"], false);
+
+    let set = client
+        .one(
+            "VacationResponse/set",
+            json!({
+                "update": {"singleton": {
+                    "isEnabled": true,
+                    "fromDate": "2026-12-20T00:00:00Z",
+                    "toDate": "2027-01-04T00:00:00Z",
+                    "subject": "Away",
+                    "textBody": "Back in January.",
+                }},
+                "create": {"x": {"isEnabled": true}},
+                "destroy": ["singleton"],
+            }),
+        )
+        .await;
+    assert!(set["updated"].get("singleton").is_some(), "{set}");
+    assert_eq!(set["notCreated"]["x"]["type"], "singleton");
+    assert_eq!(set["notDestroyed"]["singleton"]["type"], "singleton");
+    assert_ne!(set["oldState"], set["newState"]);
+
+    let fetched = client
+        .one(
+            "VacationResponse/get",
+            json!({"ids": ["singleton", "other"]}),
+        )
+        .await;
+    assert_eq!(fetched["list"][0]["fromDate"], "2026-12-20T00:00:00Z");
+    assert_eq!(fetched["list"][0]["textBody"], "Back in January.");
+    assert_eq!(fetched["notFound"], json!(["other"]));
+    let stored = db::get_vacation_response(&state.db_path, USER).unwrap();
+    assert!(stored.enabled);
+    assert!(
+        stored.active_at(
+            chrono::DateTime::parse_from_rfc3339("2026-12-25T12:00:00Z")
+                .unwrap()
+                .timestamp()
+        )
+    );
+    assert!(
+        !stored.active_at(
+            chrono::DateTime::parse_from_rfc3339("2027-01-05T00:00:00Z")
+                .unwrap()
+                .timestamp()
+        )
+    );
+
+    let invalid = client
+        .one(
+            "VacationResponse/set",
+            json!({"update": {"singleton": {"fromDate": "soon"}}}),
+        )
+        .await;
+    assert_eq!(
+        invalid["notUpdated"]["singleton"]["type"],
+        "invalidProperties"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_sending_holds_until_release_and_can_be_cancelled() {
+    let td = tempfile::tempdir().unwrap();
+    let mail_root = td.path().join("mail");
+    std::fs::create_dir_all(&mail_root).unwrap();
+    let (address, mut received) = fake_submission(mail_root).await;
+    let state = state(&td, Some(address));
+    let client = Client::new(&state, USER);
+    let own = account_id(USER);
+
+    let (_, _, body) = send(
+        &state,
+        "GET",
+        "/jmap/session",
+        Some(&client.auth),
+        Vec::new(),
+    )
+    .await;
+    let session: Value = serde_json::from_slice(&body).unwrap();
+    let submission = &session["accounts"][&own]["accountCapabilities"][super::SUBMISSION];
+    assert_eq!(
+        submission["maxDelayedSend"],
+        rmail_common::hold::MAX_HOLD_SECONDS
+    );
+    assert!(submission["submissionExtensions"]["FUTURERELEASE"].is_array());
+
+    let drafts = client.mailbox_id(&own, "drafts").await;
+    let identity = client.one("Identity/get", json!({})).await["list"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send_later = |parameters: Value| {
+        json!([
+            ["Email/set", {"create": {"d": {
+                "mailboxIds": {drafts.clone(): true},
+                "from": [{"email": USER}],
+                "to": [{"email": "to@x.test"}],
+                "subject": "Later",
+                "bodyValues": {"b": {"value": "Tomorrow"}},
+                "textBody": [{"partId": "b"}],
+            }}}, "0"],
+            ["EmailSubmission/set", {"create": {"s": {
+                "identityId": identity,
+                "emailId": "#d",
+                "envelope": {
+                    "mailFrom": {"email": USER, "parameters": parameters},
+                    "rcptTo": [{"email": "to@x.test"}],
+                },
+            }}}, "1"],
+        ])
+    };
+    let responses = client.call(send_later(json!({"HOLDFOR": "3600"}))).await;
+    let created = &responses[1][1]["created"]["s"];
+    assert_eq!(created["undoStatus"], "pending", "{responses:?}");
+    let submission_id = created["id"].as_str().unwrap().to_string();
+    let held =
+        rmail_common::hold::due(&state.mail_root, chrono::Utc::now().timestamp() + 7200).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        held[0].submission_id.as_deref(),
+        Some(submission_id.as_str())
+    );
+    assert!(
+        received.try_recv().is_err(),
+        "nothing is sent before the release"
+    );
+
+    let cancelled = client
+        .one(
+            "EmailSubmission/set",
+            json!({"update": {submission_id.clone(): {"undoStatus": "canceled"}}}),
+        )
+        .await;
+    assert!(
+        cancelled["updated"].get(&submission_id).is_some(),
+        "{cancelled}"
+    );
+    assert!(
+        rmail_common::hold::due(&state.mail_root, chrono::Utc::now().timestamp() + 7200)
+            .unwrap()
+            .is_empty()
+    );
+    let record = client
+        .one("EmailSubmission/get", json!({"ids": [submission_id]}))
+        .await;
+    assert_eq!(record["list"][0]["undoStatus"], "canceled");
+    let again = client
+        .one(
+            "EmailSubmission/set",
+            json!({"update": {submission_id.clone(): {"undoStatus": "canceled"}}}),
+        )
+        .await;
+    assert_eq!(again["notUpdated"][&submission_id]["type"], "cannotUnsend");
+
+    let too_late = client
+        .call(send_later(json!({"HOLDFOR": "99999999"})))
+        .await;
+    assert_eq!(
+        too_late[1][1]["notCreated"]["s"]["type"],
+        "invalidProperties"
+    );
 }

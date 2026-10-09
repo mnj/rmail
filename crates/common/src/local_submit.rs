@@ -1,7 +1,8 @@
-//! Sending through this server's own submission service, so webmail mail
-//! gets exactly the checks, routing, signing and limits of any other
-//! authenticated client. Webmail authenticates over loopback with the local
-//! submission secret as its signed-in user (SASL `X-RMAIL-WEBMAIL`).
+//! Sending through this server's own submission service, so mail from
+//! webmail, JMAP and released scheduled messages gets exactly the checks,
+//! routing, signing and limits of any other authenticated client. The
+//! caller authenticates over loopback with the local submission secret as
+//! the user it acts for (SASL `X-RMAIL-WEBMAIL`).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -111,10 +112,8 @@ pub async fn submit_as(
     }
     let key = {
         let mail_root = mail_root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            rmail_common::runtime::webmail_submission_key(&mail_root)
-        })
-        .await??
+        tokio::task::spawn_blocking(move || crate::runtime::webmail_submission_key(&mail_root))
+            .await??
     };
     let exchange = async {
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))

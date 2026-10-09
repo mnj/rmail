@@ -119,10 +119,20 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             thread_id TEXT NOT NULL,
             envelope TEXT NOT NULL,
             send_at INTEGER NOT NULL,
-            delivery_status TEXT NOT NULL
+            delivery_status TEXT NOT NULL,
+            undo_status TEXT NOT NULL DEFAULT 'final',
+            hold_id TEXT
         );
         ",
     )?;
+    // Scheduled sending (pending submissions) came after the table.
+    imap_state::add_column_if_missing(
+        conn,
+        "jmap_submissions",
+        "undo_status",
+        "TEXT NOT NULL DEFAULT 'final'",
+    )?;
+    imap_state::add_column_if_missing(conn, "jmap_submissions", "hold_id", "TEXT")?;
     let email_created = |row: &str| {
         format!(
             "NOT EXISTS (SELECT 1 FROM messages o WHERE o.email_id = {row}.email_id AND o.id != {row}.id)"
@@ -841,6 +851,43 @@ pub fn email_id_at(conn: &Connection, folder: &str, uid: u64) -> Result<Option<S
         )
         .optional()?
         .flatten())
+}
+
+/// The JMAP thread of each of `email_ids`, indexing new emails first.
+/// IMAP reports these as THREADID (RFC 8474).
+pub fn thread_ids(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    email_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let conn = open(maildir_root, domain, localpart)?;
+    index_new_emails(&conn, maildir_root, domain, localpart)?;
+    let mut statement = conn.prepare("SELECT thread_id FROM jmap_emails WHERE email_id = ?1")?;
+    let mut out = HashMap::new();
+    for id in email_ids {
+        if let Some(thread) = statement
+            .query_row(params![id], |row| row.get::<_, String>(0))
+            .optional()?
+        {
+            out.insert(id.clone(), thread);
+        }
+    }
+    Ok(out)
+}
+
+/// The EMAILIDs in thread `thread_id`, indexing new emails first.
+pub fn thread_members(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    thread_id: &str,
+) -> Result<Vec<String>> {
+    let conn = open(maildir_root, domain, localpart)?;
+    index_new_emails(&conn, maildir_root, domain, localpart)?;
+    Ok(threads(&conn, &[thread_id.to_string()])?
+        .remove(thread_id)
+        .unwrap_or_default())
 }
 
 /// Open the account's state database (creating the account if needed).
