@@ -915,7 +915,7 @@ impl Notifier {
             reader.get_mut().write_all(output.as_bytes()).await?;
         }
         if let Some(fetch) = &group.events.fetch {
-            write_new_messages(reader, &refreshed, &known, fetch, options).await?;
+            write_new_messages(reader, mail_root, &refreshed, &known, fetch, options).await?;
         }
         let updates = contexts
             .refresh(Some(&refreshed), options.imap4rev2)
@@ -931,6 +931,7 @@ impl Notifier {
 /// in the selected mailbox.
 async fn write_new_messages(
     reader: &mut ImapReader,
+    mail_root: &str,
     refreshed: &SelectedMailbox,
     known: &HashSet<u64>,
     fetch: &FetchItems,
@@ -940,10 +941,22 @@ async fn write_new_messages(
     if options.condstore && !items.iter().any(|item| item == "MODSEQ") {
         items.push("MODSEQ".to_string());
     }
+    let new_ids = refreshed
+        .msgs
+        .iter()
+        .filter(|message| !known.contains(&message.0))
+        .filter_map(|message| refreshed.email_ids.get(&message.0).cloned())
+        .collect();
+    let thread_ids = mailbox::thread_ids_for(mail_root, refreshed, &items, new_ids).await;
     for (index, (uid, path, flags, modseq)) in refreshed.msgs.iter().enumerate() {
         if known.contains(uid) || refreshed.is_expunged(*uid) {
             continue;
         }
+        let email_id = refreshed
+            .email_ids
+            .get(uid)
+            .map(String::as_str)
+            .unwrap_or_default();
         let mut flags = flags.clone();
         if !options.imap4rev2 && refreshed.recent_uids.contains(uid) {
             flags.push("\\Recent".to_string());
@@ -958,11 +971,8 @@ async fn write_new_messages(
             *modseq,
             refreshed.internal_dates.get(uid).copied().unwrap_or((0, 0)),
             refreshed.save_dates.get(uid).copied().unwrap_or(0),
-            refreshed
-                .email_ids
-                .get(uid)
-                .map(String::as_str)
-                .unwrap_or_default(),
+            email_id,
+            thread_ids.get(email_id).map(String::as_str),
             path.clone(),
             &items,
             &fetch.raw,

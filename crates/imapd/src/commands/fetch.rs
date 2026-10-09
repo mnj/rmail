@@ -216,6 +216,16 @@ pub(crate) async fn handle(
 
     let flags_requested = request.items.iter().any(|item| item == "FLAGS");
     let modseq_requested = request.items.iter().any(|item| item == "MODSEQ");
+    let thread_ids = mailbox::thread_ids_for(
+        mail_root,
+        selected,
+        &request.items,
+        targets
+            .iter()
+            .map(|target| target.email_id.clone())
+            .collect(),
+    )
+    .await;
     for target in targets {
         let mut response_flags = target.flags.clone();
         if !context.imap4rev2 && selected.recent_uids.contains(&target.uid) {
@@ -255,6 +265,7 @@ pub(crate) async fn handle(
             target.internal_date,
             target.save_date,
             &target.email_id,
+            thread_ids.get(&target.email_id).map(String::as_str),
             target.path,
             items,
             &request.raw_items,

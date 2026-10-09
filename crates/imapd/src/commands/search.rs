@@ -60,6 +60,26 @@ pub(crate) async fn handle(
         return response(StatusLine::tagged(tag, Status::Bad, "Tag reuse"));
     }
 
+    let mut request = request;
+    if parser::mentions_thread_id(&request.criterion)
+        && let Some(root) = mail_root
+    {
+        // RFC 8474 §6: THREADID names a JMAP thread; find its emails.
+        let root = root.to_path_buf();
+        let domain = selected.domain.clone();
+        let local = selected.local.clone();
+        let criterion = request.criterion.clone();
+        if let Ok(resolved) = tokio::task::spawn_blocking(move || {
+            parser::resolve_thread_ids(criterion, &|thread| {
+                rmail_common::jmap::store::thread_members(&root, &domain, &local, thread)
+                    .unwrap_or_default()
+            })
+        })
+        .await
+        {
+            request.criterion = resolved;
+        }
+    }
     let view = selected;
     let selected = selected.clone();
     let criterion = request.criterion.clone();

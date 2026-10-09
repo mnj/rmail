@@ -908,9 +908,11 @@ pub(crate) enum SearchCriterion {
     Smaller(usize),
     /// RFC 8474 §6 SEARCH EMAILID.
     EmailId(String),
-    /// RFC 8474 §6 SEARCH THREADID; rMail assigns no thread IDs, so nothing
-    /// matches.
-    ThreadId,
+    /// RFC 8474 §6 SEARCH THREADID, as parsed.
+    ThreadId(String),
+    /// A THREADID key resolved to the thread's EMAILIDs (sorted); an
+    /// unresolved `ThreadId` matches nothing.
+    ThreadMembers(Vec<String>),
     Header(String, String),
     Body(String),
     Text(String),
@@ -1004,6 +1006,45 @@ pub(crate) fn fts_needles(
 
 /// Like [`search_requires_message_data`], but a BODY or TEXT test the index
 /// already answers for `uid` does not need the message read.
+/// Whether the search uses a THREADID key.
+pub(crate) fn mentions_thread_id(criterion: &SearchCriterion) -> bool {
+    match criterion {
+        SearchCriterion::ThreadId(_) => true,
+        SearchCriterion::Not(inner) => mentions_thread_id(inner),
+        SearchCriterion::Or(left, right) => mentions_thread_id(left) || mentions_thread_id(right),
+        SearchCriterion::And(items) => items.iter().any(mentions_thread_id),
+        _ => false,
+    }
+}
+
+/// Replace each THREADID key by the members of its thread.
+pub(crate) fn resolve_thread_ids(
+    criterion: SearchCriterion,
+    members: &dyn Fn(&str) -> Vec<String>,
+) -> SearchCriterion {
+    match criterion {
+        SearchCriterion::ThreadId(id) => {
+            let mut ids = members(&id);
+            ids.sort();
+            SearchCriterion::ThreadMembers(ids)
+        }
+        SearchCriterion::Not(inner) => {
+            SearchCriterion::Not(Box::new(resolve_thread_ids(*inner, members)))
+        }
+        SearchCriterion::Or(left, right) => SearchCriterion::Or(
+            Box::new(resolve_thread_ids(*left, members)),
+            Box::new(resolve_thread_ids(*right, members)),
+        ),
+        SearchCriterion::And(items) => SearchCriterion::And(
+            items
+                .into_iter()
+                .map(|item| resolve_thread_ids(item, members))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 pub(crate) fn search_requires_message_data_for(
     criterion: &SearchCriterion,
     uid: u64,
@@ -1229,7 +1270,7 @@ fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCr
         "THREADID" => {
             let id = tokens.get(*pos)?.clone();
             *pos += 1;
-            valid_object_id(&id).then_some(SearchCriterion::ThreadId)
+            valid_object_id(&id).then_some(SearchCriterion::ThreadId(id))
         }
         "FROM" | "TO" | "CC" | "BCC" | "SUBJECT" => {
             let value = tokens.get(*pos)?.clone();
@@ -1697,7 +1738,10 @@ pub(crate) fn search_matches(
         SearchCriterion::Larger(size) => msg.size > *size,
         SearchCriterion::Smaller(size) => msg.size < *size,
         SearchCriterion::EmailId(id) => msg.email_id == id,
-        SearchCriterion::ThreadId => false,
+        SearchCriterion::ThreadId(_) => false,
+        SearchCriterion::ThreadMembers(members) => members
+            .binary_search_by(|member| member.as_str().cmp(msg.email_id))
+            .is_ok(),
         SearchCriterion::Header(name, value) => crate::mailbox::header_value(msg.data, name)
             .map(|header| normalized_casefold(&header).contains(&normalized_casefold(value)))
             .unwrap_or(false),

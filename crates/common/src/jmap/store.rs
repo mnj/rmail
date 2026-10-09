@@ -843,6 +843,43 @@ pub fn email_id_at(conn: &Connection, folder: &str, uid: u64) -> Result<Option<S
         .flatten())
 }
 
+/// The JMAP thread of each of `email_ids`, indexing new emails first.
+/// IMAP reports these as THREADID (RFC 8474).
+pub fn thread_ids(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    email_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let conn = open(maildir_root, domain, localpart)?;
+    index_new_emails(&conn, maildir_root, domain, localpart)?;
+    let mut statement = conn.prepare("SELECT thread_id FROM jmap_emails WHERE email_id = ?1")?;
+    let mut out = HashMap::new();
+    for id in email_ids {
+        if let Some(thread) = statement
+            .query_row(params![id], |row| row.get::<_, String>(0))
+            .optional()?
+        {
+            out.insert(id.clone(), thread);
+        }
+    }
+    Ok(out)
+}
+
+/// The EMAILIDs in thread `thread_id`, indexing new emails first.
+pub fn thread_members(
+    maildir_root: &Path,
+    domain: &str,
+    localpart: &str,
+    thread_id: &str,
+) -> Result<Vec<String>> {
+    let conn = open(maildir_root, domain, localpart)?;
+    index_new_emails(&conn, maildir_root, domain, localpart)?;
+    Ok(threads(&conn, &[thread_id.to_string()])?
+        .remove(thread_id)
+        .unwrap_or_default())
+}
+
 /// Open the account's state database (creating the account if needed).
 pub fn open(
     maildir_root: &Path,
