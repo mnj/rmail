@@ -77,6 +77,15 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Delivery routes: send a domain's mail (or, with `*`, all mail) via a
+    /// relay host instead of its MX hosts, or refuse it
+    Transport {
+        #[command(subcommand)]
+        action: TransportAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// DKIM signing keys and the ARC sealing key, stored in the database
     Dkim {
         #[command(subcommand)]
@@ -160,6 +169,32 @@ enum SettingsAction {
     Set { key: String, value: String },
     /// Remove a stored setting so its default applies
     Unset { key: String },
+}
+
+#[derive(Subcommand)]
+enum TransportAction {
+    /// List routes
+    List,
+    /// Send mail for DOMAIN (or `*` for every domain without its own route)
+    /// to a relay host
+    Relay {
+        domain: String,
+        /// host or host:port (port 25 by default, 465 with --implicit-tls)
+        relay: String,
+        /// TLS from the first byte instead of STARTTLS
+        #[arg(long)]
+        implicit_tls: bool,
+        /// Authenticate with AUTH PLAIN (only ever sent over TLS)
+        #[arg(long)]
+        user: Option<String>,
+        /// Password for --user; read from standard input when omitted
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Refuse mail for DOMAIN with REPLY, e.g. "550 5.1.2 No such domain"
+    Reject { domain: String, reply: String },
+    /// Remove DOMAIN's route; its mail goes to the MX hosts again
+    Remove { domain: String },
 }
 
 #[derive(Subcommand)]
@@ -592,6 +627,13 @@ async fn main() -> Result<()> {
             ServiceAction::Status(opts) => run_service_action("status", opts)?,
             ServiceAction::ApplyRequest { file } => apply_restart_request(&file)?,
         },
+        Commands::Transport { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            run_transport(action, std::path::Path::new(&cfg.global.db_path))?;
+        }
         Commands::Dkim { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
@@ -606,6 +648,86 @@ async fn main() -> Result<()> {
             });
             let cfg = Config::load(&cfg_path)?;
             run_acme(action, &cfg).await?;
+        }
+    }
+    Ok(())
+}
+
+fn run_transport(action: TransportAction, db_path: &std::path::Path) -> Result<()> {
+    use rmail_common::transport::{self, RouteAction};
+    let describe = |route: &transport::Route| match &route.action {
+        RouteAction::Relay {
+            host,
+            port,
+            implicit_tls,
+            username,
+            ..
+        } => format!(
+            "{:<24} relay {host}:{port}{}{}",
+            route.domain,
+            if *implicit_tls { " (implicit TLS)" } else { "" },
+            username
+                .as_ref()
+                .map(|user| format!(" as {user}"))
+                .unwrap_or_default()
+        ),
+        RouteAction::Reject { reply } => format!("{:<24} reject {reply}", route.domain),
+    };
+    match action {
+        TransportAction::List => {
+            let routes = transport::list_routes(db_path)?;
+            if routes.is_empty() {
+                println!("No routes; mail goes to each domain's MX hosts.");
+            }
+            for route in &routes {
+                println!("{}", describe(route));
+            }
+        }
+        TransportAction::Relay {
+            domain,
+            relay,
+            implicit_tls,
+            user,
+            password,
+        } => {
+            let (host, port) = match relay.rsplit_once(':') {
+                Some((host, port)) if !host.contains(':') => (
+                    host.to_string(),
+                    port.parse::<u16>()
+                        .with_context(|| format!("invalid port in {relay}"))?,
+                ),
+                _ => (relay.clone(), if implicit_tls { 465 } else { 25 }),
+            };
+            let password = match (&user, password) {
+                (Some(_), None) => {
+                    eprint!("Relay password: ");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    Some(line.trim_end_matches(['\r', '\n']).to_string())
+                }
+                (_, password) => password,
+            };
+            let route = transport::set_route(
+                db_path,
+                &domain,
+                RouteAction::Relay {
+                    host,
+                    port,
+                    implicit_tls,
+                    username: user,
+                    password,
+                },
+            )?;
+            println!("{}", describe(&route));
+        }
+        TransportAction::Reject { domain, reply } => {
+            let route = transport::set_route(db_path, &domain, RouteAction::Reject { reply })?;
+            println!("{}", describe(&route));
+        }
+        TransportAction::Remove { domain } => {
+            if !transport::delete_route(db_path, &domain)? {
+                anyhow::bail!("no route for {domain}");
+            }
         }
     }
     Ok(())

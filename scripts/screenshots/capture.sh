@@ -63,6 +63,8 @@ done
 "${ctl}" dkim add example.com mail2026 --config config.toml >/dev/null
 "${ctl}" dkim add example.com ed2026 --algorithm ed25519 --config config.toml >/dev/null
 "${ctl}" dkim set-arc example.com mail2026 --config config.toml
+"${ctl}" transport relay partner.example smtp.partner.example:587 --user relay@example.com --password Demo-pass-123 --config config.toml >/dev/null
+"${ctl}" transport reject old-brand.example "550 5.1.2 This domain no longer accepts mail" --config config.toml >/dev/null
 
 export RMAIL_CONFIG=config.toml RMAIL_MAIL_ROOT=mail
 export RMAIL_WEB_STATIC_DIR="${root}/crates/webui/frontend/dist"

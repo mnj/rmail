@@ -20,7 +20,7 @@ export type Page = 'overview' | 'accounts' | 'routing' | 'domains' | 'delivery' 
 const pageMeta: Record<Page, { path: string; label: string; description: string; icon: React.ElementType }> = {
   overview: { path: '/', label: 'Overview', description: 'Health, storage and delivery at a glance.', icon: Gauge },
   accounts: { path: '/accounts', label: 'Mailboxes', description: 'Create mailboxes, reset passwords and manage quotas.', icon: Users },
-  routing: { path: '/routing', label: 'Routing', description: 'Aliases and per-domain catchalls.', icon: Network },
+  routing: { path: '/routing', label: 'Routing', description: 'Aliases, catchalls and outbound delivery routes.', icon: Network },
   domains: { path: '/domains', label: 'Domains & DNS', description: 'DKIM signing keys and the DNS records to publish for each domain.', icon: Globe },
   delivery: { path: '/delivery', label: 'Delivery', description: 'Inspect and recover the outbound queue.', icon: Send },
   organization: { path: '/organization', label: 'Organization', description: 'Choose, download and test the local or hosted models that suggest folders for new mail.', icon: FolderTree },

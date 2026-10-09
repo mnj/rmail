@@ -1,10 +1,11 @@
 import React, { useId, useMemo, useState } from 'react';
 import { Pencil, Plus, Search, Trash2, X } from 'lucide-react';
-import { Account, api, Routing } from '../api';
-import { Empty, ErrorBanner, Field, IconButton, Modal, Panel, SkeletonRows, useFeedback, useResource } from '../ui';
+import { Account, api, Route, Routing } from '../api';
+import { Empty, ErrorBanner, Field, IconButton, Modal, Panel, SkeletonRows, Toggle, useFeedback, useResource } from '../ui';
 
 type AliasEdit = { mode: 'create' } | { mode: 'edit'; address: string; targets: string[] };
 type CatchallEdit = { mode: 'create' } | { mode: 'edit'; domain: string; target: string };
+type RouteEdit = { mode: 'create' } | { mode: 'edit'; route: Route };
 
 const looksLikeAddress = (value: string) => /^[^\s@]+@[^\s@]+$/.test(value);
 
@@ -134,6 +135,77 @@ function CatchallModal({ editing, mailboxes, onClose, onSaved }: { editing: Catc
   );
 }
 
+function RouteModal({ editing, onClose, onSaved }: { editing: RouteEdit; onClose: () => void; onSaved: () => void }) {
+  const { run } = useFeedback();
+  const existing = editing.mode === 'edit' ? editing.route : null;
+  const [domain, setDomain] = useState(existing?.domain || '*');
+  const [action, setAction] = useState<'relay' | 'reject'>(existing?.action || 'relay');
+  const [host, setHost] = useState(existing?.action === 'relay' ? existing.host : '');
+  const [implicitTls, setImplicitTls] = useState(existing?.action === 'relay' ? existing.implicit_tls : false);
+  const [port, setPort] = useState(existing?.action === 'relay' ? String(existing.port) : '587');
+  const [username, setUsername] = useState(existing?.action === 'relay' ? existing.username || '' : '');
+  const [password, setPassword] = useState('');
+  const [reply, setReply] = useState(existing?.action === 'reject' ? existing.reply : '550 5.1.2 Mail for this domain is not accepted');
+  const [saving, setSaving] = useState(false);
+  const keepsPassword = existing?.action === 'relay' && existing.has_password && existing.username === username.trim();
+  const portNumber = Number(port);
+  const valid = domain.trim() && (action === 'reject'
+    ? /^[45]\d\d /.test(reply.trim())
+    : host.trim() && Number.isInteger(portNumber) && portNumber > 0 && portNumber < 65536 && (!username.trim() || password || keepsPassword));
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    const body = action === 'reject'
+      ? { domain: domain.trim(), action, reply: reply.trim() }
+      : { domain: domain.trim(), action, host: host.trim(), port: portNumber, implicit_tls: implicitTls, username: username.trim() || null, password: password || null };
+    const label = domain.trim() === '*' ? 'the default route' : `the route for ${domain.trim()}`;
+    const ok = await run(() => api('/api/routing/transport', 'POST', body), `Saved ${label}`);
+    setSaving(false);
+    if (ok) { onSaved(); onClose(); }
+  }
+
+  return (
+    <Modal title={existing ? `Edit route for ${existing.domain === '*' ? 'all other domains' : existing.domain}` : 'New delivery route'} onClose={onClose} footer={<>
+      <button className="button" type="button" onClick={onClose}>Cancel</button>
+      <button className="button primary" type="submit" form="routeForm" disabled={saving || !valid}>{saving ? 'Saving…' : existing ? 'Save changes' : 'Create route'}</button>
+    </>}>
+      <form id="routeForm" className="formStack" onSubmit={submit}>
+        <Field label="Recipient domain" hint="* covers every domain without its own route, which makes the relay a smarthost.">
+          <input value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="* or example.com" disabled={!!existing} autoFocus={!existing} required />
+        </Field>
+        <Field label="Action">
+          <select value={action} onChange={(event) => setAction(event.target.value as 'relay' | 'reject')}>
+            <option value="relay">Send through a relay host</option>
+            <option value="reject">Refuse with a fixed reply</option>
+          </select>
+        </Field>
+        {action === 'relay' ? (<>
+          <Field label="Relay host">
+            <input value={host} onChange={(event) => setHost(event.target.value)} placeholder="smtp.example.net" required />
+          </Field>
+          <Field label="Port" hint={implicitTls ? 'Usually 465.' : 'Usually 587 for a provider, 25 for another MTA. STARTTLS is used when offered.'}>
+            <input value={port} inputMode="numeric" onChange={(event) => setPort(event.target.value.replace(/\D/g, ''))} required />
+          </Field>
+          <Toggle checked={implicitTls} label="TLS from the first byte (implicit TLS)" onChange={(value) => { setImplicitTls(value); if (port === '587' || port === '465' || port === '25') setPort(value ? '465' : '587'); }} />
+          <Field label="Username (optional)" hint="Sent with AUTH PLAIN, and only over TLS.">
+            <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="off" />
+          </Field>
+          {username.trim() && (
+            <Field label="Password" hint={keepsPassword ? 'Leave empty to keep the stored password.' : undefined}>
+              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" />
+            </Field>
+          )}
+        </>) : (
+          <Field label="Reply" hint="A 5xx reply bounces at once; a 4xx reply keeps the message queued.">
+            <input value={reply} onChange={(event) => setReply(event.target.value)} required />
+          </Field>
+        )}
+      </form>
+    </Modal>
+  );
+}
+
 export function RoutingPage() {
   const { run, confirm } = useFeedback();
   const routing = useResource(() => api<Routing>('/api/routing'), []);
@@ -141,6 +213,7 @@ export function RoutingPage() {
   const accounts = useResource(() => api<Account[]>('/api/accounts').catch(() => [] as Account[]), [], undefined, 'accounts');
   const [aliasEdit, setAliasEdit] = useState<AliasEdit | null>(null);
   const [catchallEdit, setCatchallEdit] = useState<CatchallEdit | null>(null);
+  const [routeEdit, setRouteEdit] = useState<RouteEdit | null>(null);
   const [filter, setFilter] = useState('');
 
   const mailboxes = useMemo(() => (accounts.data || []).map((account) => account.address).sort(), [accounts.data]);
@@ -152,6 +225,12 @@ export function RoutingPage() {
   async function removeAlias(address: string) {
     if (!await confirm({ title: `Delete alias ${address}?`, message: 'Mail to this address will no longer be forwarded.', confirmLabel: 'Delete', danger: true })) return;
     if (await run(() => api('/api/routing/alias', 'DELETE', { address }), `Deleted alias ${address}`)) routing.reload();
+  }
+
+  async function removeRoute(domain: string) {
+    const label = domain === '*' ? 'the default route' : `the route for ${domain}`;
+    if (!await confirm({ title: `Delete ${label}?`, message: 'Mail goes to the recipient domain\'s MX hosts again.', confirmLabel: 'Delete', danger: true })) return;
+    if (await run(() => api('/api/routing/transport', 'DELETE', { domain }), `Deleted ${label}`)) routing.reload();
   }
 
   async function removeCatchall(domain: string) {
@@ -217,8 +296,36 @@ export function RoutingPage() {
           </div>
           {data && !data.catchalls.length && <Empty>No catchalls. Mail to unknown addresses is rejected.</Empty>}
         </Panel>
+        <Panel
+          title="Delivery routes"
+          subtitle="Send outbound mail through a relay host instead of the recipient's MX hosts"
+          actions={<button className="button" onClick={() => setRouteEdit({ mode: 'create' })}><Plus size={16} />New route</button>}
+        >
+          <div className="tableScroll">
+          <table>
+            <thead><tr><th>Recipient domain</th><th>Route</th><th><span className="visuallyHidden">Actions</span></th></tr></thead>
+            <tbody>
+              {!data && !routing.error && <SkeletonRows rows={1} cols={3} />}
+              {data?.routes.map((route) => (
+                <tr key={route.domain}>
+                  <td className="nowrap"><strong>{route.domain === '*' ? 'All other domains' : route.domain}</strong></td>
+                  <td>{route.action === 'relay'
+                    ? <>Relay <code>{route.host}:{route.port}</code>{route.implicit_tls ? ' · implicit TLS' : ''}{route.username ? <> · as <code>{route.username}</code></> : ''}</>
+                    : <>Refuse: <code>{route.reply}</code></>}</td>
+                  <td className="rowActions">
+                    <IconButton label={`Edit route for ${route.domain}`} onClick={() => setRouteEdit({ mode: 'edit', route })}><Pencil size={15} /></IconButton>
+                    <IconButton danger label={`Delete route for ${route.domain}`} onClick={() => removeRoute(route.domain)}><Trash2 size={15} /></IconButton>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          </div>
+          {data && !data.routes.length && <Empty>No routes. Outbound mail goes straight to each recipient's MX hosts.</Empty>}
+        </Panel>
       </section>
       {aliasEdit && <AliasModal editing={aliasEdit} mailboxes={mailboxes} onClose={() => setAliasEdit(null)} onSaved={routing.reload} />}
+      {routeEdit && <RouteModal editing={routeEdit} onClose={() => setRouteEdit(null)} onSaved={routing.reload} />}
       {catchallEdit && <CatchallModal editing={catchallEdit} mailboxes={mailboxes} onClose={() => setCatchallEdit(null)} onSaved={routing.reload} />}
     </>
   );

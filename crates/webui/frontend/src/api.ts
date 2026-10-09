@@ -92,7 +92,10 @@ export type DmarcRow = { domain: string; events: number };
 export type DnsRecord = { name: string; type: string; value: string; purpose: string };
 export type DkimKey = { domain: string; selector: string; algorithm: 'rsa' | 'ed25519'; arc: boolean; created_at: number; dns_record: string };
 export type Discovery = { hostname: string; domains: { domain: string; records: DnsRecord[]; dkim: DkimKey[] }[] };
-export type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[] };
+export type Route =
+  | { domain: string; action: 'relay'; host: string; port: number; implicit_tls: boolean; username: string | null; has_password: boolean }
+  | { domain: string; action: 'reject'; reply: string; has_password: boolean };
+export type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[]; routes: Route[] };
 export type ReadinessCheck = { status: 'ok' | 'error' | 'skipped'; error?: string };
 export type Readiness = { ready: boolean; checks: Record<string, ReadinessCheck> };
 

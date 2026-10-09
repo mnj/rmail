@@ -111,6 +111,10 @@ pub(crate) fn router(state: Shared) -> Router {
             "/api/routing/catchall",
             post(save_catchall).delete(delete_catchall),
         )
+        .route(
+            "/api/routing/transport",
+            post(save_transport).delete(delete_transport),
+        )
         .route("/api/settings", get(settings).put(update_settings))
         .route("/api/services/restart", post(restart_services))
         .route("/api/admin/credentials", post(change_credentials))
@@ -873,6 +877,57 @@ async fn write_alias(state: &AdminState, body: &Bytes, delete: bool) -> Response
     )
 }
 
+#[derive(serde::Deserialize)]
+struct TransportRequest {
+    domain: String,
+    #[serde(flatten)]
+    action: Option<rmail_common::transport::RouteAction>,
+}
+
+/// Store a delivery route; a relay saved without a password keeps the
+/// stored one.
+async fn save_transport(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: TransportRequest = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    let Some(action) = input.action else {
+        return error(StatusCode::BAD_REQUEST, "action must be relay or reject");
+    };
+    outcome(
+        blocking(move || {
+            rmail_common::transport::set_route(std::path::Path::new(&db), &input.domain, action)
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn delete_transport(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: TransportRequest = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            if !rmail_common::transport::delete_route(std::path::Path::new(&db), &input.domain)? {
+                anyhow::bail!("no route for {}", input.domain);
+            }
+            Ok(json!({"result": "ok"}))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
 async fn save_catchall(State(state): State<Shared>, body: Bytes) -> Response {
     write_catchall(&state, &body, false).await
 }
@@ -1057,5 +1112,25 @@ async fn change_credentials(
             )
         }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod transport_request_tests {
+    use super::TransportRequest;
+    use rmail_common::transport::RouteAction;
+
+    #[test]
+    fn save_and_delete_bodies_parse() {
+        let save: TransportRequest = serde_json::from_str(
+            r#"{"domain":"*","action":"relay","host":"smtp.example.net","port":587,"username":"u","password":"p"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            save.action,
+            Some(RouteAction::Relay { port: 587, .. })
+        ));
+        let delete: TransportRequest = serde_json::from_str(r#"{"domain":"old.example"}"#).unwrap();
+        assert!(delete.action.is_none());
     }
 }

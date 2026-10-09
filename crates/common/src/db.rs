@@ -148,6 +148,19 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             PRIMARY KEY (domain, selector)
         ) WITHOUT ROWID;
 
+        -- Delivery routes (see transport.rs); domain '*' is the default route.
+        CREATE TABLE IF NOT EXISTS transport_routes (
+            domain TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            host TEXT,
+            port INTEGER,
+            implicit_tls INTEGER NOT NULL DEFAULT 0,
+            username TEXT,
+            password TEXT,
+            reply TEXT,
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
         -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
         CREATE TABLE IF NOT EXISTS greylist (
             key TEXT PRIMARY KEY,

@@ -120,6 +120,26 @@ select the claim (`username`, `sub`, or `email`) that contains the local mailbox
 tokens are redacted from diagnostics. Adding `OAUTHBEARER` or `XOAUTH2` to an IMAP or SMTP SASL
 mechanism list without valid OAuth settings is a startup error.
 
+## Delivery routes and smarthost
+
+Outbound mail goes to each recipient domain's MX hosts unless a delivery route says otherwise.
+Routes are stored in the database and managed on the console's **Routing** page or with
+`rmail_ctl transport`:
+
+```bash
+# Send everything through a provider's submission port (a smarthost).
+rmail_ctl transport relay '*' smtp.provider.example:587 --user relay@example.com
+# A route for one domain wins over '*'; --implicit-tls uses TLS from the first byte (465).
+rmail_ctl transport relay partner.example mx.partner.example:25
+# Refuse a domain: 5xx bounces at once, 4xx keeps the message queued.
+rmail_ctl transport reject old.example "550 5.1.2 This domain no longer accepts mail"
+rmail_ctl transport list
+```
+
+Relay credentials are sent with AUTH PLAIN and only over TLS; a relay that offers no TLS is not
+used. MTA-STS and DANE apply to MX delivery only, while REQUIRETLS messages still need TLS to the
+relay.
+
 ## LMTP local delivery
 
 LMTP is disabled by default. Enable a TCP endpoint with, for example,

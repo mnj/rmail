@@ -58,6 +58,7 @@ struct AccountSummary {
 struct RoutingSummary {
     aliases: Vec<AliasSummary>,
     catchalls: Vec<CatchallSummary>,
+    routes: Vec<rmail_common::transport::Route>,
 }
 
 #[derive(Serialize)]
@@ -566,6 +567,7 @@ fn routing_summary_sync(db_path: Option<&str>) -> Result<RoutingSummary> {
         return Ok(RoutingSummary {
             aliases: Vec::new(),
             catchalls: Vec::new(),
+            routes: Vec::new(),
         });
     };
     Ok(RoutingSummary {
@@ -577,6 +579,7 @@ fn routing_summary_sync(db_path: Option<&str>) -> Result<RoutingSummary> {
             .into_iter()
             .map(|(domain, target)| CatchallSummary { domain, target })
             .collect(),
+        routes: rmail_common::transport::list_routes(std::path::Path::new(db_path))?,
     })
 }
 
