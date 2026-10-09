@@ -25,18 +25,49 @@ use crate::api::AppState;
 
 const POLL: Duration = Duration::from_secs(3);
 const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
-const TYPES: &[&str] = &["Mailbox", "Email", "Thread", "Identity", "EmailSubmission"];
+const TYPES: &[&str] = &[
+    "Mailbox",
+    "Email",
+    "EmailDelivery",
+    "Thread",
+    "Identity",
+    "EmailSubmission",
+];
 
-/// Each account's state string, after bringing the account up to date.
-fn states(state: &AppState, user: &User) -> anyhow::Result<HashMap<String, (Account, String)>> {
+/// An account's state now.
+struct Snapshot {
+    account: Account,
+    seq: u64,
+    state: String,
+}
+
+/// Each account's state, after bringing the account up to date.
+fn states(state: &AppState, user: &User) -> anyhow::Result<HashMap<String, Snapshot>> {
     let mut out = HashMap::new();
     for account in accounts(state, user)? {
         store::sync_account(&state.mail_root, &account.domain, &account.localpart)?;
         let conn = store::open(&state.mail_root, &account.domain, &account.localpart)?;
         let seq = store::state(&conn)?;
-        out.insert(account.id.clone(), (account.clone(), account.state(seq)));
+        out.insert(
+            account.id.clone(),
+            Snapshot {
+                state: account.state(seq),
+                account,
+                seq,
+            },
+        );
     }
     Ok(out)
+}
+
+/// Whether emails were created in `account` since `since` (the
+/// EmailDelivery push type, RFC 8621 section 1.5).
+fn delivered_since(state: &AppState, account: &Account, since: u64) -> bool {
+    store::open(&state.mail_root, &account.domain, &account.localpart)
+        .ok()
+        .and_then(|conn| store::changes(&conn, "Email", since, None).ok())
+        .and_then(Result::ok)
+        .is_some_and(|changes| !changes.created.is_empty())
 }
 
 struct Stream {
@@ -45,7 +76,8 @@ struct Stream {
     types: Vec<String>,
     close_after_state: bool,
     ping: Option<Duration>,
-    known: HashMap<String, String>,
+    /// The state string and sequence last reported per account.
+    known: HashMap<String, (String, u64)>,
     started: Instant,
     last_event: Instant,
     done: bool,
@@ -82,7 +114,7 @@ pub(crate) async fn event_source(
     let known = match initial {
         Ok(states) => states
             .into_iter()
-            .map(|(id, (_, state))| (id, state))
+            .map(|(id, snapshot)| (id, (snapshot.state, snapshot.seq)))
             .collect(),
         Err(error) => {
             return (
@@ -108,30 +140,60 @@ pub(crate) async fn event_source(
             if stream.done || stream.started.elapsed() > MAX_LIFETIME {
                 return None;
             }
-            tokio::time::sleep(POLL).await;
+            match stream.state.shutdown.clone() {
+                Some(mut shutdown) => {
+                    if *shutdown.borrow() {
+                        return None;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(POLL) => {}
+                        _ = shutdown.changed() => return None,
+                    }
+                }
+                None => tokio::time::sleep(POLL).await,
+            }
             let task_state = stream.state.clone();
             let task_user = stream.user.clone();
-            let Ok(current) = blocking(move || states(&task_state, &task_user)).await else {
+            let known = stream.known.clone();
+            let Ok((current, delivered)) = blocking(move || {
+                let current = states(&task_state, &task_user)?;
+                let delivered = current
+                    .iter()
+                    .filter(|(id, snapshot)| {
+                        known.get(*id).is_some_and(|(state, seq)| {
+                            *state != snapshot.state
+                                && delivered_since(&task_state, &snapshot.account, *seq)
+                        })
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                Ok((current, delivered))
+            })
+            .await
+            else {
                 continue;
             };
             let mut changed = Map::new();
-            for (id, (account, state)) in &current {
-                if stream.known.get(id) == Some(state) {
+            for (id, snapshot) in &current {
+                if stream.known.get(id).map(|(state, _)| state) == Some(&snapshot.state) {
                     continue;
                 }
                 let mut types = Map::new();
                 for kind in &stream.types {
-                    let personal_only = matches!(kind.as_str(), "Identity" | "EmailSubmission");
-                    if personal_only && !account.is_personal() {
-                        continue;
+                    let skip = match kind.as_str() {
+                        "Identity" | "EmailSubmission" => !snapshot.account.is_personal(),
+                        "EmailDelivery" => !delivered.contains(id),
+                        _ => false,
+                    };
+                    if !skip {
+                        types.insert(kind.clone(), Value::String(snapshot.state.clone()));
                     }
-                    types.insert(kind.clone(), Value::String(state.clone()));
                 }
                 changed.insert(id.clone(), Value::Object(types));
             }
             stream.known = current
                 .into_iter()
-                .map(|(id, (_, state))| (id, state))
+                .map(|(id, snapshot)| (id, (snapshot.state, snapshot.seq)))
                 .collect();
             if !changed.is_empty() {
                 stream.last_event = Instant::now();

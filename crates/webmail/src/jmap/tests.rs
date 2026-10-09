@@ -39,6 +39,7 @@ fn state(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) -> Ar
         submission,
         oauth: None,
         jmap_logins: Default::default(),
+        shutdown: None,
     })
 }
 

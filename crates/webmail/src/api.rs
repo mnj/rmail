@@ -51,6 +51,9 @@ pub(crate) struct AppState {
     pub oauth: Option<rmail_common::oauth::OAuthValidator>,
     /// JMAP clients authenticate every request; recent checks are cached.
     pub jmap_logins: crate::jmap::LoginCache,
+    /// Becomes true when the server shuts down; long-lived responses (JMAP
+    /// push) end then instead of holding up the shutdown.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 type Shared = Arc<AppState>;
@@ -1498,6 +1501,7 @@ mod tests {
             submission: None,
             oauth: None,
             jmap_logins: Default::default(),
+            shutdown: None,
         })
     }
 
@@ -2103,6 +2107,7 @@ mod tests {
             submission: Some(address),
             oauth: None,
             jmap_logins: Default::default(),
+            shutdown: None,
         });
         let cookie = Some(format!(
             "{SESSION_COOKIE}={}",

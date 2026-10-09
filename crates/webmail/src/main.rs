@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
     let bind_addrs = cfg.global.webmail_listeners();
     let tls = rmail_common::tls::web_tls_channel(&cfg.global)?;
     let secure_cookies = tls.1.borrow().is_some() || cfg.global.tls.web_http_only;
+    let shutdown = GracefulShutdown::new();
     let state = Arc::new(api::AppState {
         mail_root,
         db_path,
@@ -67,6 +68,7 @@ async fn main() -> Result<()> {
             None => None,
         },
         jmap_logins: Default::default(),
+        shutdown: Some(shutdown.subscribe()),
     });
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
@@ -77,7 +79,6 @@ async fn main() -> Result<()> {
     );
     let app = api::router(state);
     let listener_config = cfg.global.tcp_listener.clone();
-    let shutdown = GracefulShutdown::new();
     let mut listeners = JoinSet::new();
     for addr in bind_addrs {
         let listener = bind_tcp_listener_with_config(&addr, &listener_config)?;
