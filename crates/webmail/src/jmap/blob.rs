@@ -107,7 +107,7 @@ pub(crate) async fn upload(
     let state = app.0;
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if body.len() > MAX_SIZE_UPLOAD {
         return (StatusCode::PAYLOAD_TOO_LARGE, "upload too large").into_response();
@@ -186,7 +186,7 @@ pub(crate) async fn download(
     let state = app.0;
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let task_state = state.clone();
     let task_blob = blob_id.clone();

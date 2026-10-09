@@ -92,7 +92,7 @@ pub(crate) async fn event_source(
     let state = app.0;
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let types = match params.get("types").map(String::as_str) {
         None | Some("*") | Some("") => TYPES.iter().map(|t| t.to_string()).collect(),

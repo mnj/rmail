@@ -145,12 +145,12 @@ pub(crate) async fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
     peer: &Peer,
-) -> Result<User, Response> {
+) -> Result<User, Box<Response>> {
     let Some(value) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
     else {
-        return Err(unauthorized());
+        return Err(Box::new(unauthorized()));
     };
     if let Some(remaining) = peer.ip().and_then(|ip| state.throttle.blocked_for(ip)) {
         let mut response = (
@@ -161,7 +161,7 @@ pub(crate) async fn authenticate(
         if let Ok(value) = HeaderValue::from_str(&remaining.as_secs().to_string()) {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
-        return Err(response);
+        return Err(Box::new(response));
     }
     let reject = || {
         if let Some(ip) = peer.ip() {
@@ -173,17 +173,17 @@ pub(crate) async fn authenticate(
     let (scheme, credentials) = value.split_once(' ').unwrap_or((value, ""));
     let address = if scheme.eq_ignore_ascii_case("Bearer") {
         let Some(validator) = &state.oauth else {
-            return Err(reject());
+            return Err(Box::new(reject()));
         };
         match validator.validate(credentials.trim(), None).await {
             rmail_common::oauth::OAuthValidation::Active { identity } => {
                 auth::normalize_login_name(&identity).unwrap_or_default()
             }
-            rmail_common::oauth::OAuthValidation::Rejected => return Err(reject()),
+            rmail_common::oauth::OAuthValidation::Rejected => return Err(Box::new(reject())),
             rmail_common::oauth::OAuthValidation::Unavailable(_) => {
-                return Err(
-                    (StatusCode::SERVICE_UNAVAILABLE, "token check unavailable").into_response()
-                );
+                return Err(Box::new(
+                    (StatusCode::SERVICE_UNAVAILABLE, "token check unavailable").into_response(),
+                ));
             }
         }
     } else if scheme.eq_ignore_ascii_case("Basic") {
@@ -193,15 +193,15 @@ pub(crate) async fn authenticate(
             .and_then(|bytes| String::from_utf8(bytes).ok());
         let Some((name, password)) = decoded.as_deref().and_then(|text| text.split_once(':'))
         else {
-            return Err(reject());
+            return Err(Box::new(reject()));
         };
         let address = auth::normalize_login_name(name.trim()).unwrap_or_default();
         if !verify_password(state, &address, password).await {
-            return Err(reject());
+            return Err(Box::new(reject()));
         }
         address
     } else {
-        return Err(reject());
+        return Err(Box::new(reject()));
     };
     // The stored account decides the address's spelling from here on.
     let db_path = state.db_path.clone();
@@ -212,7 +212,7 @@ pub(crate) async fn authenticate(
         .flatten();
     let Some(user) = mailbox.and_then(|mailbox| user_for(&mailbox.address.to_ascii_lowercase()))
     else {
-        return Err(reject());
+        return Err(Box::new(reject()));
     };
     if let Some(ip) = peer.ip() {
         state.throttle.reset(ip);
@@ -512,7 +512,7 @@ async fn session_resource(
     let state = app.0;
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let base = base_url(&state, &headers);
     let task_state = state.clone();
@@ -914,7 +914,7 @@ async fn api(
     let state = app.0;
     let user = match authenticate(&state, &headers, &peer).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if body.len() > MAX_SIZE_REQUEST {
         return problem(
