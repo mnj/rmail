@@ -147,7 +147,7 @@ methodology as the tables above.
 
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
-| RFC 5321 | SMTP client | 90% | MX preference ordering, implicit-MX fallback only when no MX exists, EHLO with a configured FQDN, connection reuse, transient/permanent reply classification, and delivery routes (smarthost or per-domain relay with AUTH PLAIN over TLS) are implemented. Opportunistic STARTTLS accepts any certificate (RFC 7435). Commands are not pipelined to the next hop. |
+| RFC 5321 | SMTP client | 90% | MX preference ordering, implicit-MX fallback only when no MX exists, EHLO with a configured FQDN, connection reuse, transient/permanent reply classification, and delivery routes (smarthost or per-domain relay with AUTH PLAIN over TLS) are implemented. Opportunistic STARTTLS accepts any certificate (RFC 7435). With `PIPELINING` (RFC 2920), MAIL and RCPT go out as one group. |
 | RFC 7505 | Null MX | 100% | A domain publishing `MX 0 .` fails immediately with a permanent error and a failure DSN. |
 | RFC 3461 | DSN client parameters | 100% | `RET`, `ENVID`, `NOTIFY` and `ORCPT` are passed on when the next hop advertises `DSN`, which then owns success reports; a next hop without DSN gets an `Action: relayed` report naming the Remote-MTA. Delay and failure reports are generated locally. |
 | RFC 6152 / RFC 6531 / RFC 3030 | `8BITMIME`, `SMTPUTF8`, `CHUNKING`/`BINARYMIME` | 95% | Declared when the next hop advertises them; BDAT is used when CHUNKING is offered and binary content requires both extensions. No 8-bit-to-7-bit downgrade. |
@@ -176,7 +176,6 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
   (RFC 4467) with BURL (RFC 4468).
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852),
   `FUTURERELEASE` (RFC 4865) and `ETRN` (RFC 1985).
-- **Outbound command pipelining** to the next hop.
 - **DMARC failure reports** (RFC 6591 / `ruf`) and **ARF abuse feedback** (RFC 5965).
 - **Sender Rewriting Scheme** for forwarded mail; ARC sealing is the only SPF mitigation.
 

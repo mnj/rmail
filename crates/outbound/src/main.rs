@@ -1603,6 +1603,34 @@ async fn smtp_begin_transaction(
         capabilities,
     )?;
 
+    let rcptcmd = build_rcpt_command(recipient, dsn, capabilities)?;
+    if capabilities.pipelining {
+        // RFC 2920: send MAIL and RCPT in one group, then read both replies
+        // in order so the session stays in step even when MAIL fails.
+        reader
+            .get_mut()
+            .write_all(format!("{mailcmd}{rcptcmd}").as_bytes())
+            .await?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.command("mail", &mailcmd, mailcmd.len());
+            trace.command("rcpt", &rcptcmd, rcptcmd.len());
+        }
+        reader.get_mut().flush().await?;
+        let (mail_code, mail_reply) = read_response(&mut *reader).await?;
+        let (rcpt_code, rcpt_reply) = read_response(&mut *reader).await?;
+        if let Some(trace) = trace {
+            trace.reply("mail", mail_code, &mail_reply);
+            trace.reply("rcpt", rcpt_code, &rcpt_reply);
+        }
+        if mail_code / 100 != 2 {
+            return Err(rejected("MAIL FROM", mail_code, mail_reply));
+        }
+        if rcpt_code / 100 != 2 {
+            return Err(rejected("RCPT TO", rcpt_code, rcpt_reply));
+        }
+        return Ok(());
+    }
+
     reader.get_mut().write_all(mailcmd.as_bytes()).await?;
     if let Some(trace) = trace.as_deref_mut() {
         trace.command("mail", &mailcmd, mailcmd.len());
@@ -1616,7 +1644,6 @@ async fn smtp_begin_transaction(
         return Err(rejected("MAIL FROM", code, resp));
     }
 
-    let rcptcmd = build_rcpt_command(recipient, dsn, capabilities)?;
     reader.get_mut().write_all(rcptcmd.as_bytes()).await?;
     if let Some(trace) = trace.as_deref_mut() {
         trace.command("rcpt", &rcptcmd, rcptcmd.len());
@@ -1923,6 +1950,8 @@ struct SmtpCapabilities {
     require_tls: bool,
     dsn: bool,
     auth_plain: bool,
+    /// RFC 2920: MAIL and RCPT may be sent together.
+    pipelining: bool,
     /// RFC 9422 LIMITS MAILMAX: transactions the server accepts per session.
     mail_max: Option<u32>,
 }
@@ -1953,6 +1982,8 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.require_tls = true;
         } else if keyword.eq_ignore_ascii_case("DSN") {
             capabilities.dsn = true;
+        } else if keyword.eq_ignore_ascii_case("PIPELINING") {
+            capabilities.pipelining = true;
         } else if keyword.eq_ignore_ascii_case("LIMITS") {
             // RFC 9422: malformed or unknown limits are ignored.
             capabilities.mail_max = line
@@ -3132,6 +3163,7 @@ mod tests {
             require_tls: true,
             dsn: false,
             auth_plain: false,
+            pipelining: false,
             mail_max: None,
         };
         assert_eq!(
@@ -3374,6 +3406,7 @@ mod tests {
                 require_tls: false,
                 dsn: false,
                 auth_plain: false,
+                pipelining: false,
                 mail_max: None,
             },
             None,
@@ -3527,6 +3560,7 @@ mod tests {
                 require_tls: false,
                 dsn: false,
                 auth_plain: false,
+                pipelining: false,
                 mail_max: None,
             },
         )
@@ -3732,5 +3766,45 @@ mod tests {
         let server = tokio::spawn(serve(listener, "500 Internal Server Error"));
         assert!(post_tls_report(&url, b"gzdata").await.is_err());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mail_and_rcpt_are_pipelined_when_offered() {
+        use tokio::io::AsyncBufReadExt;
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut server = tokio::io::BufReader::new(server);
+            let (mut mail, mut rcpt) = (String::new(), String::new());
+            server.read_line(&mut mail).await.unwrap();
+            // Both commands are already sent before any reply goes out.
+            server.read_line(&mut rcpt).await.unwrap();
+            server
+                .get_mut()
+                .write_all(b"250 2.1.0 OK\r\n550 5.1.1 No such user\r\n")
+                .await
+                .unwrap();
+            (mail, rcpt)
+        });
+        let mut reader: BufReader<Box<dyn AsyncStream>> = BufReader::new(Box::new(client));
+        let capabilities = SmtpCapabilities {
+            pipelining: true,
+            ..SmtpCapabilities::default()
+        };
+        let error = smtp_begin_transaction(
+            &mut reader,
+            Some("sender@example.test"),
+            "missing@example.net",
+            &MessageRequirements::default(),
+            false,
+            None,
+            &capabilities,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("RCPT TO"), "{error:#}");
+        let (mail, rcpt) = server.await.unwrap();
+        assert_eq!(mail, "MAIL FROM:<sender@example.test>\r\n");
+        assert_eq!(rcpt, "RCPT TO:<missing@example.net>\r\n");
     }
 }
