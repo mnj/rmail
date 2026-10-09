@@ -15,6 +15,8 @@ pub(crate) struct StoreContext {
     pub(crate) imap4rev2: bool,
     /// RFC 9586: responses are UIDFETCH.
     pub(crate) uidonly: bool,
+    /// RFC 9738 MESSAGELIMIT.
+    pub(crate) message_limit: Option<usize>,
 }
 
 pub(crate) struct Outcome {
@@ -51,11 +53,17 @@ pub(crate) async fn handle(
             )))
         };
     }
-    let targets = if uid_mode {
+    let mut targets = if uid_mode {
         uid_targets(&request.message_set, selected, saved_uids)
     } else {
         sequence_targets(&request.message_set, selected, saved_uids)
     };
+    let limited =
+        crate::commands::limit::truncate_by(&mut targets, context.message_limit, |target| target.1);
+    if limited.is_some() {
+        // Back in sequence order for the FETCH responses.
+        targets.sort_unstable_by_key(|target| target.0);
+    }
     let mut modified = Vec::new();
     let mut updates = Vec::new();
     let requested_flags = request
@@ -178,8 +186,12 @@ pub(crate) async fn handle(
     if !modified.is_empty() {
         completion = completion.with_code(format!("MODIFIED {}", compress_ids(&modified)));
     }
+    let mut response = response.status(completion);
+    if let Some(code) = limited {
+        response = response.with_message_limit(code);
+    }
     Outcome {
-        response: response.status(completion),
+        response,
         flag_updates: applied,
         condstore_activated,
     }

@@ -206,6 +206,18 @@ pub fn dns_records(
             purpose: "Deliver mail for the domain to this server",
         },
         DnsRecord {
+            name: domain.to_string(),
+            kind: "TXT",
+            value: "v=spf1 mx -all".to_string(),
+            purpose: "SPF: only the domain's MX hosts send its mail (RFC 7208)",
+        },
+        DnsRecord {
+            name: format!("_dmarc.{domain}"),
+            kind: "TXT",
+            value: format!("v=DMARC1; p=none; rua=mailto:{tls_rpt_mailbox}"),
+            purpose: "DMARC: start with p=none and aggregate reports, then tighten to quarantine or reject",
+        },
+        DnsRecord {
             name: format!("autoconfig.{domain}"),
             kind: "CNAME",
             value: format!("{host}."),
@@ -414,7 +426,7 @@ mod tests {
     #[test]
     fn endpoints_prefer_implicit_tls_and_parse_ports() {
         let global: Global = toml::from_str(
-            "mail_root = \"m\"\nhostname = \"mail.example.com\"\n[listeners]\nimaps = [\"[::]:993\"]\nsubmission = [\"0.0.0.0:587\"]\n",
+            "mail_root = \"m\"\ndb_path = \"rmail.db\"\nhostname = \"mail.example.com\"\n[listeners]\nimaps = [\"[::]:993\"]\nsubmission = [\"0.0.0.0:587\"]\n",
         )
         .unwrap();
         let e = ServiceEndpoints::from_global(&global);

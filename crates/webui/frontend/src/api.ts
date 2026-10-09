@@ -68,7 +68,7 @@ export type PasswordPolicy = {
   require_symbol: boolean;
   forbid_username: boolean;
 };
-export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; settings_managed: boolean; password_policy?: PasswordPolicy };
+export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; password_policy?: PasswordPolicy };
 export type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
 export type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null };
 export type QueueSummary = { queued: number; inflight: number; sent: number; failed: number };
@@ -89,7 +89,13 @@ export type QueueControl = { attempts?: number; max_attempts?: number; priority?
 export type QueueItem = { name: string; control?: QueueControl | null };
 export type Spool = 'queue' | 'inflight' | 'failed' | 'sent';
 export type DmarcRow = { domain: string; events: number };
-export type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[] };
+export type DnsRecord = { name: string; type: string; value: string; purpose: string };
+export type DkimKey = { domain: string; selector: string; algorithm: 'rsa' | 'ed25519'; arc: boolean; created_at: number; dns_record: string };
+export type Discovery = { hostname: string; domains: { domain: string; records: DnsRecord[]; dkim: DkimKey[] }[] };
+export type Route =
+  | { domain: string; action: 'relay'; host: string; port: number; implicit_tls: boolean; username: string | null; has_password: boolean }
+  | { domain: string; action: 'reject'; reply: string; has_password: boolean };
+export type Routing = { aliases: { address: string; targets: string[] }[]; catchalls: { domain: string; target: string }[]; routes: Route[] };
 export type ReadinessCheck = { status: 'ok' | 'error' | 'skipped'; error?: string };
 export type Readiness = { ready: boolean; checks: Record<string, ReadinessCheck> };
 
@@ -125,15 +131,10 @@ export type ServiceState = {
   pending_changes: string[];
 };
 
-export type SettingsView =
-  | { managed: false }
-  | {
-      managed: true;
+export type SettingsView = {
       revision: number;
-      imported_from: string | null;
       groups: { id: string; label: string; description: string }[];
       settings: Setting[];
-      other: { key: string; value: unknown }[];
       services: ServiceState[];
       restart_available?: boolean;
     };
@@ -141,7 +142,6 @@ export type SettingsView =
 export type CertificateInfo = { subject: string; names: string[]; issuer: string; not_before: number; not_after: number; serial: string; self_signed: boolean };
 export type AcmeRun = { trigger: string; dry_run: boolean; started_at: number; finished_at: number | null; ok: boolean | null; error: string | null; names: string[]; log: { at: number; message: string }[] };
 export type Certificates = {
-  managed: boolean;
   enabled: boolean;
   names: string[];
   names_error: string | null;
@@ -184,7 +184,6 @@ export type ClassifierStatus = {
   last_cycle: { finished_at: number; duration_ms: number; report: { accounts: number; learned: number; classified: number; suggested: number; moved: number; labeled?: number; awaiting_consent?: number; errors: string[] } } | null;
 };
 export type Organization = {
-  managed: boolean;
   models_dir: string;
   catalog: CatalogModel[];
   installed: InstalledModel[];

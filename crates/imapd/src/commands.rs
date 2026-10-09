@@ -434,6 +434,7 @@ pub(crate) mod expunge;
 pub(crate) mod fetch;
 pub(crate) mod id;
 pub(crate) mod idle;
+pub(crate) mod limit;
 pub(crate) mod list;
 pub(crate) mod login;
 pub(crate) mod mailboxes;

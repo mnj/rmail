@@ -1,13 +1,10 @@
 //! Database-managed runtime settings.
 //!
-//! When the configuration file names a `db_path`, the file only bootstraps
-//! `global.mail_root` and `global.db_path`. Every other setting is stored as a
-//! flattened `section.key` → JSON row in the `settings` table, which is the
-//! single source of truth that the admin web UI and `rmail_ctl settings` edit.
-//!
-//! On the first start against a database without settings, every value in the
-//! configuration file is imported once. After that, file values other than the
-//! bootstrap keys are ignored (a warning names them).
+//! The configuration file only bootstraps `global.mail_root` and
+//! `global.db_path`. Every other setting is stored as a flattened
+//! `section.key` → JSON row in the `settings` table, which is the single
+//! source of truth that the admin web UI and `rmail_ctl settings` edit. Other
+//! values in the file are ignored (a warning names them).
 //!
 //! Daemons read settings at startup and record the revision they loaded in
 //! `service_state`, so the admin UI can show which services need a restart.
@@ -787,6 +784,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         OUTBOUND,
     ),
     spec(
+        "security.dane_enabled",
+        "tls",
+        "Outbound DANE",
+        "Authenticate recipient MX hosts with DNSSEC-signed TLSA records (RFC 7672). Requires a resolver that passes DNSSEC records; signed domains are deferred if it strips them.",
+        SettingKind::Bool,
+        OUTBOUND,
+    ),
+    spec(
         "security.greylist_enabled",
         "filtering",
         "Greylisting",
@@ -809,6 +814,38 @@ pub const SETTINGS: &[SettingSpec] = &[
         "How often changed greylist state is written to disk. Changes are batched; nothing is written while idle.",
         int(10, 86_400),
         SMTP,
+    ),
+    spec(
+        "security.dmarc_failure_reports",
+        "filtering",
+        "DMARC failure reports",
+        "Send failure reports (RFC 6591) to domains whose DMARC policy asks for them (ruf, fo). Each report includes the failing message's headers but not its body; at most 10 per domain per hour.",
+        SettingKind::Bool,
+        SMTP,
+    ),
+    spec(
+        "security.srs_domain",
+        "filtering",
+        "SRS domain",
+        "Rewrite the envelope sender of mail forwarded by aliases, catchalls and Sieve redirects into this domain (Sender Rewriting Scheme), so SPF passes at the next hop, and return bounces to the original sender. The domain's MX and SPF must point at this server. Empty disables SRS.",
+        SettingKind::Text,
+        SMTP,
+    ),
+    spec(
+        "security.imap_message_limit",
+        "limits",
+        "IMAP message limit",
+        "Most messages one IMAP command may touch (RFC 9738 MESSAGELIMIT, at least 1000). Larger FETCH, STORE, SEARCH and MOVE commands handle the newest messages and tell the client where to continue; larger COPY and APPEND are refused. Clients that do not know the extension see partial results, so 0 (no limit) is the default.",
+        int(0, 100_000_000),
+        IMAP,
+    ),
+    spec(
+        "security.proxy_protocol_trusted_networks",
+        "limits",
+        "PROXY protocol networks",
+        "Load balancer addresses or networks (e.g. 10.0.0.0/8), one per line. Their SMTP, IMAP, POP3 and ManageSieve connections must start with a HAProxy PROXY header (v1 or v2) carrying the client address. Empty disables it.",
+        SettingKind::List,
+        MAIL,
     ),
     spec(
         "security.dnsbl_zones",
@@ -1153,6 +1190,7 @@ pub fn open(db_path: impl AsRef<Path>) -> Result<Connection> {
     let db_path = db_path.as_ref();
     let conn = Connection::open(db_path)
         .with_context(|| format!("opening settings database {}", db_path.display()))?;
+    crate::db::restrict_permissions_or_warn(db_path);
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     ensure_schema(&conn)?;
     Ok(conn)
@@ -1167,9 +1205,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
          );
          CREATE TABLE IF NOT EXISTS settings_meta (
              id INTEGER PRIMARY KEY CHECK (id = 1),
-             revision INTEGER NOT NULL,
-             imported_from TEXT,
-             imported_at INTEGER
+             revision INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS settings_changes (
              revision INTEGER NOT NULL,
@@ -1203,13 +1239,6 @@ pub fn revision(conn: &Connection) -> Result<u64> {
         )
         .optional()?;
     Ok(revision.unwrap_or(0) as u64)
-}
-
-fn is_initialized(conn: &Connection) -> Result<bool> {
-    Ok(conn
-        .query_row("SELECT 1 FROM settings_meta WHERE id = 1", [], |_| Ok(()))
-        .optional()?
-        .is_some())
 }
 
 pub fn load_all(conn: &Connection) -> Result<BTreeMap<String, Value>> {
@@ -1413,190 +1442,13 @@ pub fn unflatten<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Value)>)
     Value::Object(root)
 }
 
-/// First line of the banner [`tidy_config`] adds; also marks a file as tidied.
-pub const TIDY_MARKER: &str = "# rMail: settings below were migrated to the database";
-
-/// Result of [`tidy_config`].
-pub struct TidyReport {
-    /// The rewritten file contents.
-    pub text: String,
-    /// Settings commented out because the database already holds them.
-    pub commented: usize,
-    /// Settings left active because their value differs from the database's
-    /// (the database wins, so these edits have no effect).
-    pub differing: Vec<String>,
-}
-
-/// Comment out the entries of a configuration file whose values were
-/// imported into the settings database, keeping the bootstrap keys and any
-/// entry the database does not hold identically. Comments, blank lines and
-/// layout are preserved, and running it again changes nothing.
-pub fn tidy_config(text: &str, file: &Value, stored: &BTreeMap<String, Value>) -> TidyReport {
-    let file_flat = flatten(file);
-    let mut differing = Vec::new();
-    let mut commented = 0;
-    // True when every value under `path` is stored unchanged.
-    let migrated = |path: &str, differing: &mut Vec<String>| -> bool {
-        let prefix = format!("{path}.");
-        let keys = file_flat
-            .iter()
-            .filter(|(key, _)| key.as_str() == path || key.starts_with(&prefix))
-            .collect::<Vec<_>>();
-        if keys.is_empty() || keys.iter().any(|(key, _)| is_bootstrap(key)) {
-            return false;
-        }
-        let mut all = true;
-        for (key, value) in keys {
-            if stored.get(key.as_str()) != Some(value) {
-                differing.push(key.clone());
-                all = false;
-            }
-        }
-        all
-    };
-
-    let mut out: Vec<String> = Vec::new();
-    let mut table: Option<String> = Some(String::new());
-    // Index in `out` of the current header and whether live lines follow it.
-    let mut header: Option<usize> = None;
-    let mut live = false;
-    let finish_section = |out: &mut Vec<String>, header: Option<usize>, live: bool| {
-        if let (Some(index), false) = (header, live) {
-            out[index] = format!("# {}", out[index]);
-        }
-    };
-    let lines = text.lines().collect::<Vec<_>>();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            out.push(line.to_string());
-            i += 1;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            finish_section(&mut out, header, live);
-            let array_table = trimmed.starts_with("[[");
-            let name = trimmed
-                .trim_start_matches('[')
-                .split(']')
-                .next()
-                .unwrap_or("")
-                .split('.')
-                .map(|part| part.trim().trim_matches(['"', '\'']))
-                .collect::<Vec<_>>()
-                .join(".");
-            table = (!array_table).then_some(name);
-            header = Some(out.len());
-            live = array_table;
-            out.push(line.to_string());
-            i += 1;
-            continue;
-        }
-        // A key = value statement, possibly spanning several lines.
-        let start = i;
-        let mut scan = ValueScan::default();
-        let eq = line.find('=').unwrap_or(line.len());
-        scan.advance(line.get(eq + 1..).unwrap_or(""));
-        i += 1;
-        while (scan.depth > 0 || scan.multiline.is_some()) && i < lines.len() {
-            scan.advance(lines[i]);
-            i += 1;
-        }
-        let key = line[..eq]
-            .split('.')
-            .map(|part| part.trim().trim_matches(['"', '\'']))
-            .collect::<Vec<_>>()
-            .join(".");
-        let hide = match &table {
-            Some(table) if !table.is_empty() => migrated(&format!("{table}.{key}"), &mut differing),
-            Some(_) => migrated(&key, &mut differing),
-            None => false,
-        };
-        if hide {
-            commented += 1;
-            out.extend(
-                lines[start..i]
-                    .iter()
-                    .map(|l| format!("# {l}").trim_end().to_string()),
-            );
-        } else {
-            live = true;
-            out.extend(lines[start..i].iter().map(|l| l.to_string()));
-        }
-    }
-    finish_section(&mut out, header, live);
-    differing.sort();
-    differing.dedup();
-    let mut text = out.join("\n");
-    text.push('\n');
-    if commented > 0 && !text.contains(TIDY_MARKER) {
-        text = format!(
-            "{TIDY_MARKER}.\n# They are managed in the admin console or with `rmail_ctl settings`; commented\n# entries are ignored. Only mail_root and db_path are read from this file.\n\n{text}"
-        );
-    }
-    TidyReport {
-        text,
-        commented,
-        differing,
-    }
-}
-
-/// Tracks bracket depth and multi-line strings across the lines of one TOML value.
-#[derive(Default)]
-struct ValueScan {
-    depth: i32,
-    multiline: Option<&'static str>,
-}
-
-impl ValueScan {
-    fn advance(&mut self, line: &str) {
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if let Some(delim) = self.multiline {
-                if delim == "\"\"\"" && bytes[i] == b'\\' {
-                    i += 2;
-                } else if line[i..].starts_with(delim) {
-                    self.multiline = None;
-                    i += 3;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            match bytes[i] {
-                b'#' => return,
-                quote @ (b'"' | b'\'') => {
-                    let triple = if quote == b'"' { "\"\"\"" } else { "\'\'\'" };
-                    if line[i..].starts_with(triple) {
-                        self.multiline = Some(triple);
-                        i += 3;
-                        continue;
-                    }
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != quote {
-                        i += if quote == b'"' && bytes[i] == b'\\' {
-                            2
-                        } else {
-                            1
-                        };
-                    }
-                    i += 1;
-                }
-                b'[' | b'{' => {
-                    self.depth += 1;
-                    i += 1;
-                }
-                b']' | b'}' => {
-                    self.depth -= 1;
-                    i += 1;
-                }
-                _ => i += 1,
-            }
-        }
-    }
+/// Stand-in bootstrap values for building a config that only checks or
+/// describes the stored settings.
+fn placeholder_bootstrap() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("global.mail_root".to_string(), Value::from("mail")),
+        ("global.db_path".to_string(), Value::from("rmail.db")),
+    ])
 }
 
 fn is_bootstrap(key: &str) -> bool {
@@ -1630,6 +1482,18 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
         crate::domain::canonicalize_domain(hostname.trim()).map_err(|error| {
             anyhow!("global.hostname: {hostname:?} is not a valid domain name ({error})")
         })?;
+    }
+    if !config.security.srs_domain.is_empty() {
+        crate::domain::canonicalize_domain(config.security.srs_domain.trim())
+            .map_err(|error| anyhow!("security.srs_domain: {error:#}"))?;
+    }
+    let limit = config.security.imap_message_limit;
+    if limit > 0 && limit < 1000 {
+        bail!("security.imap_message_limit: use 0 (no limit) or at least 1000 (RFC 9738)");
+    }
+    for network in &config.security.proxy_protocol_trusted_networks {
+        crate::proxy::Network::parse(network)
+            .map_err(|error| anyhow!("security.proxy_protocol_trusted_networks: {error:#}"))?;
     }
     let policy = &config.security.admin_password_policy;
     if policy.min_length > policy.max_length {
@@ -1675,61 +1539,33 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the effective configuration from a parsed configuration file.
+/// Resolve the effective configuration: `mail_root` and `db_path` from the
+/// file, everything else from the settings database.
 pub fn resolve_config(file: Value, source: &str) -> Result<Config> {
-    let Some(db_path) = file
+    let db_path = file
         .pointer("/global/db_path")
         .and_then(Value::as_str)
         .map(str::to_string)
-    else {
-        return serde_json::from_value(file).with_context(|| format!("parsing {source}"));
-    };
+        .with_context(|| format!("{source} must set global.db_path"))?;
     let file_flat = flatten(&file);
-    let mut conn = open(&db_path)?;
-    if !is_initialized(&conn)? {
-        import_file(&mut conn, &file_flat, source)?;
-    }
-    let stored = load_all(&conn)?;
-    // Values identical to the database are harmless leftovers from the
-    // import; only warn about edits that will not take effect.
+    let conn = open(&db_path)?;
     let ignored = file_flat
-        .iter()
-        .filter(|(key, value)| !is_bootstrap(key) && stored.get(*key) != Some(*value))
-        .map(|(key, _)| key.as_str())
+        .keys()
+        .filter(|key| !is_bootstrap(key))
+        .map(String::as_str)
         .collect::<Vec<_>>();
     if !ignored.is_empty() {
         crate::structured_log!("warn", "settings", "file_settings_ignored", {
             "config_file": source,
-            "database": db_path,
             "keys": ignored,
-            "hint": "settings are managed in the admin UI or with `rmail_ctl settings`",
+            "hint": "only mail_root and db_path are read from the file; manage settings in the admin console or with `rmail_ctl settings`",
         });
     }
+    let stored = load_all(&conn)?;
     let mut config = build_config(&file_flat, &stored)
         .with_context(|| format!("settings stored in {db_path}"))?;
     config.settings_revision = revision(&conn)?;
     Ok(config)
-}
-
-fn import_file(
-    conn: &mut Connection,
-    file_flat: &BTreeMap<String, Value>,
-    source: &str,
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    let now = now();
-    for (key, value) in file_flat.iter().filter(|(key, _)| !is_bootstrap(key)) {
-        tx.execute(
-            "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![key, value.to_string(), now],
-        )?;
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO settings_meta(id, revision, imported_from, imported_at) VALUES (1, 1, ?1, ?2)",
-        params![source, now],
-    )?;
-    tx.commit()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,9 +1666,6 @@ pub fn normalize(spec: &SettingSpec, value: &Value) -> Result<Option<Value>> {
 
 /// Apply user edits: validate every value, check the resulting configuration
 /// as a whole, then store it atomically. Returns the new revision.
-///
-/// Keys outside the registry may be edited or cleared if they already exist
-/// (legacy values imported from a configuration file).
 pub fn update(conn: &mut Connection, changes: &BTreeMap<String, Value>) -> Result<u64> {
     if changes.is_empty() {
         return revision(conn);
@@ -1848,7 +1681,6 @@ pub fn update(conn: &mut Connection, changes: &BTreeMap<String, Value>) -> Resul
         }
         let normalized = match spec_for(key) {
             Some(spec) => normalize(spec, value)?,
-            None if stored.contains_key(key) => (!value.is_null()).then(|| value.clone()),
             None => bail!("unknown setting {key}"),
         };
         match &normalized {
@@ -1873,7 +1705,7 @@ pub fn update(conn: &mut Connection, changes: &BTreeMap<String, Value>) -> Resul
             writes.insert(key, None);
         }
     }
-    let bootstrap = BTreeMap::from([("global.mail_root".to_string(), Value::from("validation"))]);
+    let bootstrap = placeholder_bootstrap();
     build_config(&bootstrap, &stored)?;
     write_raw(conn, &writes)
 }
@@ -1887,12 +1719,6 @@ pub struct SettingView {
     pub value: Option<Value>,
     pub default: Option<Value>,
     pub is_set: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct OtherSetting {
-    pub key: String,
-    pub value: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -1910,16 +1736,13 @@ pub struct ServiceState {
 #[derive(Debug, Serialize)]
 pub struct SettingsView {
     pub revision: u64,
-    pub imported_from: Option<String>,
     pub groups: &'static [SettingGroup],
     pub settings: Vec<SettingView>,
-    /// Stored keys that the editor has no dedicated control for.
-    pub other: Vec<OtherSetting>,
     pub services: Vec<ServiceState>,
 }
 
 fn default_values() -> BTreeMap<String, Value> {
-    let bootstrap = BTreeMap::from([("global.mail_root".to_string(), Value::from("mail"))]);
+    let bootstrap = placeholder_bootstrap();
     build_config(&bootstrap, &BTreeMap::new())
         .ok()
         .and_then(|config| serde_json::to_value(config).ok())
@@ -1947,33 +1770,10 @@ pub fn describe(conn: &Connection) -> Result<SettingsView> {
             }
         })
         .collect();
-    let other = stored
-        .iter()
-        .filter(|(key, _)| {
-            spec_for(key).is_none()
-                && !is_internal(key)
-                && !is_bootstrap(key)
-                && !RESERVED_KEYS.contains(&key.as_str())
-        })
-        .map(|(key, value)| OtherSetting {
-            key: key.clone(),
-            value: value.clone(),
-        })
-        .collect();
-    let imported_from = conn
-        .query_row(
-            "SELECT imported_from FROM settings_meta WHERE id = 1",
-            [],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
     Ok(SettingsView {
         revision: revision(conn)?,
-        imported_from,
         groups: GROUPS,
         settings,
-        other,
         services: service_states(conn)?,
     })
 }
@@ -1982,11 +1782,8 @@ pub fn describe(conn: &Connection) -> Result<SettingsView> {
 // Service state
 
 /// Record that `service` started with the settings revision in `config`.
-/// Does nothing when settings are file-only.
 pub fn record_service_start(config: &Config, service: &str) -> Result<()> {
-    let Some(db_path) = config.global.db_path.as_deref() else {
-        return Ok(());
-    };
+    let db_path = config.global.db_path.as_str();
     let conn = open(db_path)?;
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
@@ -2070,82 +1867,6 @@ mod tests {
             db.display()
         );
         serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn file_without_db_path_is_used_as_is() {
-        let value = serde_json::to_value(
-            toml::from_str::<toml::Value>(
-                "[global]\nmail_root = \"m\"\n[security]\nsmtp_max_recipients = 7\n",
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let config = resolve_config(value, "test").unwrap();
-        assert_eq!(config.security.smtp_max_recipients, 7);
-        assert_eq!(config.settings_revision, 0);
-    }
-
-    #[test]
-    fn tidy_config_comments_migrated_entries_only() {
-        let text = "# my server\n[global]\nmail_root = \"mail\"\ndb_path = \"x.db\"\nlog_level = \"debug\"\n\n[global.listeners]\nsmtp = [\n  \"[::]:25\", # mx\n]\nadmin = [\"[::]:8080\"]\n\n[security]\nsmtp_max_recipients = 7\n";
-        let file = serde_json::to_value(toml::from_str::<toml::Value>(text).unwrap()).unwrap();
-        let mut stored = BTreeMap::new();
-        for (key, value) in flatten(&file).into_iter().filter(|(k, _)| !is_bootstrap(k)) {
-            stored.insert(key, value);
-        }
-        stored.insert("global.listeners.admin".into(), json!(["127.0.0.1:8080"]));
-        let report = tidy_config(text, &file, &stored);
-        assert_eq!(report.commented, 3);
-        assert_eq!(report.differing, ["global.listeners.admin"]);
-        assert!(report.text.starts_with(TIDY_MARKER));
-        assert!(report.text.contains("\nmail_root = \"mail\"\n"));
-        assert!(report.text.contains("\n# log_level = \"debug\"\n"));
-        assert!(
-            report
-                .text
-                .contains("\n# smtp = [\n#   \"[::]:25\", # mx\n# ]\n")
-        );
-        assert!(report.text.contains("\nadmin = [\"[::]:8080\"]\n"));
-        assert!(
-            report
-                .text
-                .contains("\n# [security]\n# smtp_max_recipients = 7\n")
-        );
-        assert!(report.text.contains("\n[global.listeners]\n"));
-        // Still valid TOML with the same effective bootstrap keys, and stable.
-        let parsed: toml::Value = toml::from_str(&report.text).unwrap();
-        assert_eq!(parsed["global"]["mail_root"].as_str(), Some("mail"));
-        assert_eq!(tidy_config(&report.text, &file, &stored).text, report.text);
-    }
-
-    #[test]
-    fn first_start_imports_file_then_database_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("rmail.db");
-        let first = resolve_config(
-            file(&db, "[security]\nsmtp_max_recipients = 7\n[global.listeners]\nsmtp = [\"127.0.0.1:25\"]\n"),
-            "test",
-        )
-        .unwrap();
-        assert_eq!(first.security.smtp_max_recipients, 7);
-        assert_eq!(first.global.smtp_listeners(), ["127.0.0.1:25"]);
-        assert_eq!(first.settings_revision, 1);
-
-        let mut conn = open(&db).unwrap();
-        let revision = update(
-            &mut conn,
-            &BTreeMap::from([("security.smtp_max_recipients".to_string(), json!(9))]),
-        )
-        .unwrap();
-        assert_eq!(revision, 2);
-
-        // The file still says 7, but the database is authoritative now.
-        let second =
-            resolve_config(file(&db, "[security]\nsmtp_max_recipients = 7\n"), "test").unwrap();
-        assert_eq!(second.security.smtp_max_recipients, 9);
-        assert_eq!(second.global.smtp_listeners(), ["127.0.0.1:25"]);
-        assert_eq!(second.global.mail_root, "mail");
     }
 
     #[test]
@@ -2233,13 +1954,21 @@ mod tests {
     fn describe_hides_secrets_and_reports_restart_needs() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rmail.db");
-        let config = resolve_config(
-            file(&db, "[security.oauth]\nintrospection_url = \"https://idp.example/i\"\nclient_id = \"c\"\nclient_secret = \"s3cret\"\n"),
-            "test",
+        let mut conn = open(&db).unwrap();
+        update(
+            &mut conn,
+            &BTreeMap::from([
+                (
+                    "security.oauth.introspection_url".to_string(),
+                    json!("https://idp.example/i"),
+                ),
+                ("security.oauth.client_id".to_string(), json!("c")),
+                ("security.oauth.client_secret".to_string(), json!("s3cret")),
+            ]),
         )
         .unwrap();
+        let config = resolve_config(file(&db, ""), "test").unwrap();
         record_service_start(&config, "smtpd").unwrap();
-        let mut conn = open(&db).unwrap();
         update(
             &mut conn,
             &BTreeMap::from([("security.smtp_max_recipients".to_string(), json!(5))]),

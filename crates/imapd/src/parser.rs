@@ -883,6 +883,12 @@ pub(crate) enum SearchCriterion {
     SentSince(chrono::NaiveDate),
     SentBefore(chrono::NaiveDate),
     SentOn(chrono::NaiveDate),
+    /// RFC 8514 §4 save-date keys.
+    SavedSince(chrono::NaiveDate),
+    SavedBefore(chrono::NaiveDate),
+    SavedOn(chrono::NaiveDate),
+    /// RFC 8514 §4: every mailbox here records save dates, so this is ALL.
+    SaveDateSupported,
     Larger(usize),
     Smaller(usize),
     /// RFC 8474 §6 SEARCH EMAILID.
@@ -920,6 +926,8 @@ pub(crate) struct SearchMessage<'a> {
     pub(crate) uid: u64,
     pub(crate) flags: &'a [String],
     pub(crate) internal_date: i64,
+    /// When the message was stored in this mailbox (RFC 8514).
+    pub(crate) save_date: i64,
     pub(crate) in_saved_result: bool,
     pub(crate) now: i64,
     pub(crate) size: usize,
@@ -1172,6 +1180,22 @@ fn parse_search_criterion(tokens: &[String], pos: &mut usize) -> Option<SearchCr
             *pos += 1;
             Some(SearchCriterion::SentOn(date))
         }
+        "SAVEDSINCE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SavedSince(date))
+        }
+        "SAVEDBEFORE" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SavedBefore(date))
+        }
+        "SAVEDON" => {
+            let date = parse_imap_date(tokens.get(*pos)?)?;
+            *pos += 1;
+            Some(SearchCriterion::SavedOn(date))
+        }
+        "SAVEDATESUPPORTED" => Some(SearchCriterion::SaveDateSupported),
         "LARGER" => {
             let size = tokens.get(*pos)?.parse::<usize>().ok()?;
             *pos += 1;
@@ -1434,6 +1458,9 @@ pub(crate) enum SortKey {
     Arrival,
     Cc,
     Date,
+    /// RFC 5957 display-name sort keys.
+    DisplayFrom,
+    DisplayTo,
     From,
     Size,
     Subject,
@@ -1493,6 +1520,8 @@ fn parse_sort_request_inner(input: &str) -> Option<SortRequest> {
             "ARRIVAL" => SortKey::Arrival,
             "CC" => SortKey::Cc,
             "DATE" => SortKey::Date,
+            "DISPLAYFROM" => SortKey::DisplayFrom,
+            "DISPLAYTO" => SortKey::DisplayTo,
             "FROM" => SortKey::From,
             "SIZE" => SortKey::Size,
             "SUBJECT" => SortKey::Subject,
@@ -1640,6 +1669,16 @@ pub(crate) fn search_matches(
         SearchCriterion::SentOn(date) => message_sent_date(msg.data)
             .map(|msg_date| msg_date == *date)
             .unwrap_or(false),
+        SearchCriterion::SavedSince(date) => message_internal_date(msg.save_date)
+            .map(|saved| saved >= *date)
+            .unwrap_or(false),
+        SearchCriterion::SavedBefore(date) => message_internal_date(msg.save_date)
+            .map(|saved| saved < *date)
+            .unwrap_or(false),
+        SearchCriterion::SavedOn(date) => message_internal_date(msg.save_date)
+            .map(|saved| saved == *date)
+            .unwrap_or(false),
+        SearchCriterion::SaveDateSupported => true,
         SearchCriterion::Larger(size) => msg.size > *size,
         SearchCriterion::Smaller(size) => msg.size < *size,
         SearchCriterion::EmailId(id) => msg.email_id == id,
@@ -2222,6 +2261,8 @@ pub(crate) struct ListReturnOptions {
     pub(crate) children: bool,
     pub(crate) special_use: bool,
     pub(crate) status: Vec<StatusItem>,
+    /// RFC 9590 LIST-METADATA entries.
+    pub(crate) metadata: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2235,6 +2276,8 @@ pub(crate) enum StatusItem {
     Size,
     /// RFC 9051 STATUS DELETED: messages with the \Deleted flag.
     Deleted,
+    /// RFC 9208 §4.2.4: KiB that EXPUNGE would reclaim.
+    DeletedStorage,
     /// RFC 8474 §4.2 STATUS MAILBOXID.
     MailboxId,
 }
@@ -2253,6 +2296,7 @@ impl StatusItem {
             "HIGHESTMODSEQ" => Ok(Self::HighestModSeq),
             "SIZE" => Ok(Self::Size),
             "DELETED" => Ok(Self::Deleted),
+            "DELETED-STORAGE" => Ok(Self::DeletedStorage),
             "MAILBOXID" => Ok(Self::MailboxId),
             _ => Err(ParseError::InvalidAtom),
         }
@@ -2345,6 +2389,17 @@ fn parse_list_return(items: &[ImapArg]) -> Result<ListReturnOptions, ParseError>
                 pos += 1;
                 let status_items = arg_list(items.get(pos).ok_or(ParseError::UnexpectedEnd)?)?;
                 out.status = parse_status_items(status_items)?;
+            }
+            "METADATA" => {
+                pos += 1;
+                let entries = arg_list(items.get(pos).ok_or(ParseError::UnexpectedEnd)?)?;
+                if entries.is_empty() {
+                    return Err(ParseError::UnexpectedEnd);
+                }
+                out.metadata = entries
+                    .iter()
+                    .map(|entry| arg_text(entry).map(|text| text.to_string()))
+                    .collect::<Result<_, _>>()?;
             }
             _ => return Err(ParseError::InvalidAtom),
         }
@@ -2471,6 +2526,7 @@ mod tests {
             uid: 1,
             flags: &flags,
             internal_date: 0,
+            save_date: 0,
             in_saved_result: false,
             now: 0,
             size: data.len(),

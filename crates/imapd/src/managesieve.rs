@@ -48,6 +48,7 @@ pub(crate) async fn run_listener(
     ctx: ManageSieveContext,
 ) -> Result<()> {
     imap_log!("info", "managesieve_listener_started", { "address": addr });
+    let mut clients = rmail_common::proxy::ClientAcceptor::new(listener, "imapd", addr.clone());
     let mut shutdown_signal = ctx.shutdown.subscribe();
     loop {
         if *shutdown_signal.borrow() {
@@ -58,7 +59,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for ManageSieve shutdown signal")?;
                 return Ok(());
             }
-            accepted = rmail_common::net::accept_retrying(&listener, "imapd", &addr) => accepted,
+            accepted = clients.accept() => accepted,
         };
         if !accept_connection_from(peer.ip(), ctx.connection_rate_limit) {
             let _ = stream

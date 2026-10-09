@@ -41,6 +41,7 @@ pub(crate) async fn run_listener(
 ) -> Result<()> {
     let service = ctx.service;
     smtp_log!("info", "listener_started", { "address": addr, "service": service.as_str(), "tls": ctx.implicit_tls });
+    let mut clients = rmail_common::proxy::ClientAcceptor::new(listener, "smtpd", addr.clone());
     let mut shutdown_signal = ctx.shutdown.subscribe();
     loop {
         if *shutdown_signal.borrow() {
@@ -51,7 +52,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for SMTP shutdown signal")?;
                 return Ok(());
             }
-            accepted = rmail_common::net::accept_retrying(&listener, "smtpd", &addr) => accepted,
+            accepted = clients.accept() => accepted,
         };
         let trace = ConnectionTrace::new(stream.local_addr().ok());
         smtp_log!("info", "connection_accepted", { "connection_id": trace.id, "listener": addr, "peer": peer.to_string(), "service": service.as_str(), "tls": ctx.implicit_tls, "starttls_available": !ctx.implicit_tls && ctx.tls.borrow().is_some() });

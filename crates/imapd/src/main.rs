@@ -74,6 +74,8 @@ async fn main() -> Result<()> {
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
     rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
+    rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
+        .context("security.proxy_protocol_trusted_networks")?;
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "imapd") {
         rmail_common::structured_log!("warn", "imapd", "service_state_failed", { "error": format!("{error:#}") });
     }
@@ -97,10 +99,6 @@ async fn main() -> Result<()> {
     ));
     let connection_rate_limit = cfg.security.imap_max_connections_per_minute.max(1);
     let mut listeners = JoinSet::new();
-    if db_path.is_none() {
-        imap_log!("error", "configuration_invalid", { "field": "global.db_path" });
-        std::process::exit(1);
-    }
 
     // TLS context if certs present
     let tls_context = match (&cfg.global.tls_cert, &cfg.global.tls_key) {
@@ -126,28 +124,26 @@ async fn main() -> Result<()> {
         None
     };
 
-    let pop3_context = db_path.clone().map(|db_path| pop3::Pop3Context {
+    let pop3_context = pop3::Pop3Context {
         mail_root: mail_root.clone(),
-        db_path,
+        db_path: db_path.clone(),
         tls: tls_receiver.clone(),
         session_limit: session_limit.clone(),
         connection_rate_limit,
         implicit_tls: false,
         shutdown: shutdown.clone(),
-    });
-    let managesieve_context = db_path
-        .clone()
-        .map(|db_path| managesieve::ManageSieveContext {
-            db_path,
-            tls: tls_receiver.clone(),
-            session_limit: session_limit.clone(),
-            connection_rate_limit,
-            shutdown: shutdown.clone(),
-        });
+    };
+    let managesieve_context = managesieve::ManageSieveContext {
+        db_path: db_path.clone(),
+        tls: tls_receiver.clone(),
+        session_limit: session_limit.clone(),
+        connection_rate_limit,
+        shutdown: shutdown.clone(),
+    };
     let template = ListenerContext {
         mail_root,
         tls: tls_receiver,
-        db_path,
+        db_path: Some(db_path),
         auth_policy,
         session_limit,
         connection_rate_limit,
@@ -179,45 +175,41 @@ async fn main() -> Result<()> {
     }
 
     // POP3 (STLS) and POP3S (implicit TLS).
-    if let Some(context) = pop3_context {
-        for (addrs, implicit_tls) in [
-            (cfg.global.pop3_listeners(), false),
-            (cfg.global.pop3s_listeners(), true),
-        ] {
-            if implicit_tls && tls_context.is_none() && !addrs.is_empty() {
-                imap_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
-                continue;
-            }
-            for addr in addrs {
-                let listener = bind_tcp_listener_with_config(&addr, &tcp)
-                    .with_context(|| format!("starting POP3 listener on {addr}"))?;
-                let context = pop3::Pop3Context {
-                    implicit_tls,
-                    ..context.clone()
-                };
-                listeners.spawn(async move {
-                    if let Err(error) = pop3::run_listener(addr, listener, context).await {
-                        imap_log!("error", "pop3_listener_failed", { "error": error.to_string() });
-                    }
-                });
-                listener_count += 1;
-            }
+    for (addrs, implicit_tls) in [
+        (cfg.global.pop3_listeners(), false),
+        (cfg.global.pop3s_listeners(), true),
+    ] {
+        if implicit_tls && tls_context.is_none() && !addrs.is_empty() {
+            imap_log!("warn", "implicit_tls_listener_disabled", { "reason": "TLS certificate or key unavailable" });
+            continue;
         }
-    }
-
-    // ManageSieve (STARTTLS); plain-text login is only offered once TLS is active.
-    if let Some(context) = managesieve_context {
-        for addr in cfg.global.managesieve_listeners() {
+        for addr in addrs {
             let listener = bind_tcp_listener_with_config(&addr, &tcp)
-                .with_context(|| format!("starting ManageSieve listener on {addr}"))?;
-            let context = context.clone();
+                .with_context(|| format!("starting POP3 listener on {addr}"))?;
+            let context = pop3::Pop3Context {
+                implicit_tls,
+                ..pop3_context.clone()
+            };
             listeners.spawn(async move {
-                if let Err(error) = managesieve::run_listener(addr, listener, context).await {
-                    imap_log!("error", "managesieve_listener_failed", { "error": error.to_string() });
+                if let Err(error) = pop3::run_listener(addr, listener, context).await {
+                    imap_log!("error", "pop3_listener_failed", { "error": error.to_string() });
                 }
             });
             listener_count += 1;
         }
+    }
+
+    // ManageSieve (STARTTLS); plain-text login is only offered once TLS is active.
+    for addr in cfg.global.managesieve_listeners() {
+        let listener = bind_tcp_listener_with_config(&addr, &tcp)
+            .with_context(|| format!("starting ManageSieve listener on {addr}"))?;
+        let context = managesieve_context.clone();
+        listeners.spawn(async move {
+            if let Err(error) = managesieve::run_listener(addr, listener, context).await {
+                imap_log!("error", "managesieve_listener_failed", { "error": error.to_string() });
+            }
+        });
+        listener_count += 1;
     }
 
     if listener_count == 0 {

@@ -283,9 +283,40 @@ fn parse_set(arguments: &[ImapArg]) -> Result<(String, Changes), &'static str> {
     Ok((mailbox, changes))
 }
 
+/// RFC 9590 LIST RETURN (METADATA (...)): the METADATA data for `mailbox`
+/// with each requested entry's value, or NIL when unset. `None` when the
+/// annotations cannot be read, which the RFC lets the server leave out.
+pub(crate) fn list_metadata(
+    root: &Path,
+    domain: &str,
+    local: &str,
+    mailbox: &str,
+    entries: &[String],
+    utf8_accept: bool,
+) -> Option<String> {
+    let stored = rmail_common::imap_state::get_metadata(root, domain, local, Some(mailbox))
+        .ok()
+        .flatten()?;
+    let items = entries
+        .iter()
+        .map(|entry| {
+            let value = stored
+                .iter()
+                .find(|(stored, _)| stored.eq_ignore_ascii_case(entry))
+                .map(|(_, value)| value.as_str());
+            format!("{} {}", quote(entry), encode_value(value))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "METADATA {} ({items})",
+        mailbox::quote_wire_mailbox_name(mailbox, utf8_accept)
+    ))
+}
+
 /// RFC 5464 §3.2: a slash-separated name under `/private/` or `/shared/`
 /// with no empty components, no `*` or `%`, and no control characters.
-fn valid_entry(entry: &str) -> bool {
+pub(crate) fn valid_entry(entry: &str) -> bool {
     let lower = entry.to_ascii_lowercase();
     let rest = if let Some(rest) = lower.strip_prefix("/private/") {
         rest

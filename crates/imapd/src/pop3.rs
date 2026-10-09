@@ -74,6 +74,7 @@ pub(crate) async fn run_listener(
     ctx: Pop3Context,
 ) -> Result<()> {
     imap_log!("info", "pop3_listener_started", { "address": addr, "tls": ctx.implicit_tls });
+    let mut clients = rmail_common::proxy::ClientAcceptor::new(listener, "imapd", addr.clone());
     let mut shutdown_signal = ctx.shutdown.subscribe();
     loop {
         if *shutdown_signal.borrow() {
@@ -84,7 +85,7 @@ pub(crate) async fn run_listener(
                 changed.context("waiting for POP3 shutdown signal")?;
                 return Ok(());
             }
-            accepted = rmail_common::net::accept_retrying(&listener, "imapd", &addr) => accepted,
+            accepted = clients.accept() => accepted,
         };
         let tls = ctx.tls.borrow().clone();
         if ctx.implicit_tls && tls.is_none() {

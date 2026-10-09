@@ -1,13 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use mail_auth::dmarc::{Dmarc, Policy, verify::DmarcParameters};
 use mail_auth::spf::verify::SpfParameters;
 use mail_auth::{AuthenticatedMessage, DkimResult, DmarcResult, MessageAuthenticator, SpfResult};
 use once_cell::sync::OnceCell;
-use serde::Deserialize;
 use std::borrow::Cow;
-use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
 
 static AUTHENTICATOR: OnceCell<MessageAuthenticator> = OnceCell::new();
 
@@ -18,6 +15,21 @@ pub struct AuthenticationResults {
     pub dmarc: Option<String>,
     pub arc: Option<String>,
     pub header_from: Option<String>,
+    /// The DMARC policy domain, when it asks for reports (rua or ruf).
+    pub dmarc_domain: Option<String>,
+    /// Set when the policy's `fo` tag asks for a failure report (RFC 6591).
+    pub failure_report: Option<FailureReportRequest>,
+}
+
+/// A DMARC failure report the policy domain asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureReportRequest {
+    pub domain: String,
+    /// `mailto:` destinations with their size limits (0 for none), before the
+    /// external-destination check.
+    pub recipients: Vec<(String, usize)>,
+    pub dkim_aligned: bool,
+    pub spf_aligned: bool,
 }
 
 fn authenticator() -> Result<&'static MessageAuthenticator> {
@@ -131,6 +143,26 @@ pub async fn analyze_message(
         .await;
     crate::metrics::observe_dns_duration(started.elapsed());
     let dmarc = Some(dmarc_disposition(&dmarc_output).to_string());
+    let dmarc_domain = dmarc_output
+        .requested_reports()
+        .then(|| dmarc_output.domain().to_ascii_lowercase());
+    let failure_report = dmarc_output
+        .failure_report()
+        .and(dmarc_output.dmarc_record())
+        .map(|record| FailureReportRequest {
+            domain: dmarc_output.domain().to_ascii_lowercase(),
+            recipients: record
+                .ruf()
+                .iter()
+                .filter_map(|uri| {
+                    uri.uri()
+                        .strip_prefix("mailto:")
+                        .map(|address| (address.to_string(), uri.max_size()))
+                })
+                .collect(),
+            dkim_aligned: dmarc_output.dkim_result() == &DmarcResult::Pass,
+            spf_aligned: dmarc_output.spf_result() == &DmarcResult::Pass,
+        });
 
     Ok(AuthenticationResults {
         dkim,
@@ -138,6 +170,8 @@ pub async fn analyze_message(
         dmarc,
         arc,
         header_from: message.from.first().cloned(),
+        dmarc_domain,
+        failure_report,
     })
 }
 
@@ -216,12 +250,65 @@ pub async fn get_dmarc_rua(domain: &str) -> Result<Vec<String>> {
     let Ok(record) = record else {
         return Ok(Vec::new());
     };
-    Ok(record
+    let addresses = record
         .rua()
         .iter()
         .filter_map(|uri| uri.uri.strip_prefix("mailto:"))
         .map(str::to_string)
-        .collect())
+        .collect::<Vec<_>>();
+    Ok(authorized_report_destinations(&domain, addresses).await)
+}
+
+/// RFC 7489 section 7.1: report addresses outside the policy domain's
+/// organization are used only when that domain publishes
+/// `<policy domain>._report._dmarc.<destination domain>` with `v=DMARC1`.
+pub async fn authorized_report_destinations(
+    policy_domain: &str,
+    addresses: Vec<String>,
+) -> Vec<String> {
+    let mut authorized = Vec::new();
+    for address in addresses.into_iter().take(10) {
+        let Some((_, destination)) = address.rsplit_once('@') else {
+            continue;
+        };
+        let destination = destination.to_ascii_lowercase();
+        let policy = policy_domain.to_ascii_lowercase();
+        // Same organization, approximated without a public suffix list: one
+        // domain is the other or a subdomain of it.
+        let related = destination == policy
+            || destination.ends_with(&format!(".{policy}"))
+            || policy.ends_with(&format!(".{destination}"));
+        if related || external_destination_allows(&policy, &destination).await {
+            authorized.push(address);
+        }
+    }
+    authorized
+}
+
+async fn external_destination_allows(policy_domain: &str, destination: &str) -> bool {
+    let Ok(resolver) = authenticator() else {
+        return false;
+    };
+    let name = format!("{policy_domain}._report._dmarc.{destination}.");
+    let started = std::time::Instant::now();
+    let lookup = resolver.resolver().txt_lookup(name).await;
+    crate::metrics::observe_dns_duration(started.elapsed());
+    lookup.is_ok_and(|lookup| {
+        lookup.answers().iter().any(|record| {
+            let mail_auth::hickory_resolver::proto::rr::RData::TXT(txt) = &record.data else {
+                return false;
+            };
+            let text = txt
+                .txt_data
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .map(char::from)
+                .collect::<String>();
+            text.split(';')
+                .next()
+                .is_some_and(|version| version.trim().eq_ignore_ascii_case("v=DMARC1"))
+        })
+    })
 }
 
 /// Retrieve the published DMARC policy for a domain, if one exists.
@@ -238,121 +325,85 @@ pub async fn get_dmarc_policy(domain: &str) -> Result<Option<String>> {
 // The resolver API needs a concrete cache type even when no cache is supplied.
 type NoResolverCache = mail_auth::common::cache::NoCache<Box<str>, mail_auth::Txt>;
 
-#[derive(Debug, Deserialize)]
-struct SigningFile {
-    #[serde(default)]
-    signer: Vec<SigningEntry>,
-    /// Local administrative identity used only when rMail forwards mail.
-    arc_signer: Option<SigningEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SigningEntry {
-    domain: String,
-    selector: String,
-    private_key: String,
-    #[serde(default = "default_signed_headers")]
-    headers: Vec<String>,
-}
-
-fn default_signed_headers() -> Vec<String> {
-    [
-        "From",
-        "To",
-        "Subject",
-        "Date",
-        "Message-ID",
-        "MIME-Version",
-        "Content-Type",
-    ]
-    .map(str::to_string)
-    .to_vec()
-}
-
-/// Add a DKIM signature for a configured envelope-sender domain.
-///
-/// Configuration is read from `<mail_root>/dkim.toml`. An absent file disables
-/// signing; a present but invalid configuration fails queue publication.
-pub fn sign_outbound<'a>(
-    mail_root: &Path,
-    data: &'a [u8],
-    envelope_from: Option<&str>,
-) -> Result<Cow<'a, [u8]>> {
+/// Add a DKIM signature from every key stored for the envelope sender's
+/// domain (see `crate::dkim`). Without a registered key database, or keys for
+/// the domain, the message is left unsigned; a failing key stops it from
+/// entering the queue.
+pub fn sign_outbound<'a>(data: &'a [u8], envelope_from: Option<&str>) -> Result<Cow<'a, [u8]>> {
     let Some(sender_domain) = envelope_from
         .and_then(|sender| sender.rsplit_once('@'))
         .map(|(_, domain)| domain)
     else {
         return Ok(Cow::Borrowed(data));
     };
-    let config_path = mail_root.join("dkim.toml");
-    let config = match fs::read_to_string(&config_path) {
-        Ok(config) => config,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Cow::Borrowed(data));
-        }
-        Err(error) => return Err(error).context("reading DKIM signing configuration"),
-    };
-    let config: SigningFile = toml::from_str(&config).context("parsing dkim.toml")?;
-    let Some(entry) = config
-        .signer
-        .iter()
-        .find(|entry| entry.domain.eq_ignore_ascii_case(sender_domain))
-    else {
+    let Some(db_path) = crate::dkim::database() else {
         return Ok(Cow::Borrowed(data));
     };
+    sign_with_keys(&db_path, data, sender_domain)
+}
 
-    let domain = crate::domain::canonicalize_domain(&entry.domain)?;
-    validate_signing_selector(&domain, &entry.selector)?;
-    let key_path = Path::new(&entry.private_key);
-    ensure_private_key_permissions(key_path)?;
-    let pem = fs::read(key_path).context("reading DKIM private key")?;
-    use mail_auth::common::crypto::{RsaKey, Sha256};
-    use mail_auth::common::headers::HeaderWriter;
-    use mail_auth::dkim::DkimSigner;
-    use rustls_pki_types::pem::PemObject;
-    let key_der = rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem)
-        .context("parsing DKIM private key PEM")?;
-    let key = RsaKey::<Sha256>::from_key_der(key_der).context("loading RSA DKIM private key")?;
-    let signature = DkimSigner::from_key(key)
-        .domain(domain)
-        .selector(entry.selector.clone())
-        .headers(entry.headers.iter().map(String::as_str))
-        .sign(data)
-        .context("signing outbound message")?;
-    let header = signature.to_header();
-    let mut signed = Vec::with_capacity(header.len() + data.len());
-    signed.extend_from_slice(header.as_bytes());
+fn sign_with_keys<'a>(
+    db_path: &std::path::Path,
+    data: &'a [u8],
+    sender_domain: &str,
+) -> Result<Cow<'a, [u8]>> {
+    let mut headers = String::new();
+    for key in crate::dkim::keys_for_domain(db_path, sender_domain)? {
+        headers.push_str(&dkim_signature(&key, data)?);
+    }
+    if headers.is_empty() {
+        return Ok(Cow::Borrowed(data));
+    }
+    let mut signed = Vec::with_capacity(headers.len() + data.len());
+    signed.extend_from_slice(headers.as_bytes());
     signed.extend_from_slice(data);
     Ok(Cow::Owned(signed))
+}
+
+/// The DKIM-Signature header `key` adds to `data`.
+fn dkim_signature(key: &crate::dkim::DkimKey, data: &[u8]) -> Result<String> {
+    use crate::dkim::SigningKey;
+    use mail_auth::common::headers::HeaderWriter;
+    use mail_auth::dkim::DkimSigner;
+    let headers = crate::dkim::SIGNED_HEADERS.iter().copied();
+    let signature = match crate::dkim::parse_key(&key.private_key)? {
+        SigningKey::Rsa(signing) => DkimSigner::from_key(signing)
+            .domain(key.domain.clone())
+            .selector(key.selector.clone())
+            .headers(headers)
+            .sign(data),
+        SigningKey::Ed25519(signing) => DkimSigner::from_key(signing)
+            .domain(key.domain.clone())
+            .selector(key.selector.clone())
+            .headers(headers)
+            .sign(data),
+    }
+    .with_context(|| format!("signing with {}", key.dns_name()))?;
+    Ok(signature.to_header())
 }
 
 /// Add an ARC set when a message is being forwarded by a local alias or
 /// catchall. An absent ARC signer leaves the message untouched. A failed ARC
 /// chain is deliberately not extended.
 pub async fn seal_forwarded<'a>(
-    mail_root: &Path,
+    db_path: Option<&std::path::Path>,
     data: &'a [u8],
     peer_ip: IpAddr,
     helo_domain: &str,
     host_domain: &str,
     mail_from: Option<&str>,
 ) -> Result<Cow<'a, [u8]>> {
-    let config_path = mail_root.join("dkim.toml");
-    let config = match fs::read_to_string(&config_path) {
-        Ok(config) => config,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Cow::Borrowed(data));
-        }
-        Err(error) => return Err(error).context("reading ARC signing configuration"),
-    };
-    let config: SigningFile = toml::from_str(&config).context("parsing dkim.toml")?;
-    let Some(entry) = config.arc_signer.as_ref() else {
+    let Some(db_path) = db_path else {
         return Ok(Cow::Borrowed(data));
     };
-    let domain = crate::domain::canonicalize_domain(&entry.domain)?;
-    validate_signing_selector(&domain, &entry.selector)?;
-    let key_path = Path::new(&entry.private_key);
-    ensure_private_key_permissions(key_path)?;
+    let Some(arc_key) = crate::dkim::arc_key(db_path)? else {
+        return Ok(Cow::Borrowed(data));
+    };
+    // ARC verifiers expect rsa-sha256 (RFC 8617 section 4.1.3).
+    let crate::dkim::SigningKey::Rsa(key) = crate::dkim::parse_key(&arc_key.private_key)? else {
+        bail!("the ARC key {} is not RSA", arc_key.dns_name());
+    };
+    let domain = arc_key.domain.clone();
 
     let message = AuthenticatedMessage::parse(data)
         .ok_or_else(|| anyhow!("message does not contain valid RFC 5322 headers"))?;
@@ -392,18 +443,12 @@ pub async fn seal_forwarded<'a>(
         .with_spf_mailfrom_result(&spf_output, peer_ip, sender, helo_domain)
         .with_dmarc_result(&dmarc_output)
         .with_arc_result(&arc_output, peer_ip);
-    let pem = fs::read(key_path).context("reading ARC private key")?;
     use mail_auth::arc::ArcSealer;
-    use mail_auth::common::crypto::{RsaKey, Sha256};
     use mail_auth::common::headers::HeaderWriter;
-    use rustls_pki_types::pem::PemObject;
-    let key_der = rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem)
-        .context("parsing ARC private key PEM")?;
-    let key = RsaKey::<Sha256>::from_key_der(key_der).context("loading RSA ARC private key")?;
     let arc_set = ArcSealer::from_key(key)
         .domain(domain.clone())
-        .selector(entry.selector.clone())
-        .headers(entry.headers.iter().map(String::as_str))
+        .selector(arc_key.selector.clone())
+        .headers(crate::dkim::ARC_SIGNED_HEADERS.iter().copied())
         .seal(&message, &auth_results, &arc_output)
         .context("sealing forwarded message")?;
     let headers = arc_set.to_header();
@@ -432,40 +477,42 @@ fn contains_arc_header(data: &[u8]) -> bool {
         })
 }
 
-fn validate_signing_selector(domain: &str, selector: &str) -> Result<()> {
-    if selector.is_empty()
-        || !selector
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        anyhow::bail!("invalid signing selector for {domain}");
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_private_key_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let mode = fs::metadata(path)
-        .context("reading DKIM private key metadata")?
-        .mode();
-    if mode & 0o077 != 0 {
-        anyhow::bail!(
-            "mail signing private key {} must not be accessible by group or other users",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_private_key_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rmail.db");
+        crate::db::init_db(&path).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn domains_can_be_signed_with_rsa_and_ed25519_together() {
+        use crate::dkim::Algorithm;
+        let (_dir, db) = key_db();
+        crate::dkim::add_key(
+            &db,
+            "example.test",
+            "rsa1",
+            Algorithm::Rsa,
+            Some(TEST_RSA_KEY),
+        )
+        .unwrap();
+        crate::dkim::add_key(&db, "example.test", "ed1", Algorithm::Ed25519, None).unwrap();
+        let message = b"From: a@example.test\r\nTo: b@example.net\r\nSubject: hi\r\n\r\nbody\r\n";
+        let signed = sign_with_keys(&db, message, "example.test").unwrap();
+        let signed = String::from_utf8(signed.into_owned()).unwrap();
+        assert_eq!(signed.matches("DKIM-Signature:").count(), 2, "{signed}");
+        assert!(signed.contains("a=rsa-sha256"), "{signed}");
+        assert!(signed.contains("a=ed25519-sha256"), "{signed}");
+        assert!(signed.contains("s=ed1"), "{signed}");
+        assert!(signed.ends_with("\r\n\r\nbody\r\n"));
+        // Other domains stay unsigned.
+        let other = sign_with_keys(&db, message, "other.test").unwrap();
+        assert!(matches!(other, Cow::Borrowed(_)));
+    }
 
     const TEST_RSA_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
 MIICXwIBAAKBgQDwIRP/UC3SBsEmGqZ9ZJW3/DkMoGeLnQg1fWn7/zYtIxN2SnFC
@@ -483,20 +530,18 @@ eAYXunajbBSOLlx4D+TunwJBANkPI5S9iylsbLs6NkaMHV6k5ioHBBmgCak95JGX
 GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
 -----END RSA PRIVATE KEY-----"#;
 
-    fn configure_arc(directory: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let key = directory.join("arc.pem");
-        fs::write(&key, TEST_RSA_KEY).unwrap();
-        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(
-            directory.join("dkim.toml"),
-            format!(
-                "[arc_signer]\ndomain = \"forwarder.example\"\nselector = \"arc1\"\nprivate_key = {:?}\nheaders = [\"From\", \"To\", \"Subject\"]\n",
-                key.to_string_lossy()
-            ),
+    fn configure_arc() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, db) = key_db();
+        crate::dkim::add_key(
+            &db,
+            "forwarder.example",
+            "arc1",
+            crate::dkim::Algorithm::Rsa,
+            Some(TEST_RSA_KEY),
         )
         .unwrap();
+        crate::dkim::set_arc_key(&db, Some(("forwarder.example", "arc1"))).unwrap();
+        (dir, db)
     }
 
     #[test]
@@ -532,13 +577,12 @@ GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
 
     #[tokio::test]
     async fn forwarded_message_gets_complete_arc_set() {
-        let directory = tempfile::tempdir().unwrap();
-        configure_arc(directory.path());
+        let (_dir, db) = configure_arc();
         let message =
             b"From: sender@localhost\r\nTo: list@localhost\r\nSubject: forwarded\r\n\r\nbody\r\n";
 
         let sealed = seal_forwarded(
-            directory.path(),
+            Some(&db),
             message,
             "127.0.0.1".parse().unwrap(),
             "localhost",
@@ -561,12 +605,11 @@ GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
 
     #[tokio::test]
     async fn broken_arc_chain_is_not_extended() {
-        let directory = tempfile::tempdir().unwrap();
-        configure_arc(directory.path());
+        let (_dir, db) = configure_arc();
         let message = b"ARC-Seal: i=2; a=rsa-sha256; d=bad.example; s=x; cv=pass; b=AA==\r\nFrom: sender@localhost\r\nTo: list@localhost\r\nSubject: broken\r\n\r\nbody\r\n";
 
         let output = seal_forwarded(
-            directory.path(),
+            Some(&db),
             message,
             "127.0.0.1".parse().unwrap(),
             "localhost",
@@ -581,10 +624,10 @@ GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
 
     #[tokio::test]
     async fn absent_arc_configuration_leaves_forwarded_message_borrowed() {
-        let directory = tempfile::tempdir().unwrap();
+        let (_dir, db) = key_db();
         let message = b"From: sender@example.test\r\n\r\nbody\r\n";
         let output = seal_forwarded(
-            directory.path(),
+            Some(&db),
             message,
             "127.0.0.1".parse().unwrap(),
             "localhost",
@@ -594,5 +637,108 @@ GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
         .await
         .unwrap();
         assert!(matches!(output, Cow::Borrowed(_)));
+    }
+}
+
+/// What a DMARC failure report (RFC 6591) says about one message.
+pub struct FailureReport<'a> {
+    pub request: &'a FailureReportRequest,
+    pub reporting_mta: &'a str,
+    pub recipient: &'a str,
+    pub source_ip: Option<IpAddr>,
+    pub original_mail_from: Option<&'a str>,
+    pub arrival: chrono::DateTime<chrono::Utc>,
+    pub dkim: Option<&'a str>,
+    pub spf: Option<&'a str>,
+    /// The original message; only its header section is included.
+    pub message: &'a [u8],
+}
+
+/// An `auth-failure` feedback report (RFC 5965 / RFC 6591) carrying the
+/// original header section only, never the body.
+pub fn failure_report_message(report: &FailureReport<'_>) -> Vec<u8> {
+    let request = report.request;
+    let header_end = report
+        .message
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(report.message.len(), |end| end + 2);
+    let headers = String::from_utf8_lossy(&report.message[..header_end]);
+    let clean = |value: &str| value.replace(['\r', '\n'], " ");
+    let alignment = match (request.dkim_aligned, request.spf_aligned) {
+        (true, true) => "dkim, spf",
+        (true, false) => "dkim",
+        (false, true) => "spf",
+        (false, false) => "none",
+    };
+    let boundary = format!("rmail-arf-{}", crate::tracking::new_tracking_id("b"));
+    let mut feedback = format!(
+        "Feedback-Type: auth-failure\r\nUser-Agent: rMail\r\nVersion: 1\r\n\
+         Arrival-Date: {}\r\nReporting-MTA: dns; {}\r\nAuth-Failure: dmarc\r\n\
+         Reported-Domain: {}\r\nIdentity-Alignment: {alignment}\r\n\
+         Authentication-Results: {}; dmarc=fail header.from={}; dkim={}; spf={}\r\n",
+        report.arrival.to_rfc2822(),
+        clean(report.reporting_mta),
+        clean(&request.domain),
+        clean(report.reporting_mta),
+        clean(&request.domain),
+        clean(report.dkim.unwrap_or("none")),
+        clean(report.spf.unwrap_or("none")),
+    );
+    if let Some(ip) = report.source_ip {
+        feedback.push_str(&format!("Source-IP: {ip}\r\n"));
+    }
+    if let Some(from) = report.original_mail_from {
+        feedback.push_str(&format!("Original-Mail-From: <{}>\r\n", clean(from)));
+    }
+    format!(
+        "From: <postmaster@{mta}>\r\nTo: <{to}>\r\n\
+         Subject: DMARC failure report for {domain}\r\nDate: {date}\r\n\
+         Auto-Submitted: auto-generated\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type=feedback-report; boundary=\"{boundary}\"\r\n\r\n\
+         --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+         A message claiming to be from {domain} failed DMARC at {mta}.\r\n\r\n\
+         --{boundary}\r\nContent-Type: message/feedback-report\r\n\r\n{feedback}\r\n\
+         --{boundary}\r\nContent-Type: text/rfc822-headers\r\n\r\n{headers}\r\n\
+         --{boundary}--\r\n",
+        mta = clean(report.reporting_mta),
+        to = clean(report.recipient),
+        domain = clean(&request.domain),
+        date = chrono::Utc::now().to_rfc2822(),
+    )
+    .into_bytes()
+}
+
+#[cfg(test)]
+mod failure_report_tests {
+    use super::*;
+
+    #[test]
+    fn failure_reports_are_arf_with_headers_only() {
+        let request = FailureReportRequest {
+            domain: "example.org".into(),
+            recipients: vec![("ruf@example.org".into(), 0)],
+            dkim_aligned: false,
+            spf_aligned: true,
+        };
+        let message = failure_report_message(&FailureReport {
+            request: &request,
+            reporting_mta: "mx.receiver.test",
+            recipient: "ruf@example.org",
+            source_ip: Some("192.0.2.9".parse().unwrap()),
+            original_mail_from: Some("bounce@example.org"),
+            arrival: chrono::Utc::now(),
+            dkim: Some("fail"),
+            spf: Some("pass"),
+            message: b"From: ceo@example.org\r\nSubject: wire money\r\n\r\nsecret body\r\n",
+        });
+        let text = String::from_utf8(message).unwrap();
+        assert!(text.contains("report-type=feedback-report"));
+        assert!(text.contains("Feedback-Type: auth-failure\r\n"));
+        assert!(text.contains("Auth-Failure: dmarc\r\n"));
+        assert!(text.contains("Identity-Alignment: spf\r\n"));
+        assert!(text.contains("Source-IP: 192.0.2.9\r\n"));
+        assert!(text.contains("Subject: wire money\r\n"));
+        assert!(!text.contains("secret body"));
     }
 }

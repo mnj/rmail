@@ -45,6 +45,7 @@ const mobile = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, is
     ['/', 'admin-overview'],
     ['/accounts', 'admin-mailboxes'],
     ['/routing', 'admin-routing'],
+    ['/domains', 'admin-domains'],
     ['/delivery', 'admin-delivery'],
     ['/settings', 'admin-settings'],
     ['/observability', 'admin-observability'],

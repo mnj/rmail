@@ -822,6 +822,13 @@ async fn envelope_extensions_accept_dsn_and_classify_other_errors() {
             .any(|response| response.starts_with("555 5.5.4 Unsupported RCPT TO parameter"))
     );
     assert!(responses.iter().any(|response| response == "250-DSN\r\n"));
+    // RFC 9422, with the default smtp_max_recipients.
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "250-LIMITS RCPTMAX=100\r\n"),
+        "{responses:?}"
+    );
     assert!(
         responses
             .iter()
@@ -918,23 +925,18 @@ async fn multi_target_alias_emits_one_rcpt_reply_and_delivers_atomically() {
 
 #[tokio::test]
 async fn remote_alias_is_arc_sealed_before_queue_publication() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (td, mail_root, db_path) = setup_mailbox();
     rmail_common::db::add_alias(&db_path, "forward@example.test", &["recipient@example.net"])
         .unwrap();
-    std::fs::create_dir_all(&mail_root).unwrap();
-    let key = mail_root.join("arc.pem");
-    std::fs::write(&key, include_str!("../testdata/arc-test-key.pem")).unwrap();
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::write(
-            mail_root.join("dkim.toml"),
-            format!(
-                "[arc_signer]\ndomain = \"forwarder.example\"\nselector = \"arc1\"\nprivate_key = {:?}\nheaders = [\"From\", \"To\", \"Subject\"]\n",
-                key.to_string_lossy()
-            ),
-        )
-        .unwrap();
+    rmail_common::dkim::add_key(
+        &db_path,
+        "forwarder.example",
+        "arc1",
+        rmail_common::dkim::Algorithm::Rsa,
+        Some(include_str!("../testdata/arc-test-key.pem")),
+    )
+    .unwrap();
+    rmail_common::dkim::set_arc_key(&db_path, Some(("forwarder.example", "arc1"))).unwrap();
 
     let (responses, td) = run_prepared_session(
             b"EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<forward@example.test>\r\nDATA\r\nFrom: sender@localhost\r\nTo: forward@example.test\r\nSubject: forwarded\r\n\r\nmessage\r\n.\r\nQUIT\r\n"
@@ -2621,4 +2623,89 @@ async fn dnsbl_listed_clients_are_rejected_at_mail_from() {
     )
     .await;
     assert!(responses.iter().any(|r| r.starts_with("250 2.1.0")));
+}
+
+fn queued_messages(td: &tempfile::TempDir) -> Vec<String> {
+    let queue = td.path().join("mail/outbound/maildrop/queue");
+    let mut messages = std::fs::read_dir(queue)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "eml"))
+                .map(|path| std::fs::read_to_string(path).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    messages.sort();
+    messages
+}
+
+#[tokio::test]
+async fn forwarded_mail_gets_an_srs_sender_and_bounces_find_their_way_back() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::add_alias(&db_path, "forward@example.test", &["friend@example.net"]).unwrap();
+    let security = SecurityConfig {
+        srs_domain: "fwd.example.test".to_string(),
+        ..SecurityConfig::default()
+    };
+    let (responses, td) = run_prepared_session(
+        b"EHLO localhost\r\nMAIL FROM:<sender@remote.example>\r\nRCPT TO:<forward@example.test>\r\nDATA\r\nFrom: sender@remote.example\r\nSubject: hi\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+            .to_vec(),
+        32 * 1024,
+        security.clone(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root.clone(),
+        db_path.clone(),
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.0.0 Message accepted")),
+        "{responses:?}"
+    );
+    let queued = queued_messages(&td);
+    assert_eq!(queued.len(), 1);
+    let srs = queued[0]
+        .lines()
+        .find_map(|line| line.strip_prefix("X-RMail-Envelope-From: "))
+        .expect("envelope sender")
+        .to_string();
+    assert!(srs.starts_with("SRS0="), "{srs}");
+    assert!(
+        srs.ends_with("=remote.example=sender@fwd.example.test"),
+        "{srs}"
+    );
+    std::fs::remove_dir_all(td.path().join("mail/outbound/maildrop/queue")).unwrap();
+
+    // The next hop bounces to the SRS address; it goes back to the sender.
+    let session = format!(
+        "EHLO localhost\r\nMAIL FROM:<>\r\nRCPT TO:<{srs}>\r\nRCPT TO:<SRS0=AAAA=AA=remote.example=sender@fwd.example.test>\r\nDATA\r\nSubject: bounce\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+    );
+    let (responses, td) = run_prepared_session(
+        session.into_bytes(),
+        32 * 1024,
+        security,
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line == "550 5.1.1 Invalid or expired return address\r\n"),
+        "{responses:?}"
+    );
+    let queued = queued_messages(&td);
+    assert_eq!(queued.len(), 1, "{responses:?}");
+    assert!(
+        queued[0].contains("X-RMail-Envelope-To: sender@remote.example\r\n"),
+        "{}",
+        queued[0]
+    );
 }

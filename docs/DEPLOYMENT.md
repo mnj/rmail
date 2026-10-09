@@ -23,7 +23,8 @@ Administrative tools:
 
 The runtime model is:
 
-- configuration lives in `/etc/rmail/config.toml`
+- `/etc/rmail/config.toml` names `mail_root` and `db_path`; every other setting lives in that
+  database and is edited in the admin console or with `rmail_ctl settings`
 - service environment lives in `/etc/default/rmail`
 - mail and queue state live under `/var/lib/rmail`
 - logs can be read from `journalctl`; the units also allow `/var/log/rmail` if you later add file logging
@@ -66,11 +67,24 @@ sudo install -m 0644 config/example.toml /etc/rmail/config.toml
 sudo install -m 0644 packaging/systemd/rmail.env /etc/default/rmail
 ```
 
-Then edit both files:
+Then:
 
-- set real domains, passwords, cert paths, and ports in `/etc/rmail/config.toml`
-- set `RMAIL_CONFIG=/etc/rmail/config.toml` in `/etc/default/rmail`
-- set `RMAIL_MAIL_ROOT=/var/lib/rmail` in `/etc/default/rmail`
+- check `mail_root` and `db_path` in `/etc/rmail/config.toml` (the only two keys it holds)
+- set `RMAIL_CONFIG=/etc/rmail/config.toml` and `RMAIL_MAIL_ROOT` (the same directory as
+  `mail_root`) in `/etc/default/rmail`
+- create the database with `rmail_ctl init-db`, then store the rest, for example:
+
+```bash
+rmail_ctl settings set global.hostname mail.example.com
+rmail_ctl settings set global.listeners.smtp '["[::]:25"]'
+rmail_ctl settings set global.listeners.submission '["[::]:587"]'
+rmail_ctl settings set global.listeners.imaps '["[::]:993"]'
+rmail_ctl settings set global.tls_cert /etc/rmail/tls/fullchain.pem
+rmail_ctl settings set global.tls_key /etc/rmail/tls/privkey.pem
+rmail_ctl settings list      # every setting with its default
+```
+
+  or open the admin console on its loopback address and use the **Settings** page.
 
 Important:
 
@@ -83,7 +97,7 @@ Important:
 - optional `global.listeners.lmtp` endpoints provide RFC 2033 local delivery; bind them only to
   loopback or a private service network because LMTP deliberately has no authentication or relay
 
-Mail-protocol resource limits are configured in the `[security]` section:
+Mail-protocol resource limits are the `security.*` settings:
 
 - `imap_max_concurrent_sessions` — process-wide concurrent IMAP/IMAPS sessions (default: `1000`)
 - `imap_max_connections_per_minute` — accepted IMAP/IMAPS connections per source IP in a rolling minute (default: `60`)
@@ -106,10 +120,48 @@ select the claim (`username`, `sub`, or `email`) that contains the local mailbox
 tokens are redacted from diagnostics. Adding `OAUTHBEARER` or `XOAUTH2` to an IMAP or SMTP SASL
 mechanism list without valid OAuth settings is a startup error.
 
+## Delivery routes and smarthost
+
+Outbound mail goes to each recipient domain's MX hosts unless a delivery route says otherwise.
+Routes are stored in the database and managed on the console's **Routing** page or with
+`rmail_ctl transport`:
+
+```bash
+# Send everything through a provider's submission port (a smarthost).
+rmail_ctl transport relay '*' smtp.provider.example:587 --user relay@example.com
+# A route for one domain wins over '*'; --implicit-tls uses TLS from the first byte (465).
+rmail_ctl transport relay partner.example mx.partner.example:25
+# Refuse a domain: 5xx bounces at once, 4xx keeps the message queued.
+rmail_ctl transport reject old.example "550 5.1.2 This domain no longer accepts mail"
+rmail_ctl transport list
+```
+
+Relay credentials are sent with AUTH PLAIN and only over TLS with a certificate that verifies
+against the system's trusted CAs (or the relay's DNSSEC-signed TLSA records); a relay that offers
+no TLS, or a certificate that does not verify, is not used. Install a private CA's certificate in
+the system trust store to use a relay with an internal certificate. MTA-STS and DANE apply to MX delivery only, while REQUIRETLS messages still need TLS to the
+relay.
+
+## Forwarding and SRS
+
+Aliases, catchalls and Sieve `redirect` that point at other servers forward mail with ARC sealing.
+The next hop still checks SPF against the original envelope sender, which fails for most senders.
+Set an SRS domain to rewrite that sender (Sender Rewriting Scheme):
+
+```bash
+rmail_ctl settings set security.srs_domain fwd.example.com
+```
+
+Forwarded mail then leaves with a sender like `SRS0=HHHHHHHH=TT=example.org=alice@fwd.example.com`,
+and bounces to it within 21 days go back to `alice@example.org`. The SRS domain needs an MX
+pointing at this server and an SPF record that authorizes it (for example `v=spf1 mx -all`).
+Senders in hosted domains and null senders are not rewritten. The signing key is generated on
+first start and kept in the settings database.
+
 ## LMTP local delivery
 
 LMTP is disabled by default. Enable a TCP endpoint with, for example,
-`lmtp = ["127.0.0.1:24"]` under `[global.listeners]`. The service requires `LHLO`, rejects SMTP
+`rmail_ctl settings set global.listeners.lmtp '["127.0.0.1:24"]'`. The service requires `LHLO`, rejects SMTP
 `HELO`/`EHLO`, does not offer `AUTH` or `STARTTLS`, and never queues remote delivery. Exact local
 mailboxes, local catchalls, and aliases resolving to one local mailbox are accepted. Multi-target
 or remote aliases are rejected during `RCPT` to prevent partial delivery and duplicate mail when an
@@ -125,34 +177,27 @@ tracking, and graceful shutdown as SMTP delivery.
 Inbound SMTP verifies SPF, DKIM, DMARC, and ARC with the system asynchronous DNS resolver. DNS
 failures remain authentication temporary errors and do not turn into DMARC policy rejections.
 
-Outbound messages are signed immediately before their atomic queue publication. Create
-`<mail_root>/dkim.toml` with one or more sender-domain entries:
+Outbound messages are signed immediately before their atomic queue publication, with the keys
+stored in the database. Create them with `rmail_ctl dkim` (or the admin console's **DKIM** page),
+which prints the TXT record to publish:
 
-```toml
-[[signer]]
-domain = "example.com"
-selector = "mail2026"
-private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
-# Optional; these are the defaults.
-headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"]
-
-# Optional local ARC identity. This is used only for remote targets reached
-# through a local alias or catchall, never for ordinary authenticated relay.
-[arc_signer]
-domain = "example.com"
-selector = "mail2026"
-private_key = "/etc/rmail/dkim/example.com-mail2026.pem"
-headers = ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "DKIM-Signature"]
+```bash
+rmail_ctl dkim add example.com mail2026                       # 2048-bit RSA
+rmail_ctl dkim add example.com ed2026 --algorithm ed25519     # optional, RFC 8463
+rmail_ctl dkim add example.com old --private-key key.pem      # import an existing key
+rmail_ctl dkim list
 ```
 
-The private key may be PKCS#1 or PKCS#8 PEM and must have no group/other permission bits (for
-example, mode `0600`). Publish the corresponding RSA public key at
-`mail2026._domainkey.example.com`. A missing `dkim.toml`, or a sender domain without a matching
-entry, leaves the message unsigned; an invalid matching entry prevents the message from entering
-the queue. When `arc_signer` is present, rMail verifies the incoming ARC chain and adds an
-ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal set before publishing a forwarded
-message. A chain with invalid continuity is forwarded unchanged rather than being extended with a
-misleading local seal. The ARC key has the same `0600` permission requirement as DKIM keys.
+Every key of a sender domain signs its mail, so RSA and Ed25519 signatures go out side by side;
+keep an RSA key, since many verifiers still ignore Ed25519. Signatures cover From, To, Subject,
+Date, Message-ID, MIME-Version and Content-Type. A domain without keys is sent unsigned; a key that
+fails to sign stops the message from entering the queue.
+
+`rmail_ctl dkim set-arc example.com mail2026` makes an RSA key the ARC identity. rMail then verifies
+the incoming ARC chain of mail it forwards to remote targets (aliases, catchalls and Sieve
+redirects) and adds an ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal set. A
+chain with invalid continuity is forwarded unchanged rather than being extended with a misleading
+local seal. `rmail_ctl dkim clear-arc` turns sealing off.
 
 Optional outbound-worker tuning in `/etc/default/rmail`:
 
@@ -209,7 +254,7 @@ SMTP phases and commands, reply codes, message IDs, and cumulative RX/TX bytes. 
 a streaming format for pipes and minimal terminals. AUTH payloads and message bodies are not
 recorded.
 
-Durable history is bounded through `[global.tracking]`: `retention_days` and `max_events` set the
+Durable history is bounded through the `global.tracking.*` settings: `retention_days` and `max_events` set the
 age and count limits, while `prune_interval_seconds` and `prune_batch_size` control incremental
 cleanup. Setting either retention limit to zero disables that individual limit.
 
@@ -218,9 +263,9 @@ Outbound transport security:
 - rMail advertises and relays RFC 8689 `REQUIRETLS`; such messages are never sent over plaintext, and the next hop must advertise `REQUIRETLS`
 - rMail advertises RFC 3461 `DSN`, validates `ENVID`, `RET`, `NOTIFY`, and `ORCPT`, preserves those parameters through aliases and the private queue, and relays them to DSN-capable next hops. Requested success, delayed-delivery, and terminal-failure notifications use a null reverse path and `multipart/report; report-type=delivery-status`; `NOTIFY=NEVER` suppresses local bounces.
 - MTA-STS policies are discovered through `_mta-sts.<domain>` TXT records, fetched over authenticated HTTPS, cached for `max_age`, and enforced against MX names and TLS certificate validation
-- TLS failures are reported to valid `mailto:` destinations in `_smtp._tls.<domain>` RFC 8460 records using `application/tlsrpt+json`; reports themselves use a null reverse path to prevent loops
+- TLS failures are reported to the `mailto:` and `https:` destinations in `_smtp._tls.<domain>` RFC 8460 records as daily gzipped JSON (`application/tlsrpt+gzip`), by mail or HTTPS POST; mailed reports use a null reverse path to prevent loops
 
-TLS policy is configured once under `[global.tls]`. `minimum_version` accepts
+TLS policy is configured once with the `global.tls.*` settings. `minimum_version` accepts
 `"1.2"` (the default, enabling TLS 1.2 and 1.3) or `"1.3"`. `cipher_suites` may be left empty for
 Rustls safe defaults or set to an allow-list of Rustls cipher-suite names. Unknown suites, a suite
 set incompatible with the selected protocol versions, partial cert/key configuration, and invalid
@@ -311,17 +356,12 @@ served through the same single-page frontend, so a reverse proxy should pass unk
 
 ### Settings and admin access
 
-When the configuration file sets `db_path`, the file only bootstraps `mail_root` and `db_path`.
-Every other setting lives in the `settings` table of that database:
+The configuration file only bootstraps `mail_root` and `db_path`. Every other setting lives in the
+`settings` table of that database:
 
-- On the first start against a database without settings, all values in the file are imported once.
-- Afterwards settings are edited on the console's **Settings** page or with
-  `rmail_ctl settings list|get|set|unset`. Values still present in the file are ignored; each daemon
-  logs the keys whose file value differs from the database.
-- `rmail_ctl settings tidy-config` comments out the file entries the database already holds
-  (keeping `mail_root` and `db_path`), after saving a `config.toml.pre-db` backup. Entries whose
-  value differs from the database stay active and are reported. Package upgrades run it
-  automatically; `--stdout` previews the result.
+- Settings are edited on the console's **Settings** page or with
+  `rmail_ctl settings list|get|set|unset`. Other keys left in the file are ignored, and each daemon
+  logs their names at startup.
 - Daemons read settings at startup and record the revision they loaded. The Settings and System
   pages show which services must be restarted (for example
   `rmail_ctl service restart --unit smtpd`) and which changed keys each one is waiting for.
@@ -628,10 +668,8 @@ sudo apt install ./target/debian/rmail_0.1.0_amd64.deb
 
 Avoid installing a local `.deb` from `/root/...` with `apt install` if possible. Put it in a world-readable path like your normal home directory or `/tmp`, otherwise `apt` may warn that download/acquire ran unsandboxed because the `_apt` user cannot read the file.
 
-Then edit:
-
-- `/etc/rmail/config.toml`
-- `/etc/default/rmail`
+Then check `/etc/default/rmail` and store the server's settings with `rmail_ctl settings set` (or
+in the admin console); `/etc/rmail/config.toml` already points at `/opt/rmail`.
 
 On first package install, the maintainer script will also try to:
 

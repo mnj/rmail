@@ -115,7 +115,6 @@ async fn overview(State(state): State<Shared>) -> Response {
         })
         .collect();
     Json(json!({
-        "managed": state.db_path.is_some(),
         "models_dir": models_dir(&state),
         "catalog": models::CATALOG,
         "installed": installed,

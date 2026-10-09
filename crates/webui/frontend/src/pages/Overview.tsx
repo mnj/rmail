@@ -46,7 +46,7 @@ export function OverviewPage({ navigate }: { navigate: (page: Page) => void }) {
     if (check.status === 'error') attention.push({ key: `ready-${name}`, tone: 'error', text: <>{name.replaceAll('_', ' ')} check failing: {check.error}</>, page: 'system' });
   }
   const view = settings.data;
-  if (view && view.managed) {
+  if (view) {
     for (const service of view.services.filter((item) => item.restart_required)) {
       attention.push({ key: `restart-${service.service}`, tone: 'warn', text: <>Restart <code>{service.service}</code> to apply {plural(service.pending_changes.length, 'changed setting')}</>, page: 'settings' });
     }

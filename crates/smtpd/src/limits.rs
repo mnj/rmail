@@ -243,3 +243,48 @@ mod tests {
         assert!(daily.contains_key(user));
     }
 }
+
+/// At most this many DMARC failure reports per policy domain per hour, so a
+/// spoofing run cannot turn this server into a report flood.
+const FAILURE_REPORTS_PER_HOUR: usize = 10;
+
+static FAILURE_REPORTS: once_cell::sync::Lazy<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    >,
+> = once_cell::sync::Lazy::new(Default::default);
+
+pub(crate) fn failure_report_allowed(domain: &str) -> bool {
+    let now = std::time::Instant::now();
+    let hour = std::time::Duration::from_secs(3600);
+    let mut all = FAILURE_REPORTS.lock().unwrap();
+    all.retain(|_, sent| {
+        while sent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > hour)
+        {
+            sent.pop_front();
+        }
+        !sent.is_empty()
+    });
+    let sent = all.entry(domain.to_ascii_lowercase()).or_default();
+    if sent.len() >= FAILURE_REPORTS_PER_HOUR {
+        return false;
+    }
+    sent.push_back(now);
+    true
+}
+
+#[cfg(test)]
+mod failure_report_limit_tests {
+    #[test]
+    fn failure_reports_are_capped_per_domain() {
+        let domain = "flood.example.test";
+        for _ in 0..super::FAILURE_REPORTS_PER_HOUR {
+            assert!(super::failure_report_allowed(domain));
+        }
+        assert!(!super::failure_report_allowed(domain));
+        assert!(!super::failure_report_allowed("FLOOD.example.test"));
+        assert!(super::failure_report_allowed("other.example.test"));
+    }
+}

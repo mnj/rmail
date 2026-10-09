@@ -24,6 +24,7 @@ pub(crate) async fn handle(
     uid_mode: bool,
     utf8_accept: bool,
     qresync_enabled: bool,
+    message_limit: Option<usize>,
 ) -> Outcome {
     let move_messages = command_name.ends_with("MOVE");
     let request = match parser::parse_transfer_request(raw_args) {
@@ -41,7 +42,18 @@ pub(crate) async fn handle(
         Ok(destination) => destination,
         Err(_) => return failure(bad(tag, "Invalid mailbox name".to_string())),
     };
-    let source_uids = resolve_uids(&request.message_set, selected, saved_uids, uid_mode);
+    let mut source_uids = resolve_uids(&request.message_set, selected, saved_uids, uid_mode);
+    // RFC 9738 §3.1: COPY is atomic, so too large a set is refused; MOVE
+    // moves the newest messages and the client repeats it for the rest.
+    let limited = if move_messages {
+        crate::commands::limit::truncate(&mut source_uids, message_limit)
+    } else if let Some(code) = crate::commands::limit::exceeded(source_uids.len(), message_limit) {
+        return failure(Response::new().status(
+            StatusLine::tagged(tag, Status::No, "Too many messages for one COPY").with_code(code),
+        ));
+    } else {
+        None
+    };
     if source_uids.iter().any(|uid| selected.is_expunged(*uid)) {
         // COPY is all-or-nothing (RFC 3501 §6.4.7); a message expunged by
         // another session can no longer be copied (RFC 2180 §4.4.1).
@@ -141,8 +153,12 @@ pub(crate) async fn handle(
             compress_ids(&destination_uids)
         ));
     }
+    let mut response = response.status(completion);
+    if let Some(code) = limited {
+        response = response.with_message_limit(code);
+    }
     Outcome {
-        response: response.status(completion),
+        response,
         removed_uids: if move_messages {
             mapped_source_uids
         } else {
@@ -260,6 +276,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .await;
         let response = outcome.response.encode();

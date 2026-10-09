@@ -95,7 +95,7 @@
           <ul>
             <li>Inspect, requeue, promote or delete from the console or <code>rmail_queuectl</code></li>
             <li>Negotiates 8BITMIME, SMTPUTF8 and BDAT with the remote end</li>
-            <li>Experimental DANE / TLSA verification</li>
+            <li>MTA-STS enforcement, Null MX handling and daily TLS-RPT reports</li>
           </ul>
         </article>
         <article class="feature">
@@ -233,12 +233,10 @@ sudo apt install ./rmail_latest_amd64.deb</pre>
         </article>
         <article class="feature">
           <h3>2. Point it at storage</h3>
-          <p>In <code>/etc/rmail/config.toml</code>, set the storage locations and your certificate. On first start everything else is imported into the database, and from then on you edit it in the console.</p>
+          <p><code>/etc/rmail/config.toml</code> only names the data directory and the database. Everything else, from listeners to certificates, is set in the admin console or with <code>rmail_ctl settings</code>.</p>
 <pre>[global]
 mail_root = "/opt/rmail/mail"
-db_path = "/opt/rmail/rmail.db"
-tls_cert = "/etc/rmail/certs/fullchain.pem"
-tls_key = "/etc/rmail/certs/privkey.pem"</pre>
+db_path = "/opt/rmail/config/rmail.db"</pre>
         </article>
         <article class="feature">
           <h3>3. Start it and open the console</h3>

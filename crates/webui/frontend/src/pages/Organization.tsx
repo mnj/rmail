@@ -113,7 +113,7 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
     <Panel
       title="Providers"
       subtitle="Run models on this server, or use a hosted provider. Hosted providers only receive mail from users who agree to it in webmail."
-      actions={<button className="button primary" disabled={!dirty || saving || !org.managed} onClick={save}><Save size={16} />{saving ? 'Saving…' : 'Save'}</button>}
+      actions={<button className="button primary" disabled={!dirty || saving} onClick={save}><Save size={16} />{saving ? 'Saving…' : 'Save'}</button>}
     >
       {cloud.length > 0 && (
         <p className="panelNote"><Cloud size={14} /> Mail goes to {cloud.map((id) => providerNames[id] || id).join(' and ')} for {consented} of {optedIn} opted-in mailbox{optedIn === 1 ? '' : 'es'}; the rest {status?.embed_model?.cloud ? 'get no suggestions until their users agree' : 'get suggestions from this server only'}.</p>
@@ -278,13 +278,12 @@ export function OrganizationPage() {
           </p>
         </div>
         <div className="heroActions">
-          <Toggle checked={enabled} disabled={!data.managed} label="Enabled" onChange={(value) => activate({ enabled: value }, value ? 'Mail organization enabled' : 'Mail organization disabled')} />
+          <Toggle checked={enabled} label="Enabled" onChange={(value) => activate({ enabled: value }, value ? 'Mail organization enabled' : 'Mail organization disabled')} />
           <button className="button" onClick={() => run(() => api('/api/organization/reload', 'POST'), 'Classifier reloaded').then(() => org.reload())} disabled={!status}><RefreshCw size={16} />Reload</button>
         </div>
       </div>
       {status?.errors.map((message) => <ErrorBanner key={message} error={message} />)}
       {status && !status.local_models && <ErrorBanner error="This rmail_classifier build has no local-model support (built without the local-models feature)." />}
-      {!data.managed && <ErrorBanner error="Settings are file-only (no db_path), so models cannot be activated here." />}
       <Panel
         title="Models"
         subtitle={<>Stored in <code>{data.models_dir}</code>. An embedding model is required. A chat model is an optional fallback for messages the embedding vote is unsure about.</>}

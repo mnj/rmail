@@ -45,28 +45,46 @@ pub(crate) async fn uid_expunge(
     selected: &SelectedMailbox,
     saved_uids: &[u64],
     qresync_enabled: bool,
+    message_limit: Option<usize>,
 ) -> Outcome {
     let uid_set = match parse_uid_set(raw_args) {
         Some(uid_set) => uid_set,
         None => return failure(bad(tag, "Invalid UID EXPUNGE arguments")),
     };
-    let requested = if uid_set == "$" {
+    let requested: HashSet<u64> = if uid_set == "$" {
         saved_uids.iter().copied().collect()
     } else {
         parser::uids_from_set(&uid_set, &selected.msgs)
             .into_iter()
             .collect()
     };
-    run(
+    // RFC 9738 §3.1: only \Deleted messages count towards the limit.
+    let mut deleted = selected
+        .msgs
+        .iter()
+        .filter(|(uid, _, flags, _)| {
+            requested.contains(uid)
+                && flags
+                    .iter()
+                    .any(|flag| flag.eq_ignore_ascii_case("\\Deleted"))
+        })
+        .map(|(uid, _, _, _)| *uid)
+        .collect::<Vec<_>>();
+    let limited = crate::commands::limit::truncate(&mut deleted, message_limit);
+    let mut outcome = run(
         tag,
         "UID EXPUNGE",
         mail_root,
         selected,
-        Some(requested),
+        Some(deleted.into_iter().collect()),
         qresync_enabled,
         false,
     )
-    .await
+    .await;
+    if let Some(code) = limited {
+        outcome.response = outcome.response.with_message_limit(code);
+    }
+    outcome
 }
 
 pub(crate) async fn close(tag: &str, mail_root: &str, selected: &SelectedMailbox) -> Outcome {

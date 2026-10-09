@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
-import { RefreshCw, RotateCcw, Save, Search, ServerCog, Trash2 } from 'lucide-react';
+import { RefreshCw, RotateCcw, Save, Search } from 'lucide-react';
 import { api, Setting, SettingsView } from '../api';
-import { Empty, ErrorBanner, IconButton, invalidate, Toggle, useFeedback, useResource, useUnsavedChanges } from '../ui';
+import { Empty, ErrorBanner, invalidate, Toggle, useFeedback, useResource, useUnsavedChanges } from '../ui';
 
 /** Draft edits keyed by setting key. `null` means "reset to default". */
 type Drafts = Record<string, unknown>;
@@ -106,13 +106,12 @@ export function SettingControl({ setting, value, onChange, labels }: { setting: 
 export function RestartNotice({ view, onRestarted }: { view: SettingsView; onRestarted: () => void }) {
   const { run, confirm } = useFeedback();
   const [restarting, setRestarting] = useState(false);
-  if (!view.managed) return null;
   const restartNeeded = view.services.filter((service) => service.restart_required);
   if (restartNeeded.length === 0) return null;
   const names = restartNeeded.map((service) => service.service);
 
   async function restart() {
-    const pending = (current: SettingsView) => current.managed && current.services.some((service) => names.includes(service.service) && service.restart_required);
+    const pending = (current: SettingsView) => current.services.some((service) => names.includes(service.service) && service.restart_required);
     const ok = await confirm({
       title: `Restart ${names.join(', ')}?`,
       message: names.includes('web')
@@ -167,7 +166,7 @@ export function SettingsPage() {
   const view = resource.data;
 
   // Certificate settings have their own page.
-  const settings = view && view.managed ? view.settings.filter((setting) => setting.group !== 'acme') : [];
+  const settings = view ? view.settings.filter((setting) => setting.group !== 'acme') : [];
   const dirtyKeys = Object.keys(drafts);
   useUnsavedChanges(dirtyKeys.length);
 
@@ -180,17 +179,6 @@ export function SettingsPage() {
 
   if (resource.error) return <ErrorBanner error={resource.error} />;
   if (!view) return <Empty>Loading settings…</Empty>;
-  if (!view.managed) {
-    return (
-      <article className="panel callout">
-        <ServerCog size={28} />
-        <div>
-          <h2>Settings are read from the configuration file</h2>
-          <p>Set <code>db_path</code> in the configuration file to manage settings here. On the next start every value in the file is imported into the database once, and the file then only needs <code>mail_root</code> and <code>db_path</code>.</p>
-        </div>
-      </article>
-    );
-  }
 
   const valueOf = (setting: Setting) => (setting.key in drafts ? drafts[setting.key] : setting.value);
 
@@ -229,14 +217,6 @@ export function SettingsPage() {
     if (ok) setDrafts((current) => ({ ...current, [setting.key]: null }));
   }
 
-  async function removeOther(key: string) {
-    const ok = await confirm({ title: `Remove ${key}?`, message: 'This legacy value will no longer be passed to the services.', confirmLabel: 'Remove', danger: true });
-    if (!ok) return;
-    await run(async () => {
-      resource.setData(await api<SettingsView>('/api/settings', 'PUT', { changes: { [key]: null } }));
-      invalidate('settings');
-    }, `Removed ${key}`);
-  }
 
   const groupsWithSettings = view.groups.filter((item) => settings.some((setting) => setting.group === item.id));
 
@@ -255,29 +235,15 @@ export function SettingsPage() {
               </button>
             );
           })}
-          {view.other.length > 0 && <button className={group === 'other' ? 'active' : ''} onClick={() => setGroup('other')}>Other stored keys <small>{view.other.length}</small></button>}
         </nav>
 
         <div className="settingsMain">
           <div className="settingsToolbar">
             <div className="searchBox"><Search size={16} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Search settings" aria-label="Search settings" /></div>
-            <span className="muted">Revision {view.revision}{view.imported_from ? ` · imported from ${view.imported_from}` : ''}</span>
+            <span className="muted">Revision {view.revision}</span>
           </div>
 
-          {group === 'other' ? (
-            <article className="panel">
-              <div className="panelHead"><div><h2>Other stored keys</h2><small>Values imported from the configuration file that have no dedicated control, such as legacy listener fields.</small></div></div>
-              <table>
-                <thead><tr><th>Key</th><th>Value</th><th /></tr></thead>
-                <tbody>
-                  {view.other.map((item) => (
-                    <tr key={item.key}><td><code>{item.key}</code></td><td><code>{JSON.stringify(item.value)}</code></td><td className="rowActions"><IconButton danger label={`Remove ${item.key}`} onClick={() => removeOther(item.key)}><Trash2 size={15} /></IconButton></td></tr>
-                  ))}
-                </tbody>
-              </table>
-            </article>
-          ) : (
-            (group === 'all' ? groupsWithSettings : groupsWithSettings.filter((item) => item.id === group)).map((item) => {
+          {(group === 'all' ? groupsWithSettings : groupsWithSettings.filter((item) => item.id === group)).map((item) => {
               const rows = visible.filter((setting) => setting.group === item.id);
               if (!rows.length) return null;
               return (
@@ -307,8 +273,8 @@ export function SettingsPage() {
                 </article>
               );
             })
-          )}
-          {group !== 'other' && visible.length === 0 && <Empty>No settings match “{filter}”{group !== 'all' && <> in this group. <button className="linkButton" onClick={() => setGroup('all')}>Search all settings</button></>}.</Empty>}
+          }
+          {visible.length === 0 && <Empty>No settings match “{filter}”{group !== 'all' && <> in this group. <button className="linkButton" onClick={() => setGroup('all')}>Search all settings</button></>}.</Empty>}
         </div>
       </div>
 

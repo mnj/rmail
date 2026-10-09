@@ -39,7 +39,10 @@ fn connection_inner(path: &Path) -> Result<SqliteConnection> {
 }
 
 fn build_pool(path: &Path) -> Result<SqlitePool> {
-    let manager = SqliteConnectionManager::file(path).with_init(|connection| {
+    let file = path.to_path_buf();
+    let manager = SqliteConnectionManager::file(path).with_init(move |connection| {
+        // Every database here holds mail, credentials or metadata.
+        crate::db::restrict_permissions_or_warn(&file);
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         Ok(())

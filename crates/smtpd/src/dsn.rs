@@ -36,8 +36,10 @@ pub(crate) fn queue_local_success_notification(
         .unwrap_or_default();
     let sender = dsn_header_value(original_sender);
     let recipient = dsn_header_value(final_recipient);
+    // RFC 3464 §2.2.2: the reporting MTA's own name.
+    let reporting_mta = dsn_header_value(crate::server_hostname());
     let notification = format!(
-        "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\n\
+        "From: Mail Delivery Subsystem <MAILER-DAEMON@{reporting_mta}>\r\n\
          To: <{sender}>\r\n\
          Subject: Delivery Status Notification (Success)\r\n\
          Date: {date}\r\n\
@@ -53,7 +55,7 @@ pub(crate) fn queue_local_success_notification(
          --{boundary}\r\n\
          Content-Type: message/delivery-status\r\n\
          \r\n\
-         Reporting-MTA: dns; rmail\r\n\
+         Reporting-MTA: dns; {reporting_mta}\r\n\
          {envelope_id}\
          Arrival-Date: {date}\r\n\
          \r\n\

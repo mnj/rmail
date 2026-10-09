@@ -25,6 +25,18 @@ pub(crate) fn handle(
             ));
         }
     };
+    if let Some(entry) = request
+        .returns
+        .metadata
+        .iter()
+        .find(|entry| !crate::commands::metadata::valid_entry(entry))
+    {
+        return Response::new().status(StatusLine::tagged(
+            tag,
+            Status::Bad,
+            format!("Invalid metadata entry {entry}"),
+        ));
+    }
     request.reference = match mailbox::decode_wire_mailbox_name(&request.reference, utf8_accept) {
         Ok(reference) => reference,
         Err(_) => return bad_mailbox_name(tag),
@@ -112,6 +124,18 @@ pub(crate) fn handle(
                 mailbox::quote_wire_mailbox_name(&summary.folder.name, utf8_accept),
                 status_values(summary, recent, &request.returns.status).join(" ")
             ));
+        }
+        if !request.returns.metadata.is_empty()
+            && let Some(data) = crate::commands::metadata::list_metadata(
+                mail_root,
+                &domain,
+                &local,
+                &summary.folder.name,
+                &request.returns.metadata,
+                utf8_accept,
+            )
+        {
+            response = response.literal_data(data);
         }
     }
     if lsub || request.selection.subscribed {

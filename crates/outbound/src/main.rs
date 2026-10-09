@@ -1,12 +1,12 @@
 use anyhow::Context;
 use chrono::Utc;
-use native_tls::TlsConnector as NativeTlsConnector;
 use once_cell::sync::Lazy;
 use rmail_common::tracking::{TrackingEvent, TrackingHub, new_tracking_id};
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{error::Error, fmt};
 use tokio::fs::File;
@@ -14,11 +14,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufR
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinSet;
-use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::error::ResolveErrorKind;
-mod dane_blocking;
-mod tlsa;
+mod dane;
 
 // Trait object helper so the outbound worker can swap plain and TLS streams dynamically.
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -37,6 +35,11 @@ static OUTBOUND_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
 /// Name sent in EHLO/HELO: `global.hostname` or the system hostname
 /// (RFC 5321 section 4.1.1.1 requires the client's FQDN).
 static HELO_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `security.dane_enabled`: authenticate MX hosts with DNSSEC TLSA records.
+static DANE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The settings database, which holds the delivery routes.
+static DB_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn helo_name() -> &'static str {
     HELO_NAME.get_or_init(rmail_common::config::system_hostname)
@@ -116,15 +119,39 @@ struct QueuedMessage {
 struct DestinationKey {
     host: String,
     port: u16,
+    /// The relay account a pooled session authenticated as.
+    user: Option<String>,
+}
+
+/// A next hop for one delivery: an MX host, or a relay from a route.
+struct Target {
+    host: String,
+    port: u16,
+    implicit_tls: bool,
+    /// AUTH PLAIN credentials for a relay route.
+    auth: Option<(String, String)>,
+}
+
+impl Target {
+    fn mx(host: &str) -> Self {
+        Self {
+            host: host.trim_end_matches('.').to_string(),
+            port: 25,
+            implicit_tls: false,
+            auth: None,
+        }
+    }
 }
 
 struct SmtpConnection {
     reader: BufReader<Box<dyn AsyncStream>>,
     capabilities: SmtpCapabilities,
-    encrypted: bool,
+    tls: dane::TlsAuth,
     connection_id: String,
     peer_addr: Option<String>,
     local_addr: Option<String>,
+    /// MAIL FROM transactions started on this session (RFC 9422 MAILMAX).
+    transactions: u32,
 }
 
 struct DeliveryTrace<'a> {
@@ -196,6 +223,14 @@ impl ConnectionPool {
     }
 
     async fn recycle(&self, key: DestinationKey, connection: SmtpConnection) {
+        // RFC 9422: a session that used up the server's MAILMAX is closed.
+        if connection
+            .capabilities
+            .mail_max
+            .is_some_and(|max| connection.transactions >= max)
+        {
+            return;
+        }
         let mut idle = self.idle.lock().await;
         let total = idle.values().map(Vec::len).sum::<usize>();
         if total >= self.max_total {
@@ -238,10 +273,15 @@ async fn main() -> anyhow::Result<()> {
             if let Err(error) = rmail_common::settings::record_service_start(&cfg, "outbound") {
                 rmail_common::structured_log!("warn", "outbound", "service_state_failed", { "error": format!("{error:#}") });
             }
-            if cfg.security.tls_rpt_enabled
-                && let Some(db_path) = cfg.global.db_path.clone()
-            {
-                tls_report_setup = Some((PathBuf::from(db_path), cfg.global.server_hostname()));
+            DANE_ENABLED.store(cfg.security.dane_enabled, Ordering::Relaxed);
+            // DSNs and TLS reports are DKIM-signed like any queued mail.
+            rmail_common::dkim::use_database(&cfg.global.db_path);
+            let _ = DB_PATH.set(PathBuf::from(&cfg.global.db_path));
+            if cfg.security.tls_rpt_enabled {
+                tls_report_setup = Some((
+                    PathBuf::from(&cfg.global.db_path),
+                    cfg.global.server_hostname(),
+                ));
             }
             cfg.global.tracking
         }
@@ -570,24 +610,20 @@ async fn process_claim(
         return;
     }
 
-    match process_file(
-        &inflight_eml,
-        &base,
-        &connections,
-        &tracking,
-        &control.tracking_id,
-    )
-    .await
-    {
-        Ok(()) => {
+    match process_file(&inflight_eml, &connections, &tracking, &control.tracking_id).await {
+        Ok(handoff) => {
             emit("delivery", "delivered", Some(fname.clone()), Some(250));
-            if let Err(error) = queue_delivery_notification(
-                &base,
-                &inflight_eml,
-                &control,
-                DeliveryNotificationKind::Success,
-            )
-            .await
+            // RFC 3461 §6.2.3: a DSN-capable next hop now owns success reports.
+            if !handoff.dsn
+                && let Err(error) = queue_delivery_notification(
+                    &base,
+                    &inflight_eml,
+                    &control,
+                    DeliveryNotificationKind::Relayed {
+                        remote_mta: &handoff.remote_mta,
+                    },
+                )
+                .await
             {
                 rmail_common::structured_log!(
                     "error", "outbound", "success_dsn_queue_failed",
@@ -739,13 +775,12 @@ async fn process_claim(
 
 async fn process_file(
     path: &Path,
-    base: &Path,
     connections: &ConnectionPool,
     tracking: &TrackingHub,
     tracking_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Handoff> {
     let message = inspect_queued_message(path).await?;
-    deliver_to_remote(base, path, message, connections, tracking, tracking_id).await
+    deliver_to_remote(path, message, connections, tracking, tracking_id).await
 }
 
 async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
@@ -1043,17 +1078,28 @@ async fn queue_failure_notification(
 }
 
 #[derive(Clone, Copy)]
-enum DeliveryNotificationKind {
-    Success,
+enum DeliveryNotificationKind<'a> {
+    /// Handed to a next hop that does not support DSN (RFC 3461 §6.2.3.3);
+    /// a DSN-capable next hop reports success itself.
+    Relayed {
+        remote_mta: &'a str,
+    },
     Delay,
     Failure,
+}
+
+/// The next hop that accepted a message.
+struct Handoff {
+    remote_mta: String,
+    /// The next hop advertised DSN, so NOTIFY/RET/ENVID/ORCPT went with it.
+    dsn: bool,
 }
 
 async fn queue_delivery_notification(
     mail_root: &Path,
     queued_message: &Path,
     control: &rmail_common::outbound::QueueControl,
-    kind: DeliveryNotificationKind,
+    kind: DeliveryNotificationKind<'_>,
 ) -> anyhow::Result<()> {
     let message = inspect_queued_message(queued_message).await?;
     let Some(original_sender) = message.envelope_from else {
@@ -1063,7 +1109,7 @@ async fn queue_delivery_notification(
     };
     let requested = match (message.dsn.notify.as_ref(), kind) {
         (Some(notify), _) if notify.never => false,
-        (Some(notify), DeliveryNotificationKind::Success) => notify.success,
+        (Some(notify), DeliveryNotificationKind::Relayed { .. }) => notify.success,
         (Some(notify), DeliveryNotificationKind::Delay) => notify.delay,
         (Some(notify), DeliveryNotificationKind::Failure) => notify.failure,
         (None, DeliveryNotificationKind::Failure) => true,
@@ -1127,18 +1173,23 @@ fn build_failure_notification(
     final_recipient: &str,
     control: &rmail_common::outbound::QueueControl,
     dsn: &rmail_common::outbound::DsnOptions,
-    kind: DeliveryNotificationKind,
+    kind: DeliveryNotificationKind<'_>,
     return_full: bool,
     returned_content: &[u8],
 ) -> Vec<u8> {
     let date = Utc::now().to_rfc2822();
+    let arrival_date = chrono::DateTime::from_timestamp(control.created_at, 0)
+        .filter(|_| control.created_at > 0)
+        .map_or_else(|| date.clone(), |arrival| arrival.to_rfc2822());
+    // RFC 3464 §2.2.2: the reporting MTA's own name, as sent in EHLO.
+    let reporting_mta = sanitize_header_value(helo_name());
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let boundary = format!("rmail-dsn-{}-{nonce}", std::process::id());
     let status = match kind {
-        DeliveryNotificationKind::Success => "2.0.0",
+        DeliveryNotificationKind::Relayed { .. } => "2.0.0",
         DeliveryNotificationKind::Delay => {
             control.last_enhanced_status.as_deref().unwrap_or("4.4.7")
         }
@@ -1157,17 +1208,17 @@ fn build_failure_notification(
         .as_deref()
         .map(sanitize_header_value)
         .unwrap_or_else(|| match kind {
-            DeliveryNotificationKind::Success => "recipient accepted the message".to_string(),
+            DeliveryNotificationKind::Relayed { .. } => "250 message accepted".to_string(),
             DeliveryNotificationKind::Delay => "delivery is still being retried".to_string(),
             DeliveryNotificationKind::Failure => {
                 "delivery failed without a diagnostic response".to_string()
             }
         });
     let (subject, action, human_message) = match kind {
-        DeliveryNotificationKind::Success => (
-            "Delivery Status Notification (Success)",
-            "delivered",
-            "was delivered successfully.",
+        DeliveryNotificationKind::Relayed { .. } => (
+            "Delivery Status Notification (Relayed)",
+            "relayed",
+            "was relayed to a server that does not send delivery notifications; no further notification will follow.",
         ),
         DeliveryNotificationKind::Delay => (
             "Delivery Status Notification (Delay)",
@@ -1199,13 +1250,19 @@ fn build_failure_notification(
         .map(sanitize_header_value)
         .map(|value| format!("Original-Envelope-Id: {value}\r\n"))
         .unwrap_or_default();
+    let remote_mta = match kind {
+        DeliveryNotificationKind::Relayed { remote_mta } => {
+            format!("Remote-MTA: dns; {}\r\n", sanitize_header_value(remote_mta))
+        }
+        _ => String::new(),
+    };
     let returned_type = if return_full {
         "message/rfc822"
     } else {
         "message/rfc822-headers"
     };
     let mut notification = format!(
-        "From: Mail Delivery Subsystem <MAILER-DAEMON@localhost>\r\n\
+        "From: Mail Delivery Subsystem <MAILER-DAEMON@{reporting_mta}>\r\n\
          To: <{sender}>\r\n\
          Subject: {subject}\r\n\
          Date: {date}\r\n\
@@ -1223,14 +1280,15 @@ fn build_failure_notification(
          --{boundary}\r\n\
          Content-Type: message/delivery-status\r\n\
          \r\n\
-         Reporting-MTA: dns; rmail\r\n\
+         Reporting-MTA: dns; {reporting_mta}\r\n\
          {envelope_id}\
-         Arrival-Date: {date}\r\n\
+         Arrival-Date: {arrival_date}\r\n\
          \r\n\
          {original_recipient}\
          Final-Recipient: rfc822; {recipient}\r\n\
          Action: {action}\r\n\
          Status: {status}\r\n\
+         {remote_mta}\
          Diagnostic-Code: smtp; {diagnostic}\r\n\
          \r\n\
          --{boundary}\r\n\
@@ -1545,6 +1603,34 @@ async fn smtp_begin_transaction(
         capabilities,
     )?;
 
+    let rcptcmd = build_rcpt_command(recipient, dsn, capabilities)?;
+    if capabilities.pipelining {
+        // RFC 2920: send MAIL and RCPT in one group, then read both replies
+        // in order so the session stays in step even when MAIL fails.
+        reader
+            .get_mut()
+            .write_all(format!("{mailcmd}{rcptcmd}").as_bytes())
+            .await?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.command("mail", &mailcmd, mailcmd.len());
+            trace.command("rcpt", &rcptcmd, rcptcmd.len());
+        }
+        reader.get_mut().flush().await?;
+        let (mail_code, mail_reply) = read_response(&mut *reader).await?;
+        let (rcpt_code, rcpt_reply) = read_response(&mut *reader).await?;
+        if let Some(trace) = trace {
+            trace.reply("mail", mail_code, &mail_reply);
+            trace.reply("rcpt", rcpt_code, &rcpt_reply);
+        }
+        if mail_code / 100 != 2 {
+            return Err(rejected("MAIL FROM", mail_code, mail_reply));
+        }
+        if rcpt_code / 100 != 2 {
+            return Err(rejected("RCPT TO", rcpt_code, rcpt_reply));
+        }
+        return Ok(());
+    }
+
     reader.get_mut().write_all(mailcmd.as_bytes()).await?;
     if let Some(trace) = trace.as_deref_mut() {
         trace.command("mail", &mailcmd, mailcmd.len());
@@ -1558,7 +1644,6 @@ async fn smtp_begin_transaction(
         return Err(rejected("MAIL FROM", code, resp));
     }
 
-    let rcptcmd = build_rcpt_command(recipient, dsn, capabilities)?;
     reader.get_mut().write_all(rcptcmd.as_bytes()).await?;
     if let Some(trace) = trace.as_deref_mut() {
         trace.command("rcpt", &rcptcmd, rcptcmd.len());
@@ -1864,6 +1949,11 @@ struct SmtpCapabilities {
     binary_mime: bool,
     require_tls: bool,
     dsn: bool,
+    auth_plain: bool,
+    /// RFC 2920: MAIL and RCPT may be sent together.
+    pipelining: bool,
+    /// RFC 9422 LIMITS MAILMAX: transactions the server accepts per session.
+    mail_max: Option<u32>,
 }
 
 fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
@@ -1892,6 +1982,26 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.require_tls = true;
         } else if keyword.eq_ignore_ascii_case("DSN") {
             capabilities.dsn = true;
+        } else if keyword.eq_ignore_ascii_case("PIPELINING") {
+            capabilities.pipelining = true;
+        } else if keyword.eq_ignore_ascii_case("LIMITS") {
+            // RFC 9422: malformed or unknown limits are ignored.
+            capabilities.mail_max = line
+                .get(4..)
+                .unwrap_or("")
+                .split_ascii_whitespace()
+                .skip(1)
+                .filter_map(|limit| limit.split_once('='))
+                .find(|(name, _)| name.eq_ignore_ascii_case("MAILMAX"))
+                .and_then(|(_, value)| value.parse::<u32>().ok())
+                .filter(|max| (1..=999_999).contains(max));
+        } else if keyword.eq_ignore_ascii_case("AUTH") {
+            capabilities.auth_plain = line
+                .get(4..)
+                .unwrap_or("")
+                .split_ascii_whitespace()
+                .skip(1)
+                .any(|mechanism| mechanism.eq_ignore_ascii_case("PLAIN"));
         }
     }
     capabilities
@@ -2068,13 +2178,21 @@ async fn mta_sts_policy_for_domain(
     Some(policy)
 }
 
-async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> Vec<String> {
+/// Where a domain wants its TLS reports (RFC 8460 section 3).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TlsReportTargets {
+    mail: Vec<String>,
+    https: Vec<String>,
+}
+
+async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> TlsReportTargets {
     let started = Instant::now();
     let lookup_result = resolver.txt_lookup(format!("_smtp._tls.{domain}")).await;
     rmail_common::metrics::observe_dns_duration(started.elapsed());
     let Ok(lookup) = lookup_result else {
-        return Vec::new();
+        return TlsReportTargets::default();
     };
+    let mut https = Vec::new();
     let valid_records = lookup
         .iter()
         .filter_map(|record| {
@@ -2092,6 +2210,18 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
                 } else if let Some((name, addresses)) = field.split_once('=')
                     && name.eq_ignore_ascii_case("rua")
                 {
+                    // RFC 8460 section 5.4: https: targets get the report POSTed.
+                    https.extend(
+                        addresses
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|uri| {
+                                uri.get(..8)
+                                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+                            })
+                            .filter_map(|uri| reqwest::Url::parse(uri).ok())
+                            .map(String::from),
+                    );
                     recipients.extend(addresses.split(',').filter_map(|uri| {
                         uri.trim()
                             .strip_prefix("mailto:")
@@ -2107,8 +2237,9 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
         })
         .collect::<Vec<_>>();
     if valid_records.len() != 1 {
-        return Vec::new();
+        return TlsReportTargets::default();
     }
+    https.truncate(10);
     let candidates = valid_records.into_iter().flatten().take(10);
     let mut authorized = Vec::new();
     for recipient in candidates {
@@ -2142,7 +2273,25 @@ async fn tls_report_recipients(resolver: &TokioAsyncResolver, domain: &str) -> V
             authorized.push(recipient);
         }
     }
-    authorized
+    TlsReportTargets {
+        mail: authorized,
+        https,
+    }
+}
+
+/// POST a gzipped report to an https: rua target; any 2xx is success.
+async fn post_tls_report(url: &str, gz: &[u8]) -> anyhow::Result<()> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/tlsrpt+gzip")
+        .body(gz.to_vec())
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// Flush TLS-RPT counters every few minutes and send each finished UTC day's
@@ -2212,7 +2361,7 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
                 _ => continue,
             }
         };
-        let recipients = tls_report_recipients(resolver, &domain).await;
+        let targets = tls_report_recipients(resolver, &domain).await;
         let mut queued_copies = 0usize;
         if let Some((report_id, json)) = rmail_common::tlsrpt::build_report(
             "rMail",
@@ -2220,10 +2369,19 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
             &day,
             &domain,
             &rows,
-        ) && !recipients.is_empty()
+        ) && !(targets.mail.is_empty() && targets.https.is_empty())
             && let Ok(gz) = rmail_common::tlsrpt::gzip(&json)
         {
-            for recipient in recipients {
+            for url in &targets.https {
+                match post_tls_report(url, &gz).await {
+                    Ok(()) => queued_copies += 1,
+                    Err(error) => rmail_common::structured_log!(
+                        "warn", "outbound", "tls_report_post_failed",
+                        { "domain": domain, "day": day, "url": url, "error": format!("{error:#}") }
+                    ),
+                }
+            }
+            for recipient in targets.mail {
                 let message = rmail_common::tlsrpt::build_message(
                     &format!("noreply-tls-rpt@{hostname}"),
                     &recipient,
@@ -2273,13 +2431,12 @@ async fn send_due_tls_reports(base: &Path, db_path: &Path, hostname: &str) {
 }
 
 async fn deliver_to_remote(
-    base: &Path,
     message_path: &Path,
     message: QueuedMessage,
     connections: &ConnectionPool,
     tracking: &TrackingHub,
     tracking_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Handoff> {
     let recipient = rmail_common::domain::canonicalize_mailbox_address(&message.envelope_to)
         .context("canonicalizing recipient IDN")?;
     let envelope_from = message
@@ -2296,32 +2453,54 @@ async fn deliver_to_remote(
     // All outbound MX, policy, and address lookups share one bounded resolver
     // cache so DNS TTLs and negative responses survive across queue entries.
     let resolver = outbound_resolver().await?;
-    // transport may indicate implicit TLS (smtps) or explicit SMTP. Track optional port.
-    let mut targets: Vec<(String, Option<u16>)> = Vec::new();
-    match rmail_common::transport::lookup_transport(base, domain) {
-        Ok(rmail_common::transport::Transport::Smtp(Some(h))) => {
-            targets.push((h, None));
+    // A delivery route (see rmail_common::transport) replaces the MX hosts.
+    let mut targets: Vec<Target> = Vec::new();
+    let route = match DB_PATH.get() {
+        Some(db_path) => {
+            let db_path = db_path.clone();
+            let lookup_domain = domain.to_string();
+            tokio::task::spawn_blocking(move || {
+                rmail_common::transport::lookup(&db_path, &lookup_domain)
+            })
+            .await
+            .context("joining the delivery route lookup")?
+            .context("looking up the delivery route")?
         }
-        Ok(rmail_common::transport::Transport::Smtp(None)) => { /* fallthrough to MX lookup */ }
-        Ok(rmail_common::transport::Transport::Smtps(Some(h))) => {
-            targets.push((h, Some(465)));
+        None => None,
+    };
+    match route.map(|route| route.action) {
+        Some(rmail_common::transport::RouteAction::Relay {
+            host,
+            port,
+            implicit_tls,
+            username,
+            password,
+        }) => targets.push(Target {
+            host,
+            port,
+            implicit_tls,
+            auth: username.zip(password),
+        }),
+        Some(rmail_common::transport::RouteAction::Reject { reply }) => {
+            let enhanced = reply
+                .split_whitespace()
+                .nth(1)
+                .filter(|code| code.chars().next().is_some_and(|c| matches!(c, '4' | '5')))
+                .filter(|code| code.contains('.'));
+            if reply.starts_with('5') {
+                return Err(permanent_delivery_error(
+                    format!("delivery route refuses {domain}: {reply}"),
+                    enhanced,
+                ));
+            }
+            anyhow::bail!("delivery route defers {domain}: {reply}");
         }
-        Ok(rmail_common::transport::Transport::Smtps(None)) => { /* fallthrough to MX lookup */ }
-        Ok(rmail_common::transport::Transport::Error(msg)) => {
-            return Err(anyhow::anyhow!(format!(
-                "transport map error for {}: {}",
-                domain, msg
-            )));
-        }
-        Err(e) => {
-            rmail_common::structured_log!(
-                "warn", "outbound", "transport_map_lookup_failed",
-                { "domain": domain, "error": e.to_string() }
-            );
-        }
+        None => {}
     }
 
-    // If transport map didn't provide a next-hop, perform MX lookup.
+    // DANE applies to MX-derived hosts, not to transport-map next hops.
+    let from_dns = targets.is_empty();
+    // Without a route, deliver to the MX hosts.
     if targets.is_empty() {
         let started = Instant::now();
         let mx_result = resolver.mx_lookup(domain).await;
@@ -2340,23 +2519,28 @@ async fn deliver_to_remote(
                             Some("5.1.10"),
                         ));
                     }
-                    targets.push((host.trim_end_matches('.').to_string(), None));
+                    targets.push(Target::mx(&host));
                 }
             }
             Err(error) if matches!(error.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
                 // RFC 5321 implicit-MX fallback applies only when MX records are
                 // absent, never when DNS itself is unavailable or fails validation.
-                targets.push((domain.to_string(), None));
+                targets.push(Target::mx(domain));
             }
             Err(error) => return Err(error).context("resolving recipient MX records"),
         }
     }
 
     if targets.is_empty() {
-        targets.push((domain.to_string(), None));
+        targets.push(Target::mx(domain));
     }
 
-    let mta_sts_policy = mta_sts_policy_for_domain(resolver, domain).await;
+    // MTA-STS governs delivery to the recipient's MX hosts, not to a relay.
+    let mta_sts_policy = if from_dns {
+        mta_sts_policy_for_domain(resolver, domain).await
+    } else {
+        None
+    };
     let mta_sts_enforced = mta_sts_policy
         .as_ref()
         .is_some_and(|policy| policy.mode == MtaStsMode::Enforce);
@@ -2365,11 +2549,11 @@ async fn deliver_to_remote(
     {
         let mismatched = targets
             .iter()
-            .filter(|(host, _)| !mta_sts_matches_mx(policy, host))
-            .map(|(host, _)| host.clone())
+            .filter(|target| !mta_sts_matches_mx(policy, &target.host))
+            .map(|target| target.host.clone())
             .collect::<Vec<_>>();
         if policy.mode == MtaStsMode::Enforce {
-            targets.retain(|(host, _)| mta_sts_matches_mx(policy, host));
+            targets.retain(|target| mta_sts_matches_mx(policy, &target.host));
             if targets.is_empty() {
                 let diagnostic = format!(
                     "no recipient MX matches the active MTA-STS policy (rejected: {})",
@@ -2386,20 +2570,63 @@ async fn deliver_to_remote(
         }
     }
     let transport_tls_required = message.require_tls || mta_sts_enforced;
+    // RFC 7672 section 2.2.1: MX host names are TLSA base domains only when
+    // the MX RRset is DNSSEC-secure.
+    let mx_secure = if from_dns && DANE_ENABLED.load(Ordering::Relaxed) {
+        match dane::mx_is_secure(domain).await {
+            Ok(secure) => secure,
+            Err(error) => {
+                rmail_common::tlsrpt::record_failure(domain, "tlsa", "", &format!("{error:#}"));
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
 
     // Reuse an idle session for the selected destination when possible. Each
     // connection stays owned by one delivery task at a time, while the worker's
     // task limit bounds simultaneous connections and transactions.
     let mut last_delivery_error = None;
-    for (host, port_opt) in &targets {
-        let port = port_opt.unwrap_or(25);
+    for target in &targets {
+        let port = target.port;
         let key = DestinationKey {
-            host: host.trim_end_matches('.').to_ascii_lowercase(),
+            host: target.host.trim_end_matches('.').to_ascii_lowercase(),
             port,
+            user: target.auth.as_ref().map(|(user, _)| user.clone()),
+        };
+        let dane_lookup = if mx_secure {
+            match dane::tlsa_for(&key.host, port).await {
+                Ok(lookup) => lookup,
+                Err(error) => {
+                    // A bogus or failed TLSA lookup rules this host out.
+                    rmail_common::tlsrpt::record_failure(
+                        domain,
+                        "tlsa",
+                        &key.host,
+                        &format!("{error:#}"),
+                    );
+                    last_delivery_error = Some(error);
+                    continue;
+                }
+            }
+        } else {
+            dane::DaneLookup::NotApplicable
+        };
+        // DANE takes precedence over MTA-STS (RFC 8461 section 2). REQUIRETLS
+        // needs an authenticated peer, so unusable TLSA records fall back to PKIX.
+        let requirement = match &dane_lookup {
+            dane::DaneLookup::Secure(records) if !records.is_empty() => {
+                dane::TlsRequirement::Dane(records)
+            }
+            // Relay credentials go only to a server whose certificate verifies.
+            _ if transport_tls_required || target.auth.is_some() => dane::TlsRequirement::Pkix,
+            dane::DaneLookup::Secure(_) => dane::TlsRequirement::Mandatory,
+            dane::DaneLookup::NotApplicable => dane::TlsRequirement::Opportunistic,
         };
         let mut fresh_session = true;
         let connection = match connections.take(&key).await {
-            Some(mut connection) if !transport_tls_required || connection.encrypted => {
+            Some(mut connection) if requirement.satisfied_by(connection.tls) => {
                 let pooled_connection_id = connection.connection_id.clone();
                 let mut noop_trace = DeliveryTrace {
                     hub: tracking,
@@ -2430,7 +2657,9 @@ async fn deliver_to_remote(
                             resolver,
                             &key.host,
                             key.port,
-                            transport_tls_required,
+                            target.implicit_tls,
+                            target.auth.as_ref(),
+                            requirement,
                             message.require_tls,
                             tracking,
                             tracking_id,
@@ -2444,7 +2673,9 @@ async fn deliver_to_remote(
                     resolver,
                     &key.host,
                     key.port,
-                    transport_tls_required,
+                    target.implicit_tls,
+                    target.auth.as_ref(),
+                    requirement,
                     message.require_tls,
                     tracking,
                     tracking_id,
@@ -2453,22 +2684,24 @@ async fn deliver_to_remote(
             }
         };
         // TLS-RPT counts sessions, not messages: a reused connection is not new.
-        // Sessions are reported against the MTA-STS policy, when there is one.
-        if fresh_session
-            && mta_sts_policy
+        // Sessions are reported against the DANE or MTA-STS policy, if any.
+        let report_policy = requirement.report_policy().or_else(|| {
+            mta_sts_policy
                 .as_ref()
                 .is_some_and(|policy| policy.mode != MtaStsMode::None)
-        {
+                .then_some("sts")
+        });
+        if fresh_session && let Some(policy_type) = report_policy {
             match &connection {
-                Ok(connection) if connection.encrypted => {
-                    rmail_common::tlsrpt::record_success(domain, "sts", &key.host);
+                Ok(connection) if connection.tls != dane::TlsAuth::Plaintext => {
+                    rmail_common::tlsrpt::record_success(domain, policy_type, &key.host);
                 }
                 // Only a `testing` policy gets here unencrypted: `enforce`
                 // refuses plaintext above. Testing exists to report this.
                 Ok(_) => {
                     rmail_common::tlsrpt::record_failure(
                         domain,
-                        "sts",
+                        policy_type,
                         &key.host,
                         &format!("remote host {} does not offer STARTTLS", key.host),
                     );
@@ -2478,7 +2711,12 @@ async fn deliver_to_remote(
                     let lower = diagnostic.to_ascii_lowercase();
                     // Refused connections and 4xx greetings are not TLS failures.
                     if lower.contains("tls") || lower.contains("certificate") {
-                        rmail_common::tlsrpt::record_failure(domain, "sts", &key.host, &diagnostic);
+                        rmail_common::tlsrpt::record_failure(
+                            domain,
+                            policy_type,
+                            &key.host,
+                            &diagnostic,
+                        );
                     }
                 }
             }
@@ -2506,6 +2744,7 @@ async fn deliver_to_remote(
             None,
         );
         let capabilities = connection.capabilities;
+        connection.transactions += 1;
         match smtp_send_file_with_reader(
             &mut connection.reader,
             message_path,
@@ -2524,8 +2763,12 @@ async fn deliver_to_remote(
                     Some(recipient.clone()),
                     Some(250),
                 );
+                let handoff = Handoff {
+                    remote_mta: key.host.clone(),
+                    dsn: capabilities.dsn,
+                };
                 connections.recycle(key, connection).await;
-                return Ok(());
+                return Ok(handoff);
             }
             Err(error) => {
                 trace.emit("transaction", "failed", Some(error.to_string()), None);
@@ -2572,11 +2815,14 @@ async fn smtp_noop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish_smtp_connection(
     resolver: &TokioAsyncResolver,
     host: &str,
     port: u16,
-    require_encryption: bool,
+    implicit_tls: bool,
+    auth: Option<&(String, String)>,
+    requirement: dane::TlsRequirement<'_>,
     requiretls_message: bool,
     tracking: &TrackingHub,
     tracking_id: &str,
@@ -2600,15 +2846,13 @@ async fn establish_smtp_connection(
         Some(format!("{host}:{port}")),
         None,
     );
-    let mut encrypted = port == 465;
-    let boxed_stream: Box<dyn AsyncStream> = if encrypted {
-        let native = NativeTlsConnector::builder()
-            .build()
-            .context("building native TLS connector")?;
+    let mut tls = dane::TlsAuth::Plaintext;
+    let boxed_stream: Box<dyn AsyncStream> = if implicit_tls {
         let started = Instant::now();
-        let handshake = TokioTlsConnector::from(native).connect(host, stream).await;
+        let handshake = dane::connect(stream, host, requirement).await;
         rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
-        let tls_stream = handshake.context("TLS connect failed (implicit)")?;
+        let (tls_stream, auth) = handshake.context("implicit TLS")?;
+        tls = auth;
         Box::new(tls_stream)
     } else {
         Box::new(stream)
@@ -2642,7 +2886,7 @@ async fn establish_smtp_connection(
         parse_ehlo_capabilities(&ehlo_response)
     };
 
-    if port != 465 && capabilities.starttls {
+    if !implicit_tls && capabilities.starttls {
         reader.get_mut().write_all(b"STARTTLS\r\n").await?;
         trace.command("starttls", "STARTTLS", 10);
         reader.get_mut().flush().await?;
@@ -2652,15 +2896,12 @@ async fn establish_smtp_connection(
             return Err(rejected("STARTTLS", code, response));
         }
         let inner = reader.into_inner();
-        let native = NativeTlsConnector::builder()
-            .build()
-            .context("building native TLS connector")?;
         let started = Instant::now();
-        let handshake = TokioTlsConnector::from(native).connect(host, inner).await;
+        let handshake = dane::connect(inner, host, requirement).await;
         rmail_common::metrics::observe_tls_handshake_duration(started.elapsed());
-        let tls_stream = handshake.context("TLS connect failed")?;
+        let (tls_stream, auth) = handshake.context("STARTTLS")?;
         reader = BufReader::new(Box::new(tls_stream));
-        encrypted = true;
+        tls = auth;
         trace.emit("tls", "encrypted", Some(host.to_string()), None);
 
         reader.get_mut().write_all(ehlo.as_bytes()).await?;
@@ -2684,7 +2925,18 @@ async fn establish_smtp_connection(
         }
     }
 
-    if require_encryption && !encrypted {
+    if auth.is_some() && tls == dane::TlsAuth::Plaintext {
+        anyhow::bail!("relay {host} does not offer TLS, so its credentials are not sent");
+    }
+    if requirement.needs_tls() && tls == dane::TlsAuth::Plaintext {
+        if matches!(
+            requirement,
+            dane::TlsRequirement::Dane(_) | dane::TlsRequirement::Mandatory
+        ) {
+            return Err(anyhow::anyhow!(
+                "remote host {host} does not offer STARTTLS required by its DANE TLSA records"
+            ));
+        }
         if requiretls_message {
             return Err(permanent_delivery_error(
                 format!("remote host {host} does not offer STARTTLS required by REQUIRETLS"),
@@ -2694,13 +2946,41 @@ async fn establish_smtp_connection(
         anyhow::bail!("remote host {host} does not offer STARTTLS required by MTA-STS");
     }
 
+    if let Some((user, password)) = auth {
+        // Relay credentials go only to a server that proved its identity, so
+        // whoever intercepts the connection cannot collect them.
+        if !matches!(tls, dane::TlsAuth::Pkix | dane::TlsAuth::Dane) {
+            anyhow::bail!(
+                "relay {host} did not present a verified certificate, so its credentials are not sent"
+            );
+        }
+        if !capabilities.auth_plain {
+            anyhow::bail!("relay {host} does not offer AUTH PLAIN");
+        }
+        use base64::Engine;
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{password}"));
+        reader
+            .get_mut()
+            .write_all(format!("AUTH PLAIN {token}\r\n").as_bytes())
+            .await?;
+        trace.command("auth", "AUTH PLAIN ****", 0);
+        reader.get_mut().flush().await?;
+        let (code, response) = read_response(&mut reader).await?;
+        trace.reply("auth", code, &response);
+        if code != 235 {
+            return Err(rejected("AUTH", code, response));
+        }
+    }
+
     Ok(SmtpConnection {
         reader,
         capabilities,
-        encrypted,
+        tls,
         connection_id,
         peer_addr,
         local_addr,
+        transactions: 0,
     })
 }
 
@@ -2810,6 +3090,29 @@ mod tests {
     }
 
     #[test]
+    fn relayed_notification_names_both_mtas_and_the_arrival_time() {
+        let mut control = rmail_common::outbound::QueueControl::new(5, 0);
+        control.created_at = 1_700_000_000;
+        let notification = build_failure_notification(
+            "sender@example.test",
+            "user@remote.test",
+            &control,
+            &rmail_common::outbound::DsnOptions::default(),
+            DeliveryNotificationKind::Relayed {
+                remote_mta: "mx.remote.test",
+            },
+            false,
+            b"Subject: original\r\n\r\n",
+        );
+        let notification = String::from_utf8(notification).unwrap();
+        assert!(notification.contains("Action: relayed\r\nStatus: 2.0.0\r\n"));
+        assert!(notification.contains("Remote-MTA: dns; mx.remote.test\r\n"));
+        assert!(notification.contains(&format!("Reporting-MTA: dns; {}\r\n", helo_name())));
+        assert!(!notification.contains("@localhost"));
+        assert!(notification.contains("Arrival-Date: Tue, 14 Nov 2023 22:13:20 +0000\r\n"));
+    }
+
+    #[test]
     fn failure_notification_is_a_loop_safe_delivery_status_report() {
         let mut control = rmail_common::outbound::QueueControl::new(5, 0);
         control.last_smtp_code = Some(550);
@@ -2853,6 +3156,18 @@ mod tests {
     }
 
     #[test]
+    fn limits_mailmax_is_read_and_bad_values_are_ignored() {
+        let parsed = |limits: &str| {
+            parse_ehlo_capabilities(&format!("250-mx.example.test\r\n250 LIMITS {limits}")).mail_max
+        };
+        assert_eq!(parsed("RCPTMAX=20 MAILMAX=5"), Some(5));
+        assert_eq!(parsed("mailmax=7"), Some(7));
+        assert_eq!(parsed("MAILMAX=0"), None);
+        assert_eq!(parsed("MAILMAX=1234567"), None);
+        assert_eq!(parsed("MAILMAX=x RCPTMAX=3"), None);
+    }
+
+    #[test]
     fn mail_command_handles_null_sender_and_required_content_extensions() {
         let all = SmtpCapabilities {
             eight_bit_mime: true,
@@ -2862,6 +3177,9 @@ mod tests {
             binary_mime: true,
             require_tls: true,
             dsn: false,
+            auth_plain: false,
+            pipelining: false,
+            mail_max: None,
         };
         assert_eq!(
             build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
@@ -3102,6 +3420,9 @@ mod tests {
                 binary_mime: true,
                 require_tls: false,
                 dsn: false,
+                auth_plain: false,
+                pipelining: false,
+                mail_max: None,
             },
             None,
         )
@@ -3116,6 +3437,7 @@ mod tests {
         let key = DestinationKey {
             host: "mx.example.test".to_string(),
             port: 25,
+            user: None,
         };
         let (first_client, _first_server) = tokio::io::duplex(64);
         pool.recycle(
@@ -3123,10 +3445,11 @@ mod tests {
             SmtpConnection {
                 reader: BufReader::new(Box::new(first_client)),
                 capabilities: SmtpCapabilities::default(),
-                encrypted: false,
+                tls: dane::TlsAuth::Plaintext,
                 connection_id: "first".into(),
                 peer_addr: None,
                 local_addr: None,
+                transactions: 0,
             },
         )
         .await;
@@ -3136,10 +3459,11 @@ mod tests {
             SmtpConnection {
                 reader: BufReader::new(Box::new(second_client)),
                 capabilities: SmtpCapabilities::default(),
-                encrypted: false,
+                tls: dane::TlsAuth::Plaintext,
                 connection_id: "second".into(),
                 peer_addr: None,
                 local_addr: None,
+                transactions: 0,
             },
         )
         .await;
@@ -3148,6 +3472,7 @@ mod tests {
             pool.take(&DestinationKey {
                 host: "other-mx.example.test".to_string(),
                 port: 25,
+                user: None,
             })
             .await
             .is_none()
@@ -3249,6 +3574,9 @@ mod tests {
                 binary_mime: true,
                 require_tls: false,
                 dsn: false,
+                auth_plain: false,
+                pipelining: false,
+                mail_max: None,
             },
         )
         .await
@@ -3264,5 +3592,284 @@ mod tests {
         // Nothing queued: keep retrying while recent, give up when stale.
         assert!(!tls_report_settled(0, false));
         assert!(tls_report_settled(0, true));
+    }
+
+    /// A fake relay: STARTTLS (when `tls`) with a self-signed certificate,
+    /// then AUTH PLAIN. Returns the AUTH line it received, if any.
+    fn relay_certificate() -> (
+        openssl::pkey::PKey<openssl::pkey::Private>,
+        openssl::x509::X509,
+    ) {
+        let key =
+            openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = openssl::x509::X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "relay.test").unwrap();
+        let name = name.build();
+        let mut cert = openssl::x509::X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert.sign(&key, openssl::hash::MessageDigest::sha256())
+            .unwrap();
+        (key, cert.build())
+    }
+
+    /// A relay that offers STARTTLS with `tls` (or no TLS at all) and
+    /// returns the first command it receives after EHLO, if any.
+    async fn fake_relay(
+        listener: tokio::net::TcpListener,
+        tls: Option<(
+            openssl::pkey::PKey<openssl::pkey::Private>,
+            openssl::x509::X509,
+        )>,
+    ) -> Option<String> {
+        use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
+        use tokio::io::AsyncBufReadExt;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut plain = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        plain
+            .get_mut()
+            .write_all(b"220 relay ready\r\n")
+            .await
+            .unwrap();
+        plain.read_line(&mut line).await.unwrap();
+        let Some((key, cert)) = tls else {
+            plain
+                .get_mut()
+                .write_all(b"250-relay\r\n250 AUTH PLAIN\r\n")
+                .await
+                .unwrap();
+            line.clear();
+            let _ = plain.read_line(&mut line).await;
+            return (!line.is_empty()).then_some(line);
+        };
+        plain
+            .get_mut()
+            .write_all(b"250-relay\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n")
+            .await
+            .unwrap();
+        line.clear();
+        plain.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "STARTTLS\r\n");
+        plain
+            .get_mut()
+            .write_all(b"220 go ahead\r\n")
+            .await
+            .unwrap();
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor.set_private_key(&key).unwrap();
+        acceptor.set_certificate(&cert).unwrap();
+        let acceptor = acceptor.build();
+        let mut tls_stream = tokio_openssl::SslStream::new(
+            Ssl::new(acceptor.context()).unwrap(),
+            plain.into_inner(),
+        )
+        .unwrap();
+        std::pin::Pin::new(&mut tls_stream).accept().await.unwrap();
+        let mut secure = tokio::io::BufReader::new(tls_stream);
+        line.clear();
+        secure.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("EHLO "), "{line}");
+        secure
+            .get_mut()
+            .write_all(b"250-relay\r\n250 AUTH PLAIN LOGIN\r\n")
+            .await
+            .unwrap();
+        line.clear();
+        // The client hangs up instead when it refuses to authenticate.
+        if secure.read_line(&mut line).await.is_err() || line.is_empty() {
+            return None;
+        }
+        secure
+            .get_mut()
+            .write_all(b"235 2.7.0 Accepted\r\n")
+            .await
+            .unwrap();
+        Some(line)
+    }
+
+    #[tokio::test]
+    async fn relay_credentials_are_sent_only_to_a_verified_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = TrackingHub::start(dir.path(), "outbound-test").unwrap();
+        let resolver = outbound_resolver().await.unwrap();
+        let credentials = ("relay-user".to_string(), "s3cret".to_string());
+
+        // A certificate the relay's TLSA records pin is verified.
+        let (key, cert) = relay_certificate();
+        let pinned = [dane::TlsaRecord {
+            usage: 3,
+            selector: 0,
+            mtype: 0,
+            data: cert.to_der().unwrap(),
+        }];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_relay(listener, Some((key, cert))));
+        let connection = establish_smtp_connection(
+            resolver,
+            "127.0.0.1",
+            port,
+            false,
+            Some(&credentials),
+            dane::TlsRequirement::Dane(&pinned),
+            false,
+            &hub,
+            "t1",
+        )
+        .await
+        .expect("authenticated relay session");
+        assert_eq!(connection.tls, dane::TlsAuth::Dane);
+        assert_eq!(
+            server.await.unwrap().as_deref(),
+            // base64 of "\0relay-user\0s3cret"
+            Some("AUTH PLAIN AHJlbGF5LXVzZXIAczNjcmV0\r\n")
+        );
+
+        // Encryption alone is not enough: anyone on the path can present a
+        // self-signed certificate.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_relay(listener, Some(relay_certificate())));
+        let error = establish_smtp_connection(
+            resolver,
+            "127.0.0.1",
+            port,
+            false,
+            Some(&credentials),
+            dane::TlsRequirement::Opportunistic,
+            false,
+            &hub,
+            "t2",
+        )
+        .await
+        .err()
+        .expect("unverified relay refused");
+        assert!(
+            format!("{error:#}").contains("did not present a verified certificate"),
+            "{error:#}"
+        );
+        assert_eq!(server.await.unwrap(), None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_relay(listener, None));
+        let error = establish_smtp_connection(
+            resolver,
+            "127.0.0.1",
+            port,
+            false,
+            Some(&credentials),
+            dane::TlsRequirement::Opportunistic,
+            false,
+            &hub,
+            "t3",
+        )
+        .await
+        .err()
+        .expect("plaintext relay refused");
+        assert!(
+            format!("{error:#}").contains("does not offer TLS"),
+            "{error:#}"
+        );
+        // The credentials never went out.
+        assert_eq!(server.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn tls_reports_post_gzip_and_treat_errors_as_failures() {
+        use tokio::io::AsyncReadExt;
+        async fn serve(listener: tokio::net::TcpListener, status: &'static str) -> String {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, body)) = text.split_once("\r\n\r\n")
+                    && head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_string)
+                        })
+                        .and_then(|length| length.trim().parse::<usize>().ok())
+                        .is_some_and(|length| body.len() >= length)
+                {
+                    break;
+                }
+            }
+            stream
+                .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tlsrpt", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve(listener, "201 Created"));
+        post_tls_report(&url, b"gzdata").await.unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /tlsrpt "), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/tlsrpt+gzip")
+        );
+        assert!(request.ends_with("gzdata"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tlsrpt", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve(listener, "500 Internal Server Error"));
+        assert!(post_tls_report(&url, b"gzdata").await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mail_and_rcpt_are_pipelined_when_offered() {
+        use tokio::io::AsyncBufReadExt;
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut server = tokio::io::BufReader::new(server);
+            let (mut mail, mut rcpt) = (String::new(), String::new());
+            server.read_line(&mut mail).await.unwrap();
+            // Both commands are already sent before any reply goes out.
+            server.read_line(&mut rcpt).await.unwrap();
+            server
+                .get_mut()
+                .write_all(b"250 2.1.0 OK\r\n550 5.1.1 No such user\r\n")
+                .await
+                .unwrap();
+            (mail, rcpt)
+        });
+        let mut reader: BufReader<Box<dyn AsyncStream>> = BufReader::new(Box::new(client));
+        let capabilities = SmtpCapabilities {
+            pipelining: true,
+            ..SmtpCapabilities::default()
+        };
+        let error = smtp_begin_transaction(
+            &mut reader,
+            Some("sender@example.test"),
+            "missing@example.net",
+            &MessageRequirements::default(),
+            false,
+            None,
+            &capabilities,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("RCPT TO"), "{error:#}");
+        let (mail, rcpt) = server.await.unwrap();
+        assert_eq!(mail, "MAIL FROM:<sender@example.test>\r\n");
+        assert_eq!(rcpt, "RCPT TO:<missing@example.net>\r\n");
     }
 }

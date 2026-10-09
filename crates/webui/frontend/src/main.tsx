@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, FolderTree, Gauge, LockKeyhole, LogOut, Menu, Monitor, Moon, Network, Send, Server, SlidersHorizontal, Sun, Users, X } from 'lucide-react';
+import { Activity, FolderTree, Gauge, Globe, LockKeyhole, LogOut, Menu, Monitor, Moon, Network, Send, Server, SlidersHorizontal, Sun, Users, X } from 'lucide-react';
 import { api, errorMessage, onUnauthorized, QueueSummary, Session, SettingsView } from './api';
 import { confirmLeave, FeedbackProvider, Field, useResource } from './ui';
 import { OverviewPage } from './pages/Overview';
 import { AccountsPage } from './pages/Accounts';
 import { RoutingPage } from './pages/Routing';
+import { DomainsPage } from './pages/Domains';
 import { DeliveryPage } from './pages/Delivery';
 import { SettingsPage } from './pages/Settings';
 import { CertificatesPage } from './pages/Certificates';
@@ -14,12 +15,13 @@ import { ObservabilityPage } from './pages/Observability';
 import { AdminCredentialsForm, SystemPage } from './pages/System';
 import './style.css';
 
-export type Page = 'overview' | 'accounts' | 'routing' | 'delivery' | 'organization' | 'settings' | 'certificates' | 'observability' | 'system';
+export type Page = 'overview' | 'accounts' | 'routing' | 'domains' | 'delivery' | 'organization' | 'settings' | 'certificates' | 'observability' | 'system';
 
 const pageMeta: Record<Page, { path: string; label: string; description: string; icon: React.ElementType }> = {
   overview: { path: '/', label: 'Overview', description: 'Health, storage and delivery at a glance.', icon: Gauge },
   accounts: { path: '/accounts', label: 'Mailboxes', description: 'Create mailboxes, reset passwords and manage quotas.', icon: Users },
-  routing: { path: '/routing', label: 'Routing', description: 'Aliases and per-domain catchalls.', icon: Network },
+  routing: { path: '/routing', label: 'Routing', description: 'Aliases, catchalls and outbound delivery routes.', icon: Network },
+  domains: { path: '/domains', label: 'Domains & DNS', description: 'DKIM signing keys and the DNS records to publish for each domain.', icon: Globe },
   delivery: { path: '/delivery', label: 'Delivery', description: 'Inspect and recover the outbound queue.', icon: Send },
   organization: { path: '/organization', label: 'Organization', description: 'Choose, download and test the local or hosted models that suggest folders for new mail.', icon: FolderTree },
   settings: { path: '/settings', label: 'Settings', description: 'Listeners, TLS, authentication, limits and filtering. Stored in the database.', icon: SlidersHorizontal },
@@ -30,7 +32,7 @@ const pageMeta: Record<Page, { path: string; label: string; description: string;
 
 const navGroups: { label: string; pages: Page[] }[] = [
   { label: 'Workspace', pages: ['overview'] },
-  { label: 'Mail', pages: ['accounts', 'routing', 'delivery', 'organization'] },
+  { label: 'Mail', pages: ['accounts', 'routing', 'domains', 'delivery', 'organization'] },
   { label: 'Server', pages: ['settings', 'certificates', 'observability', 'system'] },
 ];
 
@@ -93,7 +95,7 @@ function useNavBadges(): Partial<Record<Page, { count: number; tone: 'warn' | 'e
   const badges: ReturnType<typeof useNavBadges> = {};
   if (queue.data?.failed) badges.delivery = { count: queue.data.failed, tone: 'error', label: `${queue.data.failed} failed` };
   const view = settings.data;
-  const restarts = view && view.managed ? view.services.filter((service) => service.restart_required).length : 0;
+  const restarts = view ? view.services.filter((service) => service.restart_required).length : 0;
   if (restarts) badges.settings = { count: restarts, tone: 'warn', label: `${restarts} service${restarts === 1 ? '' : 's'} need a restart` };
   return badges;
 }
@@ -145,14 +147,6 @@ function LoginScreen({ onLogin }: { onLogin: (session: Session) => void }) {
 }
 
 function SetupScreen({ session, onDone }: { session: Session; onDone: (session: Session) => void }) {
-  if (!session.settings_managed) {
-    return (
-      <AuthScreen title="Finish setting up" subtitle="No admin credentials are configured.">
-        <p>This console is only reachable from this machine until you set <code>web_admin_user</code> and <code>web_admin_password_hash</code> in the configuration file (generate the hash with <code>rmail_ctl hash</code>), or configure a <code>db_path</code> to manage settings here.</p>
-        <button className="button primary" onClick={() => onDone({ ...session, setup_required: false })}>Continue without a password</button>
-      </AuthScreen>
-    );
-  }
   return (
     <AuthScreen title="Create the admin account" subtitle="No admin account exists yet. Choose the credentials you will use to sign in.">
       <AdminCredentialsForm setup session={session} onChanged={(user) => onDone({ ...session, user, authenticated: true, setup_required: false })} />
@@ -244,6 +238,7 @@ function Console({ session, setSession }: { session: Session; setSession: (sessi
         {page === 'overview' && <OverviewPage navigate={navigate} />}
         {page === 'accounts' && <AccountsPage />}
         {page === 'routing' && <RoutingPage />}
+        {page === 'domains' && <DomainsPage />}
         {page === 'delivery' && <DeliveryPage />}
         {page === 'organization' && <OrganizationPage />}
         {page === 'settings' && <SettingsPage />}

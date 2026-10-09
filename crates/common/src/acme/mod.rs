@@ -413,11 +413,7 @@ pub struct RunOutcome {
 /// Request a certificate now and install it (unless `dry_run`). Only one
 /// run can be active at a time across all processes.
 pub async fn run(config: &Config, options: RunOptions) -> Result<RunOutcome> {
-    let db_path = config
-        .global
-        .db_path
-        .clone()
-        .ok_or_else(|| anyhow!("ACME needs the settings database (global.db_path)"))?;
+    let db_path = config.global.db_path.clone();
     let Some(_lock) = RunLock::acquire(&lock_path(config))? else {
         bail!("another certificate request is already running");
     };
@@ -1093,9 +1089,7 @@ fn point_settings_at(
     if !repoint && config.global.tls_cert.is_some() && config.global.tls_key.is_some() {
         return Ok(false);
     }
-    let Some(db_path) = config.global.db_path.as_deref() else {
-        return Ok(false);
-    };
+    let db_path = config.global.db_path.as_str();
     let mut conn = crate::settings::open(db_path)?;
     let changes = BTreeMap::from([
         (
@@ -1224,11 +1218,7 @@ pub async fn renew_if_due(config: &Config, trigger: &str) -> Result<Option<RunOu
     if !config.acme.enabled {
         return Ok(None);
     }
-    let db_path = config
-        .global
-        .db_path
-        .clone()
-        .ok_or_else(|| anyhow!("ACME needs the settings database (global.db_path)"))?;
+    let db_path = config.global.db_path.clone();
     let status = load_status(&db_path)?;
     if status.retry_after.is_some_and(|at| at > now()) {
         return Ok(None);
@@ -1263,7 +1253,7 @@ mod tests {
 
     fn config(extra: &str) -> Config {
         toml::from_str(&format!(
-            "[global]\nmail_root = \"mail\"\nhostname = \"mail.example.com\"\n{extra}"
+            "[global]\nmail_root = \"mail\"\ndb_path = \"rmail.db\"\nhostname = \"mail.example.com\"\n{extra}"
         ))
         .unwrap()
     }

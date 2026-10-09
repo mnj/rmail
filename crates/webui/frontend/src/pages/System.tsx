@@ -56,7 +56,7 @@ export function SystemPage({ session, onSessionChange }: { session: Session; onS
   const ready = useResource(readiness, [], 60000);
   const settings = useResource(() => api<SettingsView>('/api/settings'), [], 30000, 'settings');
   const view = settings.data;
-  const services = view && view.managed ? view.services : [];
+  const services = view ? view.services : [];
   const checks = Object.entries(ready.data?.checks || {}).sort(([a, x], [b, y]) => checkOrder[x.status] - checkOrder[y.status] || a.localeCompare(b));
   const failing = checks.filter(([, check]) => check.status === 'error').length;
 
@@ -90,9 +90,7 @@ export function SystemPage({ session, onSessionChange }: { session: Session; onS
           </div>
         </Panel>
         <Panel title="Admin account" subtitle={session.user ? `Signed in as ${session.user}` : undefined}>
-          {session.settings_managed
-            ? <AdminCredentialsForm session={session} onChanged={(user) => onSessionChange({ ...session, user, authenticated: true, setup_required: false })} />
-            : <Empty>Admin credentials come from <code>web_admin_user</code> and <code>web_admin_password_hash</code> in the configuration file.</Empty>}
+          <AdminCredentialsForm session={session} onChanged={(user) => onSessionChange({ ...session, user, authenticated: true, setup_required: false })} />
         </Panel>
       </section>
 
@@ -116,7 +114,7 @@ export function SystemPage({ session, onSessionChange }: { session: Session; onS
             </tbody>
           </table>
         </div>
-        {view && !services.length && <Empty>{!view.managed ? 'Service tracking needs a settings database (db_path).' : 'No service has recorded a start yet.'}</Empty>}
+        {view && !services.length && <Empty>No service has recorded a start yet.</Empty>}
       </Panel>
 
       <Panel title="Operator endpoints">

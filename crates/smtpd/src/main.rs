@@ -64,6 +64,13 @@ pub(crate) const STARTTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 static SERVER_HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Domain announced in greetings, EHLO/HELO replies and Received headers.
+/// The HMAC key for SRS addresses (see `rmail_common::srs`).
+static SRS_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+pub(crate) fn srs_key() -> &'static [u8] {
+    SRS_KEY.get().map_or(&[], Vec::as_slice)
+}
+
 pub(crate) fn server_hostname() -> &'static str {
     SERVER_HOSTNAME.get_or_init(rmail_common::config::system_hostname)
 }
@@ -91,7 +98,10 @@ async fn main() -> Result<()> {
         std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string());
     let cfg = Config::load(&cfg_path).context(format!("loading {}", cfg_path))?;
     rmail_common::runtime::set_log_level(cfg.global.log_level.as_deref());
+    rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
+        .context("security.proxy_protocol_trusted_networks")?;
     let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
+    rmail_common::dkim::use_database(&cfg.global.db_path);
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "smtpd") {
         smtp_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
     }
@@ -115,10 +125,11 @@ async fn main() -> Result<()> {
         "smtpd",
     )?;
     // SQLite DB is the authoritative source for mailboxes and catchalls
-    let Some(db_path) = cfg.global.db_path.clone() else {
-        smtp_log!("error", "configuration_invalid", { "field": "global.db_path" });
-        std::process::exit(1);
-    };
+    let db_path = cfg.global.db_path.clone();
+    let srs_key = rmail_common::settings::open(&db_path)
+        .and_then(|mut conn| rmail_common::settings::internal_secret(&mut conn, "srs_key"))
+        .context("loading the SRS key")?;
+    let _ = SRS_KEY.set(srs_key.into_bytes());
     if let Err(e) = rmail_common::db::init_db(&db_path) {
         smtp_log!("error", "database_initialization_failed", { "path": db_path, "error": e.to_string() });
         std::process::exit(1);

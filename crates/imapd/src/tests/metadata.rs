@@ -183,3 +183,45 @@ async fn annotations_follow_rename_and_go_away_with_delete() {
     );
     session.finish().await;
 }
+
+#[tokio::test]
+async fn list_returns_metadata_after_each_mailbox() {
+    let mut session = authenticated_session(0).await;
+    session.command("C1 CREATE Projects", "C1 OK").await;
+    session
+        .command(
+            "S1 SETMETADATA INBOX (/shared/vendor/x/color \"#b71c1c\")",
+            "S1 OK",
+        )
+        .await;
+    let listed = session
+        .command(
+            "L1 LIST \"\" % RETURN (METADATA (/shared/vendor/x/color))",
+            "L1 OK",
+        )
+        .await;
+    let lines = listed
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>();
+    let inbox = lines
+        .iter()
+        .position(|line| line.starts_with("* LIST") && line.ends_with("\"INBOX\""))
+        .expect("INBOX listed");
+    assert_eq!(
+        lines[inbox + 1],
+        "* METADATA \"INBOX\" (\"/shared/vendor/x/color\" \"#b71c1c\")"
+    );
+    let projects = lines
+        .iter()
+        .position(|line| line.starts_with("* LIST") && line.ends_with("\"Projects\""))
+        .expect("Projects listed");
+    assert_eq!(
+        lines[projects + 1],
+        "* METADATA \"Projects\" (\"/shared/vendor/x/color\" NIL)"
+    );
+    session
+        .command("L2 LIST \"\" % RETURN (METADATA (color))", "L2 BAD")
+        .await;
+    session.finish().await;
+}

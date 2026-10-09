@@ -38,16 +38,17 @@ pub(crate) fn handle(
         Ok(quota) => quota,
         Err(error) => return unavailable(tag, &error.to_string()),
     };
+    // RFC 9208: an unlimited account has no quota root, since a QUOTA
+    // response needs at least one resource with a limit.
     let quota_line = quota_response(quota);
     match command {
         Command::GetQuota => {
-            if !argument.is_empty() {
-                return Response::new().status(StatusLine::tagged(
-                    tag,
-                    Status::No,
-                    "No such quota root",
-                ));
-            }
+            let Some(quota_line) = quota_line.filter(|_| argument.is_empty()) else {
+                return Response::new().status(
+                    StatusLine::tagged(tag, Status::No, "No such quota root")
+                        .with_code("NONEXISTENT"),
+                );
+            };
             Response::new().data(quota_line).status(StatusLine::tagged(
                 tag,
                 Status::Ok,
@@ -65,17 +66,20 @@ pub(crate) fn handle(
                 &local,
                 &mailbox_name,
             ) {
-                Ok(true) => Response::new()
-                    .data(format!(
-                        "QUOTAROOT {} \"\"",
-                        mailbox::quote_wire_mailbox_name(&mailbox_name, utf8_accept)
-                    ))
-                    .data(quota_line)
-                    .status(StatusLine::tagged(
+                Ok(true) => {
+                    let mailbox_name = mailbox::quote_wire_mailbox_name(&mailbox_name, utf8_accept);
+                    let response = match quota_line {
+                        Some(quota_line) => Response::new()
+                            .data(format!("QUOTAROOT {mailbox_name} \"\""))
+                            .data(quota_line),
+                        None => Response::new().data(format!("QUOTAROOT {mailbox_name}")),
+                    };
+                    response.status(StatusLine::tagged(
                         tag,
                         Status::Ok,
                         "GETQUOTAROOT completed",
-                    )),
+                    ))
+                }
                 Ok(false) => Response::new().status(StatusLine::tagged(
                     tag,
                     Status::No,
@@ -88,15 +92,14 @@ pub(crate) fn handle(
     }
 }
 
-fn quota_response((used, limit): (u64, Option<u64>)) -> String {
-    match limit {
-        Some(limit) => format!(
+fn quota_response((used, limit): (u64, Option<u64>)) -> Option<String> {
+    limit.map(|limit| {
+        format!(
             "QUOTA \"\" (STORAGE {} {})",
             used.div_ceil(1024),
             limit.div_ceil(1024)
-        ),
-        None => "QUOTA \"\" ()".to_string(),
-    }
+        )
+    })
 }
 
 fn bad(tag: &str, message: &str) -> Response {
@@ -112,11 +115,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quota_response_uses_1024_octet_units_and_reports_unlimited_roots() {
+    fn quota_response_uses_1024_octet_units_and_unlimited_accounts_have_no_root() {
         assert_eq!(
-            quota_response((1025, Some(4096))),
-            "QUOTA \"\" (STORAGE 2 4)"
+            quota_response((1025, Some(4096))).as_deref(),
+            Some("QUOTA \"\" (STORAGE 2 4)")
         );
-        assert_eq!(quota_response((0, None)), "QUOTA \"\" ()");
+        assert_eq!(quota_response((0, None)), None);
     }
 }

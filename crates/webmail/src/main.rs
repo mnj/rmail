@@ -6,7 +6,6 @@
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use rmail_common::{
     config::Config, http::serve_connection, net::bind_tcp_listener_with_config,
     runtime::GracefulShutdown, throttle::AuthThrottle, websession,
@@ -31,27 +30,16 @@ async fn main() -> Result<()> {
     let mail_root = PathBuf::from(&cfg.global.mail_root);
     rmail_common::runtime::redirect_stdio_to_log(&mail_root, "webmail")
         .context("redirecting logs")?;
-    let db_path = cfg
-        .global
-        .db_path
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| mail_root.join("rmail.sqlite"));
+    let db_path = PathBuf::from(&cfg.global.db_path);
     if let Err(error) = rmail_common::settings::record_service_start(&cfg, "webmail") {
         webmail_log!("warn", "service_state_failed", { "error": format!("{error:#}") });
     }
-    let session_secret = match (&cfg.global.webmail_session_secret, &cfg.global.db_path) {
-        (Some(secret), _) => secret.clone(),
+    let session_secret = match &cfg.global.webmail_session_secret {
+        Some(secret) => secret.clone(),
         // Persist a generated key so sessions survive restarts.
-        (None, Some(db_path)) => {
-            let mut conn = rmail_common::settings::open(db_path)?;
+        None => {
+            let mut conn = rmail_common::settings::open(&db_path)?;
             rmail_common::settings::internal_secret(&mut conn, "webmail_session_key")?
-        }
-        (None, None) => {
-            webmail_log!("warn", "ephemeral_session_secret", { "reason": "no database or webmail_session_secret; sessions end on restart" });
-            let mut bytes = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
-            base64::engine::general_purpose::STANDARD.encode(bytes)
         }
     }
     .into_bytes();

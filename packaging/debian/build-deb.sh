@@ -116,6 +116,8 @@ if ! id -u rmail >/dev/null 2>&1; then
 fi
 mkdir -p /opt/rmail/mail /opt/rmail/config /etc/rmail
 chown -R rmail:rmail /opt/rmail
+# The database holds password hashes, DKIM keys and relay passwords.
+chmod 0700 /opt/rmail/config
 systemctl daemon-reload || true
 # Lets the admin console restart services after settings changes.
 systemctl enable --now rmail_restart.path >/dev/null 2>&1 || true
@@ -127,18 +129,6 @@ if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
     rmail_webmail.service \
     rmail_outbound.service \
     rmail_classifier.service >/dev/null 2>&1 || true
-fi
-# On upgrade, import legacy file settings into the database (as the service
-# user, so the database stays rmail-owned) and comment them out of the config.
-if [ "$1" = "configure" ] && [ -n "${2:-}" ] && [ -f /etc/rmail/config.toml ]; then
-  tidied="$(mktemp)"
-  if runuser -u rmail -- /usr/bin/rmail_ctl settings tidy-config --stdout \
-      --config /etc/rmail/config.toml >"$tidied" 2>/dev/null \
-    && [ -s "$tidied" ] && ! cmp -s "$tidied" /etc/rmail/config.toml; then
-    cp -p /etc/rmail/config.toml /etc/rmail/config.toml.pre-db
-    cat "$tidied" >/etc/rmail/config.toml
-  fi
-  rm -f "$tidied"
 fi
 EOF
 chmod 0755 "${PKG_ROOT}/DEBIAN/postinst"

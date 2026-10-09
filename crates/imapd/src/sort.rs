@@ -14,6 +14,8 @@ pub(crate) struct SortRecord {
     date: i64,
     size: usize,
     cc: String,
+    display_from: String,
+    display_to: String,
     from: String,
     subject: String,
     to: String,
@@ -33,6 +35,8 @@ impl SortRecord {
             date,
             size: data.len(),
             cc: normalized_mailbox(first_header(&headers, "cc")),
+            display_from: display_name(first_header(&headers, "from")),
+            display_to: display_name(first_header(&headers, "to")),
             from: normalized_mailbox(first_header(&headers, "from")),
             subject: normalized_string(&base_subject(
                 &first_header(&headers, "subject")
@@ -54,6 +58,8 @@ pub(crate) fn compare_records(
             SortKey::Arrival => left.arrival.cmp(&right.arrival),
             SortKey::Cc => left.cc.cmp(&right.cc),
             SortKey::Date => left.date.cmp(&right.date),
+            SortKey::DisplayFrom => left.display_from.cmp(&right.display_from),
+            SortKey::DisplayTo => left.display_to.cmp(&right.display_to),
             SortKey::From => left.from.cmp(&right.from),
             SortKey::Size => left.size.cmp(&right.size),
             SortKey::Subject => left.subject.cmp(&right.subject),
@@ -120,6 +126,26 @@ fn normalized_mailbox(value: Option<&str>) -> String {
         .next()
         .unwrap_or("");
     normalized_string(mailbox)
+}
+
+/// RFC 5957 section 2: the first mailbox's display name, or its address
+/// when it has none.
+fn display_name(value: Option<&str>) -> String {
+    let value = value.map(decode_rfc2047).unwrap_or_default();
+    let first = value.split(',').next().unwrap_or("").trim();
+    let display = match first.rfind('<') {
+        Some(start) => {
+            let name = first[..start].trim().trim_matches('"').trim();
+            if name.is_empty() {
+                let tail = &first[start + 1..];
+                &tail[..tail.find('>').unwrap_or(tail.len())]
+            } else {
+                name
+            }
+        }
+        None => first,
+    };
+    normalized_string(display.trim())
 }
 
 pub(crate) fn decode_rfc2047(value: &str) -> String {
@@ -258,6 +284,36 @@ mod tests {
         assert_eq!(decode_rfc2047("=?UTF-8?Q?J=C3=B8rgen?="), "Jørgen");
         assert_eq!(decode_rfc2047("=?UTF-8?B?SsO4cmdlbg==?="), "Jørgen");
         assert_eq!(base_subject(" Re: [list] Fwd: topic (fwd) "), "topic");
+    }
+
+    #[test]
+    fn display_keys_use_the_display_name_or_the_address() {
+        assert_eq!(
+            display_name(Some("\"Zoe Adams\" <a@example.test>")),
+            "zoe adams"
+        );
+        assert_eq!(display_name(Some("<bob@example.test>")), "bob@example.test");
+        assert_eq!(
+            display_name(Some("carol@example.test, Dave <d@x>")),
+            "carol@example.test"
+        );
+        assert_eq!(
+            display_name(Some("=?UTF-8?Q?=C3=85se?= <a@x>")),
+            "a\u{30a}se"
+        );
+        assert_eq!(display_name(None), "");
+        let zoe = SortRecord::from_message(1, 1, 0, b"From: Zoe <a@example.test>\r\n\r\n");
+        let bob = SortRecord::from_message(2, 2, 0, b"From: <bob@example.test>\r\n\r\n");
+        let by_display = [SortCriterion {
+            key: SortKey::DisplayFrom,
+            reverse: false,
+        }];
+        let by_mailbox = [SortCriterion {
+            key: SortKey::From,
+            reverse: false,
+        }];
+        assert_eq!(compare_records(&bob, &zoe, &by_display), Ordering::Less);
+        assert_eq!(compare_records(&zoe, &bob, &by_mailbox), Ordering::Less);
     }
 
     #[test]

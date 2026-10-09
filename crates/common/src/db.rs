@@ -24,6 +24,47 @@ pub struct Mailbox {
 use serde_json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Make a database readable by its owner only: they hold password hashes,
+/// DKIM private keys, relay passwords, message text and connection
+/// metadata. Pooled connections and the tracking database apply it when
+/// they open a file; settings::open does too. SQLite gives the `-wal` and `-shm`
+/// files it creates the database's mode, and existing ones are fixed here.
+pub fn restrict_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use anyhow::Context;
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let file = std::path::PathBuf::from(file);
+            let mode = match std::fs::metadata(&file) {
+                Ok(metadata) => metadata.permissions().mode(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", file.display()));
+                }
+            };
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode & 0o7700))
+                    .with_context(|| format!("restricting permissions of {}", file.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`restrict_permissions`], logging instead of failing: a database the
+/// process may use but does not own (an operator's tool, say) stays usable.
+pub fn restrict_permissions_or_warn(path: &Path) {
+    if let Err(error) = restrict_permissions(path) {
+        crate::structured_log!("warn", "sqlite", "permissions_not_restricted", {
+            "path": path.display().to_string(),
+            "error": format!("{error:#}"),
+        });
+    }
+}
+
 /// Initialize SQLite DB schema if not present
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
@@ -134,6 +175,31 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             count INTEGER NOT NULL,
             info TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (day, domain, policy_type, mx_host, result)
+        ) WITHOUT ROWID;
+
+        -- DKIM keys (see dkim.rs): every key for a domain signs its mail; the
+        -- one with arc = 1 seals forwarded mail.
+        CREATE TABLE IF NOT EXISTS dkim_keys (
+            domain TEXT NOT NULL,
+            selector TEXT NOT NULL,
+            algorithm TEXT NOT NULL,
+            private_key TEXT NOT NULL,
+            arc INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (domain, selector)
+        ) WITHOUT ROWID;
+
+        -- Delivery routes (see transport.rs); domain '*' is the default route.
+        CREATE TABLE IF NOT EXISTS transport_routes (
+            domain TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            host TEXT,
+            port INTEGER,
+            implicit_tls INTEGER NOT NULL DEFAULT 0,
+            username TEXT,
+            password TEXT,
+            reply TEXT,
+            updated_at INTEGER NOT NULL
         ) WITHOUT ROWID;
 
         -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
@@ -1065,6 +1131,24 @@ mod tests {
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn database_files_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempdir().expect("tempdir");
+        let db = td.path().join("rmail.db");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        init_db(&db).expect("init db");
+        crate::settings::open(&db).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = td.path().join(format!("rmail.db{suffix}"));
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600, "{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn sieve_scripts_have_one_active_and_cannot_delete_it() {

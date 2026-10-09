@@ -58,6 +58,7 @@ struct AccountSummary {
 struct RoutingSummary {
     aliases: Vec<AliasSummary>,
     catchalls: Vec<CatchallSummary>,
+    routes: Vec<rmail_common::transport::Route>,
 }
 
 #[derive(Serialize)]
@@ -566,6 +567,7 @@ fn routing_summary_sync(db_path: Option<&str>) -> Result<RoutingSummary> {
         return Ok(RoutingSummary {
             aliases: Vec::new(),
             catchalls: Vec::new(),
+            routes: Vec::new(),
         });
     };
     Ok(RoutingSummary {
@@ -577,6 +579,7 @@ fn routing_summary_sync(db_path: Option<&str>) -> Result<RoutingSummary> {
             .into_iter()
             .map(|(domain, target)| CatchallSummary { domain, target })
             .collect(),
+        routes: rmail_common::transport::list_routes(std::path::Path::new(db_path))?,
     })
 }
 
@@ -1141,7 +1144,6 @@ fn queue_listing_sync(mail_root: &PathBuf, spool: &str) -> Result<serde_json::Va
 fn settings_view_sync(db_path: &str) -> Result<serde_json::Value> {
     let conn = rmail_common::settings::open(db_path)?;
     let mut view = serde_json::to_value(rmail_common::settings::describe(&conn)?)?;
-    view["managed"] = json!(true);
     view["restart_available"] = json!(rmail_common::restart::helper_installed());
     Ok(view)
 }
@@ -1220,7 +1222,7 @@ async fn main() -> Result<()> {
 
     let mut state = api::AdminState::new(
         mail_root.clone(),
-        cfg.global.db_path.clone(),
+        Some(cfg.global.db_path.clone()),
         cfg.global
             .web_admin_user
             .clone()
@@ -1234,12 +1236,10 @@ async fn main() -> Result<()> {
         .clone()
         .filter(|url| !url.trim().is_empty());
     state.secure_cookies = tls_active || cfg.global.tls.web_http_only;
-    if let Some(db_path) = cfg.global.db_path.as_deref() {
-        // A persistent key keeps admins signed in across restarts.
-        let mut conn = rmail_common::settings::open(db_path)?;
-        state.session_key =
-            rmail_common::settings::internal_secret(&mut conn, "admin_session_key")?.into_bytes();
-    }
+    // A persistent key keeps admins signed in across restarts.
+    let mut conn = rmail_common::settings::open(&cfg.global.db_path)?;
+    state.session_key =
+        rmail_common::settings::internal_secret(&mut conn, "admin_session_key")?.into_bytes();
     // Without credentials the console runs in first-run setup mode, where the
     // first visitor chooses the admin password. Never allow that remotely.
     let has_credentials =
@@ -1262,9 +1262,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(state);
     let app = api::router(state.clone());
     let http_app = api::certificates::http_router(state);
-    if cfg.global.db_path.is_some() {
-        api::certificates::spawn_renewal_task(cfg_path.clone());
-    }
+    api::certificates::spawn_renewal_task(cfg_path.clone());
 
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
@@ -1950,12 +1948,13 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "[global]\nmail_root = {:?}\ndb_path = {:?}\nhostname = \"mail.example.com\"\n",
+                "[global]\nmail_root = {:?}\ndb_path = {:?}\n",
                 td.path().display().to_string(),
                 db.display().to_string()
             ),
         )
         .unwrap();
+        store_settings(&db, &[("global.hostname", json!("mail.example.com"))]);
         let mut state = api::AdminState::new(
             td.path().to_path_buf(),
             Some(db.display().to_string()),
@@ -2531,6 +2530,18 @@ mod tests {
         assert!(response.contains("\"folder\":\"Travel\""), "{response}");
     }
 
+    fn store_settings(db: &std::path::Path, values: &[(&str, serde_json::Value)]) {
+        let mut conn = rmail_common::settings::open(db).unwrap();
+        rmail_common::settings::update(
+            &mut conn,
+            &values
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect(),
+        )
+        .unwrap();
+    }
+
     fn discovery_state(td: &tempfile::TempDir, mode: &str) -> Arc<api::AdminState> {
         let db = td.path().join("rmail.db");
         rmail_common::db::init_db(&db).unwrap();
@@ -2539,12 +2550,21 @@ mod tests {
         fs::write(
             &config,
             format!(
-                "[global]\nmail_root = \"{root}\"\ndb_path = \"{db}\"\nhostname = \"mail.example.com\"\n[global.listeners]\nimaps = [\"[::]:993\"]\nsubmission = [\"[::]:587\"]\n[security]\nmta_sts_mode = \"{mode}\"\n",
+                "[global]\nmail_root = \"{root}\"\ndb_path = \"{db}\"\n",
                 root = td.path().display(),
                 db = db.display(),
             ),
         )
         .unwrap();
+        store_settings(
+            &db,
+            &[
+                ("global.hostname", json!("mail.example.com")),
+                ("global.listeners.imaps", json!(["[::]:993"])),
+                ("global.listeners.submission", json!(["[::]:587"])),
+                ("security.mta_sts_mode", json!(mode)),
+            ],
+        );
         let mut state = api::AdminState::new(
             td.path().to_path_buf(),
             Some(db.display().to_string()),

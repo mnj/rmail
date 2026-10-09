@@ -14,6 +14,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "ID",
             "ENABLE",
             "IDLE",
+            "INPROGRESS",
             "SASL-IR",
             "LITERAL+",
             "LITERAL-",
@@ -66,6 +67,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "ID",
             "ENABLE",
             "IDLE",
+            "INPROGRESS",
             "SASL-IR",
             "LITERAL+",
             "LITERAL-",
@@ -73,6 +75,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "MULTIAPPEND",
             "CATENATE",
             "QUOTA",
+            "QUOTA=RES-STORAGE",
             "NAMESPACE",
             "SPECIAL-USE",
             "LIST-EXTENDED",
@@ -84,6 +87,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "SEARCHRES",
             "PARTIAL",
             "SORT",
+            "SORT=DISPLAY",
             "ESORT",
             "CONTEXT=SEARCH",
             "CONTEXT=SORT",
@@ -104,6 +108,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "CREATE-SPECIAL-USE",
             "OBJECTID",
             "METADATA",
+            "LIST-METADATA",
             "NOTIFY",
             "UIDONLY",
             "REPLACE",
@@ -870,4 +875,104 @@ async fn command_preflight_enforces_auth_and_selected_states() {
     assert!(fetch_after_select.iter().any(|l| l.contains("FETCH")));
     let _logout = read_until_contains(&mut reader, "A008 OK").await;
     server_task.await.expect("join").expect("server");
+}
+
+#[tokio::test]
+async fn message_limit_cuts_large_commands_and_refuses_atomic_ones() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let mail_root = td.path().join("mail");
+    let db_path = td.path().join("config.db");
+    rmail_common::db::init_db(&db_path).expect("init db");
+    rmail_common::db::add_mailbox(
+        &db_path,
+        "user@example.test",
+        Some("plain:password"),
+        None,
+        None,
+    )
+    .expect("add mailbox");
+    for subject in ["one", "two", "three"] {
+        rmail_common::imap_state::append_message_with_internal_date(
+            &mail_root,
+            "example.test",
+            "user",
+            "INBOX",
+            format!("Subject: {subject}\r\n\r\nbody\r\n").as_bytes(),
+            vec!["\\Deleted".to_string()],
+            None,
+        )
+        .expect("append");
+    }
+    // Below the 1000 the setting allows, to keep the test small.
+    let policy = Arc::new(
+        crate::auth::AuthPolicy::from_security(&rmail_common::config::SecurityConfig::default())
+            .unwrap()
+            .with_message_limit(2),
+    );
+    let (client, server) = duplex(16 * 1024);
+    let server_task = tokio::spawn(async move {
+        process_stream_with_policy(
+            Box::new(server),
+            mail_root.to_string_lossy().into_owned(),
+            None,
+            Some(db_path.to_string_lossy().into_owned()),
+            None,
+            true,
+            policy,
+        )
+        .await
+    });
+    let mut reader = BufReader::new(client);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    reader.read_line(&mut greeting).await.unwrap();
+    reader
+        .get_mut()
+        .write_all(
+            b"A1 LOGIN \"user@example.test\" \"password\"\r\nA2 CAPABILITY\r\nA3 SELECT INBOX\r\nA4 UID FETCH 1:* (UID)\r\nA5 UID SEARCH ALL\r\nA6 COPY 1:3 INBOX\r\nA7 UID STORE 1:* +FLAGS (\\Seen)\r\nA8 UID EXPUNGE 1:*\r\nA9 LOGOUT\r\n",
+        )
+        .await
+        .unwrap();
+    reader.get_mut().flush().await.unwrap();
+    let _login = read_until_contains_bounded(&mut reader, "A1 OK").await;
+    let caps = read_until_contains_bounded(&mut reader, "A2 OK")
+        .await
+        .join("");
+    assert!(caps.contains(" MESSAGELIMIT=2"), "{caps}");
+    let _select = read_until_contains_bounded(&mut reader, "A3 OK").await;
+    let fetch = read_until_contains_bounded(&mut reader, "A4 OK")
+        .await
+        .join("");
+    assert!(!fetch.contains("UID 1)"), "{fetch}");
+    assert!(
+        fetch.contains("UID 2)") && fetch.contains("UID 3)"),
+        "{fetch}"
+    );
+    assert!(fetch.contains("A4 OK [MESSAGELIMIT 2 2]"), "{fetch}");
+    let search = read_until_contains_bounded(&mut reader, "A5 OK").await;
+    assert!(
+        search.iter().any(|line| line == "* SEARCH 2 3\r\n"),
+        "{search:?}"
+    );
+    assert!(search.join("").contains("A5 OK [MESSAGELIMIT 2 2]"));
+    let copy = read_until_contains_bounded(&mut reader, "A6 NO")
+        .await
+        .join("");
+    assert!(copy.contains("A6 NO [MESSAGELIMIT 2]"), "{copy}");
+    let store = read_until_contains_bounded(&mut reader, "A7 OK")
+        .await
+        .join("");
+    assert!(store.contains("[MESSAGELIMIT 2 2]"), "{store}");
+    assert!(!store.contains("* 1 FETCH"), "{store}");
+    let expunge = read_until_contains_bounded(&mut reader, "A8 OK")
+        .await
+        .join("");
+    assert!(expunge.contains("[MESSAGELIMIT 2 2]"), "{expunge}");
+    assert!(
+        expunge.contains("* 3 EXPUNGE") && expunge.contains("* 2 EXPUNGE"),
+        "{expunge}"
+    );
+    assert!(!expunge.contains("* 1 EXPUNGE"), "{expunge}");
+    let _logout = read_until_contains_bounded(&mut reader, "A9 OK").await;
+    server_task.await.unwrap().unwrap();
 }

@@ -11,6 +11,7 @@ WorkingDirectory=/opt/rmail
 ExecStart=/usr/bin/rmail_outbound
 User=rmail
 Group=rmail
+UMask=0077
 StateDirectory=rmail
 LogsDirectory=rmail
 RuntimeDirectory=rmail
@@ -20,6 +21,9 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 NoNewPrivileges=true
+# Each session holds a socket plus Maildir, index and TLS files; systemd's
+# default soft limit of 1024 is below the default session caps.
+LimitNOFILE=65536
 Restart=on-failure
 RestartSec=5s
 

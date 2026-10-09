@@ -90,7 +90,7 @@ impl Session {
             let forwarded =
                 is_forwarded_recipient(&self.forwarded_recipient, rcpt, self.generation);
             if forwarded && arc_sealed.is_none() {
-                match self.arc_seal(&mail_root, data).await {
+                match self.arc_seal(data).await {
                     Ok(sealed) => arc_sealed = Some(sealed),
                     Err(error) => {
                         report.any_rejected = true;
@@ -104,7 +104,8 @@ impl Session {
             } else {
                 data.to_vec()
             };
-            self.queue_remote(&mail_root, rcpt, body, &mut report).await;
+            self.queue_remote(&mail_root, rcpt, body, forwarded, &mut report)
+                .await;
         }
         report
     }
@@ -372,7 +373,7 @@ impl Session {
                 }
                 Action::Redirect { address } => {
                     // Redirected mail is forwarded mail: ARC-seal it like an alias.
-                    let body = match self.arc_seal(mail_root, data).await {
+                    let body = match self.arc_seal(data).await {
                         Ok(sealed) => sealed,
                         Err(error) => {
                             report.any_rejected = true;
@@ -381,7 +382,10 @@ impl Session {
                         }
                     };
                     session_log!(self, "info", "sieve_redirect", { "message_id": self.message_id, "rcpt": rcpt, "to": address });
-                    if self.queue_remote(mail_root, &address, body, report).await {
+                    if self
+                        .queue_remote(mail_root, &address, body, true, report)
+                        .await
+                    {
                         // LMTP otherwise keeps its temporary failure and the
                         // client retries, forwarding another copy each time.
                         report
@@ -505,13 +509,13 @@ impl Session {
         }
     }
 
-    async fn arc_seal(&self, mail_root: &Path, data: &Bytes) -> Result<Vec<u8>> {
+    async fn arc_seal(&self, data: &Bytes) -> Result<Vec<u8>> {
         let peer_ip = self
             .peer
             .map(|address| address.ip())
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let sealed = rmail_common::mail_auth::seal_forwarded(
-            mail_root,
+            self.db_path.as_deref().map(Path::new),
             data,
             peer_ip,
             self.helo_name.as_deref().unwrap_or("unknown"),
@@ -527,6 +531,7 @@ impl Session {
         mail_root: &Path,
         rcpt: &str,
         body: Vec<u8>,
+        forwarded: bool,
         report: &mut DeliveryReport,
     ) -> bool {
         let bytes = body.len();
@@ -543,7 +548,17 @@ impl Session {
         let mail_root = mail_root.to_path_buf();
         let recipient = rcpt.to_string();
         let sender = self.tx.mail_from.clone();
+        let srs_domain = forwarded
+            .then(|| self.security.srs_domain.trim().to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty());
+        let db_path = self.db_path.clone();
         let queued = tokio::task::spawn_blocking(move || {
+            let sender = match (sender, srs_domain, db_path) {
+                (Some(sender), Some(srs_domain), Some(db_path)) if !sender.is_empty() => {
+                    srs_sender(&db_path, &sender, &srs_domain)?
+                }
+                (sender, _, _) => sender,
+            };
             rmail_common::outbound::queue_outbound_with_options(
                 &mail_root,
                 &recipient,
@@ -598,4 +613,17 @@ async fn increment_delivery_counter(mail_root: &Path) -> Result<()> {
     tokio::fs::write(&tmp, count.to_string()).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(())
+}
+
+/// The envelope sender for forwarding mail from `sender` (SRS). Senders in
+/// hosted domains are kept: their SPF already covers this server.
+fn srs_sender(db_path: &str, sender: &str, srs_domain: &str) -> anyhow::Result<Option<String>> {
+    let domain = sender.rsplit_once('@').map_or("", |(_, domain)| domain);
+    let hosted = rmail_common::db::local_domains(db_path)?
+        .iter()
+        .any(|local| local.eq_ignore_ascii_case(domain));
+    if hosted {
+        return Ok(Some(sender.to_string()));
+    }
+    rmail_common::srs::forward(sender, srs_domain, crate::srs_key()).map(Some)
 }

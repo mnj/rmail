@@ -87,6 +87,13 @@ pub(crate) fn status_values(
     if requested(parser::StatusItem::Deleted) {
         values.push(format!("DELETED {}", summary.deleted));
     }
+    if requested(parser::StatusItem::DeletedStorage) {
+        // In STORAGE resource units of 1024 octets, like GETQUOTA.
+        values.push(format!(
+            "DELETED-STORAGE {}",
+            summary.deleted_size.div_ceil(1024)
+        ));
+    }
     if requested(parser::StatusItem::MailboxId) {
         values.push(format!("MAILBOXID ({})", summary.folder.mailbox_id));
     }
