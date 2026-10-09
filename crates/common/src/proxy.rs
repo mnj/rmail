@@ -6,7 +6,7 @@
 //! addresses are handled as before and never parsed for a header, so a
 //! client cannot spoof its address.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -209,7 +209,15 @@ impl ClientAcceptor {
                 tokio::spawn(async move {
                     match tokio::time::timeout(HEADER_TIMEOUT, read_header(&mut stream)).await {
                         Ok(Ok(client)) => {
-                            let _ = sender.send((stream, client.unwrap_or(peer))).await;
+                            // LOCAL and UNKNOWN headers carry no client
+                            // address. The proxy's own address would hand
+                            // the client its trust (a loopback proxy makes
+                            // every such client local), so use the
+                            // unspecified address, which earns none.
+                            let client = client.unwrap_or_else(|| {
+                                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                            });
+                            let _ = sender.send((stream, client)).await;
                         }
                         Ok(Err(error)) => {
                             crate::structured_log!("warn", component, "proxy_header_rejected", {

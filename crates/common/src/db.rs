@@ -24,10 +24,39 @@ pub struct Mailbox {
 use serde_json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Make the database readable by its owner only: it holds password hashes,
+/// DKIM private keys and relay passwords. SQLite gives the `-wal` and `-shm`
+/// files it creates the database's mode, and existing ones are fixed here.
+pub fn restrict_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use anyhow::Context;
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let file = std::path::PathBuf::from(file);
+            let mode = match std::fs::metadata(&file) {
+                Ok(metadata) => metadata.permissions().mode(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", file.display()));
+                }
+            };
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode & 0o7700))
+                    .with_context(|| format!("restricting permissions of {}", file.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Initialize SQLite DB schema if not present
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
     let conn = Connection::open(path)?;
+    restrict_permissions(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(
         r#"
@@ -1090,6 +1119,24 @@ mod tests {
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn database_files_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempdir().expect("tempdir");
+        let db = td.path().join("rmail.db");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        init_db(&db).expect("init db");
+        crate::settings::open(&db).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = td.path().join(format!("rmail.db{suffix}"));
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600, "{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn sieve_scripts_have_one_active_and_cannot_delete_it() {

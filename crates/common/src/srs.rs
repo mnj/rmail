@@ -5,12 +5,12 @@
 //! rewrites the sender into an address at `security.srs_domain` that encodes
 //! the original one, and bounces to that address are verified and sent back:
 //!
-//! - `user@example.org` becomes `SRS0=HHHH=TT=example.org=user@srs.domain`.
+//! - `user@example.org` becomes `SRS0=HHHHHHHH=TT=example.org=user@srs.domain`.
 //! - An address that is already SRS0 (from another forwarder) becomes
-//!   `SRS1=HHHH=forwarder.example==HHHH=TT=example.org=user@srs.domain`,
+//!   `SRS1=HHHHHHHH=forwarder.example==HHHHHHHH=TT=example.org=user@srs.domain`,
 //!   which reverses to the SRS0 address at that forwarder.
 //!
-//! `HHHH` is a keyed hash and `TT` a day stamp, both base32 so they survive
+//! `HHHHHHHH` is a keyed hash and `TT` a day stamp, both base32 so they survive
 //! case changes. Only rMail reverses its own addresses, so the hash need not
 //! match other implementations.
 
@@ -21,7 +21,9 @@ use sha2::Sha256;
 const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 /// Bounces to rewritten addresses are accepted for this many days.
 const MAX_AGE_DAYS: u64 = 21;
-const HASH_LEN: usize = 4;
+/// 8 base32 characters (40 bits): a valid hash lets anyone relay through
+/// the SRS domain, so it must resist guessing over many RCPT attempts.
+const HASH_LEN: usize = 8;
 
 fn day_stamp(day: u64) -> String {
     let day = day % 1024;

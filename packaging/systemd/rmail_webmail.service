@@ -11,6 +11,7 @@ ExecStart=/usr/bin/rmail_webmail
 ExecReload=/bin/kill -HUP $MAINPID
 User=rmail
 Group=rmail
+UMask=0077
 StateDirectory=rmail
 LogsDirectory=rmail
 RuntimeDirectory=rmail

@@ -116,6 +116,8 @@ if ! id -u rmail >/dev/null 2>&1; then
 fi
 mkdir -p /opt/rmail/mail /opt/rmail/config /etc/rmail
 chown -R rmail:rmail /opt/rmail
+# The database holds password hashes, DKIM keys and relay passwords.
+chmod 0700 /opt/rmail/config
 systemctl daemon-reload || true
 # Lets the admin console restart services after settings changes.
 systemctl enable --now rmail_restart.path >/dev/null 2>&1 || true

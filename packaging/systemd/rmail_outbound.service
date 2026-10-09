@@ -11,6 +11,7 @@ WorkingDirectory=/opt/rmail
 ExecStart=/usr/bin/rmail_outbound
 User=rmail
 Group=rmail
+UMask=0077
 StateDirectory=rmail
 LogsDirectory=rmail
 RuntimeDirectory=rmail

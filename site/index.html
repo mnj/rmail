@@ -236,9 +236,7 @@ sudo apt install ./rmail_latest_amd64.deb</pre>
           <p><code>/etc/rmail/config.toml</code> only names the data directory and the database. Everything else, from listeners to certificates, is set in the admin console or with <code>rmail_ctl settings</code>.</p>
 <pre>[global]
 mail_root = "/opt/rmail/mail"
-db_path = "/opt/rmail/rmail.db"
-tls_cert = "/etc/rmail/certs/fullchain.pem"
-tls_key = "/etc/rmail/certs/privkey.pem"</pre>
+db_path = "/opt/rmail/config/rmail.db"</pre>
         </article>
         <article class="feature">
           <h3>3. Start it and open the console</h3>

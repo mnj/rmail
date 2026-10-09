@@ -2456,8 +2456,16 @@ async fn deliver_to_remote(
     // A delivery route (see rmail_common::transport) replaces the MX hosts.
     let mut targets: Vec<Target> = Vec::new();
     let route = match DB_PATH.get() {
-        Some(db_path) => rmail_common::transport::lookup(db_path, domain)
-            .context("looking up the delivery route")?,
+        Some(db_path) => {
+            let db_path = db_path.clone();
+            let lookup_domain = domain.to_string();
+            tokio::task::spawn_blocking(move || {
+                rmail_common::transport::lookup(&db_path, &lookup_domain)
+            })
+            .await
+            .context("joining the delivery route lookup")?
+            .context("looking up the delivery route")?
+        }
         None => None,
     };
     match route.map(|route| route.action) {
@@ -2611,7 +2619,8 @@ async fn deliver_to_remote(
             dane::DaneLookup::Secure(records) if !records.is_empty() => {
                 dane::TlsRequirement::Dane(records)
             }
-            _ if transport_tls_required => dane::TlsRequirement::Pkix,
+            // Relay credentials go only to a server whose certificate verifies.
+            _ if transport_tls_required || target.auth.is_some() => dane::TlsRequirement::Pkix,
             dane::DaneLookup::Secure(_) => dane::TlsRequirement::Mandatory,
             dane::DaneLookup::NotApplicable => dane::TlsRequirement::Opportunistic,
         };
@@ -2916,6 +2925,9 @@ async fn establish_smtp_connection(
         }
     }
 
+    if auth.is_some() && tls == dane::TlsAuth::Plaintext {
+        anyhow::bail!("relay {host} does not offer TLS, so its credentials are not sent");
+    }
     if requirement.needs_tls() && tls == dane::TlsAuth::Plaintext {
         if matches!(
             requirement,
@@ -2935,9 +2947,12 @@ async fn establish_smtp_connection(
     }
 
     if let Some((user, password)) = auth {
-        // Relay credentials never cross an unencrypted connection.
-        if tls == dane::TlsAuth::Plaintext {
-            anyhow::bail!("relay {host} does not offer TLS, so its credentials are not sent");
+        // Relay credentials go only to a server that proved its identity, so
+        // whoever intercepts the connection cannot collect them.
+        if !matches!(tls, dane::TlsAuth::Pkix | dane::TlsAuth::Dane) {
+            anyhow::bail!(
+                "relay {host} did not present a verified certificate, so its credentials are not sent"
+            );
         }
         if !capabilities.auth_plain {
             anyhow::bail!("relay {host} does not offer AUTH PLAIN");
@@ -3581,41 +3596,10 @@ mod tests {
 
     /// A fake relay: STARTTLS (when `tls`) with a self-signed certificate,
     /// then AUTH PLAIN. Returns the AUTH line it received, if any.
-    async fn fake_relay(listener: tokio::net::TcpListener, tls: bool) -> Option<String> {
-        use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
-        use tokio::io::AsyncBufReadExt;
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut plain = tokio::io::BufReader::new(stream);
-        let mut line = String::new();
-        plain
-            .get_mut()
-            .write_all(b"220 relay ready\r\n")
-            .await
-            .unwrap();
-        plain.read_line(&mut line).await.unwrap();
-        if !tls {
-            plain
-                .get_mut()
-                .write_all(b"250-relay\r\n250 AUTH PLAIN\r\n")
-                .await
-                .unwrap();
-            line.clear();
-            let _ = plain.read_line(&mut line).await;
-            return (!line.is_empty()).then_some(line);
-        }
-        plain
-            .get_mut()
-            .write_all(b"250-relay\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n")
-            .await
-            .unwrap();
-        line.clear();
-        plain.read_line(&mut line).await.unwrap();
-        assert_eq!(line, "STARTTLS\r\n");
-        plain
-            .get_mut()
-            .write_all(b"220 go ahead\r\n")
-            .await
-            .unwrap();
+    fn relay_certificate() -> (
+        openssl::pkey::PKey<openssl::pkey::Private>,
+        openssl::x509::X509,
+    ) {
         let key =
             openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
         let mut name = openssl::x509::X509NameBuilder::new().unwrap();
@@ -3632,7 +3616,52 @@ mod tests {
             .unwrap();
         cert.sign(&key, openssl::hash::MessageDigest::sha256())
             .unwrap();
-        let cert = cert.build();
+        (key, cert.build())
+    }
+
+    /// A relay that offers STARTTLS with `tls` (or no TLS at all) and
+    /// returns the first command it receives after EHLO, if any.
+    async fn fake_relay(
+        listener: tokio::net::TcpListener,
+        tls: Option<(
+            openssl::pkey::PKey<openssl::pkey::Private>,
+            openssl::x509::X509,
+        )>,
+    ) -> Option<String> {
+        use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
+        use tokio::io::AsyncBufReadExt;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut plain = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        plain
+            .get_mut()
+            .write_all(b"220 relay ready\r\n")
+            .await
+            .unwrap();
+        plain.read_line(&mut line).await.unwrap();
+        let Some((key, cert)) = tls else {
+            plain
+                .get_mut()
+                .write_all(b"250-relay\r\n250 AUTH PLAIN\r\n")
+                .await
+                .unwrap();
+            line.clear();
+            let _ = plain.read_line(&mut line).await;
+            return (!line.is_empty()).then_some(line);
+        };
+        plain
+            .get_mut()
+            .write_all(b"250-relay\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n")
+            .await
+            .unwrap();
+        line.clear();
+        plain.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "STARTTLS\r\n");
+        plain
+            .get_mut()
+            .write_all(b"220 go ahead\r\n")
+            .await
+            .unwrap();
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
         acceptor.set_private_key(&key).unwrap();
         acceptor.set_certificate(&cert).unwrap();
@@ -3653,7 +3682,10 @@ mod tests {
             .await
             .unwrap();
         line.clear();
-        secure.read_line(&mut line).await.unwrap();
+        // The client hangs up instead when it refuses to authenticate.
+        if secure.read_line(&mut line).await.is_err() || line.is_empty() {
+            return None;
+        }
         secure
             .get_mut()
             .write_all(b"235 2.7.0 Accepted\r\n")
@@ -3663,38 +3695,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_credentials_are_sent_only_after_starttls() {
+    async fn relay_credentials_are_sent_only_to_a_verified_relay() {
         let dir = tempfile::tempdir().unwrap();
         let hub = TrackingHub::start(dir.path(), "outbound-test").unwrap();
         let resolver = outbound_resolver().await.unwrap();
         let credentials = ("relay-user".to_string(), "s3cret".to_string());
 
+        // A certificate the relay's TLSA records pin is verified.
+        let (key, cert) = relay_certificate();
+        let pinned = [dane::TlsaRecord {
+            usage: 3,
+            selector: 0,
+            mtype: 0,
+            data: cert.to_der().unwrap(),
+        }];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(fake_relay(listener, true));
+        let server = tokio::spawn(fake_relay(listener, Some((key, cert))));
         let connection = establish_smtp_connection(
             resolver,
             "127.0.0.1",
             port,
             false,
             Some(&credentials),
-            dane::TlsRequirement::Opportunistic,
+            dane::TlsRequirement::Dane(&pinned),
             false,
             &hub,
             "t1",
         )
         .await
         .expect("authenticated relay session");
-        assert_ne!(connection.tls, dane::TlsAuth::Plaintext);
+        assert_eq!(connection.tls, dane::TlsAuth::Dane);
         assert_eq!(
             server.await.unwrap().as_deref(),
             // base64 of "\0relay-user\0s3cret"
             Some("AUTH PLAIN AHJlbGF5LXVzZXIAczNjcmV0\r\n")
         );
 
+        // Encryption alone is not enough: anyone on the path can present a
+        // self-signed certificate.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(fake_relay(listener, false));
+        let server = tokio::spawn(fake_relay(listener, Some(relay_certificate())));
         let error = establish_smtp_connection(
             resolver,
             "127.0.0.1",
@@ -3705,6 +3747,29 @@ mod tests {
             false,
             &hub,
             "t2",
+        )
+        .await
+        .err()
+        .expect("unverified relay refused");
+        assert!(
+            format!("{error:#}").contains("did not present a verified certificate"),
+            "{error:#}"
+        );
+        assert_eq!(server.await.unwrap(), None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_relay(listener, None));
+        let error = establish_smtp_connection(
+            resolver,
+            "127.0.0.1",
+            port,
+            false,
+            Some(&credentials),
+            dane::TlsRequirement::Opportunistic,
+            false,
+            &hub,
+            "t3",
         )
         .await
         .err()

@@ -136,8 +136,10 @@ rmail_ctl transport reject old.example "550 5.1.2 This domain no longer accepts 
 rmail_ctl transport list
 ```
 
-Relay credentials are sent with AUTH PLAIN and only over TLS; a relay that offers no TLS is not
-used. MTA-STS and DANE apply to MX delivery only, while REQUIRETLS messages still need TLS to the
+Relay credentials are sent with AUTH PLAIN and only over TLS with a certificate that verifies
+against the system's trusted CAs (or the relay's DNSSEC-signed TLSA records); a relay that offers
+no TLS, or a certificate that does not verify, is not used. Install a private CA's certificate in
+the system trust store to use a relay with an internal certificate. MTA-STS and DANE apply to MX delivery only, while REQUIRETLS messages still need TLS to the
 relay.
 
 ## Forwarding and SRS
@@ -150,7 +152,7 @@ Set an SRS domain to rewrite that sender (Sender Rewriting Scheme):
 rmail_ctl settings set security.srs_domain fwd.example.com
 ```
 
-Forwarded mail then leaves with a sender like `SRS0=HHHH=TT=example.org=alice@fwd.example.com`,
+Forwarded mail then leaves with a sender like `SRS0=HHHHHHHH=TT=example.org=alice@fwd.example.com`,
 and bounces to it within 21 days go back to `alice@example.org`. The SRS domain needs an MX
 pointing at this server and an SPF record that authorizes it (for example `v=spf1 mx -all`).
 Senders in hosted domains and null senders are not rewritten. The signing key is generated on
@@ -261,7 +263,7 @@ Outbound transport security:
 - rMail advertises and relays RFC 8689 `REQUIRETLS`; such messages are never sent over plaintext, and the next hop must advertise `REQUIRETLS`
 - rMail advertises RFC 3461 `DSN`, validates `ENVID`, `RET`, `NOTIFY`, and `ORCPT`, preserves those parameters through aliases and the private queue, and relays them to DSN-capable next hops. Requested success, delayed-delivery, and terminal-failure notifications use a null reverse path and `multipart/report; report-type=delivery-status`; `NOTIFY=NEVER` suppresses local bounces.
 - MTA-STS policies are discovered through `_mta-sts.<domain>` TXT records, fetched over authenticated HTTPS, cached for `max_age`, and enforced against MX names and TLS certificate validation
-- TLS failures are reported to valid `mailto:` destinations in `_smtp._tls.<domain>` RFC 8460 records as daily gzipped JSON (`application/tlsrpt+gzip`); reports themselves use a null reverse path to prevent loops
+- TLS failures are reported to the `mailto:` and `https:` destinations in `_smtp._tls.<domain>` RFC 8460 records as daily gzipped JSON (`application/tlsrpt+gzip`), by mail or HTTPS POST; mailed reports use a null reverse path to prevent loops
 
 TLS policy is configured once with the `global.tls.*` settings. `minimum_version` accepts
 `"1.2"` (the default, enabling TLS 1.2 and 1.3) or `"1.3"`. `cipher_suites` may be left empty for
