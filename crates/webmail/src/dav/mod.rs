@@ -378,18 +378,12 @@ fn preconditions_fail(headers: &HeaderMap, current: Option<&str>) -> bool {
 }
 
 fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::Result<Response> {
-    let Target::Object(collection, existing, name) = target else {
+    let Target::Object(collection, _, name) = target else {
         return Ok(status(match target {
             Target::NotFound => StatusCode::CONFLICT,
             _ => StatusCode::METHOD_NOT_ALLOWED,
         }));
     };
-    if preconditions_fail(
-        headers,
-        existing.as_ref().map(|object| object.etag.as_str()),
-    ) {
-        return Ok(status(StatusCode::PRECONDITION_FAILED));
-    }
     let prefix = match collection.kind {
         Kind::Calendar => "c",
         Kind::AddressBook => "card",
@@ -410,7 +404,10 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
             xml::error(&format!("<{valid}/>")),
         ));
     };
-    match store::put(&dav.conn, &collection, &name, text)? {
+    // The preconditions are checked against the object as it is inside the
+    // store's write transaction, so concurrent writers cannot both pass.
+    let precondition = |current: Option<&str>| !preconditions_fail(headers, current);
+    match store::put(&dav.conn, &collection, &name, text, &precondition)? {
         Ok((etag, created)) => Ok(with_etag(
             status(if created {
                 StatusCode::CREATED
@@ -427,6 +424,7 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
             StatusCode::FORBIDDEN,
             xml::error("<c:supported-calendar-component/>"),
         )),
+        Err(PutError::PreconditionFailed) => Ok(status(StatusCode::PRECONDITION_FAILED)),
         Err(PutError::UidConflict(other)) => Ok(xml_response(
             StatusCode::FORBIDDEN,
             xml::error(&format!(
@@ -439,12 +437,15 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
 
 fn delete(dav: &Dav, target: Target, headers: &HeaderMap) -> anyhow::Result<Response> {
     match target {
-        Target::Object(collection, Some(object), name) => {
-            if preconditions_fail(headers, Some(&object.etag)) {
-                return Ok(status(StatusCode::PRECONDITION_FAILED));
-            }
-            store::delete(&dav.conn, &collection, &name)?;
-            Ok(status(StatusCode::NO_CONTENT))
+        Target::Object(collection, Some(_), name) => {
+            let precondition = |current: Option<&str>| !preconditions_fail(headers, current);
+            Ok(status(
+                match store::delete(&dav.conn, &collection, &name, &precondition)? {
+                    store::Deleted::Deleted => StatusCode::NO_CONTENT,
+                    store::Deleted::NotFound => StatusCode::NOT_FOUND,
+                    store::Deleted::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+                },
+            ))
         }
         Target::Collection(collection) => {
             store::delete_collection(&dav.conn, &collection)?;
