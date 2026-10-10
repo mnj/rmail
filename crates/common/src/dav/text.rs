@@ -45,6 +45,120 @@ impl Component {
     }
 }
 
+impl Property {
+    pub fn new(name: &str, value: &str) -> Self {
+        Property {
+            name: name.to_ascii_uppercase(),
+            params: Vec::new(),
+            value: value.to_string(),
+        }
+    }
+
+    /// Set (or with `None`, remove) a parameter; a replaced one keeps its
+    /// place.
+    pub fn set_param(&mut self, name: &str, value: Option<&str>) {
+        let at = self
+            .params
+            .iter()
+            .position(|(key, _)| key.eq_ignore_ascii_case(name));
+        self.params
+            .retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        if let Some(value) = value {
+            let param = (name.to_ascii_uppercase(), value.to_string());
+            match at {
+                Some(at) => self.params.insert(at, param),
+                None => self.params.push(param),
+            }
+        }
+    }
+}
+
+impl Component {
+    pub fn new(name: &str) -> Self {
+        Component {
+            name: name.to_ascii_uppercase(),
+            properties: Vec::new(),
+            components: Vec::new(),
+        }
+    }
+
+    /// Replace every property `name` with one holding `value`.
+    pub fn set_property(&mut self, name: &str, value: &str) {
+        let at = self
+            .properties
+            .iter()
+            .position(|property| property.name.eq_ignore_ascii_case(name));
+        self.properties
+            .retain(|property| !property.name.eq_ignore_ascii_case(name));
+        let property = Property::new(name, value);
+        match at {
+            Some(at) => self
+                .properties
+                .insert(at.min(self.properties.len()), property),
+            None => self.properties.push(property),
+        }
+    }
+
+    /// The content lines again, folded at 75 octets with CRLF ends.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+
+    fn write(&self, out: &mut String) {
+        fold(out, &format!("BEGIN:{}", self.name));
+        for property in &self.properties {
+            let mut line = property.name.clone();
+            for (key, value) in &property.params {
+                line.push(';');
+                line.push_str(key);
+                line.push('=');
+                line.push_str(&param_text(key, value));
+            }
+            line.push(':');
+            line.push_str(&property.value);
+            fold(out, &line);
+        }
+        for component in &self.components {
+            component.write(out);
+        }
+        fold(out, &format!("END:{}", self.name));
+    }
+}
+
+/// A parameter value as written: quoted when it holds `:`, `;` or `,`.
+/// The parser drops quotes, so lists of addresses (`DELEGATED-TO`,
+/// `MEMBER`) are quoted value by value.
+fn param_text(key: &str, value: &str) -> String {
+    let quote = |text: &str| {
+        if text.contains([':', ';', ',']) {
+            format!("\"{}\"", text.replace('"', ""))
+        } else {
+            text.to_string()
+        }
+    };
+    if matches!(key, "DELEGATED-TO" | "DELEGATED-FROM" | "MEMBER") {
+        value.split(',').map(quote).collect::<Vec<_>>().join(",")
+    } else {
+        quote(value)
+    }
+}
+
+/// Append `line`, folded at 75 octets without splitting a character.
+fn fold(out: &mut String, line: &str) {
+    let mut width = 0;
+    for c in line.chars() {
+        if width + c.len_utf8() > 75 {
+            out.push_str("\r\n ");
+            width = 1;
+        }
+        out.push(c);
+        width += c.len_utf8();
+    }
+    out.push_str("\r\n");
+}
+
 /// Unfold and split into logical lines.
 fn lines(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -322,6 +436,28 @@ SUMMARY:Stand\r\n up\r\nDESCRIPTION;LANGUAGE=en:Room \"A\": first floor\r\nEND:V
         assert!(parse("BEGIN:VCALENDAR\r\nEND:VEVENT\r\n").is_err());
         assert!(parse("BEGIN:VCARD\r\nFN:x\r\n").is_err());
         assert!(parse("FN:x\r\n").is_err());
+    }
+
+    #[test]
+    fn writes_back_what_it_reads() {
+        let calendar = parse(EVENT).unwrap();
+        let text = calendar.to_text();
+        assert!(text.contains("SUMMARY:Standup\r\n"));
+        assert!(text.contains("DESCRIPTION;LANGUAGE=en:Room \"A\": first floor\r\n"));
+        assert_eq!(parse(&text).unwrap(), calendar);
+        let mut attendee = Property::new("ATTENDEE", "mailto:a@x.test");
+        attendee.set_param("CN", Some("Doe, Jane"));
+        attendee.set_param("DELEGATED-TO", Some("mailto:b@x.test,mailto:c@x.test"));
+        let mut event = Component::new("VEVENT");
+        event.properties.push(attendee);
+        event.set_property("SUMMARY", &"é".repeat(60));
+        let text = event.to_text();
+        assert!(text.contains(
+            "ATTENDEE;CN=\"Doe, Jane\";DELEGATED-TO=\"mailto:b@x.test\",\"mailto:c@x.test\":"
+        ));
+        assert!(text.split("\r\n").all(|line| line.len() <= 75));
+        let back = parse(&format!("BEGIN:VCALENDAR\r\n{text}END:VCALENDAR\r\n")).unwrap();
+        assert_eq!(back.components[0], event);
     }
 
     #[test]

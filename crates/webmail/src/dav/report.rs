@@ -45,7 +45,7 @@ pub(crate) fn report(
                 (collection, objects)
             }
             Target::Object(collection, Some(object), _) if collection.kind == kind => {
-                (collection, vec![object])
+                (collection, vec![*object])
             }
             Target::NotFound | Target::Object(_, None, _) | Target::NewCollection(..) => {
                 return Ok(super::status(StatusCode::NOT_FOUND));

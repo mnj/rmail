@@ -18,6 +18,15 @@ pub struct Outgoing {
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
     pub attachments: Vec<OutgoingAttachment>,
+    /// A calendar invitation, reply or cancellation (iMIP, RFC 6047), sent
+    /// as a `text/calendar` alternative to the text.
+    pub calendar: Option<CalendarPart>,
+}
+
+pub struct CalendarPart {
+    /// The iTIP method (`REQUEST`, `REPLY`, `CANCEL`).
+    pub method: String,
+    pub data: String,
 }
 
 pub struct OutgoingAttachment {
@@ -116,19 +125,30 @@ pub fn build(message: &Outgoing, include_bcc: bool, message_id: Option<&str>) ->
     header(&mut out, "MIME-Version", "1.0");
     header(&mut out, "User-Agent", "rMail Webmail");
 
-    let text_part = format!(
+    let mut text_part = format!(
         "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n{}",
         quoted_printable(&message.text)
     );
+    if let Some(calendar) = &message.calendar {
+        let method = if calendar.method.bytes().all(|b| b.is_ascii_alphabetic()) {
+            calendar.method.to_ascii_uppercase()
+        } else {
+            "PUBLISH".to_string()
+        };
+        let boundary = boundary();
+        let mut alternative = format!(
+            "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\n{text_part}\r\n--{boundary}\r\n\
+             Content-Type: text/calendar; charset=utf-8; method={method}\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n"
+        );
+        base64_lines(&mut alternative, calendar.data.as_bytes());
+        alternative.push_str(&format!("--{boundary}--\r\n"));
+        text_part = alternative;
+    }
     if message.attachments.is_empty() {
         out.push_str(&text_part);
     } else {
-        let boundary = format!(
-            "=_rmail_{}",
-            (0..12)
-                .map(|_| format!("{:02x}", rand::random::<u8>()))
-                .collect::<String>()
-        );
+        let boundary = boundary();
         out.push_str(&format!(
             "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\nThis is a multi-part message in MIME format.\r\n"
         ));
@@ -161,11 +181,7 @@ pub fn build(message: &Outgoing, include_bcc: bool, message_id: Option<&str>) ->
                 "--{boundary}\r\nContent-Type: {content_type}; name=\"{ascii}\"\r\nContent-Disposition: attachment; filename=\"{ascii}\"; filename*=UTF-8''{}\r\nContent-Transfer-Encoding: base64\r\n\r\n",
                 percent_encode(&name)
             ));
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&attachment.data);
-            for chunk in encoded.as_bytes().chunks(LINE) {
-                out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-                out.push_str("\r\n");
-            }
+            base64_lines(&mut out, &attachment.data);
         }
         out.push_str(&format!("--{boundary}--\r\n"));
     }
@@ -173,6 +189,23 @@ pub fn build(message: &Outgoing, include_bcc: bool, message_id: Option<&str>) ->
         bytes: out.into_bytes(),
         message_id,
     })
+}
+
+fn boundary() -> String {
+    format!(
+        "=_rmail_{}",
+        (0..12)
+            .map(|_| format!("{:02x}", rand::random::<u8>()))
+            .collect::<String>()
+    )
+}
+
+fn base64_lines(out: &mut String, data: &[u8]) {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    for chunk in encoded.as_bytes().chunks(LINE) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push_str("\r\n");
+    }
 }
 
 fn is_header_safe(value: &str) -> bool {
@@ -330,7 +363,31 @@ mod tests {
                 content_type: "application/pdf".into(),
                 data: b"%PDF-1.4\n\x00\xff".to_vec(),
             }],
+            calendar: None,
         }
+    }
+
+    #[test]
+    fn invitations_carry_the_calendar_as_an_alternative() {
+        let mut message = outgoing();
+        message.attachments.clear();
+        message.calendar = Some(CalendarPart {
+            method: "request".into(),
+            data: "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n".into(),
+        });
+        let built = build(&message, false, None).unwrap();
+        let raw = String::from_utf8(built.bytes.clone()).unwrap();
+        assert!(raw.contains("multipart/alternative"));
+        assert!(raw.contains("Content-Type: text/calendar; charset=utf-8; method=REQUEST"));
+        let parsed = parse_message(&built.bytes);
+        assert!(parsed.text_body.starts_with("Hej Søren"));
+        let root = crate::jmap::mime::parse(&built.bytes);
+        let calendar = root
+            .leaves()
+            .into_iter()
+            .find(|part| part.content_type.starts_with("text/calendar"))
+            .unwrap();
+        assert!(calendar.text(&built.bytes).contains("METHOD:REQUEST"));
     }
 
     #[test]

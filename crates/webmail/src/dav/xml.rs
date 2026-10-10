@@ -87,7 +87,7 @@ fn prefix(ns: &str) -> Option<&'static str> {
     })
 }
 
-const ROOT_NAMESPACES: &str = "xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" \
+pub(crate) const ROOT_NAMESPACES: &str = "xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" \
 xmlns:card=\"urn:ietf:params:xml:ns:carddav\" xmlns:cs=\"http://calendarserver.org/ns/\" \
 xmlns:ical=\"http://apple.com/ns/ical/\"";
 

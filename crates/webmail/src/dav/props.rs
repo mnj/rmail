@@ -7,8 +7,8 @@ use rmail_common::dav::store::{self, Collection, Kind, Object, Setting};
 
 use super::xml::{self, APPLE, CALDAV, CALSERVER, CARDDAV, DAV, Name};
 use super::{
-    Dav, MAX_RESOURCE_SIZE, Target, collection_href, home_href, object_href, principal_href,
-    xml_response,
+    Dav, MAX_RESOURCE_SIZE, Target, collection_href, home_href, object_href, outbox_href,
+    principal_href, xml_response,
 };
 
 /// What PROPFIND `allprop` reports (RFC 4918 9.1: the live properties of
@@ -29,6 +29,7 @@ pub(crate) enum Resource<'a> {
     Principal,
     Home(Kind),
     Collection(&'a Collection),
+    Outbox,
     Object(&'a Collection, &'a Object),
 }
 
@@ -40,6 +41,7 @@ impl Resource<'_> {
             Resource::Principal => principal_href(&dav.user),
             Resource::Home(kind) => home_href(&dav.user, *kind),
             Resource::Collection(collection) => collection_href(&dav.user, collection),
+            Resource::Outbox => outbox_href(&dav.user),
             Resource::Object(collection, object) => {
                 object_href(&dav.user, collection, &object.name)
             }
@@ -104,6 +106,17 @@ pub(crate) fn value(dav: &Dav, resource: &Resource<'_>, name: &Name) -> Option<S
                 Some(hrefs(&[format!("mailto:{}", dav.user.address), principal]))
             }
             (CALDAV, "calendar-user-type") => Some("INDIVIDUAL".to_string()),
+            (CALDAV, "schedule-inbox-URL") => Some(xml::href(&format!(
+                "{}inbox/",
+                home_href(&dav.user, Kind::Calendar)
+            ))),
+            (CALDAV, "schedule-outbox-URL") => Some(xml::href(&outbox_href(&dav.user))),
+            _ => None,
+        },
+        Resource::Outbox => match (ns, local) {
+            (DAV, "resourcetype") => Some("<d:collection/><c:schedule-outbox/>".to_string()),
+            (DAV, "displayname") => Some("Outbox".to_string()),
+            (DAV, "owner") => Some(xml::href(&principal)),
             _ => None,
         },
         Resource::Home(_) => match (ns, local) {
@@ -114,6 +127,16 @@ pub(crate) fn value(dav: &Dav, resource: &Resource<'_>, name: &Name) -> Option<S
         Resource::Collection(collection) => {
             let calendar = collection.kind == Kind::Calendar;
             match (ns, local) {
+                (DAV, "resourcetype") if collection.inbox => {
+                    Some("<d:collection/><c:schedule-inbox/>".to_string())
+                }
+                (CALDAV, "schedule-default-calendar-URL") if collection.inbox => {
+                    let default = store::default_calendar(&dav.conn).ok()?;
+                    Some(xml::href(&collection_href(&dav.user, &default)))
+                }
+                (CALDAV, "schedule-calendar-transp") if calendar && !collection.inbox => {
+                    Some("<c:opaque/>".to_string())
+                }
                 (DAV, "resourcetype") => Some(if calendar {
                     "<d:collection/><c:calendar/>".to_string()
                 } else {
@@ -199,6 +222,7 @@ pub(crate) fn value(dav: &Dav, resource: &Resource<'_>, name: &Name) -> Option<S
             (CALDAV, "calendar-data") if collection.kind == Kind::Calendar => {
                 Some(xml::escape(&object.data))
             }
+            (CALDAV, "schedule-tag") => object.schedule_tag.as_deref().map(xml::escape),
             (CARDDAV, "address-data") if collection.kind == Kind::AddressBook => {
                 Some(xml::escape(&object.data))
             }
@@ -295,11 +319,17 @@ pub(crate) fn propfind(
             }
         }
         Target::Principal => responses.push(describe(dav, &Resource::Principal, &wanted)),
+        Target::Outbox => responses.push(describe(dav, &Resource::Outbox, &wanted)),
         Target::Home(kind) => {
             responses.push(describe(dav, &Resource::Home(*kind), &wanted));
             if depth == 1 {
                 for collection in store::collections(&dav.conn, *kind)? {
                     responses.push(describe(dav, &Resource::Collection(&collection), &wanted));
+                }
+                if *kind == Kind::Calendar {
+                    let inbox = store::inbox(&dav.conn)?;
+                    responses.push(describe(dav, &Resource::Collection(&inbox), &wanted));
+                    responses.push(describe(dav, &Resource::Outbox, &wanted));
                 }
             }
         }
@@ -357,6 +387,9 @@ pub(crate) fn proppatch(dav: &Dav, target: Target, body: &[u8]) -> anyhow::Resul
             _ => StatusCode::FORBIDDEN,
         }));
     };
+    if collection.inbox {
+        return Ok(super::status(StatusCode::FORBIDDEN));
+    }
     let Ok(Some(document)) = xml::parse(body) else {
         return Ok(super::status(StatusCode::BAD_REQUEST));
     };

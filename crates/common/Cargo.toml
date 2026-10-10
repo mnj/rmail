@@ -32,6 +32,9 @@ base64 = "0.21"
 flate2 = "1"
 encoding_rs = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Calendar recurrence (RFC 5545 RRULE) and IANA time zones, for free-busy.
+rrule = "0.14"
+chrono-tz = "0.10"
 unicode-normalization = "0.1"
 stringprep = "0.1"
 idna = "1.1"
