@@ -118,7 +118,18 @@ pub fn thunderbird_config(domain: &str, endpoints: &ServiceEndpoints) -> String 
             socket(smtp.security)
         ));
     }
-    out.push_str("  </emailProvider>\n</clientConfig>\n");
+    out.push_str("  </emailProvider>\n");
+    // Thunderbird sets up calendars and contacts from these too.
+    let web = match endpoints.jmap_port {
+        443 => format!("https://{}/dav/", xml(&endpoints.hostname)),
+        port => format!("https://{}:{port}/dav/", xml(&endpoints.hostname)),
+    };
+    for (element, kind) in [("addressBook", "carddav"), ("calendar", "caldav")] {
+        out.push_str(&format!(
+            "  <{element} type=\"{kind}\">\n    <username>%EMAILADDRESS%</username>\n    <authentication>http-basic</authentication>\n    <serverURL>{web}</serverURL>\n  </{element}>\n"
+        ));
+    }
+    out.push_str("</clientConfig>\n");
     out
 }
 
@@ -283,6 +294,29 @@ pub fn dns_records(
         value: format!("0 1 {} {host}.", endpoints.jmap_port),
         purpose: "JMAP service discovery (RFC 8620)",
     });
+    // RFC 6764: CalDAV and CardDAV over TLS, with the context path.
+    for (service, label) in [("_caldavs", "CalDAV"), ("_carddavs", "CardDAV")] {
+        records.push(DnsRecord {
+            name: format!("{service}._tcp.{domain}"),
+            kind: "SRV",
+            value: format!("0 1 {} {host}.", endpoints.jmap_port),
+            purpose: if label == "CalDAV" {
+                "Calendar service discovery (RFC 6764)"
+            } else {
+                "Contacts service discovery (RFC 6764)"
+            },
+        });
+        records.push(DnsRecord {
+            name: format!("{service}._tcp.{domain}"),
+            kind: "TXT",
+            value: "path=/dav/".to_string(),
+            purpose: if label == "CalDAV" {
+                "Where the calendar service lives (RFC 6764)"
+            } else {
+                "Where the contacts service lives (RFC 6764)"
+            },
+        });
+    }
     if let Some(policy) = mta_sts_policy(mode, host, max_age_secs) {
         records.push(DnsRecord {
             name: format!("_mta-sts.{domain}"),
@@ -341,6 +375,8 @@ mod tests {
     #[test]
     fn thunderbird_config_lists_both_servers() {
         let xml = thunderbird_config("example.com", &endpoints());
+        assert!(xml.contains("<calendar type=\"caldav\">"));
+        assert!(xml.contains("<serverURL>https://mail.example.com/dav/</serverURL>"));
         assert!(xml.contains("<incomingServer type=\"imap\">"));
         assert!(xml.contains("<port>993</port>"));
         assert!(xml.contains("<socketType>SSL</socketType>"));
@@ -417,6 +453,8 @@ mod tests {
         assert!(names.contains(&"_imaps._tcp.example.com"));
         assert!(names.contains(&"_submission._tcp.example.com"));
         assert!(names.contains(&"_jmap._tcp.example.com"));
+        assert!(names.contains(&"_caldavs._tcp.example.com"));
+        assert!(names.contains(&"_carddavs._tcp.example.com"));
         assert!(names.contains(&"_smtp._tls.example.com"));
         let with = dns_records(
             "example.com",

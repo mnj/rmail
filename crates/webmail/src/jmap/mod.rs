@@ -115,7 +115,7 @@ fn unauthorized() -> Response {
     let mut response = (StatusCode::UNAUTHORIZED, "authentication required").into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"rMail JMAP\", charset=\"UTF-8\""),
+        HeaderValue::from_static("Basic realm=\"rMail\", charset=\"UTF-8\""),
     );
     response
 }

@@ -12,6 +12,7 @@ pub mod classifier_models;
 pub mod classifier_store;
 pub mod compose;
 pub mod config;
+pub mod dav;
 pub mod db;
 pub mod discovery;
 pub mod dkim;

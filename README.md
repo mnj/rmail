@@ -33,6 +33,8 @@ screenshots of every page, and a quick start.
   layout.
 - **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
   search, sending, vacation response and push.
+- **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so
+  Thunderbird, Apple devices and DAVx⁵ keep calendars and address books in sync.
 - **Operations**: structured JSON logs, live `rmail_ctl watch`, per-message tracking, built-in
   ACME certificates (Let's Encrypt over HTTP or DNS, renewed and hot-reloaded), and `.deb`
   packages for amd64 and arm64 published on every merge.
@@ -265,6 +267,24 @@ records include `_jmap._tcp` for discovery.
 | --- | --- | ---: | --- |
 | RFC 8620 | JMAP core | 90% | Session resource, `Core/echo`, result references (with `*`), creation ids across calls, request and method errors, blob upload and download, and push over an event source (with `ping` and `closeafter`). State strings come from a per-account change log, so `/changes` sees every change, whatever made it (IMAP, delivery, webmail, Sieve). `/queryChanges` always answers `cannotCalculateChanges` and clients query again. Push subscriptions (`PushSubscription`, web push) and `Blob/copy` are not implemented. Destroyed objects are remembered for 60 days; older states must resynchronize. |
 | RFC 8621 | JMAP mail and submission | 90% | `Mailbox`, `Email`, `Thread`, `SearchSnippet`, `Identity` and `EmailSubmission` with their `get`, `changes`, `query` and `set` methods, plus `Email/import`, `Email/copy` and `Email/parse`. Emails with one EMAILID in several folders are one Email, keywords are the IMAP flags, threads follow Message-ID, In-Reply-To and References. Mail goes through the submission service; with `HOLDUNTIL`/`HOLDFOR` in the envelope (up to `maxDelayedSend`, 30 days) it is held and stays `pending`, cancellable by setting `undoStatus` to `canceled`, until it is released. Delivery status is what that service reports, not later DSNs. `VacationResponse` (RFC 8621 section 8) is answered at delivery next to the account's own Sieve script, with Sieve vacation's rules (one reply per sender per week, none to lists or automated mail). Mailbox `sortOrder` follows the role and is not stored. Shared mailboxes (RFC 4314 grants) appear as one more account per owner, limited to the user's rights. |
+
+## CalDAV and CardDAV standards support
+
+Webmail serves calendars and contacts under `/dav/` with the same sign-in as JMAP. Each account
+starts with a calendar and an address book and can create more.
+
+| RFC | Feature | Estimated compliance | Remaining limitation |
+| --- | --- | ---: | --- |
+| RFC 4918 | WebDAV | 85% | PROPFIND (Depth 0 and 1; `infinity` is refused with `propfind-finite-depth`), PROPPATCH (all or nothing), PUT/GET/HEAD/DELETE with strong ETags and `If-Match`/`If-None-Match`, MKCOL. No LOCK, COPY or MOVE; collections hold calendars or address books only. |
+| RFC 4791 | CalDAV | 85% | MKCALENDAR, `calendar-query` (component, property, parameter and text filters, `time-range`), `calendar-multiget`, the calendar object preconditions (valid data, one UID and component type, supported components, `no-uid-conflict`, `max-resource-size`). Time ranges use each object's span widened for time zones; recurrences without an end match every later range, so a query can return a few extra objects. `calendar-data` is always returned whole (no `expand` or `limit-recurrence-set`); `free-busy-query` is not offered. |
+| RFC 6352 | CardDAV | 90% | Extended MKCOL, `addressbook-query` (prop/param filters, `text-match` with its match types, `anyof`/`allof`, `limit`), `addressbook-multiget`, vCard 3.0 and 4.0 stored as sent; a UID is required. `address-data` is always returned whole. |
+| RFC 6578 | sync-collection | 90% | Sync tokens per collection with deletions reported; deletions are remembered for 90 days, older tokens get `valid-sync-token`. `limit` is not applied. |
+| RFC 6764 | Service discovery | 100% | `/.well-known/caldav` and `/.well-known/carddav` redirect to `/dav/`; `_caldavs._tcp`/`_carddavs._tcp` SRV and `path=/dav/` TXT records are suggested per domain; Thunderbird autoconfig lists both. |
+| RFC 5397 | `current-user-principal` | 100% | Reported on every resource. |
+
+Scheduling (RFC 6638, invitations by email) and sharing calendars between accounts are not
+offered. The CalendarServer `getctag` and Apple calendar color and order properties are supported
+for older clients.
 
 Repeatable storage and queue performance workloads are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,
