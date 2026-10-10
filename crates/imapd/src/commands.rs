@@ -179,6 +179,9 @@ pub(crate) fn command_spec(command: &Command) -> Option<CommandSpec> {
         | Command::GetAcl
         | Command::ListRights
         | Command::MyRights
+        | Command::GenUrlAuth
+        | Command::UrlFetch
+        | Command::ResetKey
         | Command::Notify
         | Command::Subscribe { .. }
         | Command::Enable
@@ -284,6 +287,9 @@ mod tests {
             "SORT RETURN (MIN COUNT) (DATE) UTF-8 ALL",
             "SELECT INBOX",
             "EXAMINE INBOX",
+            "GENURLAUTH imap://u%40h@h/INBOX/;UID=1;URLAUTH=authuser INTERNAL",
+            "URLFETCH imap://u%40h@h/INBOX/;UID=1;URLAUTH=authuser:INTERNAL:00",
+            "RESETKEY",
         ];
         for command in commands {
             let line = format!("A1 {command}");
@@ -455,3 +461,4 @@ pub(crate) mod sort_thread;
 pub(crate) mod status;
 pub(crate) mod store;
 pub(crate) mod transfer;
+pub(crate) mod urlauth;

@@ -84,6 +84,8 @@ async fn main() -> Result<()> {
         auth::AuthPolicy::from_security(&cfg.security)
             .context("validating security.imap_sasl_mechanisms")?,
     );
+    // Host names GENURLAUTH and URLFETCH accept in IMAP URLs (RFC 4467).
+    rmail_common::urlauth::set_server_names(rmail_common::urlauth::server_names_from_config(&cfg));
     let mail_root = cfg.global.mail_root.clone();
     rmail_common::runtime::redirect_stdio_to_log(std::path::Path::new(&mail_root), "imapd")
         .context("redirecting logs")?;
