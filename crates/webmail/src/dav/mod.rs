@@ -12,8 +12,15 @@
 //!   and `getctag`; see `rmail_common::dav::store`.
 //! - Scheduling (RFC 6638) is done by the server: see `schedule`. Each
 //!   calendar home has `inbox/` and `outbox/`.
-//! - Sharing is not offered.
+//! - Collections other accounts share with the user (see
+//!   `rmail_common::dav::share`) appear in the user's home as
+//!   `<owner>~<name>/`, read-only or read-write as granted; see `sharing`.
+//!   Clients discover them like the user's own, as every client lists the
+//!   home's members, and `current-user-privilege-set` tells them whether
+//!   they may write.
 
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -22,9 +29,12 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Extension, Router};
+use rmail_common::dav::share::{self, Access};
 use rmail_common::dav::store::{self, Collection, Kind, Object, PutError};
+use rmail_common::db;
 use rmail_common::http::Peer;
 use rmail_common::sqlite_pool::SqliteConnection;
+use rusqlite::Connection;
 
 use crate::api::AppState;
 use crate::jmap::{self, User};
@@ -32,6 +42,7 @@ use crate::jmap::{self, User};
 mod props;
 mod report;
 mod schedule;
+mod sharing;
 mod xml;
 
 #[cfg(test)]
@@ -132,7 +143,24 @@ fn home_segment(kind: Kind) -> &'static str {
     }
 }
 
-pub(crate) fn collection_href(user: &User, collection: &Collection) -> String {
+/// The URL segment binding a shared collection into the grantee's home:
+/// `<owner>~<name>`. The user's own collections cannot have an `@` in
+/// their name, so the two never meet.
+pub(crate) fn binding_segment(owner: &str, name: &str) -> String {
+    format!("{owner}~{name}")
+}
+
+/// The owner and collection name a binding segment names.
+fn parse_binding(segment: &str) -> Option<(&str, &str)> {
+    let at = segment.find('@')?;
+    // Domains have no `~`; the first one after the `@` ends the owner.
+    let tilde = at + segment[at..].find('~')?;
+    let (owner, name) = (&segment[..tilde], &segment[tilde + 1..]);
+    (at > 0 && tilde > at + 1 && !name.is_empty()).then_some((owner, name))
+}
+
+/// The URL of one of the user's own collections.
+pub(crate) fn own_collection_href(user: &User, collection: &Collection) -> String {
     format!(
         "{}{}/",
         home_href(user, collection.kind),
@@ -140,16 +168,67 @@ pub(crate) fn collection_href(user: &User, collection: &Collection) -> String {
     )
 }
 
+/// A collection's URL as `user` reaches it: in their home, as their own
+/// or bound there by a share.
+pub(crate) fn collection_href(user: &User, place: &Place) -> String {
+    match &place.share {
+        None => own_collection_href(user, &place.collection),
+        Some(share) => format!(
+            "{}{}/",
+            home_href(user, place.collection.kind),
+            percent_encode(&binding_segment(
+                &share.owner.address,
+                &place.collection.name
+            ))
+        ),
+    }
+}
+
 pub(crate) fn outbox_href(user: &User) -> String {
     format!("{}outbox/", home_href(user, Kind::Calendar))
 }
 
-pub(crate) fn object_href(user: &User, collection: &Collection, name: &str) -> String {
-    format!(
-        "{}{}",
-        collection_href(user, collection),
-        percent_encode(name)
-    )
+pub(crate) fn object_href(user: &User, place: &Place, name: &str) -> String {
+    format!("{}{}", collection_href(user, place), percent_encode(name))
+}
+
+/// A collection another account shares with the user.
+pub(crate) struct Share {
+    pub owner: User,
+    /// The owner's state database, which holds the collection.
+    pub conn: Rc<SqliteConnection>,
+    pub grant: share::Grant,
+}
+
+/// A collection as a request reaches it: the user's own, or another
+/// account's shared with them.
+#[derive(Clone)]
+pub(crate) struct Place {
+    pub collection: Collection,
+    pub share: Option<Rc<Share>>,
+}
+
+impl Place {
+    pub fn own(collection: Collection) -> Self {
+        Self {
+            collection,
+            share: None,
+        }
+    }
+
+    /// Whether the user may change the collection and its objects.
+    pub fn writable(&self) -> bool {
+        self.share
+            .as_ref()
+            .is_none_or(|share| share.grant.access == Access::ReadWrite)
+    }
+
+    /// The account whose collection it is. Scheduling acts as this
+    /// calendar user (RFC 6638 3.2: as the owner of the calendar), even
+    /// when a sharee makes the change.
+    pub fn owner<'a>(&'a self, dav: &'a Dav) -> &'a User {
+        self.share.as_ref().map_or(&dav.user, |share| &share.owner)
+    }
 }
 
 /// What a request path names.
@@ -157,15 +236,17 @@ pub(crate) enum Target {
     Root,
     Principals,
     Principal,
+    /// The principal of an account that shares a collection with the user.
+    Sharer(User),
     Home(Kind),
     /// A calendar, address book or the schedule inbox.
-    Collection(Collection),
+    Collection(Place),
     /// The schedule outbox (RFC 6638 2.1), for free-busy queries.
     Outbox,
     /// A collection that does not exist yet (for MKCALENDAR/MKCOL).
     NewCollection(Kind, String),
     /// An object, which may not exist yet (for PUT).
-    Object(Collection, Option<Box<Object>>, String),
+    Object(Place, Option<Box<Object>>, String),
     NotFound,
 }
 
@@ -176,6 +257,98 @@ pub(crate) struct Dav {
 }
 
 impl Dav {
+    /// The database holding a collection and its objects.
+    pub fn conn_of<'a>(&'a self, place: &'a Place) -> &'a Connection {
+        match &place.share {
+            Some(share) => &share.conn,
+            None => &self.conn,
+        }
+    }
+
+    /// The account at `address`, if there is one.
+    fn account(&self, address: &str) -> anyhow::Result<Option<User>> {
+        let Ok(address) = rmail_common::domain::canonicalize_mailbox_address(address) else {
+            return Ok(None);
+        };
+        let Some((localpart, domain)) = address.split_once('@') else {
+            return Ok(None);
+        };
+        // Grants go with a removed account; checking anyway keeps a stale
+        // one from creating storage for a name that is gone.
+        if !db::mailbox_exists(&self.app.db_path, &address)? {
+            return Ok(None);
+        }
+        Ok(Some(User {
+            localpart: localpart.to_string(),
+            domain: domain.to_string(),
+            address: address.clone(),
+        }))
+    }
+
+    /// The collections shared with the user: of `kind` (or both), and of
+    /// `owner` (or every owner). Grants on collections deleted since are
+    /// skipped; each owner's database is opened once.
+    pub fn shared(&self, kind: Option<Kind>, owner: Option<&str>) -> anyhow::Result<Vec<Place>> {
+        let mut grants = share::shared_with(&self.app.db_path, &self.user.address)?;
+        if let Some(owner) = owner {
+            grants.retain(|grant| grant.owner.eq_ignore_ascii_case(owner));
+        }
+        let mut owners = HashMap::<String, Option<(User, Rc<SqliteConnection>)>>::new();
+        let mut found = Vec::new();
+        for grant in grants {
+            if !owners.contains_key(&grant.owner) {
+                let opened = match self.account(&grant.owner)? {
+                    Some(user) => {
+                        let conn = rmail_common::jmap::store::open(
+                            &self.app.mail_root,
+                            &user.domain,
+                            &user.localpart,
+                        )?;
+                        Some((user, Rc::new(conn)))
+                    }
+                    None => None,
+                };
+                owners.insert(grant.owner.clone(), opened);
+            }
+            let Some(Some((user, conn))) = owners.get(&grant.owner) else {
+                continue;
+            };
+            let Some(collection) = store::collection_by_id(conn, grant.collection_id)? else {
+                continue;
+            };
+            if kind.is_some_and(|kind| kind != collection.kind) {
+                continue;
+            }
+            found.push(Place {
+                collection,
+                share: Some(Rc::new(Share {
+                    owner: user.clone(),
+                    conn: conn.clone(),
+                    grant,
+                })),
+            });
+        }
+        Ok(found)
+    }
+
+    /// The collection a segment of the user's home names: their own, the
+    /// schedule inbox, or a shared one's binding.
+    fn place(&self, kind: Kind, name: &str) -> anyhow::Result<Option<Place>> {
+        if name.contains('@') {
+            let Some((owner, name)) = parse_binding(name) else {
+                return Ok(None);
+            };
+            return Ok(self
+                .shared(Some(kind), Some(owner))?
+                .into_iter()
+                .find(|place| place.collection.name == name));
+        }
+        if kind == Kind::Calendar && name == "inbox" {
+            return Ok(Some(Place::own(store::inbox(&self.conn)?)));
+        }
+        Ok(store::collection(&self.conn, kind, name)?.map(Place::own))
+    }
+
     pub fn resolve(&self, segments: &[String]) -> anyhow::Result<Target> {
         let own = |address: &String| address.eq_ignore_ascii_case(&self.user.address);
         let kind = |segment: &str| match segment {
@@ -187,33 +360,35 @@ impl Dav {
             [] => Target::Root,
             [first] if first == "principals" => Target::Principals,
             [first, user] if first == "principals" && own(user) => Target::Principal,
+            [first, user] if first == "principals" => {
+                // Another account's principal is visible only to accounts
+                // it shares with, as the owner of what they see.
+                match self.shared(None, Some(user))?.into_iter().next() {
+                    Some(place) => Target::Sharer(place.owner(self).clone()),
+                    None => Target::NotFound,
+                }
+            }
             [home, user] if kind(home).is_some() && own(user) => {
                 Target::Home(kind(home).unwrap_or(Kind::Calendar))
-            }
-            [home, user, name] if home == "calendars" && own(user) && name == "inbox" => {
-                Target::Collection(store::inbox(&self.conn)?)
             }
             [home, user, name] if home == "calendars" && own(user) && name == "outbox" => {
                 Target::Outbox
             }
             [home, user, name] if kind(home).is_some() && own(user) => {
                 let kind = kind(home).unwrap_or(Kind::Calendar);
-                match store::collection(&self.conn, kind, name)? {
-                    Some(collection) => Target::Collection(collection),
+                match self.place(kind, name)? {
+                    Some(place) => Target::Collection(place),
+                    // Names with `@` are for shares, never new collections.
+                    None if name.contains('@') => Target::NotFound,
                     None => Target::NewCollection(kind, name.clone()),
                 }
             }
             [home, user, name, object] if kind(home).is_some() && own(user) => {
                 let kind = kind(home).unwrap_or(Kind::Calendar);
-                let collection = if kind == Kind::Calendar && name == "inbox" {
-                    Some(store::inbox(&self.conn)?)
-                } else {
-                    store::collection(&self.conn, kind, name)?
-                };
-                match collection {
-                    Some(collection) => {
-                        let found = store::object(&self.conn, &collection, object)?;
-                        Target::Object(collection, found.map(Box::new), object.clone())
+                match self.place(kind, name)? {
+                    Some(place) => {
+                        let found = store::object(self.conn_of(&place), &place.collection, object)?;
+                        Target::Object(place, found.map(Box::new), object.clone())
                     }
                     None => Target::NotFound,
                 }
@@ -239,13 +414,26 @@ pub(crate) fn xml_response(code: StatusCode, body: String) -> Response {
     response
 }
 
+/// 403 for a write the user's access does not allow (RFC 3744 7.1.1),
+/// naming the resource and the privilege it needs.
+pub(crate) fn need_privilege(href: &str, privilege: &str) -> Response {
+    xml_response(
+        StatusCode::FORBIDDEN,
+        xml::error(&format!(
+            "<d:need-privileges><d:resource>{}<d:privilege><d:{privilege}/></d:privilege></d:resource></d:need-privileges>",
+            xml::href(href)
+        )),
+    )
+}
+
 fn options() -> Response {
     let mut response = StatusCode::OK.into_response();
     let headers = response.headers_mut();
     headers.insert(
         "dav",
         HeaderValue::from_static(
-            "1, 3, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol",
+            "1, 3, calendar-access, calendar-auto-schedule, addressbook, \
+             extended-mkcol, calendarserver-sharing",
         ),
     );
     headers.insert(
@@ -340,6 +528,7 @@ fn dispatch(
         "GET" | "HEAD" => Ok(get(target, method == Method::HEAD)),
         "PUT" => put(dav, target, headers, body),
         "DELETE" => delete(dav, target, headers),
+        "POST" if matches!(target, Target::Collection(_)) => sharing::post(dav, target, body),
         "POST" => schedule::post(dav, target, headers, body),
         _ => Ok(status(StatusCode::METHOD_NOT_ALLOWED)),
     };
@@ -361,7 +550,7 @@ fn with_etag(mut response: Response, etag: &str) -> Response {
 }
 
 fn get(target: Target, head: bool) -> Response {
-    let Target::Object(collection, Some(object), _) = target else {
+    let Target::Object(place, Some(object), _) = target else {
         return match target {
             Target::NotFound | Target::NewCollection(..) | Target::Object(_, None, _) => {
                 status(StatusCode::NOT_FOUND)
@@ -378,7 +567,7 @@ fn get(target: Target, head: bool) -> Response {
     with_schedule_tag(&mut response, object.schedule_tag.as_deref());
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type(collection.kind)),
+        HeaderValue::from_static(content_type(place.collection.kind)),
     );
     if head && let Ok(length) = HeaderValue::from_str(&object.data.len().to_string()) {
         response
@@ -424,15 +613,24 @@ fn preconditions_fail(headers: &HeaderMap, current: Option<&Object>) -> bool {
 }
 
 fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::Result<Response> {
-    let Target::Object(collection, _, name) = target else {
+    let Target::Object(place, existing, name) = target else {
         return Ok(status(match target {
             Target::NotFound => StatusCode::CONFLICT,
             _ => StatusCode::METHOD_NOT_ALLOWED,
         }));
     };
+    let collection = &place.collection;
     if collection.inbox {
         // Only the server delivers to the inbox (RFC 6638 2.2).
         return Ok(status(StatusCode::FORBIDDEN));
+    }
+    if !place.writable() {
+        // Changing an object needs write-content on it, adding one bind on
+        // the collection (RFC 3744 3.3, 3.9).
+        return Ok(match existing {
+            Some(_) => need_privilege(&object_href(&dav.user, &place, &name), "write-content"),
+            None => need_privilege(&collection_href(&dav.user, &place), "bind"),
+        });
     }
     let prefix = match collection.kind {
         Kind::Calendar => "c",
@@ -454,6 +652,7 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
             xml::error(&format!("<{valid}/>")),
         ));
     };
+    let conn = dav.conn_of(&place);
     // The preconditions are checked against the object as it is inside the
     // store's write transaction, so concurrent writers cannot both pass;
     // scheduling compares against that same version.
@@ -468,11 +667,11 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
                 schedule_tag: store::ScheduleTag::None,
             });
         }
-        let (prepared, messages) = schedule::prepare_put(dav, current, text);
+        let (prepared, messages) = schedule::prepare_put(dav, place.owner(dav), current, text);
         outgoing = messages;
         Ok(prepared)
     };
-    match store::put_with(&dav.conn, &collection, &name, &mut prepare)? {
+    match store::put_with(conn, collection, &name, &mut prepare)? {
         Ok(stored) => {
             schedule::deliver(dav, outgoing);
             let mut response = status(if stored.created {
@@ -483,7 +682,7 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
             with_schedule_tag(&mut response, stored.schedule_tag.as_deref());
             // An ETag only when the object is stored as sent (RFC 4791
             // 5.3.4); scheduling may have added statuses.
-            let as_sent = store::object(&dav.conn, &collection, &name)?
+            let as_sent = store::object(conn, collection, &name)?
                 .is_some_and(|object| object.etag == stored.etag && object.data == text);
             Ok(if as_sent {
                 with_etag(response, &stored.etag)
@@ -504,7 +703,7 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
             StatusCode::FORBIDDEN,
             xml::error(&format!(
                 "<{prefix}:no-uid-conflict>{}</{prefix}:no-uid-conflict>",
-                xml::href(&object_href(&dav.user, &collection, &other))
+                xml::href(&object_href(&dav.user, &place, &other))
             )),
         )),
     }
@@ -512,17 +711,23 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
 
 fn delete(dav: &Dav, target: Target, headers: &HeaderMap) -> anyhow::Result<Response> {
     match target {
-        Target::Object(collection, Some(_), name) => {
+        Target::Object(place, Some(_), _) if !place.writable() => Ok(need_privilege(
+            &collection_href(&dav.user, &place),
+            "unbind",
+        )),
+        Target::Object(place, Some(_), name) => {
+            let collection = &place.collection;
             let precondition = |current: Option<&Object>| !preconditions_fail(headers, current);
             Ok(status(
-                match store::delete(&dav.conn, &collection, &name, &precondition)? {
+                match store::delete(dav.conn_of(&place), collection, &name, &precondition)? {
                     store::Deleted::Deleted(previous) => {
                         // RFC 6638 8.1: `Schedule-Reply: F` deletes quietly.
                         let quiet = headers
                             .get("schedule-reply")
                             .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"F"));
                         if collection.kind == Kind::Calendar && !collection.inbox && !quiet {
-                            let messages = schedule::prepare_delete(dav, &previous);
+                            let messages =
+                                schedule::prepare_delete(dav, place.owner(dav), &previous);
                             schedule::deliver(dav, messages);
                         }
                         StatusCode::NO_CONTENT
@@ -532,9 +737,24 @@ fn delete(dav: &Dav, target: Target, headers: &HeaderMap) -> anyhow::Result<Resp
                 },
             ))
         }
-        Target::Collection(collection) if collection.inbox => Ok(status(StatusCode::FORBIDDEN)),
-        Target::Collection(collection) => {
+        Target::Collection(place) if place.collection.inbox => Ok(status(StatusCode::FORBIDDEN)),
+        Target::Collection(Place {
+            collection,
+            share: Some(share),
+        }) => {
+            // A sharee deleting a shared collection only leaves it; the
+            // owner's collection stays (as with CalendarServer sharing).
+            share::delete(
+                &dav.app.db_path,
+                &share.owner.address,
+                collection.id,
+                &dav.user.address,
+            )?;
+            Ok(status(StatusCode::NO_CONTENT))
+        }
+        Target::Collection(Place { collection, .. }) => {
             store::delete_collection(&dav.conn, &collection)?;
+            share::forget_collection(&dav.app.db_path, &dav.user.address, collection.id)?;
             Ok(status(StatusCode::NO_CONTENT))
         }
         Target::Object(_, None, _) | Target::NotFound | Target::NewCollection(..) => {
@@ -585,7 +805,10 @@ fn make_collection(
             xml::error("<d:valid-resourcetype/>"),
         ));
     }
+    // `inbox` and `outbox` are the scheduling collections; names with an
+    // `@` are kept for shared collections (see `binding_segment`).
     if !store::valid_name(&name)
+        || name.contains('@')
         || kind == Kind::Calendar && matches!(name.as_str(), "inbox" | "outbox")
     {
         return Ok(status(StatusCode::FORBIDDEN));
@@ -613,8 +836,28 @@ fn make_collection(
         }
     }
     let mut response = status(StatusCode::CREATED);
-    if let Ok(location) = HeaderValue::from_str(&collection_href(&dav.user, &collection)) {
+    if let Ok(location) = HeaderValue::from_str(&own_collection_href(&dav.user, &collection)) {
         response.headers_mut().insert(header::LOCATION, location);
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn binding_segments_name_the_owner_and_collection() {
+        let segment = binding_segment("team+cal@example.test", "work~2026");
+        assert_eq!(segment, "team+cal@example.test~work~2026");
+        assert_eq!(
+            parse_binding(&segment),
+            Some(("team+cal@example.test", "work~2026"))
+        );
+        assert_eq!(parse_binding("default"), None);
+        assert_eq!(parse_binding("a@example.test"), None);
+        assert_eq!(parse_binding("a@example.test~"), None);
+        assert_eq!(parse_binding("@~x"), None);
+        assert_eq!(parse_binding("a@~x"), None);
+    }
 }

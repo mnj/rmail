@@ -3,6 +3,12 @@
 /** `owner` and `rights` (RFC 4314 letters) are set on folders other accounts share with the user. */
 export type Folder = { name: string; special_use: string | null; messages: number; unread: number; owner?: string; rights?: string };
 export type Grant = { address: string; rights: string; access: 'read' | 'edit' | null };
+/** One of the user's calendars or address books, with whom it is shared. */
+export type DavCollection = { kind: 'calendar' | 'addressbook'; name: string; displayname: string; grants: { address: string; access: 'read' | 'edit' }[] };
+export type CalendarListing = {
+  own: DavCollection[];
+  shared: { kind: 'calendar' | 'addressbook'; owner: string; displayname: string; access: 'read' | 'edit' }[];
+};
 export type Suggestion = { folder: string; score: number; method: 'sender' | 'knn' | 'llm' };
 export type Label = { name: string; keyword: string; description: string; origin?: 'user' | 'starter' | 'ai' };
 export type Message = {

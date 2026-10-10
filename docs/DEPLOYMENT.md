@@ -557,7 +557,27 @@ respected.
   submission service like any other mail; with no loopback submission listener, those attendees
   are marked undeliverable (`SCHEDULE-STATUS` 5.1). Free-busy lookups answer only for accounts in
   the asker's domain.
-- Calendars cannot be shared between accounts yet.
+- Users can share a calendar or address book with other accounts on the server, read-only or
+  with changes allowed. In webmail, **Calendar sharing** in the sidebar lists the user's
+  calendars and address books with a share button on each, since Thunderbird and DAVx⁵ cannot
+  share; Apple Calendar shares from its own calendar settings. The recipient's apps show the
+  shared collection next to their own (it appears in their home as `<owner>~<name>`), marked
+  read-only when it is; its name and color can be changed for themselves without affecting the
+  owner, and deleting it there only stops receiving it. Like shared folders, any account on the
+  server can be named, in any domain. Administrators see every share on the admin portal's
+  Mailboxes page and can revoke it there or from the CLI:
+
+  ```bash
+  rmail_ctl share list user@example.com
+  rmail_ctl share calendar user@example.com default colleague@example.com read        # read
+  rmail_ctl share calendar user@example.com default colleague@example.com read-write  # change
+  rmail_ctl share addressbook user@example.com default colleague@example.com none     # stop
+  ```
+
+  The name is the collection's URL segment (`default` for the ones every account starts with).
+  A change in a calendar shared with changes allowed is scheduled as the owner: when the
+  recipient sends or updates an invitation of the owner's there, it goes out from the owner's
+  address, as from a delegate. Deleting a calendar, address book or account removes its grants.
 
 ## Mail organization
 

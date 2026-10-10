@@ -3,12 +3,12 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X,
+  ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser,
 } from 'lucide-react';
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import {
-  Api, ApiError, Attachment, Folder, Grant, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
+  Api, ApiError, Attachment, CalendarListing, DavCollection, Folder, Grant, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
   can, formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sharedFolderName, sortFolders, splitAddress,
 } from './types';
 import './style.css';
@@ -107,14 +107,81 @@ function allowed(folder: Folder | undefined, action: string) {
 const accessLabel: Record<string, string> = { read: 'Can read', edit: 'Can read and change' };
 
 /** Who one of the user's own folders is shared with, and changes to that. */
-function ShareDialog({ api, folder, onClose }: { api: Api; folder: string; onClose: () => void }) {
+function FolderShareDialog({ api, folder, onClose }: { api: Api; folder: string; onClose: () => void }) {
+  const base = `/api/folders/${encodeURIComponent(folder)}/sharing`;
+  const load = useCallback(() => api<Grant[]>(base), [api, base]);
+  return (
+    <ShareDialog api={api} base={base} load={load} name={folder === 'INBOX' ? 'Inbox' : folder} onClose={onClose}
+      intro="People on this server you share with see the folder under “Shared with me” in webmail and under Other Users in mail apps. Read and starred marks are shared with them." />
+  );
+}
+
+const davIntro = 'People on this server you share with see it in their calendar or contacts app (CalDAV/CardDAV) next to their own, read-only or with changes allowed. With changes allowed, invitations they send from a shared calendar come from you.';
+
+/** The user's calendars and address books, shared from here since most calendar apps cannot share. */
+function CalendarsDialog({ api, onClose }: { api: Api; onClose: () => void }) {
+  const [listing, setListing] = useState<CalendarListing | null>(null);
+  const [error, setError] = useState('');
+  const [sharing, setSharing] = useState<DavCollection | null>(null);
+  const load = useCallback(() => api<CalendarListing>('/api/calendars').then(setListing).catch((err) => setError((err as Error).message)), [api]);
+  useEffect(() => { load(); }, [load]);
+  const grantsOf = useCallback(async () => {
+    const fresh = await api<CalendarListing>('/api/calendars');
+    setListing(fresh);
+    const found = fresh.own.find((c) => c.kind === sharing?.kind && c.name === sharing?.name);
+    return (found?.grants ?? []).map((grant) => ({ ...grant, rights: '' }));
+  }, [api, sharing]);
+  if (sharing) {
+    return (
+      <ShareDialog api={api} base={`/api/calendars/${sharing.kind}/${encodeURIComponent(sharing.name)}/sharing`} load={grantsOf}
+        name={sharing.displayname} intro={davIntro} onClose={() => setSharing(null)} />
+    );
+  }
+  const icon = (kind: string) => (kind === 'calendar' ? <CalendarDays size={16} /> : <BookUser size={16} />);
+  return (
+    <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
+      <section className="dialog" role="dialog" aria-label="Calendar sharing">
+        <header><h2>Calendar sharing</h2><IconButton label="Close" onClick={onClose}><X size={16} /></IconButton></header>
+        <p className="dialog-intro">Share your calendars and address books with other people on this server.</p>
+        {error && <p className="error">{error}</p>}
+        {listing === null ? <p className="muted">Loading…</p> : (
+          <>
+            <ul className="share-list">
+              {listing.own.map((collection) => (
+                <li key={`${collection.kind} ${collection.name}`}>
+                  {icon(collection.kind)}
+                  <span className="share-who" title={collection.displayname}>
+                    {collection.displayname}
+                    <small className="muted"> {collection.grants.length === 0 ? 'not shared' : `shared with ${collection.grants.length}`}</small>
+                  </span>
+                  <IconButton label={`Share ${collection.displayname}`} onClick={() => setSharing(collection)}><Share2 size={14} /></IconButton>
+                </li>
+              ))}
+            </ul>
+            {listing.shared.length > 0 && <h3 className="folder-group">Shared with me</h3>}
+            <ul className="share-list">
+              {listing.shared.map((collection) => (
+                <li key={`${collection.kind} ${collection.owner} ${collection.displayname}`}>
+                  {icon(collection.kind)}
+                  <span className="share-who">{collection.displayname}<small className="muted"> from {collection.owner}{collection.access === 'read' ? ', read only' : ''}</small></span>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/** Who something of the user's is shared with (grants loaded by `load`, changed by PUT to `base`). */
+function ShareDialog({ api, base, load: fetchGrants, name, intro, onClose }: { api: Api; base: string; load: () => Promise<Grant[]>; name: string; intro: string; onClose: () => void }) {
   const [grants, setGrants] = useState<Grant[] | null>(null);
   const [address, setAddress] = useState('');
   const [access, setAccess] = useState<'read' | 'edit'>('read');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const base = `/api/folders/${encodeURIComponent(folder)}/sharing`;
-  const load = useCallback(() => api<Grant[]>(base).then(setGrants).catch((err) => setError((err as Error).message)), [api, base]);
+  const load = useCallback(() => fetchGrants().then(setGrants).catch((err) => setError((err as Error).message)), [fetchGrants]);
   useEffect(() => { load(); }, [load]);
   async function change(who: string, next: string) {
     setBusy(true);
@@ -136,9 +203,9 @@ function ShareDialog({ api, folder, onClose }: { api: Api; folder: string; onClo
   }
   return (
     <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
-      <section className="dialog" role="dialog" aria-label={`Share ${folder}`}>
-        <header><h2>Share {folder === 'INBOX' ? 'Inbox' : folder}</h2><IconButton label="Close" onClick={onClose}><X size={16} /></IconButton></header>
-        <p className="dialog-intro">People on this server you share with see the folder under “Shared with me” in webmail and under Other Users in mail apps. Read and starred marks are shared with them.</p>
+      <section className="dialog" role="dialog" aria-label={`Share ${name}`}>
+        <header><h2>Share {name}</h2><IconButton label="Close" onClick={onClose}><X size={16} /></IconButton></header>
+        <p className="dialog-intro">{intro}</p>
         <form className="share-add" onSubmit={add}>
           <input aria-label="Address to share with" placeholder="colleague@example.com" value={address} onChange={(e) => setAddress(e.target.value)} />
           <select aria-label="Access" value={access} onChange={(e) => setAccess(e.target.value as 'read' | 'edit')}>
@@ -367,6 +434,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [prompt, setPrompt] = useState<React.ComponentProps<typeof PromptDialog> | null>(null);
   const [rawFor, setRawFor] = useState<number | null>(null);
   const [sharing, setSharing] = useState<string | null>(null);
+  const [calendars, setCalendars] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [notice, setNotice] = useState('');
@@ -640,6 +708,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         </nav>
         <div className="sidebar-foot">
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
+          <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <ThemeSwitch />
           <button className="sidebar-link" onClick={onLogout}><LogOut size={15} />Sign out</button>
         </div>
@@ -786,7 +855,8 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {notice && <div className="toast" role="status">{notice}</div>}
       {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} />}
       {prompt && <PromptDialog {...prompt} />}
-      {sharing !== null && <ShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
+      {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
+      {calendars && <CalendarsDialog api={api} onClose={() => setCalendars(false)} />}
       {rawFor !== null && <RawDialog api={api} folder={folder} uid={rawFor} onClose={() => setRawFor(null)} />}
     </main>
   );

@@ -224,6 +224,19 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS mailbox_acl_grantee ON mailbox_acl (grantee);
 
+        -- Calendar and address book sharing (see dav/share.rs).
+        CREATE TABLE IF NOT EXISTS dav_shares (
+            owner TEXT NOT NULL,
+            collection_id INTEGER NOT NULL,
+            grantee TEXT NOT NULL,
+            access TEXT NOT NULL,
+            displayname TEXT,
+            color TEXT,
+            sort_order TEXT,
+            PRIMARY KEY (owner, collection_id, grantee)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS dav_shares_grantee ON dav_shares (grantee);
+
         -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
         CREATE TABLE IF NOT EXISTS greylist (
             key TEXT PRIMARY KEY,
@@ -305,6 +318,10 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
     conn.execute("DELETE FROM mailboxes WHERE address = ?1", params![address])?;
     conn.execute(
         "DELETE FROM mailbox_acl WHERE owner = ?1 OR grantee = ?1",
+        params![address],
+    )?;
+    conn.execute(
+        "DELETE FROM dav_shares WHERE owner = ?1 OR grantee = ?1",
         params![address],
     )?;
     conn.execute(
