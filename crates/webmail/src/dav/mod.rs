@@ -334,6 +334,11 @@ impl Dav {
     /// The collection a segment of the user's home names: their own, the
     /// schedule inbox, or a shared one's binding.
     fn place(&self, kind: Kind, name: &str) -> anyhow::Result<Option<Place>> {
+        // The user's own collection wins: ones made before `@` was reserved
+        // for shared bindings stay reachable.
+        if let Some(own) = store::collection(&self.conn, kind, name)? {
+            return Ok(Some(Place::own(own)));
+        }
         if name.contains('@') {
             let Some((owner, name)) = parse_binding(name) else {
                 return Ok(None);
@@ -346,7 +351,7 @@ impl Dav {
         if kind == Kind::Calendar && name == "inbox" {
             return Ok(Some(Place::own(store::inbox(&self.conn)?)));
         }
-        Ok(store::collection(&self.conn, kind, name)?.map(Place::own))
+        Ok(None)
     }
 
     pub fn resolve(&self, segments: &[String]) -> anyhow::Result<Target> {

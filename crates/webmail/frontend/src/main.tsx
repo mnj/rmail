@@ -161,7 +161,7 @@ function CalendarsDialog({ api, onClose }: { api: Api; onClose: () => void }) {
             {listing.shared.length > 0 && <h3 className="folder-group">Shared with me</h3>}
             <ul className="share-list">
               {listing.shared.map((collection) => (
-                <li key={`${collection.kind} ${collection.owner} ${collection.displayname}`}>
+                <li key={`${collection.kind} ${collection.owner} ${collection.name}`}>
                   {icon(collection.kind)}
                   <span className="share-who">{collection.displayname}<small className="muted"> from {collection.owner}{collection.access === 'read' ? ', read only' : ''}</small></span>
                 </li>

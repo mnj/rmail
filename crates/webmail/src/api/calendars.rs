@@ -62,6 +62,8 @@ struct OwnCollection {
 struct SharedCollection {
     kind: &'static str,
     owner: String,
+    /// The owner's collection name: with `owner` and `kind`, a unique key.
+    name: String,
     displayname: String,
     access: &'static str,
 }
@@ -105,6 +107,7 @@ async fn list(app: State<Shared>, headers: HeaderMap) -> Response {
             .into_iter()
             .map(|(grant, collection)| SharedCollection {
                 kind: kind_name(collection.kind),
+                name: collection.name.clone(),
                 displayname: grant
                     .displayname
                     .clone()

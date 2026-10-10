@@ -7,7 +7,7 @@ export type Grant = { address: string; rights: string; access: 'read' | 'edit' |
 export type DavCollection = { kind: 'calendar' | 'addressbook'; name: string; displayname: string; grants: { address: string; access: 'read' | 'edit' }[] };
 export type CalendarListing = {
   own: DavCollection[];
-  shared: { kind: 'calendar' | 'addressbook'; owner: string; displayname: string; access: 'read' | 'edit' }[];
+  shared: { kind: 'calendar' | 'addressbook'; owner: string; name: string; displayname: string; access: 'read' | 'edit' }[];
 };
 export type Suggestion = { folder: string; score: number; method: 'sender' | 'knn' | 'llm' };
 export type Label = { name: string; keyword: string; description: string; origin?: 'user' | 'starter' | 'ai' };

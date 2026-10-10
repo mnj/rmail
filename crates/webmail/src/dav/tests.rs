@@ -1318,3 +1318,32 @@ async fn address_books_are_shared_too() {
     let read = dav_as(&state, OTHER, "GET", &format!("{shared}c1.vcf"), &[], "").await;
     assert!(read.body.contains("FN:Ada"));
 }
+
+#[tokio::test]
+async fn own_collections_named_with_an_at_sign_stay_reachable() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    // Made before `@` was reserved for shared bindings.
+    let conn = rmail_common::jmap::store::open(&state.mail_root, "example.test", "user").unwrap();
+    rmail_common::dav::store::create(
+        &conn,
+        rmail_common::dav::store::Kind::Calendar,
+        "team@work",
+        Some("Team"),
+        &["VEVENT"],
+    )
+    .unwrap();
+    drop(conn);
+    let path = "/dav/calendars/user@example.test/team%40work/";
+    let found = dav(&state, "PROPFIND", path, &[("depth", "0")], "").await;
+    assert_eq!(found.status, 207, "{}", found.body);
+    let put = dav(
+        &state,
+        "PUT",
+        &format!("{path}a.ics"),
+        &[],
+        &event("a", "Kept", "20261012T090000Z"),
+    )
+    .await;
+    assert_eq!(put.status, 201, "{}", put.body);
+}
