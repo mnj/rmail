@@ -2345,6 +2345,66 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
     }
 
+    #[tokio::test]
+    async fn feedback_reports_are_listed_and_deleted() {
+        let td = tempdir().unwrap();
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).unwrap();
+        let report = rmail_common::feedback::FeedbackReport {
+            feedback_type: "abuse".into(),
+            reporter: Some("feedback@arf.example".into()),
+            report_message_id: Some("r1@arf.example".into()),
+            incidents: 2,
+            ..Default::default()
+        };
+        let attribution = rmail_common::feedback::Attribution {
+            account: Some("alice@example.test".into()),
+            domain: Some("example.test".into()),
+            method: Some("original-mail-from".into()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let id = rmail_common::feedback::record(
+            &db_path,
+            "fbl@example.test",
+            &report,
+            &attribution,
+            true,
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        let db = Some(db_path.to_string_lossy().into_owned());
+        let listed = send_request_with_db(
+            td.path().to_path_buf(),
+            "GET /api/feedback?account=alice@example.test HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                .into(),
+            db.clone(),
+        )
+        .await;
+        assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+        let body: serde_json::Value =
+            serde_json::from_str(listed.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["reports"][0]["account"], "alice@example.test");
+        assert_eq!(body["senders"][0]["complaints"], 2);
+        assert_eq!(body["threshold"], 5);
+
+        let body = format!(r#"{{"id":{id}}}"#);
+        let delete = |body: String| {
+            format!(
+                "DELETE /api/feedback HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let deleted =
+            send_request_with_db(td.path().to_path_buf(), delete(body.clone()), db.clone()).await;
+        assert!(deleted.starts_with("HTTP/1.1 200"), "{deleted}");
+        let again = send_request_with_db(td.path().to_path_buf(), delete(body), db).await;
+        assert!(again.starts_with("HTTP/1.1 404"), "{again}");
+    }
+
     fn organization_db(td: &std::path::Path) -> String {
         let db_path = td.join("rmail.sqlite");
         rmail_common::db::init_db(&db_path).expect("init db");

@@ -212,6 +212,49 @@ minutes; inactive database pools are evicted after fifteen minutes, and at most 
 database pools are retained. This bounds file descriptors and prevents concurrent IMAP, SMTP, and
 admin requests from creating a new connection for every command.
 
+## Complaint feedback loops (ARF)
+
+Large mailbox providers send an abuse report (ARF, RFC 5965) each time one of their users marks
+mail from your server as spam, if you register for their feedback loop: for example Yahoo's
+Complaint Feedback Loop, Microsoft's JMRP (with SNDS), and the loops of Fastmail, Comcast and
+other ISPs, many listed by the providers' postmaster pages. Registration usually asks for the
+sending IP addresses or DKIM domains and an address that receives the reports.
+
+1. Create a mailbox or alias for the reports, e.g. `fbl@example.com` (an alias to an operator's
+   mailbox works; the reports are ordinary mail and are delivered there too).
+2. Tell rMail which addresses receive reports. A bare local part matches it in every hosted
+   domain:
+
+   ```bash
+   rmail_ctl settings set security.feedback_addresses '["fbl@example.com"]'
+   rmail_ctl settings set security.feedback_complaint_threshold 5   # 0 disables the warning
+   rmail_ctl service restart --unit smtpd
+   ```
+
+   or set **Feedback loop addresses** under Settings → Filtering in the admin console.
+3. Register that address with each provider's feedback loop. Keep DKIM signing on: several loops
+   identify your mail by its DKIM domain.
+
+Each report is stored (once per report Message-ID, for 180 days) and tied to the local sender: the
+first of Original-Mail-From, the original Return-Path, Sender, From and DKIM `i=` that is a local
+mailbox names the account; otherwise a hosted domain among them, or the DKIM `d=` domain, names
+the domain. Reports that fail DMARC are kept but marked unverified, since anyone can send one. An
+account that collects `security.feedback_complaint_threshold` authenticated complaints within 24
+hours logs a `feedback_complaint_threshold` warning in the smtpd log, the usual sign of a
+compromised account or an unwanted mailing.
+
+See them in the admin console's **Delivery** page, or with:
+
+```bash
+rmail_ctl feedback summary --days 30          # complaints per account or domain
+rmail_ctl feedback list --account alice@example.com
+rmail_ctl feedback list --json --limit 500    # one JSON object per report
+rmail_ctl feedback delete 42
+```
+
+Prometheus exposes `rmail_feedback_reports_total{type="abuse"}` (and `fraud`, `virus`, `other`,
+`not-spam`, `auth-failure`, `unknown`). Reports larger than 4 MiB are delivered but not parsed.
+
 ## Account storage quotas
 
 Storage quotas are optional and account-wide across every IMAP folder. Configure them from the

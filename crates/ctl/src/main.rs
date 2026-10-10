@@ -103,6 +103,15 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Abuse feedback (ARF) reports received at the feedback loop addresses
+    /// (security.feedback_addresses)
+    Feedback {
+        #[command(subcommand)]
+        action: FeedbackAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// Aggregate and enqueue DMARC RUA reports for unreported events in the DB
     SendDmarcReports {
         /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
@@ -242,6 +251,28 @@ enum DkimAction {
     SetArc { domain: String, selector: String },
     /// Stop ARC sealing
     ClearArc,
+}
+
+#[derive(Subcommand)]
+enum FeedbackAction {
+    /// Newest reports, optionally only those about one account or domain
+    List {
+        /// account address or domain
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// one JSON object per line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Complaints per sender: who draws the most
+    Summary {
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+    },
+    /// Delete one report by its id
+    Delete { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -668,6 +699,16 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&cfg.global.db_path),
             )?;
         }
+        Commands::Feedback { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db_path = std::path::Path::new(&cfg.global.db_path);
+            // Creates the table on databases from before feedback reports.
+            rmail_common::db::init_db(db_path)?;
+            run_feedback(action, db_path, &mut std::io::stdout())?;
+        }
         Commands::Dkim { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
@@ -825,6 +866,78 @@ fn run_transport(action: TransportAction, db_path: &std::path::Path) -> Result<(
             if !transport::delete_route(db_path, &domain)? {
                 anyhow::bail!("no route for {domain}");
             }
+        }
+    }
+    Ok(())
+}
+
+fn run_feedback(
+    action: FeedbackAction,
+    db_path: &std::path::Path,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    use rmail_common::feedback;
+    match action {
+        FeedbackAction::List {
+            account,
+            limit,
+            json,
+        } => {
+            let reports = feedback::list(db_path, account.as_deref(), limit.clamp(1, 10_000))?;
+            if reports.is_empty() && !json {
+                writeln!(out, "No feedback reports")?;
+            }
+            for report in reports {
+                if json {
+                    writeln!(out, "{}", serde_json::to_string(&report)?)?;
+                    continue;
+                }
+                let received = chrono::DateTime::from_timestamp(report.received_at, 0)
+                    .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                let sender = report
+                    .account
+                    .or(report.domain)
+                    .unwrap_or_else(|| "(not local)".to_string());
+                writeln!(
+                    out,
+                    "{:>6}  {received}  {:<12} {sender}  from {}{}  {}",
+                    report.id,
+                    report.feedback_type,
+                    report.reporter.as_deref().unwrap_or("?"),
+                    if report.authenticated {
+                        ""
+                    } else {
+                        " (unverified)"
+                    },
+                    report.original_subject.as_deref().unwrap_or(""),
+                )?;
+            }
+        }
+        FeedbackAction::Summary { days } => {
+            let since = chrono::Utc::now().timestamp() - days.clamp(1, 3650) * 24 * 3600;
+            let senders = feedback::summary(db_path, since)?;
+            if senders.is_empty() {
+                writeln!(out, "No complaints in the last {days} days")?;
+            }
+            for row in senders {
+                let sender = if row.sender.is_empty() {
+                    "(not local)"
+                } else {
+                    row.sender.as_str()
+                };
+                writeln!(
+                    out,
+                    "{sender}  complaints={} unverified={}",
+                    row.complaints, row.unverified
+                )?;
+            }
+        }
+        FeedbackAction::Delete { id } => {
+            if !feedback::delete(db_path, id)? {
+                anyhow::bail!("no feedback report {id}");
+            }
+            writeln!(out, "Deleted feedback report {id}")?;
         }
     }
     Ok(())
@@ -1227,5 +1340,46 @@ mod tests {
         let units = selected_units(&opts, true).unwrap();
         assert_eq!(units.first().copied(), Some("rmail_classifier.service"));
         assert_eq!(units.last().copied(), Some("rmail_smtpd.service"));
+    }
+
+    #[test]
+    fn feedback_lists_summarizes_and_deletes_reports() {
+        use super::{FeedbackAction, run_feedback};
+        use rmail_common::feedback;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rmail.db");
+        rmail_common::db::init_db(&db).unwrap();
+        let report = feedback::FeedbackReport {
+            feedback_type: "abuse".into(),
+            reporter: Some("fbl@provider.example".into()),
+            report_message_id: Some("r1@provider.example".into()),
+            incidents: 1,
+            ..Default::default()
+        };
+        let attribution = feedback::Attribution {
+            account: Some("alice@example.test".into()),
+            domain: Some("example.test".into()),
+            method: Some("from".into()),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let id = feedback::record(&db, "fbl@example.test", &report, &attribution, false, now)
+            .unwrap()
+            .unwrap();
+        let run = |action| {
+            let mut out = Vec::new();
+            run_feedback(action, &db, &mut out).map(|()| String::from_utf8(out).unwrap())
+        };
+        let listed = run(FeedbackAction::List {
+            account: None,
+            limit: 10,
+            json: false,
+        })
+        .unwrap();
+        assert!(listed.contains("alice@example.test"), "{listed}");
+        assert!(listed.contains("(unverified)"), "{listed}");
+        let summary = run(FeedbackAction::Summary { days: 30 }).unwrap();
+        assert_eq!(summary, "alice@example.test  complaints=0 unverified=1\n");
+        assert!(run(FeedbackAction::Delete { id }).is_ok());
+        assert!(run(FeedbackAction::Delete { id }).is_err());
     }
 }
