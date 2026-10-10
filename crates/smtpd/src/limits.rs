@@ -325,16 +325,37 @@ pub(crate) fn etrn_client_allowed(ip: IpAddr) -> bool {
     true
 }
 
-/// Whether a queue run for `node` may start now; records it when so.
-pub(crate) fn etrn_node_due(node: &str) -> bool {
+/// What an ETRN for a node may do now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeRun {
+    /// Start a run; the node is recorded until [`etrn_node_release`] or the
+    /// interval passes.
+    Start,
+    /// A run started for this node a moment ago covers this request.
+    Running,
+    /// Too many nodes are being tracked to take another.
+    Busy,
+}
+
+/// Claim a queue run for `node`.
+pub(crate) fn etrn_node_claim(node: &str) -> NodeRun {
     let now = Instant::now();
     let mut all = ETRN_NODES.lock().unwrap();
     all.retain(|_, started| now.duration_since(*started) < ETRN_NODE_INTERVAL);
-    if all.contains_key(node) || all.len() >= MAX_TRACKED_ETRN_KEYS {
-        return false;
+    if all.contains_key(node) {
+        return NodeRun::Running;
+    }
+    if all.len() >= MAX_TRACKED_ETRN_KEYS {
+        return NodeRun::Busy;
     }
     all.insert(node.to_string(), now);
-    true
+    NodeRun::Start
+}
+
+/// Forget a claim whose run could not be requested, so a retry is not
+/// answered as if a run were under way.
+pub(crate) fn etrn_node_release(node: &str) {
+    ETRN_NODES.lock().unwrap().remove(node);
 }
 
 #[cfg(test)]
@@ -352,8 +373,18 @@ mod etrn_limit_tests {
             192, 0, 2, 78
         ))));
 
-        assert!(super::etrn_node_due("limit.example.test"));
-        assert!(!super::etrn_node_due("limit.example.test"));
-        assert!(super::etrn_node_due("@limit.example.test"));
+        use super::NodeRun;
+        assert_eq!(super::etrn_node_claim("limit.example.test"), NodeRun::Start);
+        assert_eq!(
+            super::etrn_node_claim("limit.example.test"),
+            NodeRun::Running
+        );
+        assert_eq!(
+            super::etrn_node_claim("@limit.example.test"),
+            NodeRun::Start
+        );
+        // A failed request releases the claim, so a retry starts a run.
+        super::etrn_node_release("limit.example.test");
+        assert_eq!(super::etrn_node_claim("limit.example.test"), NodeRun::Start);
     }
 }

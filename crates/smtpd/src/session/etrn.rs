@@ -17,7 +17,7 @@ use rmail_common::etrn::Node;
 
 use super::{Flow, Session, SmtpReader, reply, session_log};
 use crate::SmtpService;
-use crate::limits::{etrn_client_allowed, etrn_node_due};
+use crate::limits::{NodeRun, etrn_client_allowed, etrn_node_claim, etrn_node_release};
 use crate::protocol::{self, EtrnArgs};
 
 impl Session {
@@ -74,10 +74,17 @@ impl Session {
         } else {
             None
         };
-        // A run started for this node a moment ago covers this request too.
-        if etrn_node_due(&shown) && !self.request_queue_run(mail_root, node).await {
-            let line = format!("458 4.3.0 Unable to queue messages for node {shown}\r\n");
-            return reply(reader, line.as_bytes()).await;
+        let unable = format!("458 4.3.0 Unable to queue messages for node {shown}\r\n");
+        match etrn_node_claim(&shown) {
+            // A run started for this node a moment ago covers this request.
+            NodeRun::Running => {}
+            NodeRun::Busy => return reply(reader, unable.as_bytes()).await,
+            NodeRun::Start => {
+                if !self.request_queue_run(mail_root, node).await {
+                    etrn_node_release(&shown);
+                    return reply(reader, unable.as_bytes()).await;
+                }
+            }
         }
         session_log!(self, "info", "etrn_accepted", { "node": shown, "authenticated_user": self.authenticated_user });
         let line = match waiting {
