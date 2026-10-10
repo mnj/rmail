@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod dkim;
 pub mod dnsbl;
 pub mod domain;
+pub mod etrn;
 pub mod feedback;
 pub mod greylist;
 pub mod hold;

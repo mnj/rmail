@@ -160,6 +160,7 @@ pub(crate) fn received_header(
     extended_smtp: bool,
     encrypted: bool,
     authenticated: bool,
+    priority: Option<i8>,
 ) -> Vec<u8> {
     let helo = helo_name.unwrap_or("unknown");
     let protocol = if service == SmtpService::Lmtp {
@@ -178,14 +179,19 @@ pub(crate) fn received_header(
     let timestamp = chrono_like_utc_timestamp();
     // RFC 5321 section 4.4: "by" names the receiving host.
     let host = server_hostname();
+    // RFC 6710 section 6: the PRIORITY clause records the priority this
+    // server assigned.
+    let priority = priority
+        .map(|priority| format!(" PRIORITY {priority}"))
+        .unwrap_or_default();
     match peer {
         Some(peer) => format!(
-            "Received: from {helo} ([{}]) by {host} (rMail) with {protocol}; {timestamp}\r\n",
+            "Received: from {helo} ([{}]) by {host} (rMail) with {protocol}{priority}; {timestamp}\r\n",
             peer.ip()
         ),
-        None => {
-            format!("Received: from {helo} by {host} (rMail) with {protocol}; {timestamp}\r\n")
-        }
+        None => format!(
+            "Received: from {helo} by {host} (rMail) with {protocol}{priority}; {timestamp}\r\n"
+        ),
     }
     .into_bytes()
 }

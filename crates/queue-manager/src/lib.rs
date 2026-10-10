@@ -526,6 +526,38 @@ pub fn claim_one_with_limit(
     Ok(None)
 }
 
+/// Start a queue run for each ETRN node (RFC 1985): queued messages for
+/// it that wait for a retry become due now. Attempts are left alone, so a
+/// run never extends a message's life. Returns the messages made due.
+///
+/// Called by the outbound worker between claims, so a message is never
+/// claimed while its sidecar is rewritten here.
+pub fn start_queue_runs(maildrop_dir: &Path, nodes: &[rmail_common::etrn::Node]) -> Result<usize> {
+    if nodes.is_empty() {
+        return Ok(0);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut started = 0;
+    for mut entry in list_queue_entries(maildrop_dir)? {
+        let (Some(domain), Some(json_path)) = (entry.domain.as_deref(), entry.json_path.as_ref())
+        else {
+            continue;
+        };
+        if entry.control.next_try.is_none_or(|next| next <= now)
+            || !nodes.iter().any(|node| node.matches(domain))
+        {
+            continue;
+        }
+        entry.control.next_try = None;
+        write_control_atomic(json_path, &entry.control)?;
+        started += 1;
+    }
+    Ok(started)
+}
+
 pub fn collect_metrics(maildrop_dir: &Path) -> Result<QueueMetrics> {
     let queue_dir = maildrop_dir.join("queue");
     let inflight_dir = maildrop_dir.join("inflight");
@@ -697,6 +729,82 @@ mod tests {
         assert!(inflight_json.exists());
         let claimed2 = claim_one_with_limit(&maildrop, 1)?;
         assert!(claimed2.is_none());
+        Ok(())
+    }
+
+    fn queue_message(queue: &Path, name: &str, recipient: &str, control: &QueueControl) {
+        let eml_path = queue.join(name);
+        fs::write(
+            &eml_path,
+            format!("X-RMail-Envelope-To: {recipient}\r\n\r\nBody\r\n"),
+        )
+        .unwrap();
+        fs::write(
+            rmail_common::outbound::control_path_for_eml(&eml_path),
+            serde_json::to_string(control).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn higher_mt_priority_is_claimed_first() -> Result<()> {
+        let td = tempdir()?;
+        let maildrop = td.path().join("maildrop");
+        let queue = maildrop.join("queue");
+        fs::create_dir_all(&queue)?;
+        // Older but non-urgent, normal, then the newest urgent message.
+        for (name, priority, created_at) in [
+            ("low.eml", -4, 100),
+            ("normal.eml", 0, 200),
+            ("urgent.eml", 4, 300),
+        ] {
+            let mut control = QueueControl::new(5, priority);
+            control.created_at = created_at;
+            queue_message(&queue, name, &format!("{name}@example.com"), &control);
+        }
+        let order = (0..3)
+            .map(|_| {
+                let (eml, _) = claim_one_with_limit(&maildrop, 10).unwrap().unwrap();
+                eml.file_name().unwrap().to_string_lossy().into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["urgent.eml", "normal.eml", "low.eml"]);
+        Ok(())
+    }
+
+    #[test]
+    fn etrn_queue_runs_make_waiting_messages_for_the_node_due() -> Result<()> {
+        use rmail_common::etrn::Node;
+        let td = tempdir()?;
+        let maildrop = td.path().join("maildrop");
+        let queue = maildrop.join("queue");
+        fs::create_dir_all(&queue)?;
+        let mut waiting = QueueControl::new(5, 0);
+        waiting.attempts = 2;
+        waiting.next_try = Some(i64::MAX);
+        queue_message(&queue, "a.eml", "user@example.com", &waiting);
+        queue_message(&queue, "b.eml", "user@mx.example.com", &waiting);
+        queue_message(&queue, "c.eml", "user@example.org", &waiting);
+
+        assert_eq!(start_queue_runs(&maildrop, &[])?, 0);
+        assert!(claim_one_with_limit(&maildrop, 10)?.is_none());
+        assert_eq!(
+            start_queue_runs(&maildrop, &[Node::Domain("example.com".into())])?,
+            1
+        );
+        let (claimed, json) = claim_one_with_limit(&maildrop, 10)?.unwrap();
+        assert_eq!(claimed.file_name().unwrap(), "a.eml");
+        let control: QueueControl = serde_json::from_str(&fs::read_to_string(json)?)?;
+        assert_eq!(control.attempts, 2, "a queue run keeps the attempt count");
+        assert!(claim_one_with_limit(&maildrop, 10)?.is_none());
+
+        assert_eq!(
+            start_queue_runs(&maildrop, &[Node::Subdomains("example.com".into())])?,
+            1
+        );
+        let (claimed, _) = claim_one_with_limit(&maildrop, 10)?.unwrap();
+        assert_eq!(claimed.file_name().unwrap(), "b.eml");
+        assert!(claim_one_with_limit(&maildrop, 10)?.is_none());
         Ok(())
     }
 
