@@ -399,6 +399,7 @@ fn send_email(
             method: message.method.as_str().to_string(),
             data: message.calendar.to_text(),
         }),
+        ..Default::default()
     };
     let built = rmail_common::compose::build(&outgoing, false, None)?;
     tokio::runtime::Handle::current().block_on(crate::submit::submit_as(

@@ -138,10 +138,24 @@ pub fn recover(mail_root: &Path) -> Result<usize> {
 
 /// How many messages `user` has waiting (to bound what one user can hold).
 pub fn count_for(mail_root: &Path, user: &str) -> Result<usize> {
-    Ok(due(mail_root, i64::MAX)?
-        .iter()
-        .filter(|held| held.user.eq_ignore_ascii_case(user))
-        .count())
+    Ok(waiting_for(mail_root, user)?.len())
+}
+
+/// The messages `user` has waiting, soonest first.
+pub fn waiting_for(mail_root: &Path, user: &str) -> Result<Vec<Held>> {
+    let mut held = due(mail_root, i64::MAX)?;
+    held.retain(|held| held.user.eq_ignore_ascii_case(user));
+    Ok(held)
+}
+
+/// The content of the held message `id`, if it is still waiting.
+pub fn message(mail_root: &Path, id: &str) -> Result<Option<Vec<u8>>> {
+    let (eml, _) = paths(mail_root, id)?;
+    match std::fs::read(&eml) {
+        Ok(data) => Ok(Some(data)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The most messages one user may have waiting. The submission caps apply

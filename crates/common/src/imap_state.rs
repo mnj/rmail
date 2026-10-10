@@ -218,6 +218,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
     crate::jmap::store::ensure_schema(conn)?;
     crate::urlauth::ensure_schema(conn)?;
     crate::dav::store::ensure_schema(conn)?;
+    crate::compose_store::ensure_schema(conn)?;
     let invalid_uidvalidity_ids = {
         let mut statement = conn
             .prepare("SELECT id FROM folders WHERE uidvalidity <= 0 OR uidvalidity > 4294967295")?;

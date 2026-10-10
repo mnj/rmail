@@ -75,6 +75,12 @@ fn parse_json(text: Option<String>) -> Option<Value> {
 
 pub(crate) fn identities(ctx: &Ctx, account: &Account) -> Result<Vec<Identity>, MethodError> {
     let conn = ctx.open(account)?;
+    Ok(list(&conn, &ctx.user.address)?)
+}
+
+/// The identities in an account's state database, creating the one for
+/// `address` (the account's own) the first time.
+pub(crate) fn list(conn: &rusqlite::Connection, address: &str) -> anyhow::Result<Vec<Identity>> {
     let empty: bool = conn.query_row("SELECT COUNT(*) = 0 FROM jmap_identities", [], |row| {
         row.get(0)
     })?;
@@ -83,9 +89,9 @@ pub(crate) fn identities(ctx: &Ctx, account: &Account) -> Result<Vec<Identity>, 
         conn.execute(
             "INSERT INTO jmap_identities(id, name, email, text_signature, html_signature)
              VALUES(?1, '', ?2, '', '')",
-            params![id, ctx.user.address],
+            params![id, address],
         )?;
-        store::log_change(&conn, "Identity", &id, true, false)?;
+        store::log_change(conn, "Identity", &id, true, false)?;
     }
     let mut statement = conn.prepare(
         "SELECT id, name, email, reply_to, bcc, text_signature, html_signature
@@ -105,6 +111,26 @@ pub(crate) fn identities(ctx: &Ctx, account: &Account) -> Result<Vec<Identity>, 
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Change an identity's display name and signatures (webmail settings);
+/// false when there is no such identity.
+pub(crate) fn update_signature(
+    conn: &rusqlite::Connection,
+    id: &str,
+    name: &str,
+    text_signature: &str,
+    html_signature: &str,
+) -> anyhow::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE jmap_identities SET name = ?2, text_signature = ?3, html_signature = ?4
+         WHERE id = ?1",
+        params![id, name, text_signature, html_signature],
+    )?;
+    if changed > 0 {
+        store::log_change(conn, "Identity", id, false, false)?;
+    }
+    Ok(changed > 0)
 }
 
 pub(crate) fn get(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
