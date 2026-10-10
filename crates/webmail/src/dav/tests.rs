@@ -168,6 +168,22 @@ async fn clients_discover_the_principal_and_home_sets() {
         "unknown properties are 404"
     );
 
+    // Clients given only the host name start at the server root.
+    let server_root = dav(
+        &state,
+        "PROPFIND",
+        "/",
+        &[("depth", "0")],
+        r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#,
+    )
+    .await;
+    assert_eq!(server_root.status, 207);
+    assert!(
+        server_root
+            .body
+            .contains("/dav/principals/user@example.test/")
+    );
+
     // Another account's data is not there for this user.
     let other = dav(
         &state,
