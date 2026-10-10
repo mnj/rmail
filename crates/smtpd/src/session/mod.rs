@@ -382,8 +382,9 @@ impl Session {
             SmtpCommand::Auth(args) => self.auth(reader, args).await,
             SmtpCommand::Mail(args) => self.mail(reader, args).await,
             SmtpCommand::Rcpt(args) => self.rcpt(reader, args).await,
-            SmtpCommand::Data => self.message(reader, None).await,
-            SmtpCommand::Bdat(args) => self.message(reader, Some(args)).await,
+            SmtpCommand::Data => self.message(reader, message::Chunk::Data).await,
+            SmtpCommand::Bdat(args) => self.message(reader, message::Chunk::Bdat(args)).await,
+            SmtpCommand::Burl(args) => self.message(reader, message::Chunk::Burl(args)).await,
             SmtpCommand::Rset => {
                 self.reset_transaction();
                 reply(reader, b"250 2.0.0 Reset state\r\n").await
@@ -399,7 +400,7 @@ impl Session {
             SmtpCommand::Help => {
                 reply(
                     reader,
-                    b"214 2.0.0 Commands: HELO EHLO MAIL RCPT DATA BDAT RSET NOOP QUIT STARTTLS AUTH VRFY HELP\r\n",
+                    b"214 2.0.0 Commands: HELO EHLO MAIL RCPT DATA BDAT BURL RSET NOOP QUIT STARTTLS AUTH VRFY HELP\r\n",
                 )
                 .await
             }
@@ -439,13 +440,18 @@ impl Session {
         true
     }
 
-    /// Emit tracking and log events for a command. AUTH arguments carry
-    /// credentials, so only the mechanism is recorded.
+    /// Emit tracking and log events for a command. AUTH arguments and BURL
+    /// URLs carry credentials, so only the mechanism or `LAST` is recorded.
     fn record_command(&mut self, command: &SmtpCommand<'_>, raw: &str) {
         let logged = match command {
             SmtpCommand::Auth(args) => {
                 format!("AUTH {}", args.split_whitespace().next().unwrap_or(""))
             }
+            // A URLAUTH URL is a bearer credential for the message.
+            SmtpCommand::Burl(args) => match protocol::parse_burl_args(args) {
+                Some(burl) if burl.last => "BURL [REDACTED] LAST".to_string(),
+                _ => "BURL [REDACTED]".to_string(),
+            },
             _ => raw.to_string(),
         };
         if matches!(command, SmtpCommand::Mail(_)) {
@@ -579,6 +585,13 @@ impl Session {
         self.service != SmtpService::Lmtp && self.encrypted && self.db_path.is_some()
     }
 
+    /// BURL (RFC 4468) is offered to authenticated submission clients.
+    fn burl_available(&self) -> bool {
+        self.service == SmtpService::Submission
+            && self.db_path.is_some()
+            && self.authenticated_user.is_some()
+    }
+
     async fn greet(&mut self, reader: &mut SmtpReader, name: &str, verb: &str) -> Result<Flow> {
         if !protocol::valid_helo_domain(name) {
             return reply(reader, b"501 5.5.2 Invalid HELO/EHLO domain\r\n").await;
@@ -616,6 +629,14 @@ impl Session {
                 "DSN",
             ] {
                 response.push_str(&format!("250-{extension}\r\n"));
+            }
+            // RFC 4468 section 3: before AUTH a bare BURL says the extension
+            // exists; `imap` (URLAUTH URLs) is only usable once
+            // authenticated.
+            if self.burl_available() {
+                response.push_str("250-BURL imap\r\n");
+            } else if self.service == SmtpService::Submission && self.auth_supported() {
+                response.push_str("250-BURL\r\n");
             }
             // RFC 8689: REQUIRETLS is only offered on TLS-protected sessions.
             if self.encrypted {

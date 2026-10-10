@@ -115,6 +115,8 @@ async fn main() -> Result<()> {
     rmail_common::proxy::set_trusted_networks(&cfg.security.proxy_protocol_trusted_networks)
         .context("security.proxy_protocol_trusted_networks")?;
     let _ = SERVER_HOSTNAME.set(cfg.global.server_hostname());
+    // Host names BURL accepts in IMAP URLs: this server's own (RFC 4468).
+    rmail_common::urlauth::set_server_names(rmail_common::urlauth::server_names_from_config(&cfg));
     FUTURE_RELEASE.store(
         rmail_common::local_submit::local_submission_address(&cfg.global.submission_listeners())
             .is_some(),
