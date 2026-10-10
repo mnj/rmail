@@ -2937,3 +2937,89 @@ async fn forwarded_mail_gets_an_srs_sender_and_bounces_find_their_way_back() {
         queued[0]
     );
 }
+
+/// An ARF complaint (RFC 5965) about mail `user@example.test` sent.
+fn feedback_report(report_id: &str) -> String {
+    format!(
+        "From: Yahoo FBL <feedback@arf.mail.yahoo.example>\r\n\
+         To: postmaster@example.test\r\n\
+         Subject: FW: Weekly news\r\n\
+         Message-ID: <{report_id}@arf.mail.yahoo.example>\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type=feedback-report; boundary=\"b1\"\r\n\
+         \r\n\
+         --b1\r\n\
+         Content-Type: text/plain\r\n\
+         \r\n\
+         This is an email abuse report.\r\n\
+         --b1\r\n\
+         Content-Type: message/feedback-report\r\n\
+         \r\n\
+         Feedback-Type: abuse\r\n\
+         User-Agent: Yahoo!-Mail-Feedback/2.0\r\n\
+         Version: 1\r\n\
+         Original-Mail-From: <user@example.test>\r\n\
+         Source-IP: 192.0.2.25\r\n\
+         \r\n\
+         --b1\r\n\
+         Content-Type: text/rfc822-headers\r\n\
+         \r\n\
+         From: User <user@example.test>\r\n\
+         Subject: Weekly news\r\n\
+         Message-ID: <news-1@example.test>\r\n\
+         \r\n\
+         --b1--\r\n"
+    )
+}
+
+#[tokio::test]
+async fn feedback_reports_to_configured_addresses_are_delivered_and_recorded() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    let security = SecurityConfig {
+        feedback_addresses: vec!["postmaster".into()],
+        ..SecurityConfig::default()
+    };
+    let input = format!(
+        "EHLO arf.mail.yahoo.example\r\n\
+         MAIL FROM:<>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n{}.\r\n\
+         MAIL FROM:<>\r\nRCPT TO:<postmaster@example.test>\r\nDATA\r\n{}.\r\n\
+         MAIL FROM:<>\r\nRCPT TO:<postmaster@example.test>\r\nDATA\r\n{}.\r\n\
+         QUIT\r\n",
+        feedback_report("not-a-feedback-address"),
+        feedback_report("r1"),
+        feedback_report("r1"),
+    );
+    let (responses, td) = run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        security,
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path.clone(),
+    )
+    .await;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|line| line.starts_with("250 2.0.0"))
+            .count(),
+        3,
+        "{responses:?}"
+    );
+    // Reports are ordinary mail too: both copies to postmaster arrived.
+    let inbox = td.path().join("mail/example.test/postmaster/Maildir/new");
+    assert_eq!(std::fs::read_dir(inbox).expect("maildir").count(), 2);
+    // Only the report to the feedback address is recorded, once.
+    let reports = rmail_common::feedback::list(&db_path, None, 10).expect("reports");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report.recipient, "postmaster@example.test");
+    assert_eq!(report.feedback_type, "abuse");
+    assert_eq!(report.account.as_deref(), Some("user@example.test"));
+    assert_eq!(report.attributed_by.as_deref(), Some("original-mail-from"));
+    assert_eq!(report.original_subject.as_deref(), Some("Weekly news"));
+    // The test peer cannot pass DMARC, so the report is not trusted.
+    assert!(!report.authenticated);
+}

@@ -145,6 +145,11 @@ impl Session {
         }
 
         let report = self.deliver(&data, quarantine, &auth.dmarc).await;
+        // Feedback loop reports are recorded only once delivered, and not
+        // when the scanner quarantined them.
+        if report.any_accepted && !quarantine {
+            self.record_feedback(&data, &auth).await;
+        }
         self.finish_message(reader, &report).await?;
         self.reset_transaction();
         Ok(Flow::Continue)

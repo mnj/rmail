@@ -824,6 +824,22 @@ pub const SETTINGS: &[SettingSpec] = &[
         SMTP,
     ),
     spec(
+        "security.feedback_addresses",
+        "filtering",
+        "Feedback loop addresses",
+        "Addresses you registered with mailbox providers' complaint feedback loops (e.g. fbl@example.com), one per line; a bare local part such as abuse matches it in every hosted domain. Abuse reports (ARF, RFC 5965) sent there are still delivered, and are also recorded and tied to the account that sent the reported message. Empty disables recording.",
+        SettingKind::List,
+        SMTP,
+    ),
+    spec(
+        "security.feedback_complaint_threshold",
+        "filtering",
+        "Complaint warning threshold",
+        "Log a warning when one account draws this many complaints from authenticated feedback reports within 24 hours. 0 disables the warning.",
+        int(0, 1_000_000),
+        SMTP,
+    ),
+    spec(
         "security.srs_domain",
         "filtering",
         "SRS domain",
@@ -1486,6 +1502,17 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
     if !config.security.srs_domain.is_empty() {
         crate::domain::canonicalize_domain(config.security.srs_domain.trim())
             .map_err(|error| anyhow!("security.srs_domain: {error:#}"))?;
+    }
+    for entry in &config.security.feedback_addresses {
+        let entry = entry.trim();
+        let valid = if entry.contains('@') {
+            crate::domain::canonicalize_mailbox_address(entry).is_ok()
+        } else {
+            !entry.is_empty() && !entry.contains(char::is_whitespace)
+        };
+        if !valid {
+            bail!("security.feedback_addresses: {entry:?} is not an address or local part");
+        }
     }
     let limit = config.security.imap_message_limit;
     if limit > 0 && limit < 1000 {

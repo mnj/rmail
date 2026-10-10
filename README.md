@@ -21,8 +21,9 @@ screenshots of every page, and a quick start.
 - **Outbound relay queue** with retries, per-destination limits, connection reuse, MTA-STS, opt-in
   DANE, Null MX handling, daily SMTP TLS reports (TLS-RPT), and delivery routes (smarthost with
   AUTH, per-domain relays).
-- **Anti-abuse**: greylisting, DNSBL checks for unauthenticated clients, and per-account and
-  per-domain submission caps.
+- **Anti-abuse**: greylisting, DNSBL checks for unauthenticated clients, per-account and
+  per-domain submission caps, and complaint feedback loops: abuse reports (ARF) from mailbox
+  providers are recorded and tied to the account that sent the mail.
 - **Domains & DNS**: DKIM keys (RSA and Ed25519) generated in the console, and the DNS records to
   publish per domain (MX, SPF, DKIM, DMARC, SRV, `_mta-sts`, `_smtp._tls`); MTA-STS policy hosting,
   Thunderbird autoconfig and Outlook autodiscover.
@@ -136,6 +137,7 @@ certification results.
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
 | RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
 | RFC 7489 / RFC 6591 | DMARC policy and reports | 90% | Alignment, policy outcomes, quarantine and optional rejection are implemented. Every unauthenticated inbound evaluation for a domain that asks for reports is recorded for aggregate (`rua`) reports, and opt-in failure reports (`security.dmarc_failure_reports`, honoring `fo` and `ruf` size limits) carry the headers but never the body, at most 10 per domain per hour. External report destinations must authorize themselves (section 7.1); organizational domains are approximated without a public suffix list. |
+| RFC 5965 / RFC 6650 / RFC 6591 | Abuse feedback reports (ARF), receiving | 80% | Mail to the addresses in `security.feedback_addresses` is delivered as usual and, when it is a `multipart/report; report-type=feedback-report`, parsed (feedback type, Incidents, Original-Mail-From, Source-IP, Auth-Failure, and the original message or its headers) within size and field limits. Each report is stored once (by Message-ID) for 180 days and tied to the local account or domain that sent the reported mail via Original-Mail-From, Return-Path, Sender, From and DKIM `i=`/`d=`. Reports that fail DMARC are kept but marked unverified and do not count toward the per-account 24-hour complaint warning. Shown in the admin console (Delivery), `rmail_ctl feedback` and `rmail_feedback_reports_total`. Generating reports is not implemented. |
 | RFC 8617 | ARC verification and sealing | 85% | Inbound ARC chains are verified and forwarded mail (aliases, catchalls) is sealed once per message; sealing uses `rsa-sha256` keys only. |
 | RFC 3464 / RFC 6522 | DSN message format | 95% | Success, delay, and failure reports from the receiver and the relay are `multipart/report` with `message/delivery-status`; corpus testing against other MTAs' parsers remains. |
 | RFC 5782 | DNSBL client | 90% | Unauthenticated inbound clients are checked against configured blocklists with cached results; lookups fail open on timeouts. IPv6 lookups follow the RFC's nibble format; per-list return-code filtering is basic. |
@@ -181,7 +183,8 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 - **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and `URLAUTH`
   (RFC 4467) with BURL (RFC 4468).
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852) and `ETRN` (RFC 1985).
-- **ARF abuse feedback** (RFC 5965) beyond DMARC failure reports.
+- **Sending ARF complaint reports** (RFC 5965/RFC 6650) when local users mark mail as junk;
+  received feedback-loop reports are supported.
 
 ## IMAP standards support
 
