@@ -1563,6 +1563,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dav_sharing_api_lists_and_revokes_grants() {
+        use rmail_common::dav::{share, store};
+        let td = tempdir().expect("tempdir");
+        let mail_root = td.path().join("mail");
+        let db_path = td.path().join("config.db");
+        rmail_common::db::init_db(&db_path).unwrap();
+        for address in ["owner@example.test", "friend@example.test"] {
+            rmail_common::db::add_mailbox(&db_path, address, Some("plain:x"), None, None).unwrap();
+        }
+        let calendar =
+            share::own_collections(&mail_root, "owner@example.test", store::Kind::Calendar)
+                .unwrap()
+                .remove(0);
+        share::set_access(
+            &db_path,
+            "owner@example.test",
+            calendar.id,
+            "friend@example.test",
+            Some(share::Access::Read),
+        )
+        .unwrap();
+        let db = Some(db_path.to_string_lossy().to_string());
+
+        let request = "GET /api/dav-sharing HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string();
+        let listed = send_request_with_db(mail_root.clone(), request, db.clone()).await;
+        assert!(listed.starts_with("HTTP/1.1 200 OK"), "{listed}");
+        assert!(listed.contains("\"kind\":\"calendar\""), "{listed}");
+        assert!(listed.contains("\"name\":\"Calendar\""), "{listed}");
+        assert!(listed.contains("\"access\":\"read\""), "{listed}");
+
+        let body = format!(
+            r#"{{"owner":"owner@example.test","collection_id":{},"grantee":"friend@example.test"}}"#,
+            calendar.id
+        );
+        let delete = |body: &str| {
+            format!(
+                "DELETE /api/dav-sharing HTTP/1.1\r\nHost: localhost\r\nX-Rmail-Admin: 1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let revoked = send_request_with_db(mail_root.clone(), delete(&body), db.clone()).await;
+        assert!(revoked.starts_with("HTTP/1.1 200 OK"), "{revoked}");
+        assert!(share::all_grants(&db_path).unwrap().is_empty());
+        let again = send_request_with_db(mail_root, delete(&body), db).await;
+        assert!(again.starts_with("HTTP/1.1 400"), "{again}");
+    }
+
+    #[tokio::test]
     async fn routing_api_manages_aliases_and_catchalls() {
         let td = tempdir().expect("tempdir");
         let mail_root = td.path().join("mail");

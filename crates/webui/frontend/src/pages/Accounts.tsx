@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
-import { Account, FolderShare, api } from '../api';
+import { Account, DavShare, FolderShare, api } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
@@ -104,6 +104,45 @@ function SharingPanel() {
   );
 }
 
+const davKind: Record<DavShare['kind'], string> = { calendar: 'Calendar', addressbook: 'Address book' };
+
+function DavSharingPanel() {
+  const { run, confirm } = useFeedback();
+  const shares = useResource(() => api<DavShare[]>('/api/dav-sharing'), [], undefined, 'dav-sharing');
+  async function revoke(share: DavShare) {
+    const ok = await confirm({
+      title: `Stop sharing ${share.name}?`,
+      message: <>{share.grantee} loses access to {share.owner}'s {davKind[share.kind].toLowerCase()} {share.name}. Its contents are not changed.</>,
+      confirmLabel: 'Stop sharing',
+      danger: true,
+    });
+    if (ok && await run(() => api('/api/dav-sharing', 'DELETE', { owner: share.owner, collection_id: share.collection_id, grantee: share.grantee }), `${share.name} is no longer shared with ${share.grantee}`)) shares.reload();
+  }
+  return (
+    <Panel title="Shared calendars and address books" subtitle="Calendars and address books users share from webmail or their calendar app (CalDAV/CardDAV)">
+      <ErrorBanner error={shares.error} />
+      {shares.data && shares.data.length > 0 && (
+        <div className="tableScroll">
+          <table>
+            <thead><tr><th>Collection</th><th>Shared with</th><th>Access</th><th><span className="visuallyHidden">Actions</span></th></tr></thead>
+            <tbody>
+              {shares.data.map((share) => (
+                <tr key={`${share.owner} ${share.collection_id} ${share.grantee}`}>
+                  <td><strong>{share.name}</strong><small>{davKind[share.kind]} of {share.owner}</small></td>
+                  <td>{share.grantee}</td>
+                  <td><span className="pill">{share.access === 'read' ? 'Read only' : 'Read and change'}</span></td>
+                  <td className="rowActions"><IconButton danger label={`Stop sharing ${share.name} with ${share.grantee}`} onClick={() => revoke(share)}><Trash2 size={15} /></IconButton></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {shares.data !== null && shares.data.length === 0 && <Empty>No calendars or address books are shared. Users share them from webmail, Apple Calendar or with rmail_ctl share calendar.</Empty>}
+    </Panel>
+  );
+}
+
 export function AccountsPage() {
   const { run, confirm } = useFeedback();
   const accounts = useResource(() => api<Account[]>('/api/accounts'), [], undefined, 'accounts');
@@ -182,6 +221,7 @@ export function AccountsPage() {
         {accounts.data !== null && rows.length === 0 && <Empty>{filter ? 'No mailboxes match the filter.' : 'No mailboxes yet. Create the first one to start receiving mail.'}</Empty>}
       </Panel>
       <SharingPanel />
+      <DavSharingPanel />
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={accounts.reload} />}
     </>
   );

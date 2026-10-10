@@ -73,6 +73,7 @@ export type Stats = { mailboxes: number; total_messages: number; delivered_count
 export type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null };
 /** A folder one account shares with another (IMAP ACL); rights are RFC 4314 letters. */
 export type FolderShare = { owner: string; folder: string; mailbox_id: string; grantee: string; rights: string };
+export type DavShare = { owner: string; kind: 'calendar' | 'addressbook'; name: string; collection_id: number; grantee: string; access: 'read' | 'read-write' };
 export type QueueSummary = { queued: number; inflight: number; sent: number; failed: number };
 export type Overview = {
   accounts: number;
