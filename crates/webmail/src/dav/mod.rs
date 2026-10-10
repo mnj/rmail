@@ -41,6 +41,7 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/.well-known/caldav", any(well_known))
         .route("/.well-known/carddav", any(well_known))
+        .route("/", any(server_root))
         .route("/dav", any(handle))
         .route("/dav/", any(handle))
         .route("/dav/{*path}", any(handle))
@@ -230,6 +231,24 @@ fn options() -> Response {
         ),
     );
     response
+}
+
+/// The server root serves the webmail app, but DAV clients given only the
+/// host name start there: their requests get the DAV root.
+async fn server_root(
+    app: State<Arc<AppState>>,
+    peer: Extension<Peer>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if matches!(method, Method::GET | Method::HEAD) {
+        return crate::assets::spa(&app.0.static_dir, "/");
+    }
+    if !matches!(method.as_str(), "PROPFIND" | "REPORT" | "OPTIONS") {
+        return status(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    handle(app, peer, method, Uri::from_static("/dav/"), headers, body).await
 }
 
 async fn handle(

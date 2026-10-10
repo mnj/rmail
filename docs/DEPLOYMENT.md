@@ -532,6 +532,26 @@ enabling.
   address.
 - Uploads are limited to webmail's 16 MiB request size and are removed after a day unless used.
 
+### Calendars and contacts
+
+Webmail also serves CalDAV and CardDAV under `/dav/`, on the same listener and with the same
+sign-in as JMAP (address and password, or a Bearer token with OAuth configured). Every account
+starts with a calendar and an address book; clients can create more, and deleting the defaults is
+respected.
+
+- Clients that ask for a server name find the service through `/.well-known/caldav` and
+  `/.well-known/carddav`, or through the `_caldavs._tcp` and `_carddavs._tcp` SRV records (and
+  their `path=/dav/` TXT records) in the domain's suggested DNS records. Thunderbird's autoconfig
+  lists the calendar and address book too. In DAVx⁵ or on Apple devices, the address is the
+  webmail host name; some clients want the full `https://<host>/dav/` URL.
+- A reverse proxy must pass `/.well-known/caldav`, `/.well-known/carddav` and `/dav/` through,
+  with every method (PROPFIND, REPORT, MKCALENDAR and the rest), and also PROPFIND, REPORT and
+  OPTIONS on `/`, where some clients start.
+- Calendars and contacts are stored in each account's state database next to its mail index, so
+  they are backed up with the mail directory. One object may be up to 5 MiB.
+- Invitations are not sent by email (no CalDAV scheduling), and calendars cannot be shared between
+  accounts yet.
+
 ## Mail organization
 
 `rmail_classifier` suggests folders for new INBOX mail. It learns from how each user files their mail.
