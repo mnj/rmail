@@ -18,11 +18,19 @@ use crate::{MAX_APPEND_LITERAL_BYTES, mailbox, shared};
 pub(crate) const URLMECH: &str = "URLMECH INTERNAL";
 
 /// The arguments as strings, or `None` for a list, NIL or a malformed line.
+/// A literal may carry CR or LF, which no URL or mechanism contains and
+/// which would break the response lines they are echoed in; those are
+/// refused too.
 fn text_arguments(args: &str) -> Option<Vec<String>> {
     parser::parse_imap_args(args)
         .ok()?
         .iter()
-        .map(|argument| argument.as_text().map(str::to_string))
+        .map(|argument| {
+            argument
+                .as_text()
+                .filter(|text| !text.contains(['\r', '\n']))
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -198,5 +206,12 @@ mod tests {
             ])
         );
         assert_eq!(text_arguments("(\"imap://x\" BINARY)"), None);
+        // A literal smuggling a line break into the echoed URL reaches the
+        // parser as a quoted string with escaped CR LF (see `input.rs`).
+        assert_eq!(
+            text_arguments("\"imap://x\\\r\\\n* OK forged\" INTERNAL"),
+            None
+        );
+        assert!(text_arguments("\"imap://x\" INTERNAL").is_some());
     }
 }
