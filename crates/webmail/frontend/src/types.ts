@@ -37,6 +37,17 @@ export type Organize = {
 export type LabelGuess = { name: string; keyword: string | null; probability: number; applied: boolean };
 export type LabelPreview = { labels: LabelGuess[]; threshold: number; proposed: { name: string; description: string } | null; model: string | null };
 
+// Composing
+export type Identity = { id: string; name: string; email: string; text_signature: string; html_signature: string };
+export type ComposePrefs = { format: 'html' | 'text'; language: string; undo_seconds: number };
+export type Contact = { name: string; email: string; source: 'contacts' | 'recent' };
+export type Scheduled = { id: string; send_at: number; recipients: string[]; subject: string };
+export type SendResult = { message_id: string; saved_copy: boolean; scheduled: Scheduled | null };
+
+/** `Name <address>`, or the address alone. */
+export const formatAddress = (name: string, email: string) =>
+  name.trim() ? `${/[",;<>@]/.test(name) ? `"${name.replace(/"/g, '')}"` : name.trim()} <${email}>` : email;
+
 export type Api = <T>(url: string, options?: RequestInit) => Promise<T>;
 
 export class ApiError extends Error {

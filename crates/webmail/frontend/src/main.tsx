@@ -3,17 +3,20 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser,
+  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser,
 } from 'lucide-react';
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
+import { ComposeSettingsDialog } from './settings';
 import {
-  Api, ApiError, Attachment, CalendarListing, DavCollection, Folder, Grant, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize,
+  Api, ApiError, Attachment, CalendarListing, ComposePrefs, DavCollection, Folder, Grant, Identity, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize, SendResult,
   can, formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sharedFolderName, sortFolders, splitAddress,
 } from './types';
 import './style.css';
 
 const PAGE = 50;
+
+type Notice = { text: string; action?: { label: string; run: () => void } };
 
 // ---------------------------------------------------------------------------
 // Theme: follows the OS unless the user picks one (per browser).
@@ -437,14 +440,62 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [calendars, setCalendars] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [compose, setCompose] = useState<ComposeSeed | null>(null);
+  const [prefs, setPrefs] = useState<ComposePrefs>({ format: 'html', language: '', undo_seconds: 0 });
+  const [identities, setIdentities] = useState<Identity[]>([]);
+  const [composeSettings, setComposeSettings] = useState(false);
+  const [remoteLoaded, setRemoteLoaded] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  const flash = (text: string) => {
-    setNotice(text);
-    window.setTimeout(() => setNotice((current) => (current === text ? '' : current)), 4000);
+  const flash = (text: string, action?: Notice['action'], seconds = 4) => {
+    const next = { text, action };
+    setNotice(next);
+    window.setTimeout(() => setNotice((current) => (current === next ? null : current)), seconds * 1000);
   };
+
+  const loadComposeSettings = useCallback(() => {
+    if (!canSend) return;
+    api<ComposePrefs>('/api/compose/settings').then(setPrefs).catch(() => undefined);
+    api<Identity[]>('/api/identities').then(setIdentities).catch(() => undefined);
+  }, [api, canSend]);
+  useEffect(() => { loadComposeSettings(); }, [loadComposeSettings]);
+
+  /** Open the compose window once its seed (which may fetch the original's HTML) is ready. */
+  const startCompose = (seed: ComposeSeed | Promise<ComposeSeed>) => {
+    Promise.resolve(seed).then((ready) => { setCompose(ready); setView('list'); }).catch((err) => flash((err as Error).message));
+  };
+
+  async function openDraft(draftFolder: string, uid: number) {
+    try {
+      const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(draftFolder)}/messages/${uid}`);
+      startCompose(draftSeed(api, detail, draftFolder));
+    } catch (err) {
+      flash((err as Error).message);
+    }
+    loadFolders().catch(() => undefined);
+    if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery).catch(() => undefined);
+  }
+
+  /** After sending: offer to undo a message that waits (undo send, or send later). */
+  function sent(result?: SendResult) {
+    loadFolders().catch(() => undefined);
+    if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery).catch(() => undefined);
+    const scheduled = result?.scheduled;
+    if (!scheduled) return;
+    const undo = async () => {
+      setNotice(null);
+      try {
+        const draft = await api<{ folder: string; uid: number }>(`/api/scheduled/${scheduled.id}/cancel`, { method: 'POST' });
+        await openDraft(draft.folder, draft.uid);
+      } catch (err) {
+        flash((err as Error).message);
+      }
+    };
+    const wait = scheduled.send_at - Date.now() / 1000;
+    if (wait <= 120) flash('Sending…', { label: 'Undo', run: undo }, Math.max(3, Math.ceil(wait)));
+    else flash(`Scheduled for ${formatFullDate(scheduled.send_at)}`, { label: 'Undo', run: undo }, 8);
+  }
 
   const loadFolders = useCallback(async () => setFolders(sortFolders(await api<Folder[]>('/api/folders'))), [api]);
   const loadOrganize = useCallback(() => api<Organize>('/api/organize').then(setOrganize).catch(() => setOrganize(null)), [api]);
@@ -510,6 +561,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   async function openMessage(message: Message) {
     const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`);
     setSelected(detail);
+    setRemoteLoaded(false);
     setView('message');
     setMoreOpen(false);
     setMoveOpen(false);
@@ -524,6 +576,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
     if (!selected) return;
     const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${selected.uid}?remote_content=1`);
     setSelected({ ...detail, has_remote_content: false });
+    setRemoteLoaded(true);
   }
 
   /** Apply a bulk action; moves remove the messages from the list and select the next one. */
@@ -640,9 +693,9 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         case 's': if (selected) act(hasFlag(selected.flags, '\\Flagged') ? 'unflag' : 'flag', [selected.uid]); break;
         case 'u': if (selected && allowed(current, 'mark_unread')) { act('mark_unread', [selected.uid]); setSelected(null); setView('list'); } break;
         case 'c': if (canSend) { event.preventDefault(); setCompose({}); } break;
-        case 'r': if (canSend && selected) { event.preventDefault(); setCompose(replySeed(selected, folder, address, false)); } break;
-        case 'a': if (canSend && selected) { event.preventDefault(); setCompose(replySeed(selected, folder, address, true)); } break;
-        case 'f': if (canSend && selected) { event.preventDefault(); setCompose(forwardSeed(selected, folder)); } break;
+        case 'r': if (canSend && selected) { event.preventDefault(); startCompose(replySeed(api, selected, folder, address, false, remoteLoaded)); } break;
+        case 'a': if (canSend && selected) { event.preventDefault(); startCompose(replySeed(api, selected, folder, address, true, remoteLoaded)); } break;
+        case 'f': if (canSend && selected) { event.preventDefault(); startCompose(forwardSeed(api, selected, folder, remoteLoaded)); } break;
         case '/': event.preventDefault(); searchRef.current?.focus(); break;
         case 'Escape':
           // Close an open menu first; only then the message.
@@ -707,6 +760,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           ))}
         </nav>
         <div className="sidebar-foot">
+          {canSend && <button className="sidebar-link" onClick={() => setComposeSettings(true)}><PenLine size={15} />Compose settings</button>}
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <ThemeSwitch />
@@ -785,11 +839,11 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
             <div className="reader-actions">
               <IconButton label="Back" className="mobile-only" onClick={() => setView('list')}><ChevronLeft size={18} /></IconButton>
               {canSend && (current?.special_use === '\\Drafts' || hasFlag(selected.flags, '\\Draft')
-                ? <button className="secondary small-button" onClick={() => setCompose(draftSeed(selected, folder))}><Pencil size={14} />Edit draft</button>
+                ? <button className="secondary small-button" onClick={() => startCompose(draftSeed(api, selected, folder))}><Pencil size={14} />Edit draft</button>
                 : <>
-                  <IconButton label="Reply (r)" onClick={() => setCompose(replySeed(selected, folder, address, false))}><Reply size={16} /></IconButton>
-                  <IconButton label="Reply all (a)" onClick={() => setCompose(replySeed(selected, folder, address, true))}><ReplyAll size={16} /></IconButton>
-                  <IconButton label="Forward (f)" onClick={() => setCompose(forwardSeed(selected, folder))}><Forward size={16} /></IconButton>
+                  <IconButton label="Reply (r)" onClick={() => startCompose(replySeed(api, selected, folder, address, false, remoteLoaded))}><Reply size={16} /></IconButton>
+                  <IconButton label="Reply all (a)" onClick={() => startCompose(replySeed(api, selected, folder, address, true, remoteLoaded))}><ReplyAll size={16} /></IconButton>
+                  <IconButton label="Forward (f)" onClick={() => startCompose(forwardSeed(api, selected, folder, remoteLoaded))}><Forward size={16} /></IconButton>
                   <span className="divider" />
                 </>)}
               {!shared && <IconButton label="Archive (e)" onClick={() => act('archive', [selected.uid])}><Archive size={16} /></IconButton>}
@@ -848,11 +902,14 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           api={api}
           from={address}
           seed={compose}
+          prefs={prefs}
+          identities={identities}
           onClose={(note) => { setCompose(null); if (note) flash(note); }}
-          onSent={() => { loadFolders().catch(() => undefined); if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery).catch(() => undefined); }}
+          onSent={sent}
         />
       )}
-      {notice && <div className="toast" role="status">{notice}</div>}
+      {notice && <div className="toast" role="status">{notice.text}{notice.action && <button className="toast-action" onClick={notice.action.run}>{notice.action.label}</button>}</div>}
+      {composeSettings && <ComposeSettingsDialog api={api} prefs={prefs} identities={identities} onClose={() => setComposeSettings(false)} onSaved={loadComposeSettings} onOpenDraft={(f, uid) => { setComposeSettings(false); openDraft(f, uid); }} />}
       {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} />}
       {prompt && <PromptDialog {...prompt} />}
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
