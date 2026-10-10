@@ -49,6 +49,8 @@ ctl="${bin}/rmail_ctl"
 cd "${demo}"
 "${ctl}" init-db --config config.toml >/dev/null
 demo_setting() { "${ctl}" settings set "$1" "$2" --config config.toml >/dev/null; }
+# The host name appears in the suggested DNS records; never the build machine's.
+demo_setting global.hostname mail.example.com
 demo_setting global.tls_cert cert.pem
 demo_setting global.tls_key key.pem
 demo_setting global.listeners.smtp '["127.0.0.1:2525"]'

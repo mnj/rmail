@@ -142,6 +142,8 @@ for (const theme of ['light', 'dark']) {
   await compose(page, `webmail-compose-${theme}`);
   await page.keyboard.press('Escape');
   await page.click('.compose button[aria-label="Discard"]');
+  // Let the "Discarded" notice go before the next shot.
+  await page.waitForSelector('.toast', { state: 'detached', timeout: 10000 });
   await page.click('text=Compose settings');
   await page.waitForSelector('.settings-dialog .editor-root');
   await page.waitForTimeout(300);
@@ -158,18 +160,18 @@ for (const theme of ['light', 'dark']) {
   await page.click('button[title=Folders]');
   await page.waitForTimeout(400);
   await shot(page, 'mobile-folders');
-  await page.click('.folders button:has-text("INBOX")');
+  await page.click('button.folder-name:has-text("Inbox")');
   await page.waitForSelector('.message-list .row');
   await page.waitForTimeout(400);
   await page.click('text=Q4 infrastructure review');
   await page.waitForTimeout(700);
   await shot(page, 'mobile-message');
-  await page.click('.back');
+  await page.click('button[aria-label=Back]');
   await page.waitForTimeout(400);
   await page.click('text=This week: Rust 2024');
   await page.waitForTimeout(900);
   await shot(page, 'mobile-remote-blocked');
-  await page.click('.back');
+  await page.click('button[aria-label=Back]');
   await page.waitForTimeout(300);
   await compose(page, 'mobile-compose', true);
   await ctx.close();
