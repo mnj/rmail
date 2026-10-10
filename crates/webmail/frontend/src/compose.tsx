@@ -9,6 +9,8 @@ import {
 const MAX_BYTES = 10 * 1024 * 1024;
 /** Seconds between automatic draft saves while there are unsaved changes. */
 const AUTOSAVE_SECONDS = 20;
+/** Longest selection a rewrite takes (rmail_common::compose_ai::MAX_SELECTION_CHARS). */
+const MAX_REWRITE_CHARS = 4000;
 
 type Upload = { filename: string; content_type: string; data: string; size: number };
 type Stored = { folder: string; uid: number; index: number; filename: string; size: number };
@@ -284,13 +286,20 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
       setError('Select the text to rewrite first.');
       return;
     }
+    // The server refuses longer selections rather than rewriting only their
+    // start, which would drop the rest on replace. UTF-16 length is at least
+    // the character count the server checks.
+    if (selection.text.trim().length > MAX_REWRITE_CHARS) {
+      setError(`Select at most ${MAX_REWRITE_CHARS} characters to rewrite.`);
+      return;
+    }
     setError('');
     rewrite?.controller.abort();
     const controller = new AbortController();
     const settle = (change: Partial<Rewrite>) => setRewrite((current) => (current?.controller === controller ? { ...current, ...change } : current));
     setRewrite({ style, label, selection, result: null, error: '', controller });
     try {
-      const text = await assist(api, { kind: 'rewrite', style, selection: selection.text.slice(0, 6000), subject }, controller.signal);
+      const text = await assist(api, { kind: 'rewrite', style, selection: selection.text, subject }, controller.signal);
       if (!controller.signal.aborted) settle(text.trim() ? { result: text } : { error: 'No rewrite came back; try again.' });
     } catch (err) {
       if (!controller.signal.aborted) settle({ error: (err as Error).message });

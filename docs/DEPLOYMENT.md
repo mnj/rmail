@@ -606,7 +606,7 @@ How requests are made:
   `X-Accel-Buffering: no` for nginx).
 - What is sent: the draft around the cursor (up to 2,000 characters before and 500 after, without
   the signature), the subject and, in a reply, the start of the quoted original (up to 1,500
-  characters). A rewrite sends the selection (up to 4,000 characters) and the subject. Nothing else
+  characters). A rewrite sends the selection and the subject; selections over 4,000 characters are refused rather than cut, since the result replaces the whole selection. Nothing else
   from the mailbox is read. Webmail trims to these limits whatever the browser sends.
 - Prompts and answers are not logged. Failures are logged by kind with the provider's status and
   error code only, since provider error messages can quote part of the key.

@@ -161,6 +161,14 @@ async fn assist(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response
             before: input.before,
             after: input.after,
         },
+        // A longer selection is refused rather than cut: the result replaces
+        // the whole selection, so a rewrite of its start would drop the rest.
+        "rewrite" if input.selection.trim().chars().count() > compose_ai::MAX_SELECTION_CHARS => {
+            return rejected(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "select at most 4000 characters to rewrite",
+            );
+        }
         "rewrite" => match Style::parse(&input.style) {
             Some(style) => Task::Rewrite {
                 selection: input.selection,
@@ -490,6 +498,14 @@ mod tests {
         )
         .await;
         assert_eq!(bad_style.status, 400);
+        let too_long = call(
+            &state,
+            "POST",
+            "/api/compose/assist",
+            json!({"kind": "rewrite", "selection": "word ".repeat(1_000), "style": "shorter"}),
+        )
+        .await;
+        assert_eq!(too_long.status, 413, "refused, not cut");
         let rewrite = json!({"kind": "rewrite", "selection": "hey can u send it", "style": "formal", "quoted": "SECRET QUOTE"});
         let rewritten = call(&state, "POST", "/api/compose/assist", rewrite.clone()).await;
         assert_eq!(parsed(&rewritten)["text"], "Could you please send it?");
