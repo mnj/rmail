@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use bytes::Bytes;
+use rmail_common::dav::imip::Verified;
 use rmail_common::{imap_state, maildir, metrics};
 
 use super::{Session, session_log};
@@ -48,6 +49,7 @@ impl Session {
         data: &Bytes,
         quarantine: bool,
         dmarc: &Option<String>,
+        verified: &Verified,
     ) -> DeliveryReport {
         let quarantine = quarantine || dmarc.as_deref() == Some("quarantine");
         let mut report = DeliveryReport {
@@ -77,6 +79,7 @@ impl Session {
                         data,
                         quarantine,
                         dmarc,
+                        verified,
                         &mut report,
                     )
                     .await;
@@ -128,7 +131,10 @@ impl Session {
             .flatten()
     }
 
-    /// Returns true when the message was stored.
+    /// Returns true when the message was stored. Mail kept in the account's
+    /// own mailboxes (not quarantined, discarded or only forwarded) gets
+    /// the vacation response and has any calendar invitation put in the
+    /// schedule inbox.
     async fn deliver_local(
         &self,
         mail_root: &Path,
@@ -139,6 +145,7 @@ impl Session {
         data: &Bytes,
         quarantine: bool,
         dmarc: &Option<String>,
+        verified: &Verified,
         report: &mut DeliveryReport,
     ) -> bool {
         if !quarantine
@@ -158,6 +165,8 @@ impl Session {
             // No out-of-office reply for mail the script discarded or only
             // forwarded elsewhere.
             if outcome.kept {
+                self.receive_itip(mail_root, rcpt, local, domain, data, verified)
+                    .await;
                 self.jmap_vacation(mail_root, rcpt, data).await;
             }
             return outcome.stored;
@@ -189,6 +198,8 @@ impl Session {
             )
             .await;
         if stored && !quarantine {
+            self.receive_itip(mail_root, rcpt, local, domain, data, verified)
+                .await;
             self.jmap_vacation(mail_root, rcpt, data).await;
         }
         stored

@@ -8,9 +8,18 @@
 //! - An attendee's changed participation status sends `REPLY` to the
 //!   organizer; deleting the event declines it.
 //! - Attendees whose `SCHEDULE-AGENT` is not `SERVER` are left to the
-//!   client. Every attendee gets the whole event, overrides included.
+//!   client.
+//! - Each attendee gets only the instances they are invited to (RFC 6638
+//!   3.2): the series with the overrides that list them, the occurrences
+//!   overridden without them excluded, or only their overrides when the
+//!   series does not list them. Significant changes are judged on that
+//!   view, so a change to an instance someone is not invited to does not
+//!   reach them, and someone dropped from one instance gets a `CANCEL` for
+//!   that instance alone.
+//! - An answer for one occurrence of the series gets an override of its
+//!   own in the organizer's copy.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::text::{Component, Property};
 
@@ -215,39 +224,228 @@ fn is_cancelled(calendar: &Component) -> bool {
         })
 }
 
-fn cancel_of(calendar: &Component, recipients: Vec<String>) -> Message {
+fn cancel_of(calendar: &Component) -> Component {
     let mut cancel = outgoing(calendar, Method::Cancel);
     for component in scheduled_mut(&mut cancel) {
         component.set_property("STATUS", "CANCELLED");
     }
-    Message {
-        method: Method::Cancel,
-        recipients,
-        calendar: cancel,
+    cancel
+}
+
+/// The series: the component without a `RECURRENCE-ID`.
+fn master(calendar: &Component) -> Option<&Component> {
+    scheduled(calendar).find(|component| recurrence_key(component).is_none())
+}
+
+fn listed(component: &Component, user: &str) -> bool {
+    component
+        .properties_named("ATTENDEE")
+        .any(|attendee| is_user(attendee, user))
+}
+
+/// Whether `user` is invited to the occurrence `key` (`None`: the series):
+/// its override lists them, or it has none and the series does.
+fn invited_at(calendar: &Component, user: &str, key: Option<&str>) -> bool {
+    let instance = key.and_then(|key| {
+        scheduled(calendar).find(|component| recurrence_key(component).as_deref() == Some(key))
+    });
+    match instance {
+        Some(instance) => listed(instance, user),
+        None => master(calendar).is_some_and(|master| listed(master, user)),
+    }
+}
+
+/// The overrides' `RECURRENCE-ID`s, by value.
+fn recurrence_ids(calendar: &Component) -> BTreeMap<String, Property> {
+    scheduled(calendar)
+        .filter_map(|component| {
+            let id = component.property("RECURRENCE-ID")?;
+            Some((id.value.trim().to_string(), id.clone()))
+        })
+        .collect()
+}
+
+/// Whether an `EXDATE` of `component` already names `value`.
+fn excludes(component: &Component, value: &str) -> bool {
+    component
+        .properties_named("EXDATE")
+        .flat_map(|exdate| exdate.value.split(','))
+        .any(|found| found.trim() == value)
+}
+
+/// The part of the event `user` is invited to (RFC 6638 3.2), time
+/// zones kept: the series and the overrides that list them, with the
+/// occurrences overridden without them (and those in `without`) excluded
+/// from the series; or, when the series does not list them, only the
+/// overrides that do. `None` when they are invited to nothing.
+pub fn attendee_view(
+    calendar: &Component,
+    user: &str,
+    without: &BTreeMap<String, Property>,
+) -> Option<Component> {
+    let in_series = master(calendar).is_some_and(|master| listed(master, user));
+    let mut view = calendar.clone();
+    view.components.clear();
+    let mut excluded = without.clone();
+    for component in &calendar.components {
+        if component.name == "VTIMEZONE" {
+            view.components.push(component.clone());
+            continue;
+        }
+        match component.property("RECURRENCE-ID") {
+            None if in_series => view.components.push(component.clone()),
+            None => {}
+            Some(id) => {
+                let key = id.value.trim().to_string();
+                if listed(component, user) && !without.contains_key(&key) {
+                    view.components.push(component.clone());
+                } else {
+                    excluded.insert(key, id.clone());
+                }
+            }
+        }
+    }
+    if in_series
+        && let Some(series) =
+            scheduled_mut(&mut view).find(|component| component.property("RECURRENCE-ID").is_none())
+    {
+        for (key, id) in excluded {
+            if !excludes(series, &key) {
+                let mut exdate = id;
+                exdate.name = "EXDATE".to_string();
+                exdate.value = key;
+                series.properties.push(exdate);
+            }
+        }
+    }
+    let invited = scheduled(&view).next().is_some();
+    invited.then_some(view)
+}
+
+/// The occurrences `keys` of the event, to cancel: their overrides, or for
+/// plain occurrences of the series a copy of it moved to that occurrence.
+fn instances(calendar: &Component, keys: &BTreeMap<String, Property>) -> Component {
+    let mut out = calendar.clone();
+    out.components
+        .retain(|component| component.name == "VTIMEZONE");
+    for (key, id) in keys {
+        let found = scheduled(calendar)
+            .find(|component| recurrence_key(component).as_deref() == Some(key.as_str()));
+        if let Some(found) = found {
+            out.components.push(found.clone());
+            continue;
+        }
+        if let Some(series) = master(calendar) {
+            out.components.push(occurrence(series, id));
+        }
+    }
+    out
+}
+
+/// An override for the occurrence `id` of `series`, as the series has it:
+/// its start moved there, its length kept.
+fn occurrence(series: &Component, id: &Property) -> Component {
+    let mut instance = series.clone();
+    let length = series.property("DURATION").is_none().then(|| {
+        let start = series.property("DTSTART").and_then(super::recur::instant)?;
+        let end = series.property("DTEND").and_then(super::recur::instant)?;
+        Some((end - start).max(0))
+    });
+    instance.properties.retain(|property| {
+        !matches!(
+            property.name.as_str(),
+            "RRULE" | "RDATE" | "EXDATE" | "EXRULE" | "DTSTART" | "DTEND"
+        )
+    });
+    let mut start = id.clone();
+    start.name = "DTSTART".to_string();
+    let all_day = start
+        .param("VALUE")
+        .is_some_and(|value| value.eq_ignore_ascii_case("DATE"))
+        || start.value.trim().len() == 8;
+    instance.properties.push(start);
+    instance.properties.push(id.clone());
+    if let Some(Some(seconds)) = length {
+        let duration = if all_day {
+            format!("P{}D", seconds / 86_400)
+        } else {
+            format!("PT{seconds}S")
+        };
+        instance
+            .properties
+            .push(Property::new("DURATION", &duration));
+    }
+    instance
+}
+
+/// Messages being gathered: recipients who get the same calendar share one
+/// message.
+#[derive(Default)]
+struct Outbox(Vec<Message>);
+
+impl Outbox {
+    fn add(&mut self, method: Method, calendar: Component, recipient: &str) {
+        if let Some(found) = self
+            .0
+            .iter_mut()
+            .find(|message| message.method == method && message.calendar == calendar)
+        {
+            found.recipients.push(recipient.to_string());
+            return;
+        }
+        self.0.push(Message {
+            method,
+            recipients: vec![recipient.to_string()],
+            calendar,
+        });
+    }
+
+    fn cancel(&mut self, view: &Component, recipient: &str) {
+        self.add(Method::Cancel, cancel_of(view), recipient);
+    }
+
+    fn request(&mut self, view: &Component, recipient: &str) {
+        self.add(Method::Request, outgoing(view, Method::Request), recipient);
+    }
+
+    /// Cancellations first: someone dropped from the series hears so
+    /// before they get the instances they keep.
+    fn messages(self) -> Vec<Message> {
+        let (mut cancels, requests): (Vec<_>, Vec<_>) = self
+            .0
+            .into_iter()
+            .partition(|message| message.method == Method::Cancel);
+        cancels.extend(requests);
+        cancels
     }
 }
 
 /// The messages an organizer's change sends: `previous` and `current` are
 /// the stored versions before and after (`None` for created or deleted).
+/// Each attendee's messages carry only the instances they are invited to.
 pub fn organizer_messages(
     previous: Option<&Component>,
     current: Option<&Component>,
     user: &str,
 ) -> Vec<Message> {
+    let none = BTreeMap::new();
+    let previous = previous.filter(|calendar| role(calendar, user) == Role::Organizer);
     let before = previous
-        .filter(|calendar| role(calendar, user) == Role::Organizer)
         .map(|calendar| attendees(calendar, user))
         .unwrap_or_default();
-    let mut messages = Vec::new();
+    let mut outbox = Outbox::default();
     let Some(current) = current.filter(|calendar| role(calendar, user) == Role::Organizer) else {
         // Deleted, or no longer organized here: cancel for everyone.
         if let Some(previous) = previous
-            && !before.is_empty()
             && !is_cancelled(previous)
         {
-            messages.push(cancel_of(previous, before.into_iter().collect()));
+            for attendee in &before {
+                if let Some(view) = attendee_view(previous, attendee, &none) {
+                    outbox.cancel(&view, attendee);
+                }
+            }
         }
-        return messages;
+        return outbox.messages();
     };
     let now = attendees(current, user);
     if is_cancelled(current) {
@@ -257,32 +455,69 @@ pub fn organizer_messages(
         } else {
             now.union(&before).cloned().collect()
         };
-        if !recipients.is_empty() {
-            messages.push(cancel_of(current, recipients));
+        for attendee in &recipients {
+            let view = attendee_view(current, attendee, &none)
+                .or_else(|| previous.and_then(|previous| attendee_view(previous, attendee, &none)));
+            if let Some(view) = view {
+                outbox.cancel(&view, attendee);
+            }
         }
-        return messages;
+        return outbox.messages();
     }
-    let changed = previous.is_none_or(|previous| significant(previous) != significant(current));
-    let mut invited = if changed {
-        now.clone()
-    } else {
-        now.difference(&before).cloned().collect()
-    };
-    invited.extend(force_send(current, user));
-    if !invited.is_empty() {
-        messages.push(Message {
-            method: Method::Request,
-            recipients: invited.into_iter().collect(),
-            calendar: outgoing(current, Method::Request),
-        });
+    let forced = force_send(current, user);
+    let everyone = now
+        .iter()
+        .chain(&before)
+        .chain(&forced)
+        .collect::<BTreeSet<_>>();
+    for attendee in everyone {
+        let old = previous
+            .filter(|_| before.contains(attendee))
+            .and_then(|previous| attendee_view(previous, attendee, &none));
+        let new = (now.contains(attendee) || forced.contains(attendee))
+            .then(|| attendee_view(current, attendee, &none))
+            .flatten();
+        let (previous, old, new) = match (previous, old, new) {
+            (_, None, None) => continue,
+            (_, Some(old), None) => {
+                outbox.cancel(&old, attendee);
+                continue;
+            }
+            (Some(previous), Some(old), Some(new)) => (previous, old, new),
+            (_, _, Some(new)) => {
+                outbox.request(&new, attendee);
+                continue;
+            }
+        };
+        if invited_at(previous, attendee, None) && !invited_at(current, attendee, None) {
+            // Dropped from the series but kept in some instances: the
+            // series is cancelled, then those instances sent anew.
+            outbox.cancel(&old, attendee);
+            outbox.request(&new, attendee);
+            continue;
+        }
+        let mut ids = recurrence_ids(previous);
+        ids.extend(recurrence_ids(current));
+        let removed = ids
+            .into_iter()
+            .filter(|(key, _)| {
+                invited_at(previous, attendee, Some(key))
+                    && !invited_at(current, attendee, Some(key))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !removed.is_empty() {
+            outbox.cancel(&instances(previous, &removed), attendee);
+        }
+        // What they keep of the old version, against what they get now:
+        // only a significant difference is sent again.
+        let kept = attendee_view(previous, attendee, &removed);
+        if forced.contains(attendee)
+            || kept.is_none_or(|kept| significant(&kept) != significant(&new))
+        {
+            outbox.request(&new, attendee);
+        }
     }
-    let removed = before.difference(&now).cloned().collect::<Vec<_>>();
-    if let Some(previous) = previous
-        && !removed.is_empty()
-    {
-        messages.push(cancel_of(previous, removed));
-    }
-    messages
+    outbox.messages()
 }
 
 fn recurrence_key(component: &Component) -> Option<String> {
@@ -420,8 +655,44 @@ pub fn strip_force_send(calendar: &mut Component) -> bool {
 // Receiving
 
 /// The recipient's copy after a `REQUEST`: the organizer's version, with
-/// the recipient's alarms kept.
+/// the recipient's alarms kept. A request with only some instances updates
+/// those in a copy of the series (RFC 5546 3.2.2); otherwise it replaces
+/// the copy, as it holds everything the recipient is invited to.
 pub fn apply_request(existing: Option<&Component>, message: &Component) -> Component {
+    let copy = request_copy(existing, message);
+    let Some(existing) = existing.filter(|existing| {
+        master(&copy).is_none()
+            && master(existing).is_some_and(|series| {
+                series
+                    .property("STATUS")
+                    .is_none_or(|status| !status.value.trim().eq_ignore_ascii_case("CANCELLED"))
+            })
+    }) else {
+        return copy;
+    };
+    let mut merged = existing.clone();
+    for component in copy.components {
+        let slot = if component.name == "VTIMEZONE" {
+            let tzid = component.property("TZID").map(|tzid| tzid.value.trim());
+            merged.components.iter().position(|found| {
+                found.name == "VTIMEZONE" && found.property("TZID").map(|t| t.value.trim()) == tzid
+            })
+        } else {
+            let key = recurrence_key(&component);
+            merged
+                .components
+                .iter()
+                .position(|found| found.name != "VTIMEZONE" && recurrence_key(found) == key)
+        };
+        match slot {
+            Some(at) => merged.components[at] = component,
+            None => merged.components.push(component),
+        }
+    }
+    merged
+}
+
+fn request_copy(existing: Option<&Component>, message: &Component) -> Component {
     let mut copy = message.clone();
     copy.properties.retain(|property| property.name != "METHOD");
     for component in scheduled_mut(&mut copy) {
@@ -488,6 +759,17 @@ pub fn apply_reply(existing: &Component, message: &Component, attendee: &str) ->
             continue;
         };
         let key = recurrence_key(reply);
+        let overridden = scheduled(&copy).any(|c| recurrence_key(c) == key);
+        if !overridden
+            && let (Some(id), Some(series)) = (reply.property("RECURRENCE-ID"), master(&copy))
+            && listed(series, attendee)
+            && !excludes(series, id.value.trim())
+        {
+            // An answer for one occurrence of the series: it gets an
+            // override of its own to hold it (RFC 6638 3.2).
+            let instance = occurrence(series, id);
+            copy.components.push(instance);
+        }
         let Some(target) = scheduled_mut(&mut copy).find(|c| recurrence_key(c) == key) else {
             continue;
         };
@@ -639,10 +921,11 @@ mod tests {
         let moved = event(&[carol], "Plan (moved)", "");
         let sent = organizer_messages(Some(&more), Some(&moved), ORGANIZER);
         assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0].recipients, vec!["carol@example.test"]);
-        assert_eq!(sent[1].method, Method::Cancel);
-        assert_eq!(sent[1].recipients, vec!["bob@example.test"]);
-        assert!(sent[1].calendar.to_text().contains("STATUS:CANCELLED"));
+        assert_eq!(sent[0].method, Method::Cancel);
+        assert_eq!(sent[0].recipients, vec!["bob@example.test"]);
+        assert!(sent[0].calendar.to_text().contains("STATUS:CANCELLED"));
+        assert_eq!(sent[1].method, Method::Request);
+        assert_eq!(sent[1].recipients, vec!["carol@example.test"]);
         // Deleting cancels for everyone; so does marking it cancelled.
         let sent = organizer_messages(Some(&moved), None, ORGANIZER);
         assert_eq!(
@@ -748,5 +1031,226 @@ mod tests {
         let copy = apply_cancel(&series, &cancel);
         assert!(copy.to_text().contains("EXDATE:20261014T090000Z"));
         assert!(!copy.to_text().contains("CANCELLED"));
+    }
+
+    const BOB: &str = "bob@example.test";
+    const CAROL: &str = "carol@example.test";
+    const DAY2: &str = "20261013T090000Z";
+    const DAY3: &str = "20261014T090000Z";
+    const DAY4: &str = "20261015T090000Z";
+
+    /// A daily series with time zone, its attendees, and overrides as
+    /// (recurrence id, summary, attendees).
+    fn series(attendees: &[&str], overrides: &[(&str, &str, &[&str])]) -> Component {
+        let lines = |who: &[&str]| {
+            who.iter()
+                .map(|who| format!("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{who}\r\n"))
+                .collect::<String>()
+        };
+        let overrides = overrides
+            .iter()
+            .map(|(id, summary, who)| {
+                format!(
+                    "BEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID:{id}\r\nDTSTART:{id}\r\n\
+                     DURATION:PT1H\r\nSUMMARY:{summary}\r\nORGANIZER:mailto:{ORGANIZER}\r\n\
+                     ATTENDEE;PARTSTAT=ACCEPTED:mailto:{ORGANIZER}\r\n{}END:VEVENT\r\n",
+                    lines(who)
+                )
+            })
+            .collect::<String>();
+        text::parse(&format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+             BEGIN:VTIMEZONE\r\nTZID:Europe/Copenhagen\r\nBEGIN:STANDARD\r\n\
+             DTSTART:19701025T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\n\
+             END:STANDARD\r\nEND:VTIMEZONE\r\n\
+             BEGIN:VEVENT\r\nUID:s\r\nDTSTART:20261012T090000Z\r\nDURATION:PT1H\r\n\
+             RRULE:FREQ=DAILY;COUNT=5\r\nSUMMARY:Standup\r\nORGANIZER:mailto:{ORGANIZER}\r\n\
+             ATTENDEE;PARTSTAT=ACCEPTED:mailto:{ORGANIZER}\r\n{}END:VEVENT\r\n{overrides}\
+             END:VCALENDAR\r\n",
+            lines(attendees)
+        ))
+        .unwrap()
+    }
+
+    fn sent_to<'a>(messages: &'a [Message], who: &str) -> Vec<&'a Message> {
+        messages
+            .iter()
+            .filter(|message| message.recipients.iter().any(|to| to == who))
+            .collect()
+    }
+
+    fn events(calendar: &Component) -> usize {
+        scheduled(calendar).count()
+    }
+
+    #[test]
+    fn attendees_get_only_their_instances() {
+        // Bob is in the series but not on day 4; Carol only on day 3.
+        let first = series(
+            &[BOB],
+            &[(DAY3, "Standup", &[BOB, CAROL]), (DAY4, "Standup", &[])],
+        );
+        let sent = organizer_messages(None, Some(&first), ORGANIZER);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let bob = sent_to(&sent, BOB)[0].calendar.to_text();
+        assert!(bob.contains("RRULE:") && bob.contains(&format!("EXDATE:{DAY4}")));
+        assert!(bob.contains(&format!("RECURRENCE-ID:{DAY3}")));
+        assert!(!bob.contains(&format!("RECURRENCE-ID:{DAY4}")));
+        let carol = &sent_to(&sent, CAROL)[0].calendar;
+        assert_eq!(events(carol), 1);
+        let text = carol.to_text();
+        assert!(text.contains(&format!("RECURRENCE-ID:{DAY3}")) && !text.contains("RRULE"));
+        assert!(text.contains("BEGIN:VTIMEZONE"), "time zones are kept");
+
+        // A change to an instance neither is invited to reaches no one.
+        let moved = series(
+            &[BOB],
+            &[(DAY3, "Standup", &[BOB, CAROL]), (DAY4, "Retro", &[])],
+        );
+        assert!(organizer_messages(Some(&first), Some(&moved), ORGANIZER).is_empty());
+        // A change to day 3 reaches both, each with their own view.
+        let renamed = series(
+            &[BOB],
+            &[(DAY3, "Planning", &[BOB, CAROL]), (DAY4, "Standup", &[])],
+        );
+        let sent = organizer_messages(Some(&first), Some(&renamed), ORGANIZER);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|message| message.method == Method::Request));
+        assert_eq!(events(&sent_to(&sent, CAROL)[0].calendar), 1);
+
+        // Bob dropped from day 3: a cancellation of that instance alone.
+        let without_bob = series(
+            &[BOB],
+            &[(DAY3, "Standup", &[CAROL]), (DAY4, "Standup", &[])],
+        );
+        let sent = organizer_messages(Some(&first), Some(&without_bob), ORGANIZER);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            (sent[0].method, sent[0].recipients.clone()),
+            (Method::Cancel, vec![BOB.to_string()])
+        );
+        assert_eq!(events(&sent[0].calendar), 1);
+        let text = sent[0].calendar.to_text();
+        assert!(text.contains(&format!("RECURRENCE-ID:{DAY3}")) && !text.contains("RRULE"));
+        // Carol dropped from her only instance: cancelled for her.
+        let without_carol = series(&[BOB], &[(DAY3, "Standup", &[BOB]), (DAY4, "Standup", &[])]);
+        let sent = organizer_messages(Some(&first), Some(&without_carol), ORGANIZER);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].method, Method::Cancel);
+        assert_eq!(sent[0].recipients, vec![CAROL]);
+    }
+
+    #[test]
+    fn instances_added_and_overridden_without_an_attendee() {
+        let plain = series(&[BOB], &[]);
+        // Day 2 moved without Bob: he gets that occurrence cancelled, made
+        // from the series.
+        let moved = series(&[BOB], &[(DAY2, "Elsewhere", &[])]);
+        let sent = organizer_messages(Some(&plain), Some(&moved), ORGANIZER);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].method, Method::Cancel);
+        let text = sent[0].calendar.to_text();
+        assert!(text.contains(&format!("RECURRENCE-ID:{DAY2}")));
+        assert!(text.contains(&format!("DTSTART:{DAY2}")) && !text.contains("RRULE"));
+        let copy = apply_cancel(&apply_request(None, &plain), &sent[0].calendar);
+        assert!(copy.to_text().contains(&format!("EXDATE:{DAY2}")));
+
+        // Carol added to one instance: invited to that one only.
+        let with_carol = series(&[BOB], &[(DAY3, "Standup", &[BOB, CAROL])]);
+        let sent = organizer_messages(Some(&plain), Some(&with_carol), ORGANIZER);
+        let carol = sent_to(&sent, CAROL);
+        assert_eq!(carol.len(), 1);
+        assert_eq!(carol[0].method, Method::Request);
+        assert_eq!(events(&carol[0].calendar), 1);
+        // Bob's view gained the override, so he is updated too.
+        assert_eq!(sent_to(&sent, BOB).len(), 1);
+        // Forcing a send reaches an attendee even without a change.
+        let forced = text::parse(&with_carol.to_text().replace(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:carol",
+            "ATTENDEE;SCHEDULE-FORCE-SEND=REQUEST:mailto:carol",
+        ))
+        .unwrap();
+        let sent = organizer_messages(Some(&with_carol), Some(&forced), ORGANIZER);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recipients, vec![CAROL]);
+        assert!(!sent[0].calendar.to_text().contains("SCHEDULE-FORCE-SEND"));
+
+        // Bob dropped from the series but kept on day 3: the series is
+        // cancelled, then day 3 sent on its own.
+        let only_day3 = series(&[], &[(DAY3, "Standup", &[BOB, CAROL])]);
+        let sent = organizer_messages(Some(&with_carol), Some(&only_day3), ORGANIZER);
+        let bob = sent_to(&sent, BOB);
+        assert_eq!(bob.len(), 2, "{sent:?}");
+        assert_eq!(bob[0].method, Method::Cancel);
+        assert_eq!(bob[1].method, Method::Request);
+        assert_eq!(events(&bob[1].calendar), 1);
+        // Applied in order, Bob's copy holds day 3 alone.
+        let copy = apply_request(None, &outgoing(&with_carol, Method::Request));
+        let copy = apply_cancel(&copy, &bob[0].calendar);
+        let copy = apply_request(Some(&copy), &bob[1].calendar);
+        assert_eq!(events(&copy), 1);
+        assert!(!copy.to_text().contains("CANCELLED"));
+    }
+
+    #[test]
+    fn an_answer_for_one_occurrence_gets_its_own_override() {
+        let organized = text::parse(
+            &series(&[BOB], &[])
+                .to_text()
+                .replace("DURATION:PT1H", "DTEND:20261012T100000Z"),
+        )
+        .unwrap();
+        // Bob declines day 3 only, in his copy.
+        let mine = apply_request(None, &outgoing(&organized, Method::Request));
+        let mut declined = mine.clone();
+        let mut day3 = occurrence(
+            master(&mine).unwrap(),
+            &Property::new("RECURRENCE-ID", DAY3),
+        );
+        for attendee in &mut day3.properties {
+            if attendee.name == "ATTENDEE" && is_user(attendee, BOB) {
+                attendee.set_param("PARTSTAT", Some("DECLINED"));
+            }
+        }
+        declined.components.push(day3);
+        let reply = attendee_reply(Some(&mine), Some(&declined), BOB).unwrap();
+        assert_eq!(events(&reply.calendar), 1);
+        let merged = apply_reply(&organized, &reply.calendar, BOB).unwrap();
+        assert_eq!(events(&merged), 2);
+        let text = merged.to_text();
+        assert!(text.contains(&format!("RECURRENCE-ID:{DAY3}")));
+        assert!(text.contains("DURATION:PT3600S"), "{text}");
+        assert_eq!(text.matches("PARTSTAT=DECLINED").count(), 1);
+        // Not for an occurrence that was taken out, nor from a stranger.
+        let excluded = text::parse(
+            &organized
+                .to_text()
+                .replace("RRULE:", &format!("EXDATE:{DAY3}\r\nRRULE:")),
+        )
+        .unwrap();
+        assert!(apply_reply(&excluded, &reply.calendar, BOB).is_none());
+        assert!(apply_reply(&organized, &reply.calendar, CAROL).is_none());
+    }
+
+    #[test]
+    fn a_request_for_some_instances_updates_a_copy_of_the_series() {
+        let copy = apply_request(None, &series(&[BOB], &[]));
+        let only = |calendar: Component| attendee_view(&calendar, BOB, &BTreeMap::new()).unwrap();
+        let update = only(series(&[], &[(DAY3, "Moved", &[BOB])]));
+        let merged = apply_request(Some(&copy), &update);
+        assert_eq!(events(&merged), 2);
+        let text = merged.to_text();
+        assert!(text.contains("RRULE:") && text.contains("SUMMARY:Moved"));
+        assert_eq!(text.matches("BEGIN:VTIMEZONE").count(), 1);
+        // The same instance again replaces it.
+        let again = apply_request(
+            Some(&merged),
+            &only(series(&[], &[(DAY3, "Again", &[BOB])])),
+        );
+        assert_eq!(events(&again), 2);
+        assert!(!again.to_text().contains("SUMMARY:Moved"));
+        // A cancelled series has nothing to merge into.
+        let cancelled = apply_cancel(&copy, &cancel_of(&copy));
+        assert_eq!(events(&apply_request(Some(&cancelled), &update)), 1);
     }
 }

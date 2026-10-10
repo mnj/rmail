@@ -2757,6 +2757,213 @@ async fn jmap_vacation_response_respects_its_dates_and_sieve_filing() {
     );
 }
 
+/// An iMIP message (RFC 6047) from `from` with an iTIP calendar part.
+fn imip_mail(from: &str, method: &str, organizer: &str, attendee: &str, partstat: &str) -> String {
+    format!(
+        "From: {from}\r\nTo: user@example.test\r\nSubject: Review\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+         --b\r\nContent-Type: text/plain\r\n\r\nInvitation\r\n\
+         --b\r\nContent-Type: text/calendar; method={method}; charset=utf-8\r\n\r\n\
+         BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//remote//EN\r\nMETHOD:{method}\r\n\
+         BEGIN:VEVENT\r\nUID:imip-1\r\nDTSTAMP:20261001T000000Z\r\nDTSTART:20261012T090000Z\r\n\
+         DURATION:PT1H\r\nSUMMARY:Review\r\nORGANIZER:mailto:{organizer}\r\n\
+         ATTENDEE;PARTSTAT={partstat}:mailto:{attendee}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n\
+         --b--"
+    )
+}
+
+fn user_dav(mail_root: &Path) -> rmail_common::sqlite_pool::SqliteConnection {
+    rmail_common::jmap::store::open(mail_root, "example.test", "user").unwrap()
+}
+
+fn schedule_inbox(mail_root: &Path) -> Vec<String> {
+    use rmail_common::dav::store;
+    let conn = user_dav(mail_root);
+    store::objects(&conn, &store::inbox(&conn).unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|object| object.data)
+        .collect()
+}
+
+/// The user organizes `imip-1` with `attendee` invited.
+fn organize_event(mail_root: &Path, attendee: &str) {
+    use rmail_common::dav::store;
+    let conn = user_dav(mail_root);
+    let event = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:imip-1\r\n\
+         DTSTAMP:20261001T000000Z\r\nDTSTART:20261012T090000Z\r\nDURATION:PT1H\r\n\
+         SUMMARY:Review\r\nORGANIZER:mailto:user@example.test\r\n\
+         ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{attendee}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
+    let calendar = store::default_calendar(&conn).unwrap();
+    store::put(&conn, &calendar, "imip.ics", &event, &|_| true)
+        .unwrap()
+        .unwrap();
+}
+
+fn organized_event(mail_root: &Path) -> String {
+    use rmail_common::dav::store;
+    let conn = user_dav(mail_root);
+    let data = store::find_by_uid(&conn, "imip-1").unwrap().unwrap().1.data;
+    // Unfolded, to match whole lines.
+    data.replace("\r\n ", "")
+}
+
+#[tokio::test]
+async fn imip_invitations_reach_the_schedule_inbox_without_touching_calendars() {
+    let invite = imip_mail(
+        "boss@remote.test",
+        "REQUEST",
+        "boss@remote.test",
+        "user@example.test",
+        "NEEDS-ACTION",
+    );
+    let (responses, td) = deliver_plain(|_| {}, &[("boss@remote.test", &invite)]).await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    assert_eq!(inbox(&td), 1, "the mail itself is delivered");
+    let mail_root = td.path().join("mail");
+    let kept = schedule_inbox(&mail_root);
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].contains("METHOD:REQUEST") && kept[0].contains("UID:imip-1"));
+    let conn = user_dav(&mail_root);
+    assert!(
+        rmail_common::dav::store::find_by_uid(&conn, "imip-1")
+            .unwrap()
+            .is_none(),
+        "never added to a calendar"
+    );
+}
+
+#[tokio::test]
+async fn imip_problems_never_fail_delivery() {
+    let broken = "From: a@remote.test\r\nTo: user@example.test\r\nMIME-Version: 1.0\r\n\
+                  Content-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nBEGIN:VEVENT";
+    // Addressed to someone else; and a method that is not scheduling.
+    let elsewhere = imip_mail(
+        "a@remote.test",
+        "REQUEST",
+        "a@remote.test",
+        "carol@remote.test",
+        "NEEDS-ACTION",
+    );
+    let publish = imip_mail(
+        "a@remote.test",
+        "PUBLISH",
+        "a@remote.test",
+        "user@example.test",
+        "NEEDS-ACTION",
+    );
+    let (responses, td) = deliver_plain(
+        |_| {},
+        &[
+            ("a@remote.test", broken),
+            ("a@remote.test", &elsewhere),
+            ("a@remote.test", &publish),
+        ],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 3, "{responses:?}");
+    assert_eq!(inbox(&td), 3);
+    assert!(schedule_inbox(&td.path().join("mail")).is_empty());
+
+    // Mail a Sieve script discards is not looked at either.
+    let invite = imip_mail(
+        "a@remote.test",
+        "REQUEST",
+        "a@remote.test",
+        "user@example.test",
+        "NEEDS-ACTION",
+    );
+    let (responses, td) = deliver_with_script("discard;", &[("a@remote.test", &invite)]).await;
+    assert_eq!(accepted(&responses), 1);
+    assert!(schedule_inbox(&td.path().join("mail")).is_empty());
+}
+
+#[tokio::test]
+async fn imip_replies_apply_only_when_the_sender_is_verified() {
+    // A reply claiming to be from the attendee, from a server DMARC does
+    // not vouch for: kept in the inbox, the organizer's copy unchanged.
+    let spoofed = imip_mail(
+        "guest@remote.test",
+        "REPLY",
+        "user@example.test",
+        "guest@remote.test",
+        "ACCEPTED",
+    );
+    let (responses, td) = deliver_plain(
+        |db| organize_event(&db.parent().unwrap().join("mail"), "guest@remote.test"),
+        &[("guest@remote.test", &spoofed)],
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    let mail_root = td.path().join("mail");
+    let kept = schedule_inbox(&mail_root);
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].contains("METHOD:REPLY"));
+    assert!(organized_event(&mail_root).contains("PARTSTAT=NEEDS-ACTION"));
+
+    // The same reply submitted by the attendee's own account here (as
+    // webmail's scheduling sends to other domains) is applied.
+    let reply = imip_mail(
+        "postmaster@example.test",
+        "REPLY",
+        "user@example.test",
+        "postmaster@example.test",
+        "ACCEPTED",
+    );
+    let submit = format!(
+        "MAIL FROM:<postmaster@example.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n{reply}\r\n.\r\nQUIT\r\n"
+    );
+    let (sent, td) = run_session_from(
+        submit.into_bytes(),
+        SmtpService::Submission,
+        "127.0.0.1:40000",
+        |root| {
+            organize_event(root, "postmaster@example.test");
+            webmail_auth(root, "postmaster@example.test", false)
+        },
+    )
+    .await;
+    assert!(
+        sent.iter()
+            .any(|l| l.starts_with("250 2.0.0 Message accepted")),
+        "{sent:?}"
+    );
+    let mail_root = td.path().join("mail");
+    assert_eq!(schedule_inbox(&mail_root).len(), 1);
+    let event = organized_event(&mail_root);
+    assert!(
+        event.contains("PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:postmaster@example.test"),
+        "{event}"
+    );
+
+    // An account here cannot answer for another one.
+    let (_, td) = run_session_from(
+        format!(
+            "MAIL FROM:<postmaster@example.test>\r\nRCPT TO:<user@example.test>\r\nDATA\r\n{}\r\n.\r\nQUIT\r\n",
+            imip_mail(
+                "postmaster@example.test",
+                "REPLY",
+                "user@example.test",
+                "guest@example.test",
+                "ACCEPTED",
+            )
+        )
+        .into_bytes(),
+        SmtpService::Submission,
+        "127.0.0.1:40000",
+        |root| {
+            organize_event(root, "guest@example.test");
+            webmail_auth(root, "postmaster@example.test", false)
+        },
+    )
+    .await;
+    let mail_root = td.path().join("mail");
+    assert_eq!(schedule_inbox(&mail_root).len(), 1);
+    assert!(organized_event(&mail_root).contains("PARTSTAT=NEEDS-ACTION"));
+}
+
 #[tokio::test]
 async fn greylisting_defers_unknown_triples_but_not_submission_or_loopback() {
     let security = || SecurityConfig {

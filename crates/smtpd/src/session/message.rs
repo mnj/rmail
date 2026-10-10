@@ -166,7 +166,10 @@ impl Session {
                 .await;
         }
 
-        let report = self.deliver(&data, quarantine, &auth.dmarc).await;
+        let verified = self.itip_sender(&data, &auth);
+        let report = self
+            .deliver(&data, quarantine, &auth.dmarc, &verified)
+            .await;
         // Feedback loop reports are recorded only once delivered, and not
         // when the scanner quarantined them.
         if report.any_accepted && !quarantine {
