@@ -22,6 +22,7 @@ use rmail_common::mime::{
     Attachment, attachment_data, has_remote_content, parse_message, sanitize_email_html, snippet,
 };
 
+mod calendars;
 mod compose;
 mod organize;
 
@@ -89,6 +90,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/folders/{folder}/messages/bulk", post(bulk))
         .merge(organize::routes())
         .merge(compose::routes())
+        .merge(calendars::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())
         .fallback(fallback)
@@ -1641,6 +1643,70 @@ mod tests {
         let inbox = folders.iter().find(|f| f.name == "INBOX").unwrap();
         assert_eq!(inbox.messages, 1);
         assert_eq!(inbox.unread, 1);
+    }
+
+    #[tokio::test]
+    async fn calendars_are_shared_from_webmail() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        db::add_mailbox(
+            &state.db_path,
+            "friend@example.test",
+            Some("plain:secret"),
+            None,
+            None,
+        )
+        .unwrap();
+        let cookie = |address: &str| {
+            Some(format!(
+                "{SESSION_COOKIE}={}",
+                sign_session(&state, address)
+            ))
+        };
+        let (owner, friend) = (cookie("user@example.test"), cookie("friend@example.test"));
+        let call = |method: &'static str, path: &str, body: &str, cookie: &Option<String>| {
+            let request = req(method, path, body.as_bytes(), cookie.clone());
+            let state = state.clone();
+            async move { route(request, &state).await }
+        };
+        let share = |access: &str, address: &str| {
+            format!(r#"{{"address":"{address}","access":"{access}"}}"#)
+        };
+        let calendar = "/api/calendars/calendar/default/sharing";
+        let unknown = share("read", "nobody@example.test");
+        assert_eq!(call("PUT", calendar, &unknown, &owner).await.status, 422);
+        let missing = "/api/calendars/calendar/nope/sharing";
+        let friend_edit = share("edit", "friend@example.test");
+        assert_eq!(call("PUT", missing, &friend_edit, &owner).await.status, 404);
+        assert_eq!(
+            call("PUT", calendar, &friend_edit, &owner).await.status,
+            204
+        );
+
+        let listing = call("GET", "/api/calendars", "", &owner).await;
+        let listing: serde_json::Value = serde_json::from_slice(&listing.body).unwrap();
+        assert_eq!(
+            listing["own"][0],
+            serde_json::json!({
+                "kind": "calendar", "name": "default", "displayname": "Calendar",
+                "grants": [{"address": "friend@example.test", "access": "edit"}],
+            })
+        );
+        assert_eq!(listing["own"][1]["kind"], "addressbook");
+        let received = call("GET", "/api/calendars", "", &friend).await;
+        let received: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        assert_eq!(
+            received["shared"],
+            serde_json::json!([{
+                "kind": "calendar", "owner": "user@example.test",
+                "displayname": "Calendar", "access": "edit",
+            }])
+        );
+        let stop = share("none", "friend@example.test");
+        assert_eq!(call("PUT", calendar, &stop, &owner).await.status, 204);
+        let received = call("GET", "/api/calendars", "", &friend).await;
+        let received: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        assert_eq!(received["shared"], serde_json::json!([]));
     }
 
     #[tokio::test]

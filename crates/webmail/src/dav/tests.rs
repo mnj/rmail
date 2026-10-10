@@ -936,7 +936,7 @@ async fn simultaneous_answers_both_reach_the_organizer() {
                     app: state,
                 };
                 barrier.wait();
-                super::schedule::deliver_local(&dav, &account(USER), &reply).unwrap();
+                super::schedule::deliver_local(&dav, &dav.user, &account(USER), &reply).unwrap();
             })
         });
         for thread in threads {
@@ -951,4 +951,370 @@ async fn simultaneous_answers_both_reach_the_organizer() {
             assert!(line.contains("PARTSTAT=ACCEPTED"), "round {round}: {line}");
         }
     }
+}
+
+const SHARED: &str = "/dav/calendars/other@example.test/user@example.test~default/";
+
+fn share_request(sharee: &str, access: &str) -> String {
+    format!(
+        r#"<cs:share xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/">
+           <cs:set><d:href>mailto:{sharee}</d:href><cs:{access}/></cs:set></cs:share>"#
+    )
+}
+
+/// The element names and text inside the first `local` element of the
+/// response for `href` in a multistatus.
+fn prop_of(body: &str, href: &str, local: &str) -> String {
+    let document = roxmltree::Document::parse(body).unwrap();
+    let Some(response) = document
+        .descendants()
+        .filter(|node| node.tag_name().name() == "response")
+        .find(|response| response.descendants().any(|node| node.text() == Some(href)))
+    else {
+        return String::new();
+    };
+    response
+        .descendants()
+        .find(|node| node.tag_name().name() == local)
+        .map(|node| {
+            node.descendants()
+                .skip(1)
+                .filter_map(|node| {
+                    if node.is_element() {
+                        Some(node.tag_name().name().to_string())
+                    } else {
+                        node.text().map(str::to_string)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn shared_calendars_are_read_only_or_writable_as_granted() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let existing = format!("{CALENDAR}a.ics");
+    let standup = event("a", "Standup", "20261012T090000Z");
+    assert_eq!(
+        dav(&state, "PUT", &existing, &[], &standup).await.status,
+        201
+    );
+    let options = dav(&state, "OPTIONS", CALENDAR, &[], "").await;
+    assert!(options.header("dav").contains("calendarserver-sharing"));
+
+    // Apple Calendar shares with a CalendarServer `share` POST; accounts
+    // that do not exist are refused one by one.
+    let shared = dav(&state, "POST", CALENDAR, &[], &share_request(OTHER, "read")).await;
+    assert_eq!(shared.status, 200, "{}", shared.body);
+    let nobody = share_request("nobody@example.test", "read");
+    let unknown = dav(&state, "POST", CALENDAR, &[], &nobody).await;
+    assert_eq!(unknown.status, 207);
+    assert!(unknown.body.contains("mailto:nobody@example.test") && unknown.body.contains("403"));
+    let owner_view = dav(
+        &state,
+        "PROPFIND",
+        CALENDAR,
+        &[("depth", "0")],
+        r#"<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop>
+           <d:resourcetype/><cs:invite/><cs:allowed-sharing-modes/></d:prop></d:propfind>"#,
+    )
+    .await;
+    let body = &owner_view.body;
+    assert!(body.contains("<cs:shared-owner/>"), "{body}");
+    assert!(body.contains("mailto:other@example.test"));
+    assert!(body.contains("<cs:read/>") && body.contains("<cs:can-be-shared/>"));
+
+    // The sharee finds it in their own home, read-only.
+    let home = dav_as(
+        &state,
+        OTHER,
+        "PROPFIND",
+        "/dav/calendars/other@example.test/",
+        &[("depth", "1")],
+        r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:owner/><d:resourcetype/>
+           <d:current-user-privilege-set/></d:prop></d:propfind>"#,
+    )
+    .await;
+    let prop = |local: &str| prop_of(&home.body, SHARED, local);
+    assert_eq!(
+        prop("displayname"),
+        "Calendar (user@example.test)",
+        "{}",
+        home.body
+    );
+    assert!(prop("owner").contains("/dav/principals/user@example.test/"));
+    assert!(prop("resourcetype").contains("calendar") && prop("resourcetype").contains("shared"));
+    let privileges = prop("current-user-privilege-set");
+    assert!(privileges.contains("read"));
+    assert!(
+        !privileges.contains("write") && !privileges.contains("bind"),
+        "{privileges}"
+    );
+
+    let object = format!("{SHARED}a.ics");
+    let read = dav_as(&state, OTHER, "GET", &object, &[], "").await;
+    assert_eq!(read.status, 200);
+    assert!(read.body.contains("SUMMARY:Standup"));
+    let listed = objects_in(&state, OTHER, SHARED).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, object);
+    let multiget = dav_as(
+        &state,
+        OTHER,
+        "REPORT",
+        SHARED,
+        &[],
+        &format!(
+            r#"<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+               <d:prop><d:getetag/></d:prop><d:href>{object}</d:href></c:calendar-multiget>"#
+        ),
+    )
+    .await;
+    assert!(multiget.body.contains("getetag"), "{}", multiget.body);
+    assert!(!multiget.body.contains("404"), "{}", multiget.body);
+    let sync = dav_as(
+        &state,
+        OTHER,
+        "REPORT",
+        SHARED,
+        &[],
+        r#"<d:sync-collection xmlns:d="DAV:"><d:sync-token/><d:prop><d:getetag/></d:prop>
+           </d:sync-collection>"#,
+    )
+    .await;
+    assert!(sync.body.contains(&object), "{}", sync.body);
+
+    // Writes need privileges the sharee lacks.
+    let new_event = event("b", "Sneaky", "20261013T090000Z");
+    let added = format!("{SHARED}b.ics");
+    let refused = dav_as(&state, OTHER, "PUT", &added, &[], &new_event).await;
+    assert_eq!(refused.status, 403);
+    assert!(refused.body.contains("need-privileges"), "{}", refused.body);
+    assert!(refused.body.contains("<d:bind/>"), "{}", refused.body);
+    let changed = event("a", "Changed", "20261012T090000Z");
+    let refused = dav_as(&state, OTHER, "PUT", &object, &[], &changed).await;
+    assert!(
+        refused.body.contains("<d:write-content/>"),
+        "{}",
+        refused.body
+    );
+    let refused = dav_as(&state, OTHER, "DELETE", &object, &[], "").await;
+    assert_eq!(refused.status, 403);
+    assert!(refused.body.contains("<d:unbind/>"));
+    let onward = share_request("third@example.test", "read");
+    assert_eq!(
+        dav_as(&state, OTHER, "POST", SHARED, &[], &onward)
+            .await
+            .status,
+        403
+    );
+
+    // Name and color are the sharee's own; the description is the owner's.
+    let patch = |prop: &str| {
+        format!(
+            r#"<d:propertyupdate xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"
+               xmlns:i="http://apple.com/ns/ical/"><d:set><d:prop>{prop}</d:prop></d:set>
+               </d:propertyupdate>"#
+        )
+    };
+    let personal =
+        patch("<i:calendar-color>#00ff00</i:calendar-color><d:displayname>Team</d:displayname>");
+    let colored = dav_as(&state, OTHER, "PROPPATCH", SHARED, &[], &personal).await;
+    assert!(colored.body.contains("200 OK"), "{}", colored.body);
+    assert!(!colored.body.contains("403"), "{}", colored.body);
+    let description = patch("<c:calendar-description>Mine</c:calendar-description>");
+    let described = dav_as(&state, OTHER, "PROPPATCH", SHARED, &[], &description).await;
+    assert!(described.body.contains("403"), "{}", described.body);
+    let props = r#"<d:propfind xmlns:d="DAV:" xmlns:i="http://apple.com/ns/ical/">
+                   <d:prop><d:displayname/><i:calendar-color/></d:prop></d:propfind>"#;
+    let sharee_view = dav_as(&state, OTHER, "PROPFIND", SHARED, &[("depth", "0")], props).await;
+    assert!(sharee_view.body.contains("#00ff00"), "{}", sharee_view.body);
+    assert!(sharee_view.body.contains(">Team<"), "{}", sharee_view.body);
+    let owner_view = dav(&state, "PROPFIND", CALENDAR, &[("depth", "0")], props).await;
+    assert!(!owner_view.body.contains("#00ff00") && !owner_view.body.contains("Team"));
+
+    // The owner's principal is visible to the sharee only.
+    let principal = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>"#;
+    let owner = "/dav/principals/user@example.test/";
+    let depth = [("depth", "0")];
+    let seen = dav_as(&state, OTHER, "PROPFIND", owner, &depth, principal).await;
+    assert_eq!(seen.status, 207);
+    let third = "third@example.test";
+    let hidden = dav_as(&state, third, "PROPFIND", owner, &depth, principal).await;
+    assert_eq!(hidden.status, 404);
+    // Nobody else reaches it, by a binding of their own or the owner's path.
+    let guessed = "/dav/calendars/third@example.test/user@example.test~default/a.ics";
+    assert_eq!(
+        dav_as(&state, third, "GET", guessed, &[], "").await.status,
+        404
+    );
+    assert_eq!(
+        dav_as(&state, OTHER, "GET", &existing, &[], "")
+            .await
+            .status,
+        404
+    );
+    // Own collections cannot take the names kept for shares.
+    let reserved = "/dav/calendars/user@example.test/a@b~c/";
+    assert_eq!(
+        dav(&state, "MKCALENDAR", reserved, &[], "").await.status,
+        403
+    );
+
+    // With read-write access the sharee changes the owner's calendar.
+    let upgrade = share_request(OTHER, "read-write");
+    assert_eq!(
+        dav(&state, "POST", CALENDAR, &[], &upgrade).await.status,
+        200
+    );
+    let privileges = dav_as(
+        &state,
+        OTHER,
+        "PROPFIND",
+        SHARED,
+        &depth,
+        r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-privilege-set/></d:prop></d:propfind>"#,
+    )
+    .await;
+    assert!(privileges.body.contains("<d:write-content/>"));
+    let created = dav_as(&state, OTHER, "PUT", &added, &[], &new_event).await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let in_owner = dav(&state, "GET", &format!("{CALENDAR}b.ics"), &[], "").await;
+    assert!(in_owner.body.contains("SUMMARY:Sneaky"));
+    let description = patch("<c:calendar-description>Shared</c:calendar-description>");
+    let described = dav_as(&state, OTHER, "PROPPATCH", SHARED, &[], &description).await;
+    assert!(!described.body.contains("403"), "{}", described.body);
+    assert_eq!(
+        dav_as(&state, OTHER, "DELETE", &added, &[], "")
+            .await
+            .status,
+        204
+    );
+    // The sharee's own name outlived the change of access.
+    let sharee_view = dav_as(&state, OTHER, "PROPFIND", SHARED, &depth, props).await;
+    assert!(sharee_view.body.contains(">Team<"));
+
+    // Leaving the share drops the grant; the owner keeps the calendar.
+    assert_eq!(
+        dav_as(&state, OTHER, "DELETE", SHARED, &[], "")
+            .await
+            .status,
+        204
+    );
+    assert_eq!(
+        dav_as(&state, OTHER, "GET", &object, &[], "").await.status,
+        404
+    );
+    assert_eq!(dav(&state, "GET", &existing, &[], "").await.status, 200);
+    let grants = rmail_common::dav::share::shared_with(&state.db_path, OTHER).unwrap();
+    assert!(grants.is_empty());
+
+    // Deleting a shared collection forgets its grants.
+    let again = share_request(OTHER, "read");
+    assert_eq!(dav(&state, "POST", CALENDAR, &[], &again).await.status, 200);
+    assert_eq!(dav(&state, "DELETE", CALENDAR, &[], "").await.status, 204);
+    let grants = rmail_common::dav::share::shared_with(&state.db_path, OTHER).unwrap();
+    assert!(grants.is_empty());
+}
+
+#[tokio::test]
+async fn sharees_schedule_as_the_calendar_owner() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let third = "third@example.test";
+    let third_calendar = "/dav/calendars/third@example.test/default/";
+    let grant = share_request(OTHER, "read-write");
+    assert_eq!(dav(&state, "POST", CALENDAR, &[], &grant).await.status, 200);
+
+    // The sharee books a meeting the owner organizes, in the owner's
+    // calendar: the invitation comes from the owner.
+    let invite = meeting(&[(third, "NEEDS-ACTION")], "Review", "");
+    let shared_event = format!("{SHARED}meet.ics");
+    let created = dav_as(&state, OTHER, "PUT", &shared_event, &[], &invite).await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let stored = dav(&state, "GET", &format!("{CALENDAR}meet.ics"), &[], "").await;
+    let stored = unfolded(&stored.body);
+    assert!(
+        stored.contains("SCHEDULE-STATUS=1.2:mailto:third@example.test"),
+        "{stored}"
+    );
+    let copies = objects_in(&state, third, third_calendar).await;
+    assert_eq!(copies.len(), 1);
+    assert!(unfolded(&copies[0].1).contains("ORGANIZER:mailto:user@example.test"));
+    // The sharee is no attendee and gets nothing.
+    let sharee_inbox = "/dav/calendars/other@example.test/inbox/";
+    assert!(objects_in(&state, OTHER, sharee_inbox).await.is_empty());
+
+    // The attendee's answer reaches the owner's copy, where the sharee
+    // sees it.
+    let (copy_href, copy) = copies[0].clone();
+    let accepted = unfolded(&copy).replace(
+        "PARTSTAT=NEEDS-ACTION:mailto:third@example.test",
+        "PARTSTAT=ACCEPTED:mailto:third@example.test",
+    );
+    let answered = dav_as(&state, third, "PUT", &copy_href, &[], &accepted).await;
+    assert_eq!(answered.status, 204);
+    let seen = dav_as(&state, OTHER, "GET", &shared_event, &[], "").await;
+    let seen = unfolded(&seen.body);
+    let line = seen
+        .lines()
+        .find(|line| line.ends_with("mailto:third@example.test"))
+        .unwrap();
+    assert!(line.contains("PARTSTAT=ACCEPTED"), "{seen}");
+
+    // Deleting it in the shared calendar cancels as the owner.
+    let deleted = dav_as(&state, OTHER, "DELETE", &shared_event, &[], "").await;
+    assert_eq!(deleted.status, 204);
+    let cancelled = objects_in(&state, third, third_calendar).await;
+    assert!(
+        unfolded(&cancelled[0].1).contains("STATUS:CANCELLED"),
+        "{}",
+        cancelled[0].1
+    );
+}
+
+#[tokio::test]
+async fn address_books_are_shared_too() {
+    use rmail_common::dav::{share, store};
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let book = "/dav/addressbooks/user@example.test/default/";
+    let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c1\r\nFN:Ada\r\nEND:VCARD\r\n";
+    let put = dav(&state, "PUT", &format!("{book}c1.vcf"), &[], card).await;
+    assert_eq!(put.status, 201);
+    let conn = rmail_common::jmap::store::open(&state.mail_root, "example.test", "user").unwrap();
+    let id = store::collection(&conn, store::Kind::AddressBook, "default")
+        .unwrap()
+        .unwrap()
+        .id;
+    share::set_access(
+        &state.db_path,
+        USER,
+        id,
+        OTHER,
+        Some(share::Access::ReadWrite),
+    )
+    .unwrap();
+    let home = "/dav/addressbooks/other@example.test/";
+    let listing = dav_as(&state, OTHER, "PROPFIND", home, &[("depth", "1")], "").await;
+    let shared = "/dav/addressbooks/other@example.test/user@example.test~default/";
+    assert!(listing.body.contains(shared), "{}", listing.body);
+    // A shared address book is not reachable as a calendar.
+    let as_calendar = "/dav/calendars/other@example.test/user@example.test~default/c1.vcf";
+    assert_eq!(
+        dav_as(&state, OTHER, "GET", as_calendar, &[], "")
+            .await
+            .status,
+        404
+    );
+    let card2 = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c2\r\nFN:Grace\r\nEND:VCARD\r\n";
+    let added = dav_as(&state, OTHER, "PUT", &format!("{shared}c2.vcf"), &[], card2).await;
+    assert_eq!(added.status, 201);
+    let in_owner = dav(&state, "GET", &format!("{book}c2.vcf"), &[], "").await;
+    assert!(in_owner.body.contains("FN:Grace"));
+    let read = dav_as(&state, OTHER, "GET", &format!("{shared}c1.vcf"), &[], "").await;
+    assert!(read.body.contains("FN:Ada"));
 }
