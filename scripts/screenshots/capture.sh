@@ -34,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj /CN=mail.example.com \
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=mail.example.com \
   -keyout "${demo}/key.pem" -out "${demo}/cert.pem" 2>/dev/null
 # Relative paths: the services run from ${demo}, and the console shows the
 # config path, so this keeps the temporary directory name out of the shots.
