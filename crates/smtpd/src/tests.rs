@@ -690,6 +690,7 @@ fn received_trace_identifies_smtp_transport_and_authentication_phase() {
         false,
         false,
         false,
+        None,
     ))
     .unwrap();
     assert!(smtp.contains(" with SMTP;"));
@@ -700,6 +701,7 @@ fn received_trace_identifies_smtp_transport_and_authentication_phase() {
         true,
         true,
         true,
+        None,
     ))
     .unwrap();
     assert!(submission.contains(" with ESMTPSA;"));
@@ -711,9 +713,21 @@ fn received_trace_identifies_smtp_transport_and_authentication_phase() {
         true,
         false,
         false,
+        None,
     ))
     .unwrap();
     assert!(lmtp.contains(" with LMTP;"));
+    let urgent = String::from_utf8(received_header(
+        None,
+        Some("client"),
+        SmtpService::Submission,
+        true,
+        true,
+        true,
+        Some(4),
+    ))
+    .unwrap();
+    assert!(urgent.contains(" with ESMTPSA PRIORITY 4;"));
 }
 
 #[tokio::test]
@@ -2935,5 +2949,269 @@ async fn forwarded_mail_gets_an_srs_sender_and_bounces_find_their_way_back() {
         queued[0].contains("X-RMail-Envelope-To: sender@remote.example\r\n"),
         "{}",
         queued[0]
+    );
+}
+
+fn queued_control_priorities(td: &tempfile::TempDir) -> Vec<i32> {
+    let queue = td.path().join("mail/outbound/maildrop/queue");
+    std::fs::read_dir(queue)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    path.to_string_lossy().ends_with(".eml.json").then(|| {
+                        rmail_common::serde_json::from_str::<rmail_common::outbound::QueueControl>(
+                            &std::fs::read_to_string(path).unwrap(),
+                        )
+                        .unwrap()
+                        .priority
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn submission_assigns_mixer_priority_and_queues_it() {
+    let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+    let input = format!(
+        "EHLO localhost\r\n{auth}\
+         MAIL FROM:<user@example.test> MT-PRIORITY=4\r\nRSET\r\n\
+         MAIL FROM:<user@example.test> MT-PRIORITY=+1\r\n\
+         MAIL FROM:<user@example.test> MT-PRIORITY=7\r\nRCPT TO:<someone@remote.test>\r\n\
+         DATA\r\nFrom: user@example.test\r\nSubject: urgent\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+    );
+    let (responses, td) = run_session_with_policy(
+        input.into_bytes(),
+        16 * 1024,
+        SecurityConfig::default(),
+        true,
+        SmtpService::Submission,
+    )
+    .await;
+    assert!(
+        responses.contains(&"250-MT-PRIORITY MIXER\r\n".to_string()),
+        "{responses:?}"
+    );
+    assert!(responses.contains(&"250-DELIVERBY 60\r\n".to_string()));
+    assert!(!responses.iter().any(|line| line.contains("ETRN")));
+    // A MIXER level is accepted as is; others are rounded up to one.
+    assert!(responses.contains(&"250 2.1.0 Sender OK\r\n".to_string()));
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("501 5.5.2 Syntax")),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.3.6 4 Sender OK; priority changed")),
+        "{responses:?}"
+    );
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "{responses:?}");
+    assert!(queued[0].contains("X-RMail-MT-Priority: 4\r\n"));
+    assert!(queued[0].contains(" PRIORITY 4; "), "{}", queued[0]);
+    assert_eq!(queued_control_priorities(&td), [4]);
+}
+
+#[tokio::test]
+async fn untrusted_inbound_clients_may_only_lower_priority() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    let (responses, td) = run_prepared_session(
+        b"EHLO localhost\r\nMAIL FROM:<> MT-PRIORITY=6\r\nRSET\r\n\
+          MAIL FROM:<> MT-PRIORITY=-1\r\nRSET\r\n\
+          MAIL FROM:<> MT-PRIORITY=-9\r\nRCPT TO:<user@example.test>\r\n\
+          DATA\r\nSubject: low\r\n\r\nbody\r\n.\r\n\
+          HELO localhost\r\nMAIL FROM:<> MT-PRIORITY=1\r\nQUIT\r\n"
+            .to_vec(),
+        32 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert!(responses.contains(&"250-MT-PRIORITY MIXER\r\n".to_string()));
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.3.6 0 Sender OK")),
+        "a raised priority is cut to normal: {responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.3.6 -4 Sender OK")),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("555 5.5.4 ESMTP parameters require EHLO")),
+        "{responses:?}"
+    );
+    assert_eq!(inbox(&td), 1);
+}
+
+#[tokio::test]
+async fn deliverby_is_validated_and_queued_as_a_deadline() {
+    crate::enable_future_release();
+    let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+    let input = format!(
+        "EHLO localhost\r\n{auth}\
+         MAIL FROM:<user@example.test> BY=30;R\r\n\
+         MAIL FROM:<user@example.test> BY=0;R\r\n\
+         MAIL FROM:<user@example.test> BY=600;N HOLDFOR=60\r\n\
+         MAIL FROM:<user@example.test> BY=3600;RT\r\nRCPT TO:<someone@remote.test>\r\n\
+         DATA\r\nFrom: user@example.test\r\nSubject: soon\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+    );
+    let before = chrono::Utc::now().timestamp();
+    let (responses, td) = run_session_with_policy(
+        input.into_bytes(),
+        16 * 1024,
+        SecurityConfig::default(),
+        true,
+        SmtpService::Submission,
+    )
+    .await;
+    let after = chrono::Utc::now().timestamp();
+    for expected in [
+        "555 5.5.4 BY time is below the minimum of 60 seconds",
+        "501 5.5.2 Syntax",
+        "501 5.5.4 DELIVERBY cannot be combined with FUTURERELEASE",
+        "250 2.0.0 Message accepted",
+    ] {
+        assert!(
+            responses.iter().any(|line| line.starts_with(expected)),
+            "{expected}: {responses:?}"
+        );
+    }
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1);
+    let deadline = queued[0]
+        .lines()
+        .find_map(|line| line.strip_prefix("X-RMail-Deliver-By: "))
+        .and_then(|value| value.strip_suffix(";RT"))
+        .and_then(|value| value.parse::<i64>().ok())
+        .expect("deadline in the spool metadata");
+    assert!((before + 3600..=after + 3600).contains(&deadline));
+
+    // LMTP is final delivery and offers neither extension.
+    let (lmtp, _) = run_session_with_policy(
+        b"LHLO localhost\r\nMAIL FROM:<> BY=600;N\r\nMAIL FROM:<> MT-PRIORITY=1\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Lmtp,
+    )
+    .await;
+    assert!(!lmtp.iter().any(|line| line.contains("DELIVERBY")));
+    assert_eq!(
+        lmtp.iter()
+            .filter(|line| line.starts_with("555 5.5.4 Unsupported"))
+            .count(),
+        2,
+        "{lmtp:?}"
+    );
+}
+
+#[tokio::test]
+async fn etrn_replies_follow_rfc_1985_without_disclosing_the_queue() {
+    let (responses, td) = run_session(
+        b"ETRN etrn-early.test\r\nEHLO localhost\r\n\
+          ETRN example.test\r\nETRN #uucp\r\nETRN @com\r\nETRN\r\n\
+          ETRN etrn-remote.test\r\nETRN @etrn-sub.test\r\n\
+          MAIL FROM:<>\r\nETRN etrn-remote.test\r\nQUIT\r\n"
+            .to_vec(),
+        16 * 1024,
+    )
+    .await;
+    let expected = [
+        "503 5.5.1 Send HELO/EHLO first",
+        "250-ETRN",
+        "459 4.7.1 Node example.test not allowed: mail for it is delivered here",
+        "459 4.7.1 Node #uucp not allowed: named queues are not supported",
+        "501 5.5.4 Syntax: ETRN [@]domain",
+        "501 5.5.2 Syntax error",
+        "250 2.0.0 OK, queuing for node etrn-remote.test started",
+        "250 2.0.0 OK, queuing for node @etrn-sub.test started",
+        "503 5.5.1 ETRN not permitted during a mail transaction",
+    ];
+    for line in expected {
+        assert!(
+            responses.iter().any(|response| response.starts_with(line)),
+            "{line}: {responses:?}"
+        );
+    }
+    let mut requests = rmail_common::etrn::take_requests(&td.path().join("mail")).unwrap();
+    requests.sort_by_key(rmail_common::etrn::Node::display);
+    assert_eq!(
+        requests,
+        [
+            rmail_common::etrn::Node::Subdomains("etrn-sub.test".into()),
+            rmail_common::etrn::Node::Domain("etrn-remote.test".into()),
+        ]
+    );
+
+    // Submission does not offer it.
+    let (submission, _) = run_session_with_policy(
+        b"EHLO localhost\r\nETRN etrn-remote.test\r\nQUIT\r\n".to_vec(),
+        16 * 1024,
+        SecurityConfig::default(),
+        true,
+        SmtpService::Submission,
+    )
+    .await;
+    assert!(
+        submission
+            .iter()
+            .any(|line| line.starts_with("502 5.5.1 ETRN is not available")),
+        "{submission:?}"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_etrn_clients_get_message_counts() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    for recipient in ["a@etrn-counted.test", "b@etrn-counted.test"] {
+        rmail_common::outbound::queue_outbound(
+            &mail_root,
+            recipient,
+            b"Subject: t\r\n\r\nbody\r\n",
+            None,
+        )
+        .unwrap();
+    }
+    let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+    let (responses, _) = run_prepared_session(
+        format!(
+            "EHLO localhost\r\n{auth}ETRN etrn-counted.test\r\nETRN etrn-empty.test\r\nQUIT\r\n"
+        )
+        .into_bytes(),
+        16 * 1024,
+        SecurityConfig::default(),
+        true,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert!(
+        responses.iter().any(|line| line
+            == "253 2.0.0 OK, 2 pending messages for node etrn-counted.test started\r\n"),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line == "251 2.0.0 OK, no messages waiting for node etrn-empty.test\r\n"),
+        "{responses:?}"
     );
 }

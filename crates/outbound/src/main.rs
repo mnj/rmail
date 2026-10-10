@@ -113,6 +113,16 @@ struct QueuedMessage {
     requirements: MessageRequirements,
     require_tls: bool,
     dsn: rmail_common::outbound::DsnOptions,
+    relay: RelayParameters,
+}
+
+/// Envelope parameters passed on to next hops that advertise them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RelayParameters {
+    /// RFC 6710 MT-PRIORITY.
+    mt_priority: Option<i8>,
+    /// RFC 2852 DELIVERBY deadline.
+    deliver_by: Option<rmail_common::outbound::DeliverBy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -393,6 +403,7 @@ async fn main() -> anyhow::Result<()> {
             next_dead_letter_cleanup = now + Duration::from_secs(60);
         }
 
+        start_etrn_queue_runs(&base, &maildrop_dir).await;
         while deliveries.len() < max_concurrent_deliveries {
             let Some((inflight_eml, inflight_json)) =
                 claim_one(&maildrop_dir, per_dest_limit).await
@@ -478,6 +489,35 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Make queued mail for the nodes named in ETRN requests (RFC 1985) due
+/// now. Runs in the claim loop, so no message is claimed meanwhile; the
+/// idle loop polls every few seconds, which bounds how long a run waits.
+async fn start_etrn_queue_runs(base: &Path, maildrop_dir: &Path) {
+    let (base, maildrop_dir) = (base.to_path_buf(), maildrop_dir.to_path_buf());
+    let started = tokio::task::spawn_blocking(move || {
+        let nodes = rmail_common::etrn::take_requests(&base)?;
+        let messages = rmail_queue_manager::start_queue_runs(&maildrop_dir, &nodes)?;
+        anyhow::Ok((nodes, messages))
+    })
+    .await;
+    match started {
+        Ok(Ok((nodes, _))) if nodes.is_empty() => {}
+        Ok(Ok((nodes, messages))) => rmail_common::structured_log!(
+            "info", "outbound", "etrn_queue_run_started",
+            {
+                "nodes": nodes.iter().map(rmail_common::etrn::Node::display).collect::<Vec<_>>(),
+                "messages": messages
+            }
+        ),
+        Ok(Err(error)) => rmail_common::structured_log!(
+            "error", "outbound", "etrn_queue_run_failed", { "error": format!("{error:#}") }
+        ),
+        Err(error) => rmail_common::structured_log!(
+            "error", "outbound", "etrn_queue_run_failed", { "error": error.to_string() }
+        ),
+    }
 }
 
 /// Release scheduled messages (RFC 4865 FUTURERELEASE, JMAP delayed send)
@@ -648,17 +688,38 @@ async fn process_claim(
         return;
     }
 
-    match process_file(&inflight_eml, &connections, &tracking, &control.tracking_id).await {
+    let inspected = inspect_queued_message(&inflight_eml).await;
+    let deliver_by = inspected
+        .as_ref()
+        .ok()
+        .and_then(|message| message.relay.deliver_by);
+    let outcome = match inspected {
+        Ok(message) => {
+            process_file(
+                &inflight_eml,
+                message,
+                &connections,
+                &tracking,
+                &control.tracking_id,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    match outcome {
         Ok(handoff) => {
             emit("delivery", "delivered", Some(fname.clone()), Some(250));
-            // RFC 3461 §6.2.3: a DSN-capable next hop now owns success reports.
-            if !handoff.dsn
+            // RFC 3461 §6.2.3: a DSN-capable next hop now owns success
+            // reports. RFC 2852 asks for a relayed DSN when the deadline
+            // stops being tracked or a trace was requested.
+            if (!handoff.dsn || handoff.deliver_by_relayed)
                 && let Err(error) = queue_delivery_notification(
                     &base,
                     &inflight_eml,
                     &control,
                     DeliveryNotificationKind::Relayed {
                         remote_mta: &handoff.remote_mta,
+                        deliver_by: handoff.deliver_by_relayed,
                     },
                 )
                 .await
@@ -693,13 +754,27 @@ async fn process_claim(
             let policy_failure = failure
                 .chain()
                 .find_map(|cause| cause.downcast_ref::<PermanentDeliveryError>());
-            let permanent =
-                smtp_failure.is_some_and(SmtpReplyError::is_permanent) || policy_failure.is_some();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            // RFC 2852 section 4.1.3: past a BY;R deadline no further
+            // attempts are made and the failure DSN says 5.4.7.
+            let return_deadline_passed = deliver_by.is_some_and(|by| {
+                by.mode == rmail_common::outbound::DeliverByMode::Return && now >= by.deadline
+            });
+            let permanent = smtp_failure.is_some_and(SmtpReplyError::is_permanent)
+                || policy_failure.is_some()
+                || return_deadline_passed;
             control.last_smtp_code = smtp_failure.map(|failure| failure.code);
             control.last_enhanced_status = smtp_failure
                 .and_then(|failure| failure.enhanced_status.clone())
                 .or_else(|| policy_failure.and_then(|failure| failure.enhanced_status.clone()));
-            let error_message = failure.to_string();
+            let mut error_message = failure.to_string();
+            if return_deadline_passed && policy_failure.is_none() {
+                control.last_enhanced_status = Some("5.4.7".to_string());
+                error_message = format!("delivery time expired (DELIVERBY); {error_message}");
+            }
             control.last_error = Some(error_message.clone());
             rmail_common::structured_log!(
                 "warn", "outbound", "delivery_failed",
@@ -729,22 +804,33 @@ async fn process_claim(
                 control.next_try = None;
                 failed_dir.join(&fname)
             } else {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                control.next_try = Some(
-                    now + retry_backoff_seconds(
+                let mut next_try = now
+                    + retry_backoff_seconds(
                         control.attempts,
                         control.last_enhanced_status.as_deref(),
-                    ),
-                );
+                    );
+                // Try again when a DELIVERBY deadline falls before the next
+                // retry, so its DSN goes out on time.
+                if let Some(by) = deliver_by.filter(|by| by.deadline > now) {
+                    next_try = next_try.min(by.deadline);
+                }
+                control.next_try = Some(next_try);
                 queue_dir.join(&fname)
             };
             let send_delay_notification =
                 !terminal && control.attempts >= 2 && !control.delay_notification_sent;
             if send_delay_notification {
                 control.delay_notification_sent = true;
+            }
+            // RFC 2852 section 4.1.3: one delayed DSN (4.4.7) when a BY;N
+            // deadline passes; delivery attempts go on.
+            let send_deadline_notification = !terminal
+                && !control.deliver_by_notified
+                && deliver_by.is_some_and(|by| {
+                    by.mode == rmail_common::outbound::DeliverByMode::Notify && now >= by.deadline
+                });
+            if send_deadline_notification {
+                control.deliver_by_notified = true;
             }
 
             if let Err(error) = write_control(&inflight_json, &control).await {
@@ -770,6 +856,25 @@ async fn process_claim(
             {
                 rmail_common::structured_log!(
                     "error", "outbound", "delay_dsn_queue_failed",
+                    {
+                        "connection_id": connection_id,
+                        "message_id": tracking_message_id,
+                        "spool_file": fname,
+                        "error": error.to_string()
+                    }
+                );
+            }
+            if send_deadline_notification
+                && let Err(error) = queue_delivery_notification(
+                    &base,
+                    &inflight_eml,
+                    &control,
+                    DeliveryNotificationKind::DeadlinePassed,
+                )
+                .await
+            {
+                rmail_common::structured_log!(
+                    "error", "outbound", "deliver_by_dsn_queue_failed",
                     {
                         "connection_id": connection_id,
                         "message_id": tracking_message_id,
@@ -813,11 +918,20 @@ async fn process_claim(
 
 async fn process_file(
     path: &Path,
+    message: QueuedMessage,
     connections: &ConnectionPool,
     tracking: &TrackingHub,
     tracking_id: &str,
 ) -> anyhow::Result<Handoff> {
-    let message = inspect_queued_message(path).await?;
+    if let Some(by) = message.relay.deliver_by
+        && by.mode == rmail_common::outbound::DeliverByMode::Return
+        && Utc::now().timestamp() >= by.deadline
+    {
+        return Err(permanent_delivery_error(
+            "delivery time expired (DELIVERBY)",
+            Some("5.4.7"),
+        ));
+    }
     deliver_to_remote(path, message, connections, tracking, tracking_id).await
 }
 
@@ -832,7 +946,7 @@ async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
     if body_offset > file_len {
         anyhow::bail!("queued message metadata extends beyond the file");
     }
-    let (envelope_from, envelope_to, require_tls, dsn) = parse_queue_metadata(&metadata)?;
+    let (envelope_from, envelope_to, require_tls, dsn, relay) = parse_queue_metadata(&metadata)?;
     let body_len = file_len - body_offset;
     let requirements =
         scan_message_requirements(path, body_offset, envelope_from.as_deref(), &envelope_to)
@@ -845,6 +959,7 @@ async fn inspect_queued_message(path: &Path) -> anyhow::Result<QueuedMessage> {
         requirements,
         require_tls,
         dsn,
+        relay,
     })
 }
 
@@ -889,6 +1004,7 @@ fn parse_queue_metadata(
     String,
     bool,
     rmail_common::outbound::DsnOptions,
+    RelayParameters,
 )> {
     let metadata =
         std::str::from_utf8(metadata).context("queued message metadata is not valid UTF-8")?;
@@ -896,6 +1012,7 @@ fn parse_queue_metadata(
     let mut envelope_to = None;
     let mut require_tls = false;
     let mut dsn = rmail_common::outbound::DsnOptions::default();
+    let mut relay = RelayParameters::default();
     for raw_line in metadata.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
@@ -966,6 +1083,20 @@ fn parse_queue_metadata(
                 anyhow::bail!("invalid DSN notify combination in queue metadata");
             }
             dsn.notify = Some(notify);
+        } else if let Some(value) = line.strip_prefix("X-RMail-MT-Priority:") {
+            let priority: i8 = value
+                .trim()
+                .parse()
+                .context("invalid MT-PRIORITY queue metadata")?;
+            if relay.mt_priority.is_some() || !(-9..=9).contains(&priority) {
+                anyhow::bail!("invalid or duplicate MT-PRIORITY queue metadata");
+            }
+            relay.mt_priority = Some(priority);
+        } else if let Some(value) = line.strip_prefix("X-RMail-Deliver-By:") {
+            if relay.deliver_by.is_some() {
+                anyhow::bail!("duplicate DELIVERBY queue metadata");
+            }
+            relay.deliver_by = Some(rmail_common::outbound::DeliverBy::decode(value)?);
         } else if let Some(value) = line.strip_prefix("X-RMail-DSN-Original-Recipient:") {
             if dsn.original_recipient.is_some() {
                 anyhow::bail!("duplicate DSN original recipient queue metadata");
@@ -989,7 +1120,7 @@ fn parse_queue_metadata(
     }
     let envelope_to = envelope_to
         .ok_or_else(|| anyhow::anyhow!("no envelope recipient found in queued message"))?;
-    Ok((envelope_from, envelope_to, require_tls, dsn))
+    Ok((envelope_from, envelope_to, require_tls, dsn, relay))
 }
 
 struct MessageAnalyzer {
@@ -1121,8 +1252,13 @@ enum DeliveryNotificationKind<'a> {
     /// a DSN-capable next hop reports success itself.
     Relayed {
         remote_mta: &'a str,
+        /// Required by RFC 2852 section 4.1.4 (BY;N to a next hop without
+        /// DELIVERBY, or the T trace modifier) rather than by NOTIFY.
+        deliver_by: bool,
     },
     Delay,
+    /// RFC 2852 BY;N: the deadline passed; delivery attempts go on.
+    DeadlinePassed,
     Failure,
 }
 
@@ -1131,6 +1267,8 @@ struct Handoff {
     remote_mta: String,
     /// The next hop advertised DSN, so NOTIFY/RET/ENVID/ORCPT went with it.
     dsn: bool,
+    /// RFC 2852 section 4.1.4 asks for a relayed DSN for this hand-off.
+    deliver_by_relayed: bool,
 }
 
 async fn queue_delivery_notification(
@@ -1147,10 +1285,21 @@ async fn queue_delivery_notification(
     };
     let requested = match (message.dsn.notify.as_ref(), kind) {
         (Some(notify), _) if notify.never => false,
+        (
+            _,
+            DeliveryNotificationKind::Relayed {
+                deliver_by: true, ..
+            },
+        ) => true,
         (Some(notify), DeliveryNotificationKind::Relayed { .. }) => notify.success,
-        (Some(notify), DeliveryNotificationKind::Delay) => notify.delay,
+        (
+            Some(notify),
+            DeliveryNotificationKind::Delay | DeliveryNotificationKind::DeadlinePassed,
+        ) => notify.delay,
         (Some(notify), DeliveryNotificationKind::Failure) => notify.failure,
-        (None, DeliveryNotificationKind::Failure) => true,
+        (None, DeliveryNotificationKind::Failure | DeliveryNotificationKind::DeadlinePassed) => {
+            true
+        }
         (None, _) => false,
     };
     if !requested {
@@ -1177,13 +1326,25 @@ async fn queue_delivery_notification(
         &message.envelope_to,
         control,
         &message.dsn,
+        message.relay.deliver_by,
         kind,
         return_full,
         &returned_content,
     );
     let mail_root = mail_root.to_path_buf();
+    // RFC 6710 section 4.6: a DSN goes at the priority of its message.
+    let options = rmail_common::outbound::QueueOptions {
+        mt_priority: message.relay.mt_priority,
+        ..Default::default()
+    };
     tokio::task::spawn_blocking(move || {
-        rmail_common::outbound::queue_outbound(&mail_root, &original_sender, &notification, None)
+        rmail_common::outbound::queue_outbound_with_options(
+            &mail_root,
+            &original_sender,
+            &notification,
+            None,
+            options,
+        )
     })
     .await
     .context("joining delivery-notification queue operation")??;
@@ -1206,11 +1367,13 @@ async fn read_returned_content(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_failure_notification(
     original_sender: &str,
     final_recipient: &str,
     control: &rmail_common::outbound::QueueControl,
     dsn: &rmail_common::outbound::DsnOptions,
+    deliver_by: Option<rmail_common::outbound::DeliverBy>,
     kind: DeliveryNotificationKind<'_>,
     return_full: bool,
     returned_content: &[u8],
@@ -1231,6 +1394,8 @@ fn build_failure_notification(
         DeliveryNotificationKind::Delay => {
             control.last_enhanced_status.as_deref().unwrap_or("4.4.7")
         }
+        // RFC 2852 section 4.1.3: "delivery time expired".
+        DeliveryNotificationKind::DeadlinePassed => "4.4.7",
         DeliveryNotificationKind::Failure => {
             control.last_enhanced_status.as_deref().unwrap_or_else(|| {
                 if control.last_smtp_code.is_some_and(|code| code / 100 == 5) {
@@ -1247,12 +1412,21 @@ fn build_failure_notification(
         .map(sanitize_header_value)
         .unwrap_or_else(|| match kind {
             DeliveryNotificationKind::Relayed { .. } => "250 message accepted".to_string(),
-            DeliveryNotificationKind::Delay => "delivery is still being retried".to_string(),
+            DeliveryNotificationKind::Delay | DeliveryNotificationKind::DeadlinePassed => {
+                "delivery is still being retried".to_string()
+            }
             DeliveryNotificationKind::Failure => {
                 "delivery failed without a diagnostic response".to_string()
             }
         });
     let (subject, action, human_message) = match kind {
+        DeliveryNotificationKind::Relayed {
+            deliver_by: true, ..
+        } => (
+            "Delivery Status Notification (Relayed)",
+            "relayed",
+            "was relayed to the next server; this server no longer tracks its delivery time.",
+        ),
         DeliveryNotificationKind::Relayed { .. } => (
             "Delivery Status Notification (Relayed)",
             "relayed",
@@ -1262,6 +1436,11 @@ fn build_failure_notification(
             "Delivery Status Notification (Delay)",
             "delayed",
             "has been delayed; delivery attempts will continue.",
+        ),
+        DeliveryNotificationKind::DeadlinePassed => (
+            "Delivery Status Notification (Delay)",
+            "delayed",
+            "was not completed by the requested delivery time; delivery attempts will continue.",
         ),
         DeliveryNotificationKind::Failure => (
             "Delivery Status Notification (Failure)",
@@ -1288,8 +1467,13 @@ fn build_failure_notification(
         .map(sanitize_header_value)
         .map(|value| format!("Original-Envelope-Id: {value}\r\n"))
         .unwrap_or_default();
+    // RFC 2852 section 5: the per-message Deliver-By-Date field.
+    let deliver_by_date = deliver_by
+        .and_then(|by| chrono::DateTime::from_timestamp(by.deadline, 0))
+        .map(|deadline| format!("Deliver-By-Date: {}\r\n", deadline.to_rfc2822()))
+        .unwrap_or_default();
     let remote_mta = match kind {
-        DeliveryNotificationKind::Relayed { remote_mta } => {
+        DeliveryNotificationKind::Relayed { remote_mta, .. } => {
             format!("Remote-MTA: dns; {}\r\n", sanitize_header_value(remote_mta))
         }
         _ => String::new(),
@@ -1321,6 +1505,7 @@ fn build_failure_notification(
          Reporting-MTA: dns; {reporting_mta}\r\n\
          {envelope_id}\
          Arrival-Date: {arrival_date}\r\n\
+         {deliver_by_date}\
          \r\n\
          {original_recipient}\
          Final-Recipient: rfc822; {recipient}\r\n\
@@ -1537,6 +1722,7 @@ async fn smtp_send_with_reader(
         false,
         None,
         capabilities,
+        &RelayParameters::default(),
         None,
     )
     .await?;
@@ -1596,14 +1782,28 @@ async fn smtp_send_file_with_reader(
     capabilities: &SmtpCapabilities,
     mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
+    // RFC 2852 section 4.1.4: BY;N relayed to a next hop without
+    // DELIVERBY asks a DSN-capable one for failure and delay reports.
+    let mut dsn = message.dsn.clone();
+    if message.relay.deliver_by.is_some()
+        && capabilities.deliver_by.is_none()
+        && dsn.notify.is_none()
+    {
+        dsn.notify = Some(rmail_common::outbound::DsnNotify {
+            failure: true,
+            delay: true,
+            ..Default::default()
+        });
+    }
     smtp_begin_transaction(
         reader,
         envelope_from,
         recipient,
         &message.requirements,
         message.require_tls,
-        Some(&message.dsn),
+        Some(&dsn),
         capabilities,
+        &message.relay,
         trace.as_deref_mut(),
     )
     .await?;
@@ -1631,6 +1831,7 @@ async fn smtp_begin_transaction(
     require_tls: bool,
     dsn: Option<&rmail_common::outbound::DsnOptions>,
     capabilities: &SmtpCapabilities,
+    relay: &RelayParameters,
     mut trace: Option<&mut DeliveryTrace<'_>>,
 ) -> anyhow::Result<()> {
     let mailcmd = build_mail_from_command_for_requirements(
@@ -1639,6 +1840,7 @@ async fn smtp_begin_transaction(
         require_tls,
         dsn,
         capabilities,
+        relay,
     )?;
 
     let rcptcmd = build_rcpt_command(recipient, dsn, capabilities)?;
@@ -1896,6 +2098,7 @@ fn build_mail_from_command(
         false,
         None,
         capabilities,
+        &RelayParameters::default(),
     )
 }
 
@@ -1926,6 +2129,7 @@ fn build_mail_from_command_for_requirements(
     require_tls: bool,
     dsn: Option<&rmail_common::outbound::DsnOptions>,
     capabilities: &SmtpCapabilities,
+    relay: &RelayParameters,
 ) -> anyhow::Result<String> {
     if requirements.smtp_utf8 && !capabilities.smtp_utf8 {
         anyhow::bail!("remote server does not support required SMTPUTF8");
@@ -1956,6 +2160,18 @@ fn build_mail_from_command_for_requirements(
     if require_tls {
         mailcmd.push_str(" REQUIRETLS");
     }
+    // RFC 6710 section 4.2: the priority goes to next hops that support it.
+    if capabilities.mt_priority
+        && let Some(priority) = relay.mt_priority
+    {
+        mailcmd.push_str(&format!(" MT-PRIORITY={priority}"));
+    }
+    if let Some(by) = relay.deliver_by
+        && let Some(parameter) = deliver_by_parameter(by, capabilities, Utc::now().timestamp())?
+    {
+        mailcmd.push(' ');
+        mailcmd.push_str(&parameter);
+    }
     if capabilities.dsn
         && let Some(dsn) = dsn
     {
@@ -1978,6 +2194,35 @@ fn build_mail_from_command_for_requirements(
     Ok(mailcmd)
 }
 
+/// The BY parameter for relaying a message with a DELIVERBY deadline, if
+/// any (RFC 2852 section 4.1.4). The by-time is what remains at `now`. A
+/// BY;R message may only go to a next hop that supports DELIVERBY with a
+/// minimum the remaining time meets; otherwise it fails permanently.
+fn deliver_by_parameter(
+    by: rmail_common::outbound::DeliverBy,
+    capabilities: &SmtpCapabilities,
+    now: i64,
+) -> anyhow::Result<Option<String>> {
+    let remaining = (by.deadline - now).clamp(-999_999_999, 999_999_999);
+    let returning = by.mode == rmail_common::outbound::DeliverByMode::Return;
+    match capabilities.deliver_by {
+        None if returning => Err(permanent_delivery_error(
+            "next hop does not support DELIVERBY, which BY;R requires",
+            Some("5.4.7"),
+        )),
+        None => Ok(None),
+        Some(minimum) if returning && (remaining <= 0 || remaining < minimum) => {
+            Err(permanent_delivery_error(
+                format!(
+                    "delivery time expired: {remaining}s left, next hop requires at least {minimum}s"
+                ),
+                Some("5.4.7"),
+            ))
+        }
+        Some(_) => Ok(Some(format!("BY={remaining};{}", by.mode_text()))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SmtpCapabilities {
     eight_bit_mime: bool,
@@ -1992,6 +2237,10 @@ struct SmtpCapabilities {
     pipelining: bool,
     /// RFC 9422 LIMITS MAILMAX: transactions the server accepts per session.
     mail_max: Option<u32>,
+    /// RFC 6710 MT-PRIORITY.
+    mt_priority: bool,
+    /// RFC 2852 DELIVERBY with its min-by-time (0 when none is given).
+    deliver_by: Option<i64>,
 }
 
 fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
@@ -2022,6 +2271,20 @@ fn parse_ehlo_capabilities(response: &str) -> SmtpCapabilities {
             capabilities.dsn = true;
         } else if keyword.eq_ignore_ascii_case("PIPELINING") {
             capabilities.pipelining = true;
+        } else if keyword.eq_ignore_ascii_case("MT-PRIORITY") {
+            capabilities.mt_priority = true;
+        } else if keyword.eq_ignore_ascii_case("DELIVERBY") {
+            // A malformed min-by-time is read as none; the next hop then
+            // rejects a BY time it cannot accept.
+            capabilities.deliver_by = Some(
+                line.get(4..)
+                    .unwrap_or("")
+                    .split_ascii_whitespace()
+                    .nth(1)
+                    .and_then(|minimum| minimum.parse::<i64>().ok())
+                    .filter(|minimum| *minimum >= 0)
+                    .unwrap_or(0),
+            );
         } else if keyword.eq_ignore_ascii_case("LIMITS") {
             // RFC 9422: malformed or unknown limits are ignored.
             capabilities.mail_max = line
@@ -2804,6 +3067,10 @@ async fn deliver_to_remote(
                 let handoff = Handoff {
                     remote_mta: key.host.clone(),
                     dsn: capabilities.dsn,
+                    deliver_by_relayed: message
+                        .relay
+                        .deliver_by
+                        .is_some_and(|by| by.trace || capabilities.deliver_by.is_none()),
                 };
                 connections.recycle(key, connection).await;
                 return Ok(handoff);
@@ -3136,8 +3403,10 @@ mod tests {
             "user@remote.test",
             &control,
             &rmail_common::outbound::DsnOptions::default(),
+            None,
             DeliveryNotificationKind::Relayed {
                 remote_mta: "mx.remote.test",
+                deliver_by: false,
             },
             false,
             b"Subject: original\r\n\r\n",
@@ -3161,6 +3430,7 @@ mod tests {
             "missing@example.test",
             &control,
             &rmail_common::outbound::DsnOptions::default(),
+            None,
             DeliveryNotificationKind::Failure,
             false,
             b"Subject: original\r\nMessage-ID: <original@example.test>\r\n\r\n",
@@ -3218,6 +3488,8 @@ mod tests {
             auth_plain: false,
             pipelining: false,
             mail_max: None,
+            mt_priority: false,
+            deliver_by: None,
         };
         assert_eq!(
             build_mail_from_command(None, "user@example.test", b"Subject: x\r\n\r\nbody", &all)
@@ -3268,6 +3540,7 @@ mod tests {
             true,
             None,
             &all,
+            &RelayParameters::default(),
         )
         .unwrap();
         assert_eq!(requiretls, "MAIL FROM:<sender@example.test> REQUIRETLS\r\n");
@@ -3277,6 +3550,7 @@ mod tests {
             true,
             None,
             &SmtpCapabilities::default(),
+            &RelayParameters::default(),
         )
         .unwrap_err();
         assert!(
@@ -3304,6 +3578,7 @@ mod tests {
                 false,
                 Some(&dsn),
                 &dsn_capabilities,
+                &RelayParameters::default(),
             )
             .unwrap(),
             "MAIL FROM:<sender@example.test> ENVID=job+20+2B+207 RET=HDRS\r\n"
@@ -3461,6 +3736,8 @@ mod tests {
                 auth_plain: false,
                 pipelining: false,
                 mail_max: None,
+                mt_priority: false,
+                deliver_by: None,
             },
             None,
         )
@@ -3615,6 +3892,8 @@ mod tests {
                 auth_plain: false,
                 pipelining: false,
                 mail_max: None,
+                mt_priority: false,
+                deliver_by: None,
             },
         )
         .await
@@ -3901,6 +4180,7 @@ mod tests {
             false,
             None,
             &capabilities,
+            &RelayParameters::default(),
             None,
         )
         .await
@@ -3909,5 +4189,205 @@ mod tests {
         let (mail, rcpt) = server.await.unwrap();
         assert_eq!(mail, "MAIL FROM:<sender@example.test>\r\n");
         assert_eq!(rcpt, "RCPT TO:<missing@example.net>\r\n");
+    }
+
+    fn deliver_by(
+        deadline: i64,
+        mode: rmail_common::outbound::DeliverByMode,
+        trace: bool,
+    ) -> rmail_common::outbound::DeliverBy {
+        rmail_common::outbound::DeliverBy {
+            deadline,
+            mode,
+            trace,
+        }
+    }
+
+    #[test]
+    fn mt_priority_and_deliverby_capabilities_are_parsed() {
+        let capabilities = parse_ehlo_capabilities(
+            "250-mx.example.test\r\n250-MT-PRIORITY STANAG4406\r\n250 DELIVERBY 120",
+        );
+        assert!(capabilities.mt_priority);
+        assert_eq!(capabilities.deliver_by, Some(120));
+        assert_eq!(
+            parse_ehlo_capabilities("250-mx.example.test\r\n250 DELIVERBY").deliver_by,
+            Some(0)
+        );
+        let none = parse_ehlo_capabilities("250 mx.example.test");
+        assert!(!none.mt_priority);
+        assert_eq!(none.deliver_by, None);
+    }
+
+    #[test]
+    fn mt_priority_is_relayed_only_to_next_hops_that_advertise_it() {
+        let relay = RelayParameters {
+            mt_priority: Some(4),
+            deliver_by: None,
+        };
+        let build = |capabilities: &SmtpCapabilities| {
+            build_mail_from_command_for_requirements(
+                Some("sender@example.test"),
+                &MessageRequirements::default(),
+                false,
+                None,
+                capabilities,
+                &relay,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            build(&SmtpCapabilities {
+                mt_priority: true,
+                ..SmtpCapabilities::default()
+            }),
+            "MAIL FROM:<sender@example.test> MT-PRIORITY=4\r\n"
+        );
+        assert_eq!(
+            build(&SmtpCapabilities::default()),
+            "MAIL FROM:<sender@example.test>\r\n"
+        );
+    }
+
+    #[test]
+    fn deliverby_relays_the_remaining_time_or_refuses_unsafe_hops() {
+        use rmail_common::outbound::DeliverByMode::{Notify, Return};
+        let supporting = SmtpCapabilities {
+            deliver_by: Some(60),
+            ..SmtpCapabilities::default()
+        };
+        let plain = SmtpCapabilities::default();
+        // RFC 2852 section 6: BY=120;R relayed after 22 seconds is BY=98;R.
+        assert_eq!(
+            deliver_by_parameter(deliver_by(1_000_120, Return, false), &supporting, 1_000_022)
+                .unwrap()
+                .as_deref(),
+            Some("BY=98;R")
+        );
+        assert_eq!(
+            deliver_by_parameter(deliver_by(1_000_000, Notify, true), &supporting, 1_000_005)
+                .unwrap()
+                .as_deref(),
+            Some("BY=-5;NT")
+        );
+        // N may go to a next hop without DELIVERBY (a relayed DSN follows).
+        assert_eq!(
+            deliver_by_parameter(deliver_by(1_000_000, Notify, false), &plain, 0).unwrap(),
+            None
+        );
+        // R may not, nor to one whose minimum exceeds the time left.
+        for (by, capabilities) in [
+            (deliver_by(1_000_120, Return, false), plain),
+            (deliver_by(1_000_030, Return, false), supporting),
+        ] {
+            let error = deliver_by_parameter(by, &capabilities, 1_000_000).unwrap_err();
+            let permanent = error.downcast_ref::<PermanentDeliveryError>().unwrap();
+            assert_eq!(permanent.enhanced_status.as_deref(), Some("5.4.7"));
+        }
+    }
+
+    #[test]
+    fn queue_metadata_carries_priority_and_deadline() {
+        let (_, _, _, _, relay) = parse_queue_metadata(
+            b"X-RMail-MT-Priority: -4\r\nX-RMail-Deliver-By: 1700000000;RT\r\nX-RMail-Envelope-To: user@example.test\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(relay.mt_priority, Some(-4));
+        assert_eq!(
+            relay.deliver_by,
+            Some(deliver_by(
+                1_700_000_000,
+                rmail_common::outbound::DeliverByMode::Return,
+                true
+            ))
+        );
+        for invalid in [
+            &b"X-RMail-MT-Priority: 12\r\nX-RMail-Envelope-To: u@example.test\r\n\r\n"[..],
+            b"X-RMail-MT-Priority: 1\r\nX-RMail-MT-Priority: 1\r\nX-RMail-Envelope-To: u@example.test\r\n\r\n",
+            b"X-RMail-Deliver-By: soon;R\r\nX-RMail-Envelope-To: u@example.test\r\n\r\n",
+        ] {
+            assert!(parse_queue_metadata(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn passed_notify_deadline_produces_a_delayed_dsn_with_deliver_by_date() {
+        let control = rmail_common::outbound::QueueControl::new(5, 0);
+        let notification = String::from_utf8(build_failure_notification(
+            "sender@example.test",
+            "user@remote.test",
+            &control,
+            &rmail_common::outbound::DsnOptions::default(),
+            Some(deliver_by(
+                1_700_000_000,
+                rmail_common::outbound::DeliverByMode::Notify,
+                false,
+            )),
+            DeliveryNotificationKind::DeadlinePassed,
+            false,
+            b"Subject: original\r\n\r\n",
+        ))
+        .unwrap();
+        assert!(notification.contains("Action: delayed\r\nStatus: 4.4.7\r\n"));
+        assert!(notification.contains("Deliver-By-Date: Tue, 14 Nov 2023 22:13:20 +0000\r\n"));
+        assert!(notification.contains("Subject: Delivery Status Notification (Delay)"));
+    }
+
+    #[tokio::test]
+    async fn expired_return_deadline_fails_without_an_attempt_and_returns_a_5_4_7_dsn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().to_path_buf();
+        let maildrop = base.join("outbound").join("maildrop");
+        let (queue, inflight) = (maildrop.join("queue"), maildrop.join("inflight"));
+        let (sent, failed) = (base.join("outbound/sent"), base.join("outbound/failed"));
+        for dir in [&queue, &inflight, &sent, &failed] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let eml = inflight.join("expired.eml");
+        std::fs::write(
+            &eml,
+            "X-RMail-Envelope-From: sender@example.test\r\nX-RMail-MT-Priority: 4\r\n\
+             X-RMail-Deliver-By: 1;R\r\nX-RMail-Envelope-To: user@remote.invalid\r\n\r\n\
+             Subject: late\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        let json = rmail_common::outbound::control_path_for_eml(&eml);
+        std::fs::write(
+            &json,
+            serde_json::to_string(&rmail_common::outbound::QueueControl::new(5, 4)).unwrap(),
+        )
+        .unwrap();
+        let hub = Arc::new(TrackingHub::start(temporary.path(), "outbound-test").unwrap());
+        process_claim(
+            eml,
+            json,
+            base.clone(),
+            queue.clone(),
+            sent,
+            failed.clone(),
+            ConnectionPool::new(1, 1),
+            hub,
+        )
+        .await;
+
+        assert!(failed.join("expired.eml").exists());
+        let control: rmail_common::outbound::QueueControl = serde_json::from_str(
+            &std::fs::read_to_string(failed.join("expired.eml.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(control.last_enhanced_status.as_deref(), Some("5.4.7"));
+        // The failure DSN is queued at the message's priority.
+        let dsn = std::fs::read_dir(&queue)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().is_some_and(|extension| extension == "eml"))
+            .expect("failure DSN queued");
+        let text = std::fs::read_to_string(&dsn).unwrap();
+        assert!(text.contains("X-RMail-MT-Priority: 4\r\n"), "{text}");
+        assert!(
+            text.contains("Action: failed\r\nStatus: 5.4.7\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("Deliver-By-Date: "), "{text}");
     }
 }
