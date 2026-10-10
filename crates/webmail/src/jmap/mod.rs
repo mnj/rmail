@@ -37,7 +37,7 @@ use crate::api::AppState;
 
 mod blob;
 mod email;
-mod identity;
+pub(crate) mod identity;
 mod mailbox;
 mod push;
 mod query;

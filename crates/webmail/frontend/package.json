@@ -10,11 +10,13 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.5.2",
-    "vite": "^6.3.5",
-    "typescript": "^5.8.3",
+    "dompurify": "^3.4.16",
+    "lucide-react": "^0.468.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "lucide-react": "^0.468.0"
+    "squire-rte": "^2.4.9",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
   },
   "devDependencies": {
     "@types/react": "^19.1.0",

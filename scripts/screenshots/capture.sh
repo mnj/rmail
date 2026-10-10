@@ -34,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj /CN=mail.example.com \
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=mail.example.com \
   -keyout "${demo}/key.pem" -out "${demo}/cert.pem" 2>/dev/null
 # Relative paths: the services run from ${demo}, and the console shows the
 # config path, so this keeps the temporary directory name out of the shots.
@@ -49,6 +49,8 @@ ctl="${bin}/rmail_ctl"
 cd "${demo}"
 "${ctl}" init-db --config config.toml >/dev/null
 demo_setting() { "${ctl}" settings set "$1" "$2" --config config.toml >/dev/null; }
+# The host name appears in the suggested DNS records; never the build machine's.
+demo_setting global.hostname mail.example.com
 demo_setting global.tls_cert cert.pem
 demo_setting global.tls_key key.pem
 demo_setting global.listeners.smtp '["127.0.0.1:2525"]'

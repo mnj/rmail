@@ -2275,6 +2275,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn html_compose_identities_scheduling_and_suggestions() {
+        let td = tempfile::tempdir().unwrap();
+        let base = state(&td);
+        let (root, d, l) = (base.mail_root.clone(), "example.test", "user");
+        imap_state::init_account(&root, d, l).unwrap();
+        let (address, mut received) = fake_submission(root.clone()).await;
+        let state = Arc::new(AppState {
+            mail_root: base.mail_root.clone(),
+            db_path: base.db_path.clone(),
+            static_dir: base.static_dir.clone(),
+            session_secret: base.session_secret.clone(),
+            secure_cookies: false,
+            throttle: AuthThrottle::default(),
+            revoked: websession::RevocationList::default(),
+            submission: Some(address),
+            oauth: None,
+            jmap_logins: Default::default(),
+            shutdown: None,
+        });
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call = |method: &'static str, path: String, body: Vec<u8>| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move { route(req(method, &path, &body, cookie), &state).await }
+        };
+        let json = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap();
+
+        // The default identity gets a name and an HTML signature.
+        let identities = json(&call("GET", "/api/identities".into(), vec![]).await.body);
+        let id = identities[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(identities[0]["email"], "user@example.test");
+        let saved = call(
+            "PUT",
+            format!("/api/identities/{id}"),
+            br#"{"name":"Ulla User","html_signature":"<div><b>Ulla</b><script>x()</script></div>"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(saved.status, 204);
+        let identities = json(&call("GET", "/api/identities".into(), vec![]).await.body);
+        assert_eq!(identities[0]["html_signature"], "<div><b>Ulla</b></div>");
+        assert_eq!(identities[0]["text_signature"], "Ulla");
+
+        // Preferences round-trip and are normalized.
+        let prefs = json(
+            &call(
+                "PUT",
+                "/api/compose/settings".into(),
+                br#"{"format":"text","language":"da","undo_seconds":10}"#.to_vec(),
+            )
+            .await
+            .body,
+        );
+        assert_eq!(prefs["language"], "da");
+        let prefs = json(
+            &call("GET", "/api/compose/settings".into(), vec![])
+                .await
+                .body,
+        );
+        assert_eq!(prefs["format"], "text");
+
+        // An HTML message goes out as text + HTML with the image inline.
+        let body = serde_json::json!({
+            "to": ["Ann <ann@b.test>"], "subject": "Hi", "identity_id": id,
+            "html": "<div>Hello <b>Ann</b><img src=\"data:image/png;base64,iVBORw0KGgo=\"></div><img src=x onerror=alert(1)>",
+        });
+        let sent = call("POST", "/api/send".into(), body.to_string().into_bytes()).await;
+        assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+        let (_, data) = received.recv().await.unwrap();
+        assert!(data.contains("From: \"Ulla User\" <user@example.test>"));
+        assert!(data.contains("multipart/alternative"));
+        assert!(data.contains("multipart/related"));
+        assert!(!data.contains("onerror"));
+        let parsed = rmail_common::mime::parse_message(data.replace('\n', "\r\n").as_bytes());
+        assert_eq!(parsed.text_body, "Hello Ann");
+
+        // Suggestions know the recipient now.
+        let found = json(&call("GET", "/api/contacts?q=an".into(), vec![]).await.body);
+        assert_eq!(found[0]["email"], "ann@b.test");
+        assert_eq!(found[0]["name"], "Ann");
+
+        // With a delay the message waits; cancelling turns it into a draft.
+        let body = serde_json::json!({
+            "to": ["ann@b.test"], "bcc": ["hidden@c.test"], "subject": "Later", "html": "<p>later</p>", "delay": 30,
+        });
+        let held = json(
+            &call("POST", "/api/send".into(), body.to_string().into_bytes())
+                .await
+                .body,
+        );
+        let held_id = held["scheduled"]["id"].as_str().unwrap().to_string();
+        let list = json(&call("GET", "/api/scheduled".into(), vec![]).await.body);
+        assert_eq!(list[0]["subject"], "Later");
+        assert_eq!(list[0]["recipients"].as_array().unwrap().len(), 2);
+        let sent_before = imap_state::load_folder(&root, d, l, "Sent")
+            .unwrap()
+            .1
+            .len();
+        db::add_mailbox(
+            &state.db_path,
+            "other@example.test",
+            Some("plain:x"),
+            None,
+            None,
+        )
+        .unwrap();
+        let other = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "other@example.test")
+        ));
+        let stranger = route(
+            req(
+                "POST",
+                &format!("/api/scheduled/{held_id}/cancel"),
+                b"",
+                other,
+            ),
+            &state,
+        )
+        .await;
+        assert_ne!(stranger.status, 200, "only the sender may cancel");
+        let draft = json(
+            &call("POST", format!("/api/scheduled/{held_id}/cancel"), vec![])
+                .await
+                .body,
+        );
+        assert_eq!(draft["folder"], "Drafts");
+        let drafts = imap_state::load_folder(&root, d, l, "Drafts").unwrap().1;
+        let copy = std::fs::read_to_string(&drafts[0].path).unwrap();
+        assert!(copy.contains("Bcc: hidden@c.test"), "the draft keeps Bcc");
+        assert_eq!(
+            imap_state::load_folder(&root, d, l, "Sent")
+                .unwrap()
+                .1
+                .len(),
+            sent_before - 1
+        );
+        assert!(
+            json(&call("GET", "/api/scheduled".into(), vec![]).await.body)
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let again = call("POST", format!("/api/scheduled/{held_id}/cancel"), vec![]).await;
+        assert_eq!(again.status, 404);
+
+        // The draft's HTML comes back cleaned for the editor.
+        let source = json(
+            &call(
+                "GET",
+                format!("/api/folders/Drafts/messages/{}/compose", draft["uid"]),
+                vec![],
+            )
+            .await
+            .body,
+        );
+        assert_eq!(source["html"], "<p>later</p>");
+    }
+
+    #[tokio::test]
     async fn reading_organizing_and_ai_endpoints() {
         let td = tempfile::tempdir().unwrap();
         let state = state(&td);

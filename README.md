@@ -31,7 +31,11 @@ screenshots of every page, and a quick start.
 - **Admin console** for mailboxes, quotas, aliases, catchalls, the outbound queue, database-stored
   settings, logs, Prometheus metrics and readiness checks.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
-  layout.
+  layout. Composing has a rich-text editor (formatting, lists, quotes, links, inline images,
+  cleaned-up pastes from Word or Google Docs) that sends HTML with a generated plain-text
+  alternative, a plain-text mode, signatures per identity, the browser's spellchecker in a chosen
+  language, address suggestions from CardDAV contacts and recent recipients, autosaved drafts,
+  drag-and-drop attachments, undo send and send later.
 - **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
   search, sending, vacation response and push.
 - **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so

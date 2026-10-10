@@ -131,4 +131,20 @@ for subject, body in [
 imap._simple_command("SETACL", '"Team Projects"', "alice@example.com", "lrs")
 imap.logout()
 
+# Alice's address book (CardDAV), for address suggestions while composing.
+auth = "Basic " + __import__("base64").b64encode(f"alice@example.com:{PASSWORD}".encode()).decode()
+for uid, name, email in [
+    ("priya", "Priya Raman", "priya@northwind.test"),
+    ("sofia", "Sofia Lind", "sofia@fabrikam.test"),
+    ("marcus", "Marcus Okafor", "marcus@contoso.test"),
+    ("bob", "Bob Hansen", "bob@example.com"),
+]:
+    card = f"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{name}\r\nEMAIL:{email}\r\nEND:VCARD\r\n"
+    request = urllib.request.Request(
+        f"https://127.0.0.1:18081/dav/addressbooks/alice%40example.com/default/{uid}.vcf",
+        method="PUT", data=card.encode(),
+        headers={"Authorization": auth, "Content-Type": "text/vcard; charset=utf-8"},
+    )
+    urllib.request.urlopen(request, context=TLS).read()
+
 print("seeded demo data")

@@ -106,6 +106,51 @@ async function signIn(page) {
   await ctx.close();
 }
 
+// Composing: address suggestions, the rich-text editor and compose settings,
+// in light and dark.
+async function compose(page, name, mobile = false) {
+  if (mobile) await page.click('button[title=Folders]');
+  await page.click('.compose-button');
+  await page.waitForSelector('.compose .editor-root');
+  await page.fill('.compose label:has-text("Subject") input', 'Infrastructure review notes');
+  await page.click('.compose .editor-root');
+  await page.keyboard.type('Hi Priya,');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('Thanks for the agenda. A few ');
+  await page.keyboard.press('Control+b');
+  await page.keyboard.type('notes');
+  await page.keyboard.press('Control+b');
+  await page.keyboard.type(' before Thursday:');
+  await page.keyboard.press('Enter');
+  await page.click('button[aria-label="Bulleted list"]');
+  await page.keyboard.type('Migration is on track for the cut-over weekend');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('ACME renewals now run automatically');
+  await page.click('.compose input[aria-label=To]');
+  await page.keyboard.type('pri');
+  await page.waitForSelector('.suggestions li');
+  await page.waitForTimeout(300);
+  await shot(page, name);
+}
+
+for (const theme of ['light', 'dark']) {
+  const ctx = await browser.newContext(desktop);
+  const page = await ctx.newPage();
+  await page.addInitScript((t) => localStorage.setItem('rmail-webmail-theme', t), theme);
+  await signIn(page);
+  await compose(page, `webmail-compose-${theme}`);
+  await page.keyboard.press('Escape');
+  await page.click('.compose button[aria-label="Discard"]');
+  // Let the "Discarded" notice go before the next shot.
+  await page.waitForSelector('.toast', { state: 'detached', timeout: 10000 });
+  await page.click('text=Compose settings');
+  await page.waitForSelector('.settings-dialog .editor-root');
+  await page.waitForTimeout(300);
+  await shot(page, `webmail-compose-settings-${theme}`);
+  await ctx.close();
+}
+
 {
   const ctx = await browser.newContext(mobile);
   const page = await ctx.newPage();
@@ -115,17 +160,20 @@ async function signIn(page) {
   await page.click('button[title=Folders]');
   await page.waitForTimeout(400);
   await shot(page, 'mobile-folders');
-  await page.click('.folders button:has-text("INBOX")');
+  await page.click('button.folder-name:has-text("Inbox")');
   await page.waitForSelector('.message-list .row');
   await page.waitForTimeout(400);
   await page.click('text=Q4 infrastructure review');
   await page.waitForTimeout(700);
   await shot(page, 'mobile-message');
-  await page.click('.back');
+  await page.click('button[aria-label=Back]');
   await page.waitForTimeout(400);
   await page.click('text=This week: Rust 2024');
   await page.waitForTimeout(900);
   await shot(page, 'mobile-remote-blocked');
+  await page.click('button[aria-label=Back]');
+  await page.waitForTimeout(300);
+  await compose(page, 'mobile-compose', true);
   await ctx.close();
 }
 
