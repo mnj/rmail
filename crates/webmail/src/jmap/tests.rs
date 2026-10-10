@@ -629,7 +629,7 @@ async fn shared_mailboxes_are_a_separate_account_within_the_grants() {
 }
 
 /// A submission service that accepts everything and reports what it got.
-async fn fake_submission(
+pub(crate) async fn fake_submission(
     mail_root: std::path::PathBuf,
 ) -> (
     std::net::SocketAddr,

@@ -10,7 +10,9 @@
 //!   can create more (MKCALENDAR, extended MKCOL).
 //! - Changes are tracked per collection for `sync-collection` (RFC 6578)
 //!   and `getctag`; see `rmail_common::dav::store`.
-//! - Scheduling (RFC 6638) and sharing are not offered.
+//! - Scheduling (RFC 6638) is done by the server: see `schedule`. Each
+//!   calendar home has `inbox/` and `outbox/`.
+//! - Sharing is not offered.
 
 use std::sync::Arc;
 
@@ -29,6 +31,7 @@ use crate::jmap::{self, User};
 
 mod props;
 mod report;
+mod schedule;
 mod xml;
 
 #[cfg(test)]
@@ -137,6 +140,10 @@ pub(crate) fn collection_href(user: &User, collection: &Collection) -> String {
     )
 }
 
+pub(crate) fn outbox_href(user: &User) -> String {
+    format!("{}outbox/", home_href(user, Kind::Calendar))
+}
+
 pub(crate) fn object_href(user: &User, collection: &Collection, name: &str) -> String {
     format!(
         "{}{}",
@@ -151,17 +158,21 @@ pub(crate) enum Target {
     Principals,
     Principal,
     Home(Kind),
+    /// A calendar, address book or the schedule inbox.
     Collection(Collection),
+    /// The schedule outbox (RFC 6638 2.1), for free-busy queries.
+    Outbox,
     /// A collection that does not exist yet (for MKCALENDAR/MKCOL).
     NewCollection(Kind, String),
     /// An object, which may not exist yet (for PUT).
-    Object(Collection, Option<Object>, String),
+    Object(Collection, Option<Box<Object>>, String),
     NotFound,
 }
 
 pub(crate) struct Dav {
     pub user: User,
     pub conn: SqliteConnection,
+    pub app: Arc<AppState>,
 }
 
 impl Dav {
@@ -179,6 +190,12 @@ impl Dav {
             [home, user] if kind(home).is_some() && own(user) => {
                 Target::Home(kind(home).unwrap_or(Kind::Calendar))
             }
+            [home, user, name] if home == "calendars" && own(user) && name == "inbox" => {
+                Target::Collection(store::inbox(&self.conn)?)
+            }
+            [home, user, name] if home == "calendars" && own(user) && name == "outbox" => {
+                Target::Outbox
+            }
             [home, user, name] if kind(home).is_some() && own(user) => {
                 let kind = kind(home).unwrap_or(Kind::Calendar);
                 match store::collection(&self.conn, kind, name)? {
@@ -188,10 +205,15 @@ impl Dav {
             }
             [home, user, name, object] if kind(home).is_some() && own(user) => {
                 let kind = kind(home).unwrap_or(Kind::Calendar);
-                match store::collection(&self.conn, kind, name)? {
+                let collection = if kind == Kind::Calendar && name == "inbox" {
+                    Some(store::inbox(&self.conn)?)
+                } else {
+                    store::collection(&self.conn, kind, name)?
+                };
+                match collection {
                     Some(collection) => {
                         let found = store::object(&self.conn, &collection, object)?;
-                        Target::Object(collection, found, object.clone())
+                        Target::Object(collection, found.map(Box::new), object.clone())
                     }
                     None => Target::NotFound,
                 }
@@ -222,12 +244,14 @@ fn options() -> Response {
     let headers = response.headers_mut();
     headers.insert(
         "dav",
-        HeaderValue::from_static("1, 3, calendar-access, addressbook, extended-mkcol"),
+        HeaderValue::from_static(
+            "1, 3, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol",
+        ),
     );
     headers.insert(
         header::ALLOW,
         HeaderValue::from_static(
-            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCALENDAR, MKCOL, REPORT",
+            "OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, PROPPATCH, MKCALENDAR, MKCOL, REPORT",
         ),
     );
     response
@@ -275,10 +299,16 @@ async fn handle(
     let Some(segments) = segments(uri.path()) else {
         return status(StatusCode::NOT_FOUND);
     };
+    let app = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        let state = app;
         let conn =
             rmail_common::jmap::store::open(&state.mail_root, &user.domain, &user.localpart)?;
-        let dav = Dav { user, conn };
+        let dav = Dav {
+            user,
+            conn,
+            app: state,
+        };
         let target = dav.resolve(&segments)?;
         Ok::<_, anyhow::Error>(dispatch(&dav, &method, &headers, &body, target))
     })
@@ -310,6 +340,7 @@ fn dispatch(
         "GET" | "HEAD" => Ok(get(target, method == Method::HEAD)),
         "PUT" => put(dav, target, headers, body),
         "DELETE" => delete(dav, target, headers),
+        "POST" => schedule::post(dav, target, headers, body),
         _ => Ok(status(StatusCode::METHOD_NOT_ALLOWED)),
     };
     result.unwrap_or_else(|error| jmap::internal_response(format!("{error:#}")))
@@ -344,6 +375,7 @@ fn get(target: Target, head: bool) -> Response {
         object.data.clone()
     };
     let mut response = with_etag((StatusCode::OK, body).into_response(), &object.etag);
+    with_schedule_tag(&mut response, object.schedule_tag.as_deref());
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(content_type(collection.kind)),
@@ -356,23 +388,37 @@ fn get(target: Target, head: bool) -> Response {
     response
 }
 
-/// `If-Match`/`If-None-Match` against the current ETag (RFC 9110 13.1).
-fn preconditions_fail(headers: &HeaderMap, current: Option<&str>) -> bool {
-    let text = |name: header::HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
-    let matches = |list: &str| {
+fn with_schedule_tag(response: &mut Response, tag: Option<&str>) {
+    if let Some(value) = tag.and_then(|tag| HeaderValue::from_str(tag).ok()) {
+        response.headers_mut().insert("schedule-tag", value);
+    }
+}
+
+/// `If-Match`/`If-None-Match` against the current ETag (RFC 9110 13.1) and
+/// `If-Schedule-Tag-Match` against its schedule tag (RFC 6638 8.3).
+fn preconditions_fail(headers: &HeaderMap, current: Option<&Object>) -> bool {
+    let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let matches = |list: &str, tag: Option<&str>| {
         list.split(',')
             .map(str::trim)
-            .any(|tag| tag == "*" && current.is_some() || Some(tag) == current)
+            .any(|wanted| wanted == "*" && current.is_some() || Some(wanted) == tag)
     };
-    if let Some(list) = text(header::IF_MATCH)
-        && !matches(list)
+    let etag = current.map(|object| object.etag.as_str());
+    if let Some(list) = text("if-match")
+        && !matches(list, etag)
     {
         return true;
     }
-    if let Some(list) = text(header::IF_NONE_MATCH)
-        && matches(list)
+    if let Some(list) = text("if-none-match")
+        && matches(list, etag)
     {
         return true;
+    }
+    if let Some(list) = text("if-schedule-tag-match") {
+        let tag = current.and_then(|object| object.schedule_tag.as_deref());
+        if tag.is_none() || !matches(list, tag) {
+            return true;
+        }
     }
     false
 }
@@ -384,6 +430,10 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
             _ => StatusCode::METHOD_NOT_ALLOWED,
         }));
     };
+    if collection.inbox {
+        // Only the server delivers to the inbox (RFC 6638 2.2).
+        return Ok(status(StatusCode::FORBIDDEN));
+    }
     let prefix = match collection.kind {
         Kind::Calendar => "c",
         Kind::AddressBook => "card",
@@ -405,17 +455,42 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
         ));
     };
     // The preconditions are checked against the object as it is inside the
-    // store's write transaction, so concurrent writers cannot both pass.
-    let precondition = |current: Option<&str>| !preconditions_fail(headers, current);
-    match store::put(&dav.conn, &collection, &name, text, &precondition)? {
-        Ok((etag, created)) => Ok(with_etag(
-            status(if created {
+    // store's write transaction, so concurrent writers cannot both pass;
+    // scheduling compares against that same version.
+    let mut outgoing = Vec::new();
+    let mut prepare = |current: Option<&Object>| {
+        if preconditions_fail(headers, current) {
+            return Err(PutError::PreconditionFailed);
+        }
+        if collection.kind != Kind::Calendar {
+            return Ok(store::Prepared {
+                data: text.to_string(),
+                schedule_tag: store::ScheduleTag::None,
+            });
+        }
+        let (prepared, messages) = schedule::prepare_put(dav, current, text);
+        outgoing = messages;
+        Ok(prepared)
+    };
+    match store::put_with(&dav.conn, &collection, &name, &mut prepare)? {
+        Ok(stored) => {
+            schedule::deliver(dav, outgoing);
+            let mut response = status(if stored.created {
                 StatusCode::CREATED
             } else {
                 StatusCode::NO_CONTENT
-            }),
-            &etag,
-        )),
+            });
+            with_schedule_tag(&mut response, stored.schedule_tag.as_deref());
+            // An ETag only when the object is stored as sent (RFC 4791
+            // 5.3.4); scheduling may have added statuses.
+            let as_sent = store::object(&dav.conn, &collection, &name)?
+                .is_some_and(|object| object.etag == stored.etag && object.data == text);
+            Ok(if as_sent {
+                with_etag(response, &stored.etag)
+            } else {
+                response
+            })
+        }
         Err(PutError::InvalidData(_)) => Ok(xml_response(
             StatusCode::FORBIDDEN,
             xml::error(&format!("<{valid}/>")),
@@ -438,15 +513,26 @@ fn put(dav: &Dav, target: Target, headers: &HeaderMap, body: &[u8]) -> anyhow::R
 fn delete(dav: &Dav, target: Target, headers: &HeaderMap) -> anyhow::Result<Response> {
     match target {
         Target::Object(collection, Some(_), name) => {
-            let precondition = |current: Option<&str>| !preconditions_fail(headers, current);
+            let precondition = |current: Option<&Object>| !preconditions_fail(headers, current);
             Ok(status(
                 match store::delete(&dav.conn, &collection, &name, &precondition)? {
-                    store::Deleted::Deleted => StatusCode::NO_CONTENT,
+                    store::Deleted::Deleted(previous) => {
+                        // RFC 6638 8.1: `Schedule-Reply: F` deletes quietly.
+                        let quiet = headers
+                            .get("schedule-reply")
+                            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"F"));
+                        if collection.kind == Kind::Calendar && !collection.inbox && !quiet {
+                            let messages = schedule::prepare_delete(dav, &previous);
+                            schedule::deliver(dav, messages);
+                        }
+                        StatusCode::NO_CONTENT
+                    }
                     store::Deleted::NotFound => StatusCode::NOT_FOUND,
                     store::Deleted::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
                 },
             ))
         }
+        Target::Collection(collection) if collection.inbox => Ok(status(StatusCode::FORBIDDEN)),
         Target::Collection(collection) => {
             store::delete_collection(&dav.conn, &collection)?;
             Ok(status(StatusCode::NO_CONTENT))
@@ -499,7 +585,9 @@ fn make_collection(
             xml::error("<d:valid-resourcetype/>"),
         ));
     }
-    if !store::valid_name(&name) {
+    if !store::valid_name(&name)
+        || kind == Kind::Calendar && matches!(name.as_str(), "inbox" | "outbox")
+    {
         return Ok(status(StatusCode::FORBIDDEN));
     }
     let components = prop

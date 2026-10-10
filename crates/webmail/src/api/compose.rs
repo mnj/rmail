@@ -152,6 +152,7 @@ fn outgoing(
         in_reply_to: input.in_reply_to,
         references: input.references,
         attachments,
+        calendar: None,
     };
     Ok((message, input.source, input.draft_uid))
 }

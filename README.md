@@ -34,7 +34,9 @@ screenshots of every page, and a quick start.
 - **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
   search, sending, vacation response and push.
 - **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so
-  Thunderbird, Apple devices and DAVx⁵ keep calendars and address books in sync.
+  Thunderbird, Apple devices and DAVx⁵ keep calendars and address books in sync, and server-side
+  scheduling (RFC 6638): invitations, replies and free-busy between accounts, by email for
+  everyone else.
 - **Operations**: structured JSON logs, live `rmail_ctl watch`, per-message tracking, built-in
   ACME certificates (Let's Encrypt over HTTP or DNS, renewed and hot-reloaded), and `.deb`
   packages for amd64 and arm64 published on every merge.
@@ -276,15 +278,15 @@ starts with a calendar and an address book and can create more.
 | RFC | Feature | Estimated compliance | Remaining limitation |
 | --- | --- | ---: | --- |
 | RFC 4918 | WebDAV | 85% | PROPFIND (Depth 0 and 1; `infinity` is refused with `propfind-finite-depth`), PROPPATCH (all or nothing), PUT/GET/HEAD/DELETE with strong ETags and `If-Match`/`If-None-Match`, MKCOL. No LOCK, COPY or MOVE; collections hold calendars or address books only. |
-| RFC 4791 | CalDAV | 85% | MKCALENDAR, `calendar-query` (component, property, parameter and text filters, `time-range`), `calendar-multiget`, the calendar object preconditions (valid data, one UID and component type, supported components, `no-uid-conflict`, `max-resource-size`). Time ranges use each object's span widened for time zones; recurrences without an end match every later range, so a query can return a few extra objects. `calendar-data` is always returned whole (no `expand` or `limit-recurrence-set`); `free-busy-query` is not offered. |
+| RFC 4791 | CalDAV | 85% | MKCALENDAR, `calendar-query` (component, property, parameter and text filters, `time-range`), `calendar-multiget`, the calendar object preconditions (valid data, one UID and component type, supported components, `no-uid-conflict`, `max-resource-size`). Time ranges use each object's span widened for time zones; recurrences without an end match every later range, so a query can return a few extra objects. `calendar-data` is always returned whole (no `expand` or `limit-recurrence-set`); the `free-busy-query` REPORT is not offered (free-busy goes through the scheduling outbox). |
 | RFC 6352 | CardDAV | 90% | Extended MKCOL, `addressbook-query` (prop/param filters, `text-match` with its match types, `anyof`/`allof`, `limit`), `addressbook-multiget`, vCard 3.0 and 4.0 stored as sent; a UID is required. `address-data` is always returned whole. |
 | RFC 6578 | sync-collection | 90% | Sync tokens per collection with deletions reported; deletions are remembered for 90 days, older tokens get `valid-sync-token`. `limit` is not applied. |
 | RFC 6764 | Service discovery | 100% | `/.well-known/caldav` and `/.well-known/carddav` redirect to `/dav/`; `_caldavs._tcp`/`_carddavs._tcp` SRV and `path=/dav/` TXT records are suggested per domain; Thunderbird autoconfig lists both. |
+| RFC 6638 | Scheduling | 80% | Implicit scheduling on PUT and DELETE: the organizer's changes send `REQUEST` (to every attendee on significant changes, else only to added ones) and `CANCEL` (to removed attendees, or everyone on deletion), an attendee's changed `PARTSTAT` sends `REPLY`, deleting declines. Attendees with an account in the organizer's domain get the message in their schedule inbox and their calendar copy updated at once; everyone else gets an iMIP email (RFC 6047) through the submission service. `SCHEDULE-STATUS`, `SCHEDULE-AGENT`, `SCHEDULE-FORCE-SEND`, `Schedule-Tag` with `If-Schedule-Tag-Match`, `Schedule-Reply: F`, and free-busy queries posted to the outbox (time zones and recurrences expanded) for accounts in the same domain. Each attendee gets the whole event rather than only their instances; iMIP mail received from other servers is left to the client. |
 | RFC 5397 | `current-user-principal` | 100% | Reported on every resource. |
 
-Scheduling (RFC 6638, invitations by email) and sharing calendars between accounts are not
-offered. The CalendarServer `getctag` and Apple calendar color and order properties are supported
-for older clients.
+Sharing calendars between accounts is not offered. The CalendarServer `getctag` and Apple
+calendar color and order properties are supported for older clients.
 
 Repeatable storage and queue performance workloads are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,

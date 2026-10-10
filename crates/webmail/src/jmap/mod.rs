@@ -47,7 +47,7 @@ mod thread;
 mod vacation;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) const CORE: &str = "urn:ietf:params:jmap:core";
 pub(crate) const MAIL: &str = "urn:ietf:params:jmap:mail";

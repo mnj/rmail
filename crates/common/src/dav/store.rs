@@ -7,6 +7,10 @@
 //!   its ETag stays stable. A deleted object stays as a tombstone so
 //!   `sync-collection` can report it; tombstones older than 90 days are
 //!   forgotten and older sync tokens then answer `valid-sync-token`.
+//! - Scheduling (RFC 6638): objects the account organizes or attends carry
+//!   a schedule tag; the schedule inbox is a hidden collection of kind
+//!   `schedule-inbox` holding the scheduling messages delivered to the
+//!   account, which may share UIDs.
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -59,6 +63,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             modseq INTEGER NOT NULL,
             modified INTEGER NOT NULL,
             deleted INTEGER NOT NULL DEFAULT 0,
+            schedule_tag TEXT,
             PRIMARY KEY(collection_id, name),
             FOREIGN KEY(collection_id) REFERENCES dav_collections(id) ON DELETE CASCADE
         );
@@ -84,6 +89,8 @@ pub struct Collection {
     pub components: Vec<String>,
     pub sync_seq: i64,
     pub min_seq: i64,
+    /// The schedule inbox (RFC 6638 2.2), not a calendar of the user's.
+    pub inbox: bool,
 }
 
 impl Collection {
@@ -120,10 +127,10 @@ fn row_to_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<Collection> {
     let components: Option<String> = row.get(8)?;
     Ok(Collection {
         id: row.get(0)?,
-        kind: if kind == "calendar" {
-            Kind::Calendar
-        } else {
+        kind: if kind == "addressbook" {
             Kind::AddressBook
+        } else {
+            Kind::Calendar
         },
         name: row.get(2)?,
         displayname: row.get(3)?,
@@ -139,8 +146,15 @@ fn row_to_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<Collection> {
             .collect(),
         sync_seq: row.get(9)?,
         min_seq: row.get(10)?,
+        inbox: kind == INBOX_KIND,
     })
 }
+
+/// The `kind` of the schedule inbox row; `collections` never lists it.
+const INBOX_KIND: &str = "schedule-inbox";
+
+/// The most scheduling messages kept in the inbox; older ones go first.
+const MAX_INBOX: i64 = 500;
 
 const COLLECTION_COLUMNS: &str = "id, kind, name, displayname, description, color, sort_order, timezone, components, sync_seq, min_seq";
 
@@ -198,6 +212,107 @@ pub fn collection(conn: &Connection, kind: Kind, name: &str) -> Result<Option<Co
             row_to_collection,
         )
         .optional()?)
+}
+
+/// The account's schedule inbox, created on first use.
+pub fn inbox(conn: &Connection) -> Result<Collection> {
+    conn.execute(
+        "INSERT OR IGNORE INTO dav_collections(kind, name, displayname, components)
+         VALUES(?1, 'inbox', 'Inbox', 'VEVENT,VTODO')",
+        params![INBOX_KIND],
+    )?;
+    Ok(conn.query_row(
+        &format!("SELECT {COLLECTION_COLUMNS} FROM dav_collections WHERE kind = ?1"),
+        params![INBOX_KIND],
+        row_to_collection,
+    )?)
+}
+
+/// Deliver a scheduling message to the inbox; returns its name.
+pub fn inbox_add(conn: &Connection, data: &str) -> Result<String> {
+    let inbox = inbox(conn)?;
+    let root = text::parse(data)?;
+    let component = root
+        .components
+        .iter()
+        .find(|component| component.name != "VTIMEZONE")
+        .map(|component| component.name.clone());
+    let (start, end) = text::time_bounds(&root);
+    let name = format!("{}.ics", random_token());
+    let tx = write_transaction(conn)?;
+    let seq = bump(&tx, &inbox)?;
+    tx.execute(
+        "INSERT INTO dav_objects(collection_id, name, uid, etag, data, component, start_at, end_at,
+             modseq, modified, deleted)
+         VALUES(?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%s','now'), 0)",
+        params![inbox.id, name, etag(data), data, component, start, end, seq],
+    )?;
+    // Keep the newest messages only; the dropped ones become tombstones.
+    tx.execute(
+        "UPDATE dav_objects SET deleted = 1, data = '', modseq = ?2
+         WHERE collection_id = ?1 AND deleted = 0 AND name IN (
+             SELECT name FROM dav_objects WHERE collection_id = ?1 AND deleted = 0
+             ORDER BY modseq DESC LIMIT -1 OFFSET ?3)",
+        params![inbox.id, seq, MAX_INBOX],
+    )?;
+    tx.commit()?;
+    Ok(name)
+}
+
+/// The calendar object with this UID in any of the account's calendars.
+pub fn find_by_uid(conn: &Connection, uid: &str) -> Result<Option<(Collection, Object)>> {
+    for collection in collections(conn, Kind::Calendar)? {
+        let found = conn
+            .query_row(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM dav_objects
+                     WHERE collection_id = ?1 AND uid = ?2 AND deleted = 0"
+                ),
+                params![collection.id, uid],
+                row_to_object,
+            )
+            .optional()?;
+        if let Some(object) = found {
+            return Ok(Some((collection, object)));
+        }
+    }
+    Ok(None)
+}
+
+/// Where scheduling messages for the account land when it has no copy of
+/// the event yet (RFC 6638 9.2): the default calendar, else the first that
+/// takes events. Recreated if the account deleted every calendar.
+pub fn default_calendar(conn: &Connection) -> Result<Collection> {
+    let calendars = collections(conn, Kind::Calendar)?;
+    let takes_events = |collection: &&Collection| {
+        collection.components.is_empty() || collection.components.iter().any(|c| c == "VEVENT")
+    };
+    if let Some(found) = calendars
+        .iter()
+        .filter(takes_events)
+        .find(|collection| collection.name == "default")
+        .or_else(|| calendars.iter().find(takes_events))
+    {
+        return Ok(found.clone());
+    }
+    let name = if calendars.iter().any(|c| c.name == "default") {
+        format!("calendar-{}", random_token())
+    } else {
+        "default".to_string()
+    };
+    create(
+        conn,
+        Kind::Calendar,
+        &name,
+        Some("Calendar"),
+        &["VEVENT", "VTODO"],
+    )
+}
+
+fn random_token() -> String {
+    (0..12)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect()
 }
 
 /// Whether `name` can be a collection or object URL segment.
@@ -282,9 +397,12 @@ pub struct Object {
     pub end: Option<i64>,
     pub modseq: i64,
     pub modified: i64,
+    /// The RFC 6638 schedule tag of a scheduling object.
+    pub schedule_tag: Option<String>,
 }
 
-const OBJECT_COLUMNS: &str = "name, uid, etag, data, component, start_at, end_at, modseq, modified";
+const OBJECT_COLUMNS: &str =
+    "name, uid, etag, data, component, start_at, end_at, modseq, modified, schedule_tag";
 
 fn row_to_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Object> {
     Ok(Object {
@@ -297,6 +415,7 @@ fn row_to_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Object> {
         end: row.get(6)?,
         modseq: row.get(7)?,
         modified: row.get(8)?,
+        schedule_tag: row.get(9)?,
     })
 }
 
@@ -337,17 +456,45 @@ pub enum PutError {
     PreconditionFailed,
 }
 
-/// A request precondition, checked against the object's current ETag
-/// (`None` when it does not exist) inside the write transaction, so a
-/// concurrent change between reading and writing cannot slip past it.
-pub type Precondition<'a> = &'a dyn Fn(Option<&str>) -> bool;
+/// A request precondition, checked against the object as it is (`None`
+/// when it does not exist) inside the write transaction, so a concurrent
+/// change between reading and writing cannot slip past it.
+pub type Precondition<'a> = &'a dyn Fn(Option<&Object>) -> bool;
 
-/// What a conditional delete did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a conditional delete did; a deletion returns what was deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Deleted {
-    Deleted,
+    Deleted(Box<Object>),
     NotFound,
     PreconditionFailed,
+}
+
+/// What becomes of an object's schedule tag on a write (RFC 6638 3.2.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleTag {
+    /// Not a scheduling object: no tag.
+    None,
+    /// The server merged a reply into it: the tag stays.
+    Keep,
+    /// The organizer or attendee changed it: a new tag.
+    New,
+}
+
+/// The data a write stores, made from the object as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    pub data: String,
+    pub schedule_tag: ScheduleTag,
+}
+
+/// A stored object: its ETag and schedule tag, whether it was created, and
+/// the version it replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub etag: String,
+    pub schedule_tag: Option<String>,
+    pub created: bool,
+    pub previous: Option<Object>,
 }
 
 /// What a valid object says about itself.
@@ -436,7 +583,8 @@ fn etag(data: &str) -> String {
     )
 }
 
-/// Store an object; returns its new ETag and whether it was created.
+/// Store an object as sent; returns its new ETag and whether it was
+/// created.
 pub fn put(
     conn: &Connection,
     collection: &Collection,
@@ -444,20 +592,42 @@ pub fn put(
     data: &str,
     precondition: Precondition<'_>,
 ) -> Result<std::result::Result<(String, bool), PutError>> {
+    Ok(put_with(conn, collection, name, &mut |current| {
+        if !precondition(current) {
+            return Err(PutError::PreconditionFailed);
+        }
+        Ok(Prepared {
+            data: data.to_string(),
+            schedule_tag: ScheduleTag::Keep,
+        })
+    })?
+    .map(|stored| (stored.etag, stored.created)))
+}
+
+/// Store an object whose data `prepare` makes from the current version,
+/// inside the write transaction: preconditions and scheduling changes see
+/// exactly the version they replace.
+pub fn put_with(
+    conn: &Connection,
+    collection: &Collection,
+    name: &str,
+    prepare: &mut dyn FnMut(Option<&Object>) -> std::result::Result<Prepared, PutError>,
+) -> Result<std::result::Result<Stored, PutError>> {
     if !valid_name(name) {
         return Ok(Err(PutError::InvalidData(
             "invalid resource name".to_string(),
         )));
     }
-    let parsed = match validate(collection, data) {
+    let tx = write_transaction(conn)?;
+    let current = object(&tx, collection, name)?;
+    let prepared = match prepare(current.as_ref()) {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(Err(error)),
+    };
+    let parsed = match validate(collection, &prepared.data) {
         Ok(parsed) => parsed,
         Err(error) => return Ok(Err(error)),
     };
-    let tx = write_transaction(conn)?;
-    let current = object(&tx, collection, name)?;
-    if !precondition(current.as_ref().map(|object| object.etag.as_str())) {
-        return Ok(Err(PutError::PreconditionFailed));
-    }
     let conflict: Option<String> = tx
         .query_row(
             "SELECT name FROM dav_objects
@@ -469,31 +639,43 @@ pub fn put(
     if let Some(other) = conflict {
         return Ok(Err(PutError::UidConflict(other)));
     }
-    let existed = current.is_some();
+    let schedule_tag = match prepared.schedule_tag {
+        ScheduleTag::None => None,
+        ScheduleTag::Keep => current
+            .as_ref()
+            .and_then(|object| object.schedule_tag.clone()),
+        ScheduleTag::New => Some(format!("\"{}\"", random_token())),
+    };
     let seq = bump(&tx, collection)?;
-    let tag = etag(data);
+    let tag = etag(&prepared.data);
     tx.execute(
         "INSERT INTO dav_objects(collection_id, name, uid, etag, data, component, start_at, end_at,
-             modseq, modified, deleted)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now'), 0)
+             modseq, modified, deleted, schedule_tag)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now'), 0, ?10)
          ON CONFLICT(collection_id, name) DO UPDATE SET uid = excluded.uid, etag = excluded.etag,
              data = excluded.data, component = excluded.component, start_at = excluded.start_at,
              end_at = excluded.end_at, modseq = excluded.modseq, modified = excluded.modified,
-             deleted = 0",
+             deleted = 0, schedule_tag = excluded.schedule_tag",
         params![
             collection.id,
             name,
             parsed.uid,
             tag,
-            data,
+            prepared.data,
             parsed.component,
             parsed.start,
             parsed.end,
-            seq
+            seq,
+            schedule_tag
         ],
     )?;
     tx.commit()?;
-    Ok(Ok((tag, !existed)))
+    Ok(Ok(Stored {
+        etag: tag,
+        schedule_tag,
+        created: current.is_none(),
+        previous: current,
+    }))
 }
 
 fn bump(conn: &Connection, collection: &Collection) -> Result<i64> {
@@ -508,7 +690,7 @@ fn bump(conn: &Connection, collection: &Collection) -> Result<i64> {
     )?)
 }
 
-/// Delete an object, leaving a tombstone for sync; false when absent.
+/// Delete an object, leaving a tombstone for sync.
 pub fn delete(
     conn: &Connection,
     collection: &Collection,
@@ -519,7 +701,7 @@ pub fn delete(
     let Some(current) = object(&tx, collection, name)? else {
         return Ok(Deleted::NotFound);
     };
-    if !precondition(Some(&current.etag)) {
+    if !precondition(Some(&current)) {
         return Ok(Deleted::PreconditionFailed);
     }
     let seq = bump(&tx, collection)?;
@@ -547,7 +729,7 @@ pub fn delete(
         )?;
     }
     tx.commit()?;
-    Ok(Deleted::Deleted)
+    Ok(Deleted::Deleted(Box::new(current)))
 }
 
 /// A change for `sync-collection`.
@@ -573,7 +755,7 @@ pub fn changes_since(
     ))?;
     let rows = statement
         .query_map(params![collection.id, since], |row| {
-            Ok((row_to_object(row)?, row.get::<_, i64>(9)? != 0))
+            Ok((row_to_object(row)?, row.get::<_, i64>(10)? != 0))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Some(
@@ -632,7 +814,7 @@ mod tests {
                     &calendar,
                     "a.ics",
                     &event("a", summary),
-                    &|current| current == Some(tag.as_str()),
+                    &|current| current.map(|o| o.etag.as_str()) == Some(tag.as_str()),
                 )
                 .unwrap()
             })
@@ -641,6 +823,55 @@ mod tests {
         let wins = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
         assert_eq!(wins, 1, "{outcomes:?}");
         assert!(outcomes.contains(&Err(PutError::PreconditionFailed)));
+    }
+
+    #[test]
+    fn schedule_tags_and_the_inbox() {
+        let (_dir, conn) = conn();
+        let calendar = collections(&conn, Kind::Calendar).unwrap().remove(0);
+        let write = |data: String, schedule_tag| {
+            put_with(&conn, &calendar, "m.ics", &mut |_| {
+                Ok(Prepared {
+                    data: data.clone(),
+                    schedule_tag,
+                })
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let first = write(event("m", "One"), ScheduleTag::New);
+        let tag = first.schedule_tag.clone().unwrap();
+        assert!(first.created && first.previous.is_none());
+        // A merged reply keeps the tag; the user's own change replaces it.
+        let kept = write(event("m", "Two"), ScheduleTag::Keep);
+        assert_eq!(kept.schedule_tag.as_deref(), Some(tag.as_str()));
+        assert!(kept.previous.unwrap().data.contains("SUMMARY:One"));
+        let renewed = write(event("m", "Three"), ScheduleTag::New);
+        assert_ne!(renewed.schedule_tag.as_deref(), Some(tag.as_str()));
+        assert_eq!(
+            write(event("m", "Plain"), ScheduleTag::None).schedule_tag,
+            None
+        );
+        let (found, object) = find_by_uid(&conn, "m").unwrap().unwrap();
+        assert_eq!((found.id, object.name.as_str()), (calendar.id, "m.ics"));
+        assert!(find_by_uid(&conn, "nope").unwrap().is_none());
+
+        // The inbox takes messages with the same UID and is not a calendar.
+        let inbox = inbox(&conn).unwrap();
+        assert!(inbox.inbox);
+        inbox_add(&conn, &event("m", "Invite")).unwrap();
+        inbox_add(&conn, &event("m", "Update")).unwrap();
+        assert_eq!(objects(&conn, &inbox).unwrap().len(), 2);
+        assert!(
+            collections(&conn, Kind::Calendar)
+                .unwrap()
+                .iter()
+                .all(|c| !c.inbox)
+        );
+        assert_eq!(default_calendar(&conn).unwrap().id, calendar.id);
+        delete_collection(&conn, &calendar).unwrap();
+        let recreated = default_calendar(&conn).unwrap();
+        assert!(!recreated.inbox && recreated.id != calendar.id);
     }
 
     #[test]
@@ -653,18 +884,18 @@ mod tests {
         let calendar = calendars[0].clone();
         let start = calendar.sync_seq;
 
-        let any = |_: Option<&str>| true;
+        let any = |_: Option<&Object>| true;
         let (tag, created) = put(&conn, &calendar, "a.ics", &event("a", "One"), &any)
             .unwrap()
             .unwrap();
         assert!(created && tag.starts_with('"'));
         // A precondition naming an older version is checked under the lock.
-        let stale = |current: Option<&str>| current == Some("\"old\"");
+        let stale = |current: Option<&Object>| current.is_some_and(|o| o.etag == "\"old\"");
         assert_eq!(
             put(&conn, &calendar, "a.ics", &event("a", "Lost"), &stale).unwrap(),
             Err(PutError::PreconditionFailed)
         );
-        let matching = |current: Option<&str>| current == Some(tag.as_str());
+        let matching = |current: Option<&Object>| current.is_some_and(|o| o.etag == tag);
         let (_, created) = put(&conn, &calendar, "a.ics", &event("a", "Two"), &matching)
             .unwrap()
             .unwrap();
@@ -694,10 +925,10 @@ mod tests {
             delete(&conn, &calendar, "a.ics", &stale).unwrap(),
             Deleted::PreconditionFailed
         );
-        assert_eq!(
+        assert!(matches!(
             delete(&conn, &calendar, "a.ics", &any).unwrap(),
-            Deleted::Deleted
-        );
+            Deleted::Deleted(old) if old.data.contains("SUMMARY:Two")
+        ));
         assert_eq!(
             delete(&conn, &calendar, "a.ics", &any).unwrap(),
             Deleted::NotFound

@@ -549,8 +549,15 @@ respected.
   OPTIONS on `/`, where some clients start.
 - Calendars and contacts are stored in each account's state database next to its mail index, so
   they are backed up with the mail directory. One object may be up to 5 MiB.
-- Invitations are not sent by email (no CalDAV scheduling), and calendars cannot be shared between
-  accounts yet.
+- The server schedules meetings (CalDAV scheduling, RFC 6638), so clients such as Thunderbird and
+  Apple Calendar leave invitations to it. Attendees with an account in the organizer's domain get
+  invitations, updates and cancellations straight into their calendar (and schedule inbox), and
+  their answers update the organizer's copy. Everyone else, including accounts in other domains
+  on the same server, gets an invitation email with the event attached, sent through the
+  submission service like any other mail; with no loopback submission listener, those attendees
+  are marked undeliverable (`SCHEDULE-STATUS` 5.1). Free-busy lookups answer only for accounts in
+  the asker's domain.
+- Calendars cannot be shared between accounts yet.
 
 ## Mail organization
 
