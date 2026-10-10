@@ -1,4 +1,4 @@
-use rmail_common::outbound::{DsnNotify, DsnReturn, decode_xtext};
+use rmail_common::outbound::{DeliverByMode, DsnNotify, DsnReturn, decode_xtext};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MailFromArgs {
@@ -15,6 +15,33 @@ pub(crate) struct MailFromArgs {
     pub(crate) has_esmtp_parameters: bool,
     /// RFC 4865 FUTURERELEASE: HOLDFOR or HOLDUNTIL.
     pub(crate) hold: Option<HoldRequest>,
+    /// RFC 6710 MT-PRIORITY as requested (-9..=9).
+    pub(crate) mt_priority: Option<i8>,
+    /// RFC 2852 BY=.
+    pub(crate) deliver_by: Option<ByRequest>,
+}
+
+/// RFC 2852 `BY=<by-time>;<by-mode>[T]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByRequest {
+    /// Seconds from now; zero or negative only with `N`.
+    pub(crate) seconds: i64,
+    pub(crate) mode: DeliverByMode,
+    pub(crate) trace: bool,
+}
+
+/// The MT-PRIORITY policy (RFC 6710 Appendix B), advertised in EHLO.
+pub(crate) const PRIORITY_POLICY: &str = "MIXER";
+
+/// Map a requested priority onto the MIXER levels: non-urgent (-4), normal
+/// (0) and urgent (4). RFC 6710 section 5 rounds values the policy does not
+/// define up to the next level; there is none above urgent.
+pub(crate) fn mixer_priority(requested: i8) -> i8 {
+    match requested {
+        i8::MIN..=-4 => -4,
+        -3..=0 => 0,
+        _ => 4,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +95,7 @@ pub(crate) enum Command<'a> {
     Auth(&'a str),
     Vrfy,
     Expn,
+    Etrn(&'a str),
     Help,
     Unknown,
     BadSyntax,
@@ -116,6 +144,11 @@ pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Optio
         Command::Auth(_) if !session.encrypted => {
             Some(b"538 5.7.11 Encryption required for authentication\r\n")
         }
+        Command::Etrn(_) if !session.greeted => Some(b"503 5.5.1 Send HELO/EHLO first\r\n"),
+        // RFC 1985 section 5: not between MAIL and the end of DATA.
+        Command::Etrn(_) if session.transaction_active => {
+            Some(b"503 5.5.1 ETRN not permitted during a mail transaction\r\n")
+        }
         Command::StartTls if !session.extended_smtp => {
             Some(b"503 5.5.1 Send EHLO before STARTTLS\r\n")
         }
@@ -155,11 +188,51 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "AUTH" if !args.is_empty() => Command::Auth(args),
         "VRFY" if !args.is_empty() => Command::Vrfy,
         "EXPN" if !args.is_empty() => Command::Expn,
+        "ETRN" if !args.is_empty() => Command::Etrn(args),
         "HELP" => Command::Help,
         "HELO" | "EHLO" | "LHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT"
-        | "STARTTLS" | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
+        | "STARTTLS" | "AUTH" | "VRFY" | "EXPN" | "ETRN" => Command::BadSyntax,
         _ => Command::Unknown,
     }
+}
+
+/// What an ETRN names (RFC 1985 section 5.3).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EtrnArgs {
+    Node(rmail_common::etrn::Node),
+    /// `#queue`: a named local queue.
+    Queue(String),
+}
+
+pub(crate) fn parse_etrn_args(args: &str) -> Option<EtrnArgs> {
+    use rmail_common::etrn::Node;
+    let args = args.trim();
+    if args.contains([' ', '\t']) {
+        return None;
+    }
+    if let Some(queue) = args.strip_prefix('#') {
+        let valid = !queue.is_empty()
+            && queue.len() <= 64
+            && queue
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+        return valid.then(|| EtrnArgs::Queue(queue.to_string()));
+    }
+    let (subdomains, domain) = match args.strip_prefix('@') {
+        Some(domain) => (true, domain),
+        None => (false, args),
+    };
+    let domain = canonical_domain(domain, true)?;
+    // A single label (`@com`) would release mail for a whole top-level
+    // domain (RFC 1985 section 8).
+    if !domain.contains('.') {
+        return None;
+    }
+    Some(EtrnArgs::Node(if subdomains {
+        Node::Subdomains(domain)
+    } else {
+        Node::Domain(domain)
+    }))
 }
 
 pub(crate) fn parse_bdat_args(args: &str) -> Option<BdatArgs> {
@@ -351,6 +424,8 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
     let mut dsn_return = None;
     let mut auth_value: Option<String> = None;
     let mut hold = None;
+    let mut mt_priority = None;
+    let mut deliver_by = None;
     for parameter in params.split_whitespace() {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         if name.eq_ignore_ascii_case("SIZE") && !value.is_empty() {
@@ -409,6 +484,21 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
             let until =
                 chrono::DateTime::parse_from_rfc3339(value).map_err(|_| EnvelopeError::Syntax)?;
             hold = Some(HoldRequest::Until(until.timestamp()));
+        } else if name.eq_ignore_ascii_case("MT-PRIORITY") {
+            // RFC 6710 section 7: priority-value = (["-"] NZDIGIT) / "0".
+            let valid = matches!(
+                value.as_bytes(),
+                [b'0'] | [b'1'..=b'9'] | [b'-', b'1'..=b'9']
+            );
+            if mt_priority.is_some() || !valid {
+                return Err(EnvelopeError::Syntax);
+            }
+            mt_priority = Some(value.parse().map_err(|_| EnvelopeError::Syntax)?);
+        } else if name.eq_ignore_ascii_case("BY") {
+            if deliver_by.is_some() {
+                return Err(EnvelopeError::Syntax);
+            }
+            deliver_by = Some(parse_by_value(value).ok_or(EnvelopeError::Syntax)?);
         } else if name.eq_ignore_ascii_case("RET") {
             if dsn_return.is_some() {
                 return Err(EnvelopeError::Syntax);
@@ -452,6 +542,35 @@ pub(crate) fn parse_mail_from_args(args: &str) -> Result<MailFromArgs, EnvelopeE
         auth_mailbox,
         has_esmtp_parameters: !params.is_empty(),
         hold,
+        mt_priority,
+        deliver_by,
+    })
+}
+
+/// RFC 2852 section 4: `by-time ";" by-mode [by-trace]`, where by-time is
+/// `["-" / "+"] 1*9DIGIT` and a zero or negative time is a syntax error
+/// with the R mode.
+fn parse_by_value(value: &str) -> Option<ByRequest> {
+    let (time, mode) = value.split_once(';')?;
+    let digits = time.strip_prefix(['-', '+']).unwrap_or(time);
+    if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds: i64 = time.parse().ok()?;
+    let (mode, trace) = match mode.to_ascii_uppercase().as_str() {
+        "R" => (DeliverByMode::Return, false),
+        "RT" => (DeliverByMode::Return, true),
+        "N" => (DeliverByMode::Notify, false),
+        "NT" => (DeliverByMode::Notify, true),
+        _ => return None,
+    };
+    if mode == DeliverByMode::Return && seconds <= 0 {
+        return None;
+    }
+    Some(ByRequest {
+        seconds,
+        mode,
+        trace,
     })
 }
 
@@ -665,6 +784,8 @@ mod tests {
                 auth_mailbox: None,
                 has_esmtp_parameters: true,
                 hold: None,
+                mt_priority: None,
+                deliver_by: None,
             })
         );
         assert!(
@@ -722,6 +843,8 @@ mod tests {
                 auth_mailbox: None,
                 has_esmtp_parameters: true,
                 hold: None,
+                mt_priority: None,
+                deliver_by: None,
             })
         );
     }
@@ -783,6 +906,145 @@ mod tests {
         assert!(command_line_limit(&Command::Mail("")) >= 512 + 26 + 100 + 500);
         assert!(command_line_limit(&Command::Rcpt("")) >= 1012);
         assert_eq!(command_line_limit(&Command::Noop), 512);
+    }
+
+    #[test]
+    fn mt_priority_parameter_is_strict() {
+        let parsed = |value: &str| {
+            parse_mail_from_args(&format!("FROM:<a@example.test> MT-PRIORITY={value}"))
+                .map(|args| args.mt_priority)
+        };
+        assert_eq!(parsed("0"), Ok(Some(0)));
+        assert_eq!(parsed("9"), Ok(Some(9)));
+        assert_eq!(parsed("-9"), Ok(Some(-9)));
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> mt-priority=3")
+                .unwrap()
+                .mt_priority,
+            Some(3)
+        );
+        for invalid in ["", "-0", "+1", "10", "-10", "01", "x", "1.5"] {
+            assert_eq!(parsed(invalid), Err(EnvelopeError::Syntax), "{invalid:?}");
+        }
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> MT-PRIORITY=1 MT-PRIORITY=1"),
+            Err(EnvelopeError::Syntax)
+        );
+    }
+
+    #[test]
+    fn mixer_policy_rounds_up_to_its_three_levels() {
+        let mapped = (-9..=9).map(mixer_priority).collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            [
+                -4, -4, -4, -4, -4, -4, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4
+            ]
+        );
+    }
+
+    #[test]
+    fn by_parameter_follows_rfc_2852_grammar() {
+        let parsed = |value: &str| {
+            parse_mail_from_args(&format!("FROM:<a@example.test> BY={value}"))
+                .map(|args| args.deliver_by)
+        };
+        assert_eq!(
+            parsed("120;R"),
+            Ok(Some(ByRequest {
+                seconds: 120,
+                mode: DeliverByMode::Return,
+                trace: false
+            }))
+        );
+        assert_eq!(
+            parsed("+3600;nt"),
+            Ok(Some(ByRequest {
+                seconds: 3600,
+                mode: DeliverByMode::Notify,
+                trace: true
+            }))
+        );
+        // Zero and negative times are allowed with N only.
+        assert_eq!(parsed("-30;N").unwrap().unwrap().seconds, -30);
+        assert_eq!(parsed("0;N").unwrap().unwrap().seconds, 0);
+        for invalid in [
+            "0;R",
+            "-5;R",
+            "1000000000;N",
+            "60",
+            "60;",
+            "60;X",
+            "60;RTT",
+            ";R",
+            "--1;N",
+            "+;N",
+        ] {
+            assert_eq!(parsed(invalid), Err(EnvelopeError::Syntax), "{invalid:?}");
+        }
+        assert_eq!(parsed("999999999;R").unwrap().unwrap().seconds, 999_999_999);
+        assert_eq!(
+            parse_mail_from_args("FROM:<a@example.test> BY=60;R BY=60;R"),
+            Err(EnvelopeError::Syntax)
+        );
+    }
+
+    #[test]
+    fn etrn_arguments_name_a_domain_subdomains_or_queue() {
+        use rmail_common::etrn::Node;
+        assert_eq!(
+            parse_command("etrn example.com"),
+            Command::Etrn("example.com")
+        );
+        assert_eq!(parse_command("ETRN"), Command::BadSyntax);
+        assert_eq!(
+            parse_etrn_args("Example.COM"),
+            Some(EtrnArgs::Node(Node::Domain("example.com".into())))
+        );
+        assert_eq!(
+            parse_etrn_args("@example.com"),
+            Some(EtrnArgs::Node(Node::Subdomains("example.com".into())))
+        );
+        assert_eq!(
+            parse_etrn_args("#uucp"),
+            Some(EtrnArgs::Queue("uucp".into()))
+        );
+        for invalid in [
+            "@com",
+            "com",
+            "bad..example",
+            "a b.example",
+            "#",
+            "#bad/queue",
+            "@",
+            "[192.0.2.1]",
+        ] {
+            assert_eq!(parse_etrn_args(invalid), None, "{invalid:?}");
+        }
+        let idle = SessionContext {
+            greeted: false,
+            extended_smtp: false,
+            encrypted: false,
+            authenticated: false,
+            transaction_active: false,
+            recipients: 0,
+        };
+        assert!(preflight(&Command::Etrn("example.com"), idle).is_some());
+        let greeted = SessionContext {
+            greeted: true,
+            ..idle
+        };
+        assert!(preflight(&Command::Etrn("example.com"), greeted).is_none());
+        assert!(
+            preflight(
+                &Command::Etrn("example.com"),
+                SessionContext {
+                    transaction_active: true,
+                    ..greeted
+                }
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -880,9 +1142,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 /// RFC 5321 section 4.5.3.1.4: command line including CRLF.
 pub(crate) const MAX_COMMAND_LINE_BYTES: usize = 512;
 /// MAIL grows by the advertised extensions' allowances: SIZE (RFC 1870,
-/// +26), ENVID/RET (RFC 3461, +100), AUTH= (RFC 4954, +500) and a margin
-/// for the keyword-only parameters (BODY=, SMTPUTF8, REQUIRETLS).
-pub(crate) const MAX_MAIL_LINE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 26 + 100 + 500 + 50;
+/// +26), ENVID/RET (RFC 3461, +100), AUTH= (RFC 4954, +500), MT-PRIORITY
+/// (RFC 6710, +15), BY (RFC 2852, +17) and a margin for the keyword-only
+/// parameters (BODY=, SMTPUTF8, REQUIRETLS).
+pub(crate) const MAX_MAIL_LINE_BYTES: usize =
+    MAX_COMMAND_LINE_BYTES + 26 + 100 + 500 + 15 + 17 + 50;
 /// RCPT grows by 500 for NOTIFY and ORCPT (RFC 3461 section 4).
 pub(crate) const MAX_RCPT_LINE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 500;
 /// Largest RFC 5321 path, including the angle brackets (section 4.5.3.1.3).

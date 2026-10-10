@@ -622,6 +622,8 @@ impl Session {
                 .filter(|(generation, _)| *generation == self.generation)
                 .map(|(_, options)| options.clone())
                 .unwrap_or_default(),
+            mt_priority: self.tx.mt_priority,
+            deliver_by: self.tx.deliver_by,
         };
         let mail_root = mail_root.to_path_buf();
         let recipient = rcpt.to_string();
