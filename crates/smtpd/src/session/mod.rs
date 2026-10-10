@@ -7,8 +7,8 @@
 //! loop whether to continue, close, or upgrade to TLS.
 
 mod delivery;
-mod feedback;
 mod etrn;
+mod feedback;
 mod message;
 mod recipients;
 

@@ -3007,6 +3007,37 @@ async fn feedback_reports_to_configured_addresses_are_delivered_and_recorded() {
         input.into_bytes(),
         64 * 1024,
         security,
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path.clone(),
+    )
+    .await;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|line| line.starts_with("250 2.0.0"))
+            .count(),
+        3,
+        "{responses:?}"
+    );
+    // Reports are ordinary mail too: both copies to postmaster arrived.
+    let inbox = td.path().join("mail/example.test/postmaster/Maildir/new");
+    assert_eq!(std::fs::read_dir(inbox).expect("maildir").count(), 2);
+    // Only the report to the feedback address is recorded, once.
+    let reports = rmail_common::feedback::list(&db_path, None, 10).expect("reports");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report.recipient, "postmaster@example.test");
+    assert_eq!(report.feedback_type, "abuse");
+    assert_eq!(report.account.as_deref(), Some("user@example.test"));
+    assert_eq!(report.attributed_by.as_deref(), Some("original-mail-from"));
+    assert_eq!(report.original_subject.as_deref(), Some("Weekly news"));
+    // The test peer cannot pass DMARC, so the report is not trusted.
+    assert!(!report.authenticated);
+}
+
 fn queued_control_priorities(td: &tempfile::TempDir) -> Vec<i32> {
     let queue = td.path().join("mail/outbound/maildrop/queue");
     std::fs::read_dir(queue)
@@ -3088,31 +3119,6 @@ async fn untrusted_inbound_clients_may_only_lower_priority() {
         SmtpService::Mta,
         td,
         mail_root,
-        db_path.clone(),
-    )
-    .await;
-    assert_eq!(
-        responses
-            .iter()
-            .filter(|line| line.starts_with("250 2.0.0"))
-            .count(),
-        3,
-        "{responses:?}"
-    );
-    // Reports are ordinary mail too: both copies to postmaster arrived.
-    let inbox = td.path().join("mail/example.test/postmaster/Maildir/new");
-    assert_eq!(std::fs::read_dir(inbox).expect("maildir").count(), 2);
-    // Only the report to the feedback address is recorded, once.
-    let reports = rmail_common::feedback::list(&db_path, None, 10).expect("reports");
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    let report = &reports[0];
-    assert_eq!(report.recipient, "postmaster@example.test");
-    assert_eq!(report.feedback_type, "abuse");
-    assert_eq!(report.account.as_deref(), Some("user@example.test"));
-    assert_eq!(report.attributed_by.as_deref(), Some("original-mail-from"));
-    assert_eq!(report.original_subject.as_deref(), Some("Weekly news"));
-    // The test peer cannot pass DMARC, so the report is not trusted.
-    assert!(!report.authenticated);
         db_path,
     )
     .await;
