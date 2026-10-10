@@ -259,7 +259,7 @@ pub fn suggestions(
             }
         }
     }
-    from_cards.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    from_cards.sort_by_key(|card| card.name.to_lowercase());
     out.extend(from_cards);
     let mut statement = conn.prepare(
         "SELECT name, address FROM recent_recipients ORDER BY uses DESC, last_used DESC LIMIT ?1",
