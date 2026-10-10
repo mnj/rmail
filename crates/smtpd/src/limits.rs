@@ -288,3 +288,72 @@ mod failure_report_limit_tests {
         assert!(super::failure_report_allowed("other.example.test"));
     }
 }
+
+/// ETRN commands a client may issue per minute (RFC 1985). Each one makes
+/// this server contact the node's mail hosts, so the rate is kept low.
+const ETRN_PER_CLIENT_PER_MINUTE: usize = 5;
+/// The shortest time between two queue runs for one node, whoever asks:
+/// a flood of ETRNs cannot turn into a flood of connections to its hosts.
+const ETRN_NODE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MAX_TRACKED_ETRN_KEYS: usize = 10_000;
+
+static ETRN_CLIENTS: Lazy<Mutex<HashMap<IpAddr, VecDeque<Instant>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static ETRN_NODES: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Count an ETRN from `ip`; false when the client is over its rate.
+pub(crate) fn etrn_client_allowed(ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let mut all = ETRN_CLIENTS.lock().unwrap();
+    all.retain(|_, seen| {
+        while seen
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            seen.pop_front();
+        }
+        !seen.is_empty()
+    });
+    if !all.contains_key(&ip) && all.len() >= MAX_TRACKED_ETRN_KEYS {
+        return false;
+    }
+    let seen = all.entry(ip).or_default();
+    if seen.len() >= ETRN_PER_CLIENT_PER_MINUTE {
+        return false;
+    }
+    seen.push_back(now);
+    true
+}
+
+/// Whether a queue run for `node` may start now; records it when so.
+pub(crate) fn etrn_node_due(node: &str) -> bool {
+    let now = Instant::now();
+    let mut all = ETRN_NODES.lock().unwrap();
+    all.retain(|_, started| now.duration_since(*started) < ETRN_NODE_INTERVAL);
+    if all.contains_key(node) || all.len() >= MAX_TRACKED_ETRN_KEYS {
+        return false;
+    }
+    all.insert(node.to_string(), now);
+    true
+}
+
+#[cfg(test)]
+mod etrn_limit_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn etrn_is_rate_limited_per_client_and_per_node() {
+        let client = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77));
+        for _ in 0..super::ETRN_PER_CLIENT_PER_MINUTE {
+            assert!(super::etrn_client_allowed(client));
+        }
+        assert!(!super::etrn_client_allowed(client));
+        assert!(super::etrn_client_allowed(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 78
+        ))));
+
+        assert!(super::etrn_node_due("limit.example.test"));
+        assert!(!super::etrn_node_due("limit.example.test"));
+        assert!(super::etrn_node_due("@limit.example.test"));
+    }
+}

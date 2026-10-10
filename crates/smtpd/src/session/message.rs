@@ -217,6 +217,7 @@ impl Session {
             self.extended_smtp,
             self.encrypted,
             self.authenticated_user.is_some(),
+            self.tx.mt_priority,
         );
         traced.append(&mut data);
         Ok(Bytes::from(traced))

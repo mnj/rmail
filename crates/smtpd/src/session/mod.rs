@@ -7,6 +7,7 @@
 //! loop whether to continue, close, or upgrade to TLS.
 
 mod delivery;
+mod etrn;
 mod message;
 mod recipients;
 
@@ -20,7 +21,7 @@ use rmail_common::auth::{ChannelBindings, ScramChannelBindingPolicy};
 use rmail_common::config::SecurityConfig;
 use rmail_common::metrics;
 use rmail_common::oauth::OAuthValidator;
-use rmail_common::outbound::DsnOptions;
+use rmail_common::outbound::{DELIVERBY_MIN_SECONDS, DeliverBy, DeliverByMode, DsnOptions};
 use rmail_common::tracking::new_tracking_id;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
@@ -78,6 +79,10 @@ struct Transaction {
     given_rcpts: Vec<String>,
     /// RFC 4865: when a held message is to be released (Unix time).
     release_at: Option<i64>,
+    /// RFC 6710 priority assigned under the MIXER policy.
+    mt_priority: Option<i8>,
+    /// RFC 2852 deadline, carried into the outbound queue.
+    deliver_by: Option<DeliverBy>,
     bdat_buffer: Vec<u8>,
     bdat_started: bool,
 }
@@ -95,6 +100,8 @@ impl Default for Transaction {
             rcpts: Vec::new(),
             given_rcpts: Vec::new(),
             release_at: None,
+            mt_priority: None,
+            deliver_by: None,
             bdat_buffer: Vec::new(),
             bdat_started: false,
         }
@@ -389,6 +396,7 @@ impl Session {
                 reply(reader, b"250 2.0.0 Reset state\r\n").await
             }
             SmtpCommand::Noop => reply(reader, b"250 2.0.0 OK\r\n").await,
+            SmtpCommand::Etrn(args) => self.etrn(reader, args).await,
             SmtpCommand::Vrfy | SmtpCommand::Expn => {
                 reply(
                     reader,
@@ -541,6 +549,8 @@ impl Session {
         self.tx.rcpts.clear();
         self.tx.given_rcpts.clear();
         self.tx.release_at = None;
+        self.tx.mt_priority = None;
+        self.tx.deliver_by = None;
         self.tx.mail_from = None;
         self.tx.active = false;
         self.tx.bdat_buffer.clear();
@@ -620,6 +630,18 @@ impl Session {
             // RFC 8689: REQUIRETLS is only offered on TLS-protected sessions.
             if self.encrypted {
                 response.push_str("250-REQUIRETLS\r\n");
+            }
+            // RFC 6710 and RFC 2852 apply wherever mail may be relayed;
+            // LMTP is final delivery.
+            if self.service != SmtpService::Lmtp {
+                response.push_str(&format!(
+                    "250-MT-PRIORITY {}\r\n250-DELIVERBY {DELIVERBY_MIN_SECONDS}\r\n",
+                    protocol::PRIORITY_POLICY
+                ));
+            }
+            // RFC 1985: remote queue starting on the inbound service.
+            if self.service == SmtpService::Mta {
+                response.push_str("250-ETRN\r\n");
             }
             // RFC 4865: messages from authenticated senders may be held.
             if self.service == SmtpService::Submission && crate::future_release() {
@@ -850,6 +872,46 @@ impl Session {
                 Some(release_at)
             }
         };
+        if self.service == SmtpService::Lmtp
+            && (parsed.mt_priority.is_some() || parsed.deliver_by.is_some())
+        {
+            return reply(reader, b"555 5.5.4 Unsupported MAIL FROM parameter\r\n").await;
+        }
+        let deliver_by = match parsed.deliver_by {
+            None => None,
+            Some(by) => {
+                // The deadline would run while the message is held.
+                if release_at.is_some() {
+                    return reply(
+                        reader,
+                        b"501 5.5.4 DELIVERBY cannot be combined with FUTURERELEASE\r\n",
+                    )
+                    .await;
+                }
+                // RFC 2852 section 3: below min-by-time is a permanent 55z.
+                if by.mode == DeliverByMode::Return && by.seconds < DELIVERBY_MIN_SECONDS {
+                    let line = format!(
+                        "555 5.5.4 BY time is below the minimum of {DELIVERBY_MIN_SECONDS} seconds\r\n"
+                    );
+                    return reply(reader, line.as_bytes()).await;
+                }
+                Some(DeliverBy {
+                    deadline: chrono::Utc::now().timestamp() + by.seconds,
+                    mode: by.mode,
+                    trace: by.trace,
+                })
+            }
+        };
+        // RFC 6710 section 4.1: only trusted (authenticated) clients may
+        // raise a message's priority; anyone may lower it. Held messages are
+        // released through submission later and go at normal priority.
+        let mt_priority = parsed.mt_priority.map(|requested| {
+            let mut assigned = protocol::mixer_priority(requested);
+            if (self.authenticated_user.is_none() && assigned > 0) || release_at.is_some() {
+                assigned = 0;
+            }
+            (requested, assigned)
+        });
         if parsed.auth_mailbox.is_some() && !self.auth_supported() {
             return reply(
                 reader,
@@ -877,6 +939,8 @@ impl Session {
         self.tx.smtp_utf8 = parsed.smtp_utf8;
         self.tx.require_tls = parsed.require_tls;
         self.tx.release_at = release_at;
+        self.tx.mt_priority = mt_priority.map(|(_, assigned)| assigned);
+        self.tx.deliver_by = deliver_by;
         // RFC 4954 section 5: an AUTH= mailbox from a client that is not
         // authenticated (or that names someone else) is not trusted and is
         // handled as AUTH=<>, so it is never propagated.
@@ -943,8 +1007,19 @@ impl Session {
         self.tx.bdat_buffer.clear();
         self.tx.bdat_started = false;
         self.tx.rcpts.clear();
-        session_log!(self, "debug", "mail_from_accepted", { "mail_from": self.tx.mail_from, "auth_submitter": self.tx.auth_submitter });
-        reply(reader, b"250 2.1.0 Sender OK\r\n").await
+        session_log!(self, "debug", "mail_from_accepted", { "mail_from": self.tx.mail_from, "auth_submitter": self.tx.auth_submitter, "mt_priority_requested": mt_priority.map(|(requested, _)| requested), "mt_priority": self.tx.mt_priority, "deliver_by": self.tx.deliver_by.map(|by| by.encode()) });
+        match mt_priority {
+            // RFC 6710 section 4.1: a changed priority is reported with
+            // X.3.6, the reply text starting with the new value.
+            Some((requested, assigned)) if requested != assigned => {
+                let line = format!(
+                    "250 2.3.6 {assigned} Sender OK; priority changed under the {} policy\r\n",
+                    protocol::PRIORITY_POLICY
+                );
+                reply(reader, line.as_bytes()).await
+            }
+            _ => reply(reader, b"250 2.1.0 Sender OK\r\n").await,
+        }
     }
 
     async fn starttls(&mut self, reader: &mut SmtpReader) -> Result<Flow> {

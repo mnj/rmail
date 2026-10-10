@@ -20,6 +20,9 @@ pub struct QueueControl {
     pub last_enhanced_status: Option<String>,
     #[serde(default)]
     pub delay_notification_sent: bool,
+    /// The RFC 2852 BY;N deadline passed and the delay DSN went out.
+    #[serde(default)]
+    pub deliver_by_notified: bool,
     pub created_at: i64,
 }
 
@@ -43,6 +46,7 @@ impl QueueControl {
             last_smtp_code: None,
             last_enhanced_status: None,
             delay_notification_sent: false,
+            deliver_by_notified: false,
             created_at: now,
         }
     }
@@ -57,6 +61,7 @@ impl QueueControl {
             last_smtp_code: None,
             last_enhanced_status: None,
             delay_notification_sent: false,
+            deliver_by_notified: false,
             created_at: ts,
         }
     }
@@ -97,6 +102,74 @@ pub struct QueueOptions {
     pub require_tls: bool,
     pub tracking_id: Option<String>,
     pub dsn: DsnOptions,
+    /// RFC 6710 MT-PRIORITY as accepted (-9..=9). It orders the queue and
+    /// is relayed to next hops that advertise the extension.
+    pub mt_priority: Option<i8>,
+    /// RFC 2852 DELIVERBY deadline.
+    pub deliver_by: Option<DeliverBy>,
+}
+
+/// The smallest BY time accepted with the R (return) mode, advertised as
+/// the DELIVERBY min-by-time. A delivery attempt, including DNS, MTA-STS
+/// and TLS set-up, needs some time; shorter deadlines could not be met.
+pub const DELIVERBY_MIN_SECONDS: i64 = 60;
+
+/// RFC 2852 DELIVERBY: when a message has to be delivered and what happens
+/// when that time passes before it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliverBy {
+    /// Unix time of the deadline.
+    pub deadline: i64,
+    pub mode: DeliverByMode,
+    /// The `T` modifier: relays report each hand-off with a relayed DSN.
+    pub trace: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverByMode {
+    /// `R`: give up and return a failure DSN (5.4.7) at the deadline.
+    Return,
+    /// `N`: send a delay DSN (4.4.7) at the deadline and keep trying.
+    Notify,
+}
+
+impl DeliverBy {
+    /// The by-mode and trace flag as sent in `BY=<time>;<mode>`.
+    pub fn mode_text(&self) -> &'static str {
+        match (self.mode, self.trace) {
+            (DeliverByMode::Return, false) => "R",
+            (DeliverByMode::Return, true) => "RT",
+            (DeliverByMode::Notify, false) => "N",
+            (DeliverByMode::Notify, true) => "NT",
+        }
+    }
+
+    /// Spool form: `<deadline>;<mode>`.
+    pub fn encode(&self) -> String {
+        format!("{};{}", self.deadline, self.mode_text())
+    }
+
+    pub fn decode(value: &str) -> anyhow::Result<Self> {
+        let (deadline, mode) = value
+            .trim()
+            .split_once(';')
+            .context("invalid DELIVERBY queue metadata")?;
+        let deadline = deadline
+            .parse()
+            .context("invalid DELIVERBY deadline in queue metadata")?;
+        let (mode, trace) = match mode {
+            "R" => (DeliverByMode::Return, false),
+            "RT" => (DeliverByMode::Return, true),
+            "N" => (DeliverByMode::Notify, false),
+            "NT" => (DeliverByMode::Notify, true),
+            _ => anyhow::bail!("invalid DELIVERBY mode in queue metadata"),
+        };
+        Ok(Self {
+            deadline,
+            mode,
+            trace,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +328,15 @@ pub fn queue_outbound_with_options(
         };
         writeln!(f, "X-RMail-DSN-Notify: {value}\r")?;
     }
+    if let Some(priority) = options.mt_priority {
+        if !(-9..=9).contains(&priority) {
+            anyhow::bail!("MT-PRIORITY must be between -9 and 9");
+        }
+        write!(f, "X-RMail-MT-Priority: {priority}\r\n")?;
+    }
+    if let Some(deliver_by) = options.deliver_by.as_ref() {
+        write!(f, "X-RMail-Deliver-By: {}\r\n", deliver_by.encode())?;
+    }
     if let Some((address_type, address)) = options.dsn.original_recipient.as_ref() {
         if address_type.is_empty()
             || !address_type
@@ -279,9 +361,11 @@ pub fn queue_outbound_with_options(
 
     // Write and sync the sidecar before publishing the message. The message rename is the
     // commit marker: a queue reader never sees an `.eml` without its control record.
+    // Higher MT-PRIORITY values are claimed first (the queue orders by
+    // `priority`, highest first).
     let control = QueueControl::new_with_tracking_id(
         5,
-        0,
+        options.mt_priority.map_or(0, i32::from),
         options.tracking_id.unwrap_or_else(new_message_tracking_id),
     );
     let control_json = serde_json::to_string(&control)?;
@@ -304,8 +388,9 @@ pub fn queue_outbound_with_options(
 #[cfg(test)]
 mod tests {
     use super::{
-        DsnNotify, DsnOptions, DsnReturn, QueueOptions, control_path_for_eml, decode_xtext,
-        encode_xtext, queue_outbound, queue_outbound_with_options,
+        DeliverBy, DeliverByMode, DsnNotify, DsnOptions, DsnReturn, QueueControl, QueueOptions,
+        control_path_for_eml, decode_xtext, encode_xtext, queue_outbound,
+        queue_outbound_with_options,
     };
     use std::path::Path;
 
@@ -346,8 +431,7 @@ mod tests {
             Some("from@example.test"),
             QueueOptions {
                 require_tls: true,
-                tracking_id: None,
-                dsn: DsnOptions::default(),
+                ..QueueOptions::default()
             },
         )
         .unwrap();
@@ -389,6 +473,7 @@ mod tests {
                     }),
                     original_recipient: Some(("rfc822".into(), "alias@example.test".into())),
                 },
+                ..QueueOptions::default()
             },
         )
         .unwrap();
@@ -397,5 +482,51 @@ mod tests {
         assert!(data.contains("X-RMail-DSN-Return: HDRS\r\n"));
         assert!(data.contains("X-RMail-DSN-Notify: SUCCESS,FAILURE\r\n"));
         assert!(data.contains("X-RMail-DSN-Original-Recipient: rfc822;alias@example.test\r\n"));
+    }
+
+    #[test]
+    fn priority_and_deadline_are_spooled_and_order_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let deliver_by = DeliverBy {
+            deadline: 1_700_000_000,
+            mode: DeliverByMode::Notify,
+            trace: true,
+        };
+        let queued = queue_outbound_with_options(
+            temp.path(),
+            "to@example.test",
+            b"Subject: urgent\r\n\r\nbody\r\n",
+            Some("from@example.test"),
+            QueueOptions {
+                mt_priority: Some(4),
+                deliver_by: Some(deliver_by),
+                ..QueueOptions::default()
+            },
+        )
+        .unwrap();
+        let data = std::fs::read_to_string(&queued).unwrap();
+        assert!(data.contains("X-RMail-MT-Priority: 4\r\n"));
+        assert!(data.contains("X-RMail-Deliver-By: 1700000000;NT\r\n"));
+        let control: QueueControl =
+            serde_json::from_str(&std::fs::read_to_string(control_path_for_eml(&queued)).unwrap())
+                .unwrap();
+        assert_eq!(control.priority, 4);
+        assert!(!control.deliver_by_notified);
+        assert_eq!(DeliverBy::decode("1700000000;NT").unwrap(), deliver_by);
+        assert!(DeliverBy::decode("1700000000;X").is_err());
+        assert!(DeliverBy::decode("soon;R").is_err());
+        assert!(
+            queue_outbound_with_options(
+                temp.path(),
+                "to@example.test",
+                b"Subject: x\r\n\r\nbody\r\n",
+                None,
+                QueueOptions {
+                    mt_priority: Some(10),
+                    ..QueueOptions::default()
+                },
+            )
+            .is_err()
+        );
     }
 }
