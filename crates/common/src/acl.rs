@@ -29,6 +29,17 @@ const LETTERS: &[(char, u16)] = &[
     ('a', 1 << 10),
 ];
 
+/// The prefix of the other users' namespace (RFC 2342), without its
+/// trailing `/`: a mailbox shared by `owner` is `Other Users/<owner>/<name>`.
+pub const OTHER_USERS: &str = "Other Users";
+
+/// Split `Other Users/<owner>/<rest>` into the owner and the rest, which is
+/// empty for the owner's own node.
+pub fn split_shared_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix(OTHER_USERS)?.strip_prefix('/')?;
+    Some(rest.split_once('/').unwrap_or((rest, "")))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rights(u16);
 

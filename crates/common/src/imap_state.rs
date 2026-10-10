@@ -216,6 +216,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
     ensure_object_ids(conn)?;
     crate::jmap::store::ensure_schema(conn)?;
+    crate::urlauth::ensure_schema(conn)?;
     crate::dav::store::ensure_schema(conn)?;
     let invalid_uidvalidity_ids = {
         let mut statement = conn

@@ -133,6 +133,7 @@ certification results.
 | RFC 8689 | `REQUIRETLS` | 100% | Advertised and accepted only on TLS sessions; submission, durable queue metadata, relay advertisement checks, and downgrade-resistant TLS enforcement are implemented. |
 | RFC 4865 | `FUTURERELEASE` | 90% | Offered on submission when a loopback submission listener exists. `HOLDFOR`/`HOLDUNTIL` (up to 30 days) hold the message; the outbound worker submits it again as the sender at the release time, so recipients, limits, signing and filters apply then. A refusal at release leaves a notice in the sender's inbox. Cannot be combined with `REQUIRETLS`; DSN parameters are not carried to the release. |
 | RFC 3030 | `CHUNKING`/`BINARYMIME` | 95% | Both extensions are advertised together. The receiver supports exact-octet, multi-command BDAT transactions, LAST and zero-length chunks, cumulative SIZE enforcement with stream-preserving drains, DATA/BDAT state exclusion, and BODY=BINARYMIME validation. Relay capability negotiation selects binary-safe BDAT and requires both extensions for binary content; external conformance corpus testing remains. |
+| RFC 4468 | `BURL imap` | 90% | Submission only: bare `BURL` before AUTH, `BURL imap` after. Resolves URLAUTH URLs to this server's own store directly (no IMAP connection), for `submit+<authenticated user>` and `authuser` URLs; BURL and BDAT chunks mix freely and the content passes the same From, size, rate, scanner and quota checks as DATA/BDAT. Plain IMAP URLs and other servers' URLs get `554 5.7.8` (no trust relationships); a failed fetch fails the transaction. 8-bit content is not down-converted. |
 | RFC 7208 | SPF receiver checks | 85% | SPF evaluation and result accounting are implemented; broad DNS/interoperability corpus validation remains. |
 | RFC 6376 | DKIM verification | 85% | DKIM verification and result accounting are implemented; exhaustive algorithm/canonicalization corpus validation remains. |
 | RFC 7489 / RFC 6591 | DMARC policy and reports | 90% | Alignment, policy outcomes, quarantine and optional rejection are implemented. Every unauthenticated inbound evaluation for a domain that asks for reports is recorded for aggregate (`rua`) reports, and opt-in failure reports (`security.dmarc_failure_reports`, honoring `fo` and `ruf` size limits) carry the headers but never the body, at most 10 per domain per hour. External report destinations must authorize themselves (section 7.1); organizational domains are approximated without a public suffix list. |
@@ -178,8 +179,8 @@ Thunderbird autoconfig (`config-v1.1.xml`) and Outlook POX autodiscover are serv
 
 ## Not yet supported
 
-- **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and `URLAUTH`
-  (RFC 4467) with BURL (RFC 4468).
+- **IMAP `UTF8=ONLY`** (RFC 6855, deliberately: it locks out non-UTF-8 clients) and
+  `URLAUTH=BINARY` (RFC 5524).
 - **SMTP `MT-PRIORITY`** (RFC 6710), `DELIVERBY` (RFC 2852) and `ETRN` (RFC 1985).
 - **ARF abuse feedback** (RFC 5965) beyond DMARC failure reports.
 
@@ -223,6 +224,7 @@ or conformance-validation gaps.
 | RFC 3516 | `BINARY` | 95% | Binary FETCH sections and sizes are implemented; exhaustive MIME corpus validation remains. |
 | RFC 4466 | Collected extension grammar | 95% | Extension argument/response forms used by advertised capabilities are implemented. |
 | RFC 4469 | `CATENATE` | 100% | Streaming `TEXT`, relative same-session message/section `URL`, URL literals, `BADURL`, `TOOBIG`, and `APPENDUID` are implemented. |
+| RFC 4467 | `URLAUTH` | 90% | `GENURLAUTH`, `URLFETCH`, `RESETKEY` and `URLMECH`, with the `INTERNAL` mechanism (HMAC-SHA256 under a random per-user, per-mailbox key, checked in constant time). URLs must name this server (`global.hostname`, ACME names or certificate names), the generating user, and a message the user can read in their own or a shared mailbox; read rights are checked again at every fetch. `submit+`, `user+` and `authuser` access with `;EXPIRE=`; `anonymous` is refused. `submit+` URLs are honored only by rMail's own submission service, never by URLFETCH. Sections are part numbers with `HEADER`/`TEXT`/`MIME`; `HEADER.FIELDS` is not supported in URLs, and content containing NUL is returned as NIL. |
 | RFC 8970 | `PREVIEW` | 100% | MIME-aware UTF-8 previews and the `LAZY` priority modifier are implemented with bounded output. |
 | RFC 9208 | `QUOTA` | 95% | `QUOTA=RES-STORAGE`, account-wide STORAGE limits, GETQUOTA/GETQUOTAROOT, `STATUS DELETED-STORAGE`, atomic APPEND/COPY and SMTP enforcement, and `OVERQUOTA` are implemented; unlimited accounts have no quota root. Users cannot change limits, so `QUOTASET` is not offered. |
 | RFC 3348 | `CHILDREN` | 100% | `\HasChildren`/`\HasNoChildren` are returned in LIST responses. |

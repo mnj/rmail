@@ -73,6 +73,7 @@ fn capability_advertises_starttls_and_login_policy() {
             "LITERAL-",
             "ACL",
             "RIGHTS=kxte",
+            "URLAUTH",
             "UIDPLUS",
             "MULTIAPPEND",
             "CATENATE",

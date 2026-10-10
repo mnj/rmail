@@ -610,6 +610,9 @@ impl Session {
             | Command::GetAcl
             | Command::ListRights
             | Command::MyRights => self.acl(reader, call).await,
+            Command::GenUrlAuth | Command::UrlFetch | Command::ResetKey => {
+                self.urlauth(reader, call).await
+            }
             Command::Notify => self.notify(reader, call).await,
             Command::CancelUpdate => {
                 let response =
@@ -720,7 +723,7 @@ fn streams_own_literals(line: &[u8]) -> bool {
 pub(crate) fn logged_command_args<'a>(command: &str, args: &'a str) -> &'a str {
     if matches!(
         command.to_ascii_uppercase().as_str(),
-        "AUTHENTICATE" | "LOGIN"
+        "AUTHENTICATE" | "LOGIN" | "URLFETCH"
     ) {
         "[REDACTED]"
     } else {

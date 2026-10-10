@@ -7,6 +7,7 @@ use rmail_common::config::ScannerFailureAction;
 use rmail_common::mail_auth::AuthenticationResults;
 use rmail_common::metrics;
 use rmail_common::scanner::{ScanAction, ScanEnvelope};
+use rmail_common::urlauth::{self, Refusal, Requester};
 use tokio::io::AsyncWriteExt;
 
 use super::delivery::DeliveryReport;
@@ -19,18 +20,35 @@ use crate::protocol::{self, MailBody};
 use crate::trace::emit_tracking;
 use crate::{MAX_MESSAGE_BYTES, SmtpService};
 
+/// How the client sends (part of) the message.
+pub(super) enum Chunk<'a> {
+    Data,
+    /// BDAT arguments (RFC 3030).
+    Bdat(&'a str),
+    /// BURL arguments (RFC 4468).
+    Burl(&'a str),
+}
+
 impl Session {
-    /// DATA (`bdat` is `None`) or one BDAT chunk.
+    /// DATA, or one BDAT or BURL chunk. BDAT and BURL chunks may be mixed;
+    /// the message is complete after the one marked LAST.
     pub(super) async fn message(
         &mut self,
         reader: &mut SmtpReader,
-        bdat: Option<&str>,
+        chunk: Chunk<'_>,
     ) -> Result<Flow> {
+        if matches!(chunk, Chunk::Burl(_)) && !self.burl_available() {
+            return reply(
+                reader,
+                b"502 5.5.1 BURL requires authenticated submission\r\n",
+            )
+            .await;
+        }
         if self.tx.rcpts.is_empty() {
             return reply(reader, b"503 5.5.1 RCPT required before DATA\r\n").await;
         }
-        let incoming = match bdat {
-            None => {
+        let incoming = match chunk {
+            Chunk::Data => {
                 if self.tx.bdat_started {
                     return reply(reader, b"503 5.5.1 DATA not permitted after BDAT\r\n").await;
                 }
@@ -41,7 +59,11 @@ impl Session {
                 send(reader, b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
                 read_smtp_data(reader).await?
             }
-            Some(args) => match self.bdat_chunk(reader, args).await? {
+            Chunk::Bdat(args) => match self.bdat_chunk(reader, args).await? {
+                Intake::Message(incoming) => incoming,
+                Intake::Handled(flow) => return Ok(flow),
+            },
+            Chunk::Burl(args) => match self.burl_chunk(reader, args).await? {
                 Intake::Message(incoming) => incoming,
                 Intake::Handled(flow) => return Ok(flow),
             },
@@ -183,6 +205,67 @@ impl Session {
         if !chunk.last {
             return Ok(Intake::Handled(
                 reply(reader, b"250 2.0.0 BDAT chunk received\r\n").await?,
+            ));
+        }
+        Ok(Intake::Message(DataReadResult::Complete(std::mem::take(
+            &mut self.tx.bdat_buffer,
+        ))))
+    }
+
+    /// Resolve one BURL chunk: a URLAUTH URL to a message in this server's
+    /// store, fetched directly as the submission server acting for the
+    /// authenticated user (`submit+<user>` or `authuser` URLs only). The
+    /// content then goes through every check DATA and BDAT content does.
+    async fn burl_chunk(&mut self, reader: &mut SmtpReader, args: &str) -> Result<Intake> {
+        let Some(chunk) = protocol::parse_burl_args(args) else {
+            return Ok(Intake::Handled(
+                reply(reader, b"501 5.5.4 Syntax: BURL imap-url [LAST]\r\n").await?,
+            ));
+        };
+        self.tx.bdat_started = true;
+        let remaining = MAX_MESSAGE_BYTES.saturating_sub(self.tx.bdat_buffer.len()) as u64;
+        let mail_root = self.mail_root.clone();
+        let db_path = self.db_path.clone();
+        let user = self.authenticated_user.clone().unwrap_or_default();
+        let url = chunk.url.to_string();
+        let fetched = tokio::task::spawn_blocking(move || {
+            urlauth::fetch(
+                std::path::Path::new(&mail_root),
+                db_path.as_deref().map(std::path::Path::new),
+                &url,
+                Requester::Submit(&user),
+                remaining,
+            )
+        })
+        .await
+        .unwrap_or(Err(Refusal::Unavailable));
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
+            Err(refusal) => {
+                // The URL is a bearer credential; only the outcome is logged.
+                session_log!(self, "warn", "burl_refused", { "message_id": self.message_id, "reason": refusal.to_string() });
+                let status = match refusal {
+                    Refusal::Invalid | Refusal::Unresolved => {
+                        "554 5.6.6 IMAP URL resolution failed"
+                    }
+                    Refusal::Untrusted => "554 5.7.8 URL resolution requires trust relationship",
+                    Refusal::NotAuthorized => "554 5.7.0 IMAP URL authorization failed",
+                    Refusal::TooLarge => "554 5.3.4 Message too big for system",
+                    Refusal::Unavailable => "451 4.4.1 IMAP server unavailable",
+                };
+                // RFC 4468 section 4: a failed fetch fails the transaction.
+                return Ok(Intake::Handled(self.fail_message(reader, status).await?));
+            }
+        };
+        session_log!(self, "debug", "burl_resolved", { "message_id": self.message_id, "bytes": bytes.len(), "last": chunk.last });
+        self.tx.bdat_buffer.extend_from_slice(&bytes);
+        if !chunk.last {
+            return Ok(Intake::Handled(
+                reply(
+                    reader,
+                    b"250 2.5.0 Waiting for additional BURL or BDAT commands\r\n",
+                )
+                .await?,
             ));
         }
         Ok(Intake::Message(DataReadResult::Complete(std::mem::take(

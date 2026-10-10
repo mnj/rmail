@@ -114,6 +114,47 @@ impl Session {
         self.respond(reader, call.tag, &call.name, response).await
     }
 
+    /// GENURLAUTH, URLFETCH and RESETKEY (RFC 4467). Authorized URLs are
+    /// bearer credentials, so neither they nor URLFETCH content are logged.
+    pub(super) async fn urlauth(
+        &self,
+        reader: &mut ImapReader,
+        call: &Invocation<'_>,
+    ) -> Result<Flow> {
+        let command = call.command.clone();
+        let root = self.mail_root.clone();
+        let db_path = self.db_path.clone();
+        let address = self.address().to_string();
+        let args = call.args.to_string();
+        let tag = call.tag.to_string();
+        let utf8_accept = self.state.utf8_enabled();
+        let (output, resolved) = tokio::task::spawn_blocking(move || {
+            let root = Path::new(&root);
+            let db_path = db_path.as_deref().map(Path::new);
+            match command {
+                parser::Command::GenUrlAuth => (
+                    commands::urlauth::genurlauth(&tag, &args, root, db_path, &address)
+                        .encode()
+                        .into_bytes(),
+                    0,
+                ),
+                parser::Command::UrlFetch => {
+                    commands::urlauth::urlfetch(&tag, &args, root, db_path, &address)
+                }
+                _ => (
+                    commands::urlauth::resetkey(&tag, &args, root, db_path, &address, utf8_accept)
+                        .encode()
+                        .into_bytes(),
+                    0,
+                ),
+            }
+        })
+        .await?;
+        imap_log!("info", "urlauth_command", { "peer": self.peer_label(), "command": call.name, "resolved_urls": resolved });
+        super::write(reader, &output).await?;
+        Ok(Flow::Continue)
+    }
+
     /// NOTIFY SET and NOTIFY NONE (RFC 5465).
     pub(super) async fn notify(
         &mut self,

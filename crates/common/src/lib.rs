@@ -28,6 +28,7 @@ pub mod mail_auth;
 pub mod maildir;
 pub mod metrics;
 pub mod mime;
+pub mod mime_section;
 pub mod net;
 pub mod oauth;
 pub mod outbound;
@@ -46,6 +47,7 @@ pub mod tls;
 pub mod tlsrpt;
 pub mod tracking;
 pub mod transport;
+pub mod urlauth;
 pub mod websession;
 
 #[doc(hidden)]

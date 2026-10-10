@@ -52,6 +52,12 @@ pub(crate) struct BdatArgs {
     pub(crate) last: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BurlArgs<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) last: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command<'a> {
     Helo(&'a str),
@@ -61,6 +67,8 @@ pub(crate) enum Command<'a> {
     Rcpt(&'a str),
     Data,
     Bdat(&'a str),
+    /// RFC 4468 BURL: message content by IMAP URL.
+    Burl(&'a str),
     Rset,
     Noop,
     Quit,
@@ -108,6 +116,14 @@ pub(crate) fn preflight(command: &Command<'_>, session: SessionContext) -> Optio
         Command::Bdat(_) if session.recipients == 0 => {
             Some(b"503 5.5.1 RCPT required before BDAT\r\n")
         }
+        Command::Burl(_) if !session.extended_smtp => Some(b"503 5.5.1 Send EHLO first\r\n"),
+        Command::Burl(_) if !session.transaction_active => {
+            Some(b"503 5.5.1 MAIL required before BURL\r\n")
+        }
+        // RFC 4468 section 3: a valid RCPT TO is required before BURL.
+        Command::Burl(_) if session.recipients == 0 => {
+            Some(b"503 5.5.0 Valid RCPT TO required before BURL\r\n")
+        }
         Command::Auth(_) if !session.extended_smtp => Some(b"503 5.5.1 Send EHLO before AUTH\r\n"),
         Command::Auth(_) if session.authenticated => Some(b"503 5.5.0 Already authenticated\r\n"),
         Command::Auth(_) if session.transaction_active => {
@@ -148,6 +164,7 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "RCPT" if !args.is_empty() => Command::Rcpt(args),
         "DATA" if args.is_empty() => Command::Data,
         "BDAT" if !args.is_empty() => Command::Bdat(args),
+        "BURL" if !args.is_empty() => Command::Burl(args),
         "RSET" if args.is_empty() => Command::Rset,
         "NOOP" => Command::Noop,
         "QUIT" if args.is_empty() => Command::Quit,
@@ -156,7 +173,7 @@ pub(crate) fn parse_command(command: &str) -> Command<'_> {
         "VRFY" if !args.is_empty() => Command::Vrfy,
         "EXPN" if !args.is_empty() => Command::Expn,
         "HELP" => Command::Help,
-        "HELO" | "EHLO" | "LHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "RSET" | "QUIT"
+        "HELO" | "EHLO" | "LHLO" | "MAIL" | "RCPT" | "DATA" | "BDAT" | "BURL" | "RSET" | "QUIT"
         | "STARTTLS" | "AUTH" | "VRFY" | "EXPN" => Command::BadSyntax,
         _ => Command::Unknown,
     }
@@ -178,6 +195,21 @@ pub(crate) fn parse_bdat_args(args: &str) -> Option<BdatArgs> {
         return None;
     }
     Some(BdatArgs { size, last })
+}
+
+/// `BURL <absolute-URI> [LAST]` (RFC 4468 section 7).
+pub(crate) fn parse_burl_args(args: &str) -> Option<BurlArgs<'_>> {
+    let mut parts = args.split_ascii_whitespace();
+    let url = parts.next()?;
+    let last = match parts.next() {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("LAST") => true,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(BurlArgs { url, last })
 }
 
 pub(crate) fn valid_helo_domain(value: &str) -> bool {
@@ -574,6 +606,31 @@ mod tests {
     }
 
     #[test]
+    fn burl_takes_one_url_and_an_optional_last() {
+        assert_eq!(
+            parse_command("BURL imap://u@h/INBOX LAST"),
+            Command::Burl("imap://u@h/INBOX LAST")
+        );
+        assert_eq!(
+            parse_burl_args("imap://u@h/INBOX last"),
+            Some(BurlArgs {
+                url: "imap://u@h/INBOX",
+                last: true
+            })
+        );
+        assert_eq!(
+            parse_burl_args("imap://u@h/INBOX"),
+            Some(BurlArgs {
+                url: "imap://u@h/INBOX",
+                last: false
+            })
+        );
+        assert_eq!(parse_burl_args("imap://u@h/INBOX LAST extra"), None);
+        assert_eq!(parse_burl_args("imap://u@h/INBOX FIRST"), None);
+        assert_eq!(parse_command("BURL"), Command::BadSyntax);
+    }
+
+    #[test]
     fn mail_from_accepts_binarymime_body_declaration() {
         let parsed = parse_mail_from_args("FROM:<sender@example.test> BODY=BINARYMIME").unwrap();
         assert_eq!(parsed.body, MailBody::BinaryMime);
@@ -893,7 +950,8 @@ pub(crate) fn command_line_limit(command: &Command<'_>) -> usize {
     match command {
         Command::Mail(_) => MAX_MAIL_LINE_BYTES,
         Command::Rcpt(_) => MAX_RCPT_LINE_BYTES,
-        Command::Auth(_) => MAX_AUTH_LINE_BYTES,
+        // IMAP URLs with long mailbox names exceed 512 octets.
+        Command::Auth(_) | Command::Burl(_) => MAX_AUTH_LINE_BYTES,
         _ => MAX_COMMAND_LINE_BYTES,
     }
 }

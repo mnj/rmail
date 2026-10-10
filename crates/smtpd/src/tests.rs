@@ -2937,3 +2937,351 @@ async fn forwarded_mail_gets_an_srs_sender_and_bounces_find_their_way_back() {
         queued[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// BURL (RFC 4468) with URLAUTH URLs (RFC 4467)
+
+const DRAFT: &[u8] = b"From: User <user@example.test>\r\nTo: user@example.test\r\nSubject: saved draft\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\ndraft body\r\n--b--\r\n";
+const USER_AUTH: &str = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+
+/// A mailbox fixture with the draft saved in user@'s and postmaster@'s
+/// Drafts.
+fn setup_drafts() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (td, mail_root, db_path) = setup_mailbox();
+    for local in ["user", "postmaster"] {
+        rmail_common::imap_state::append_message(
+            &mail_root,
+            "example.test",
+            local,
+            "Drafts",
+            DRAFT,
+            Vec::new(),
+        )
+        .expect("save draft");
+    }
+    (td, mail_root, db_path)
+}
+
+/// GENURLAUTH as `user` (the code imapd runs for it) for `path` in the
+/// user's namespace on this host.
+fn authorize(mail_root: &Path, db_path: &Path, user: &str, path: &str) -> String {
+    let rump = format!(
+        "imap://{}@{}/{path}",
+        user.replace('@', "%40"),
+        rmail_common::config::system_hostname()
+    );
+    rmail_common::urlauth::generate(mail_root, Some(db_path), user, &rump, "INTERNAL")
+        .expect("GENURLAUTH")
+}
+
+fn inbox_messages(mail_root: &Path) -> Vec<Vec<u8>> {
+    let (_, messages) =
+        rmail_common::imap_state::load_folder(mail_root, "example.test", "user", "INBOX")
+            .expect("load inbox");
+    messages
+        .into_iter()
+        .map(|message| std::fs::read(message.path).expect("read message"))
+        .collect()
+}
+
+/// Run `input` on an encrypted submission session; the fixture directory
+/// is returned so the store can be inspected.
+async fn submit(
+    input: String,
+    security: SecurityConfig,
+    td: tempfile::TempDir,
+    mail_root: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+) -> (Vec<String>, tempfile::TempDir) {
+    run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        security,
+        true,
+        SmtpService::Submission,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn burl_submits_a_saved_draft_without_uploading_it() {
+    let (td, mail_root, db_path) = setup_drafts();
+    let url = authorize(
+        &mail_root,
+        &db_path,
+        "user@example.test",
+        "Drafts/;UID=1;URLAUTH=submit+user%40example.test",
+    );
+    let transaction = "MAIL FROM:<user@example.test>\r\nRCPT TO:<user@example.test>\r\n";
+    let input = format!("EHLO c\r\n{USER_AUTH}EHLO c\r\n{transaction}BURL {url} LAST\r\nQUIT\r\n");
+    // The usual submission checks apply to BURL content too.
+    let security = SecurityConfig {
+        submission_require_from_alignment: true,
+        ..SecurityConfig::default()
+    };
+    let (responses, _td) = submit(input, security, td, mail_root.clone(), db_path).await;
+    // Bare BURL before AUTH, `BURL imap` after.
+    let burl = responses
+        .iter()
+        .filter(|line| line.starts_with("250-BURL"))
+        .collect::<Vec<_>>();
+    assert_eq!(burl, ["250-BURL\r\n", "250-BURL imap\r\n"], "{responses:?}");
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.0.0 Message accepted")),
+        "{responses:?}"
+    );
+    let inbox = inbox_messages(&mail_root);
+    assert_eq!(inbox.len(), 1);
+    assert!(inbox[0].starts_with(b"Received: "));
+    assert!(inbox[0].ends_with(DRAFT));
+    // The URL is a credential: tracking records the command without it.
+    let token = &url[url.rfind(':').unwrap() + 1..];
+    let events = TRACKING_TEST_EVENTS.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.detail.as_deref() == Some("BURL [REDACTED] LAST"))
+    );
+    assert!(!events.iter().any(|event| {
+        event
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(token))
+    }));
+}
+
+#[tokio::test]
+async fn burl_content_from_another_sender_fails_from_alignment() {
+    let (td, mail_root, db_path) = setup_drafts();
+    rmail_common::imap_state::append_message(
+        &mail_root,
+        "example.test",
+        "user",
+        "Drafts",
+        b"From: Other <other@example.test>\r\nSubject: forged\r\n\r\nbody\r\n",
+        Vec::new(),
+    )
+    .expect("save forged draft");
+    let url = authorize(
+        &mail_root,
+        &db_path,
+        "user@example.test",
+        "Drafts/;UID=2;URLAUTH=submit+user%40example.test",
+    );
+    let input = format!(
+        "EHLO c\r\n{USER_AUTH}MAIL FROM:<user@example.test>\r\nRCPT TO:<user@example.test>\r\nBURL {url} LAST\r\nQUIT\r\n"
+    );
+    let security = SecurityConfig {
+        submission_require_from_alignment: true,
+        ..SecurityConfig::default()
+    };
+    let (responses, _td) = submit(input, security, td, mail_root.clone(), db_path).await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("553 5.7.1 From address not owned")),
+        "{responses:?}"
+    );
+    assert!(inbox_messages(&mail_root).is_empty());
+}
+
+#[tokio::test]
+async fn burl_and_bdat_chunks_combine_into_one_message() {
+    let (td, mail_root, db_path) = setup_drafts();
+    let body = authorize(
+        &mail_root,
+        &db_path,
+        "user@example.test",
+        "Drafts/;UID=1/;SECTION=TEXT;URLAUTH=authuser",
+    );
+    let header = "From: user@example.test\r\nSubject: forwarded body\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n";
+    let input = format!(
+        "EHLO c\r\n{USER_AUTH}MAIL FROM:<user@example.test>\r\nRCPT TO:<user@example.test>\r\nBDAT {}\r\n{header}BURL {body} LAST\r\nQUIT\r\n",
+        header.len()
+    );
+    let (responses, _td) = submit(
+        input,
+        SecurityConfig::default(),
+        td,
+        mail_root.clone(),
+        db_path,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.0.0 BDAT chunk received")),
+        "{responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.0.0 Message accepted")),
+        "{responses:?}"
+    );
+    let inbox = inbox_messages(&mail_root);
+    assert_eq!(inbox.len(), 1);
+    let expected =
+        format!("{header}--b\r\nContent-Type: text/plain\r\n\r\ndraft body\r\n--b--\r\n");
+    assert!(
+        inbox[0].ends_with(expected.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&inbox[0])
+    );
+}
+
+#[tokio::test]
+async fn burl_chunks_before_last_wait_and_data_cannot_follow() {
+    let (td, mail_root, db_path) = setup_drafts();
+    let url = authorize(
+        &mail_root,
+        &db_path,
+        "user@example.test",
+        "Drafts/;UID=1/;SECTION=HEADER;URLAUTH=authuser",
+    );
+    let input = format!(
+        "EHLO c\r\n{USER_AUTH}MAIL FROM:<user@example.test>\r\nRCPT TO:<user@example.test>\r\nBURL {url}\r\nDATA\r\nBDAT 6 LAST\r\nbody\r\nQUIT\r\n"
+    );
+    let (responses, _td) = submit(
+        input,
+        SecurityConfig::default(),
+        td,
+        mail_root.clone(),
+        db_path,
+    )
+    .await;
+    for expected in [
+        "250 2.5.0 Waiting for additional BURL or BDAT commands",
+        "503 5.5.1 DATA not permitted after BDAT",
+        "250 2.0.0 Message accepted",
+    ] {
+        assert!(
+            responses.iter().any(|line| line.starts_with(expected)),
+            "{expected}: {responses:?}"
+        );
+    }
+    let inbox = inbox_messages(&mail_root);
+    assert_eq!(inbox.len(), 1);
+    assert!(inbox[0].ends_with(b"Content-Type: multipart/mixed; boundary=b\r\n\r\nbody\r\n"));
+}
+
+#[tokio::test]
+async fn burl_refuses_urls_the_client_may_not_send() {
+    let (td, mail_root, db_path) = setup_drafts();
+    let own = |access: &str| {
+        authorize(
+            &mail_root,
+            &db_path,
+            "user@example.test",
+            &format!("Drafts/;UID=1;URLAUTH={access}"),
+        )
+    };
+    let submit_url = own("submit+user%40example.test");
+    // Another account's submit+ URL for its own namespace.
+    let theirs = authorize(
+        &mail_root,
+        &db_path,
+        "postmaster@example.test",
+        "Drafts/;UID=1;URLAUTH=submit+postmaster%40example.test",
+    );
+    let mut flipped = submit_url.clone();
+    let last = if flipped.ends_with('0') { "1" } else { "0" };
+    flipped.replace_range(flipped.len() - 1.., last);
+    let host = rmail_common::config::system_hostname();
+    let cases = [
+        (own("user+user%40example.test"), "554 5.7.0"),
+        (own("submit+postmaster%40example.test"), "554 5.7.0"),
+        (theirs, "554 5.7.0"),
+        (flipped, "554 5.6.6"),
+        (submit_url.replace(";UID=1", ";UID=9"), "554 5.6.6"),
+        (
+            format!("imap://user%40example.test@{host}/Drafts/;UID=1"),
+            "554 5.7.8",
+        ),
+        (
+            submit_url.replacen(&host, "elsewhere.example", 1),
+            "554 5.7.8",
+        ),
+    ];
+    let mut input = format!("EHLO c\r\n{USER_AUTH}");
+    for (url, _) in &cases {
+        input.push_str(&format!(
+            "MAIL FROM:<user@example.test>\r\nRCPT TO:<user@example.test>\r\nBURL {url} LAST\r\n"
+        ));
+    }
+    // A refused chunk abandons the transaction; BURL then needs MAIL again.
+    input.push_str(&format!("BURL {submit_url} LAST\r\nQUIT\r\n"));
+    let (responses, _td) = submit(
+        input,
+        SecurityConfig::default(),
+        td,
+        mail_root.clone(),
+        db_path,
+    )
+    .await;
+    let failures = responses
+        .iter()
+        .filter(|line| line.starts_with("554 ") || line.starts_with("503 "))
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), cases.len() + 1, "{responses:?}");
+    for ((_, code), line) in cases.iter().zip(&failures) {
+        assert!(line.starts_with(code), "expected {code}, got {line}");
+    }
+    assert!(failures[cases.len()].starts_with("503 5.5.1 MAIL required before BURL"));
+    assert!(inbox_messages(&mail_root).is_empty());
+}
+
+#[tokio::test]
+async fn burl_needs_an_authenticated_submission_session() {
+    let (td, mail_root, db_path) = setup_drafts();
+    let url = authorize(
+        &mail_root,
+        &db_path,
+        "user@example.test",
+        "Drafts/;UID=1;URLAUTH=authuser",
+    );
+    let input = format!(
+        "EHLO c\r\nMAIL FROM:<sender@remote.example>\r\nRCPT TO:<user@example.test>\r\nBURL {url} LAST\r\nQUIT\r\n"
+    );
+    let (responses, _td) = run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root.clone(),
+        db_path,
+    )
+    .await;
+    assert!(!responses.iter().any(|line| line.starts_with("250-BURL")));
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("502 5.5.1 BURL requires authenticated submission")),
+        "{responses:?}"
+    );
+    assert!(inbox_messages(&mail_root).is_empty());
+
+    // On submission, BURL before RCPT is a sequencing error.
+    let (td, mail_root, db_path) = setup_drafts();
+    let input = format!(
+        "EHLO c\r\n{USER_AUTH}MAIL FROM:<user@example.test>\r\nBURL {url} LAST\r\nBURL\r\nQUIT\r\n"
+    );
+    let (responses, _td) = submit(input, SecurityConfig::default(), td, mail_root, db_path).await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("503 5.5.0 Valid RCPT TO required before BURL")),
+        "{responses:?}"
+    );
+    assert!(
+        responses.iter().any(|line| line.starts_with("501 5.5.2")),
+        "{responses:?}"
+    );
+}

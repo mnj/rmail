@@ -248,6 +248,21 @@ rmail_ctl share set user@example.com Projects colleague@example.com none   # sto
 
 Deleting a folder or a mailbox removes its grants.
 
+## Sending saved messages (URLAUTH and BURL)
+
+Mail apps that support IMAP URLAUTH (RFC 4467) and SMTP BURL (RFC 4468), such as Apple Mail and
+Trojitá, can send a message already saved in IMAP (usually a draft) without uploading it again:
+the app asks IMAP to sign a URL for the message and hands that URL to the submission service,
+which reads the message straight from the mail store. Thunderbird does not use BURL. Nothing
+needs to be configured, but the URL must name this server: `global.hostname`, one of the
+`acme.domains`, or a DNS name on the configured certificate. Set `global.hostname` (or the
+certificate names) to the name mail apps connect to; otherwise GENURLAUTH is refused and apps fall
+back to uploading the message.
+
+Signed URLs act like passwords for one message, so they are not written to logs. Users revoke
+them with RESETKEY from their mail app; a URL also stops working when its mailbox is deleted or
+renamed, its message is expunged, or the user loses read access to a shared folder.
+
 ## Live SMTP watch and message tracking
 
 `rmail_smtpd` and `rmail_outbound` publish protocol events over Unix datagram sockets beneath the
