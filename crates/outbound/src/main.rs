@@ -2355,6 +2355,17 @@ async fn tls_report_task(base: PathBuf, db_path: PathBuf, hostname: String) {
         ticks += 1;
         if ticks % 12 == 1 {
             send_due_tls_reports(&base, &db_path, &hostname).await;
+            // Abuse feedback reports are kept for a limited time, whether or
+            // not new ones arrive.
+            let path = db_path.clone();
+            let now = Utc::now().timestamp();
+            if let Ok(Err(error)) =
+                tokio::task::spawn_blocking(move || rmail_common::feedback::prune(&path, now)).await
+            {
+                rmail_common::structured_log!(
+                    "error", "outbound", "feedback_prune_failed", { "error": error.to_string() }
+                );
+            }
         }
     }
 }

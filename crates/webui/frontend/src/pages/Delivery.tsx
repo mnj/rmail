@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ArrowUpToLine, RotateCcw, Trash2, Wand2 } from 'lucide-react';
 import { api, DmarcRow, QueueItem, QueueSummary, Spool } from '../api';
+import { FeedbackPanel } from './FeedbackReports';
 import { Empty, ErrorBanner, formatRelative, IconButton, invalidate, numberFmt, Panel, SkeletonRows, useFeedback, useResource } from '../ui';
 
 const spools: { id: Spool; label: string; help: string }[] = [
@@ -89,6 +90,8 @@ export function DeliveryPage() {
           <div className="metricList">{dmarc.data?.length ? dmarc.data.map((row) => <div className="metric" key={row.domain}><span>{row.domain}</span><strong>{row.events} events</strong></div>) : <Empty>No unreported DMARC events.</Empty>}</div>
         </Panel>
       </section>
+
+      <FeedbackPanel />
     </>
   );
 }

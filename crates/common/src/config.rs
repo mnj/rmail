@@ -495,6 +495,16 @@ pub struct SecurityConfig {
     /// them. They carry the failing message's headers.
     #[serde(default)]
     pub dmarc_failure_reports: bool,
+    /// Addresses registered with mailbox providers' feedback loops. Mail to
+    /// them that is an ARF report (RFC 5965) is also recorded and tied to
+    /// the local sender (see feedback.rs). A bare local part matches it in
+    /// every hosted domain. Empty disables recording.
+    #[serde(default)]
+    pub feedback_addresses: Vec<String>,
+    /// Log a warning when an account collects this many authenticated
+    /// complaints within 24 hours. Zero disables the warning.
+    #[serde(default = "default_feedback_complaint_threshold")]
+    pub feedback_complaint_threshold: u64,
     #[serde(default = "default_dnsbl_timeout_ms")]
     pub dnsbl_timeout_ms: u64,
 }
@@ -539,6 +549,8 @@ impl Default for SecurityConfig {
             imap_message_limit: 0,
             srs_domain: String::new(),
             dmarc_failure_reports: false,
+            feedback_addresses: Vec::new(),
+            feedback_complaint_threshold: default_feedback_complaint_threshold(),
             dnsbl_timeout_ms: default_dnsbl_timeout_ms(),
         }
     }
@@ -776,6 +788,10 @@ fn default_greylist_delay_secs() -> u64 {
 
 fn default_greylist_persist_interval_secs() -> u64 {
     300
+}
+
+fn default_feedback_complaint_threshold() -> u64 {
+    5
 }
 
 fn default_dnsbl_timeout_ms() -> u64 {

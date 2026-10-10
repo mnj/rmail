@@ -28,6 +28,7 @@ use crate::*;
 
 pub(crate) mod certificates;
 mod discovery;
+mod feedback;
 mod organization;
 
 pub(crate) const SESSION_COOKIE: &str = "rmail_admin";
@@ -120,6 +121,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/services/restart", post(restart_services))
         .route("/api/admin/credentials", post(change_credentials))
         .merge(organization::routes())
+        .merge(feedback::routes())
         .merge(discovery::protected_routes())
         .merge(certificates::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));

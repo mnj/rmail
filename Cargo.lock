@@ -3372,6 +3372,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2 0.4.1",
+ "chrono",
  "clap",
  "password-hash 0.4.2",
  "rand 0.8.8",

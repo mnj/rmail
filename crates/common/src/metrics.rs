@@ -391,6 +391,7 @@ pub fn gather_prometheus() -> String {
         "rmail_arc_sealed_total {}\n",
         ARC_SEALED_TOTAL.load(Ordering::Relaxed)
     ));
+    crate::feedback::render_metrics(&mut out);
     DNS_DURATION.render(&mut out, "rmail_dns_duration_seconds", "DNS lookup latency");
     TLS_HANDSHAKE_DURATION.render(
         &mut out,

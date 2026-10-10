@@ -224,6 +224,37 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS mailbox_acl_grantee ON mailbox_acl (grantee);
 
+        -- feedback_reports holds abuse feedback (ARF) reports received from
+        -- mailbox providers' feedback loops, tied to the local sender (see
+        -- feedback.rs). A report sent twice is stored once.
+        CREATE TABLE IF NOT EXISTS feedback_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at INTEGER NOT NULL,
+            recipient TEXT NOT NULL,
+            reporter TEXT,
+            feedback_type TEXT NOT NULL,
+            user_agent TEXT,
+            incidents INTEGER NOT NULL DEFAULT 1,
+            source_ip TEXT,
+            arrival_date TEXT,
+            original_mail_from TEXT,
+            original_rcpt_to TEXT,
+            reported_domain TEXT,
+            auth_failure TEXT,
+            original_from TEXT,
+            original_subject TEXT,
+            original_message_id TEXT,
+            account TEXT,
+            domain TEXT,
+            attributed_by TEXT,
+            authenticated INTEGER NOT NULL DEFAULT 0,
+            report_message_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS feedback_reports_received ON feedback_reports (received_at);
+        CREATE INDEX IF NOT EXISTS feedback_reports_account ON feedback_reports (account, received_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS feedback_reports_message
+            ON feedback_reports (report_message_id) WHERE report_message_id IS NOT NULL;
+
         -- greylist is a periodic snapshot of the in-memory greylist (see greylist.rs).
         CREATE TABLE IF NOT EXISTS greylist (
             key TEXT PRIMARY KEY,
