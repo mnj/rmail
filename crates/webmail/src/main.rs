@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
         },
         jmap_logins: Default::default(),
         shutdown: Some(shutdown.subscribe()),
+        assist_limiter: Default::default(),
     });
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),

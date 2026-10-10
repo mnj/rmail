@@ -11,6 +11,7 @@ pub mod classifier_control;
 pub mod classifier_models;
 pub mod classifier_store;
 pub mod compose;
+pub mod compose_ai;
 pub mod compose_html;
 pub mod compose_store;
 pub mod config;

@@ -22,6 +22,7 @@ use rmail_common::mime::{
     Attachment, attachment_data, has_remote_content, parse_message, sanitize_email_html, snippet,
 };
 
+pub(crate) mod assist;
 mod calendars;
 mod compose;
 mod organize;
@@ -55,6 +56,8 @@ pub(crate) struct AppState {
     /// Becomes true when the server shuts down; long-lived responses (JMAP
     /// push) end then instead of holding up the shutdown.
     pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Per-user limit on AI writing suggestions.
+    pub assist_limiter: assist::Limiter,
 }
 
 type Shared = Arc<AppState>;
@@ -90,6 +93,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/folders/{folder}/messages/bulk", post(bulk))
         .merge(organize::routes())
         .merge(compose::routes())
+        .merge(assist::routes())
         .merge(calendars::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())
@@ -1482,7 +1486,7 @@ mod tests {
     use std::fs;
     use tower::ServiceExt;
 
-    fn state(td: &tempfile::TempDir) -> Arc<AppState> {
+    pub(crate) fn state(td: &tempfile::TempDir) -> Arc<AppState> {
         let db_path = td.path().join("accounts.sqlite");
         db::init_db(&db_path).unwrap();
         db::add_mailbox(
@@ -1505,10 +1509,11 @@ mod tests {
             oauth: None,
             jmap_logins: Default::default(),
             shutdown: None,
+            assist_limiter: Default::default(),
         })
     }
 
-    fn req(
+    pub(crate) fn req(
         method: &str,
         path: &str,
         body: &[u8],
@@ -1528,15 +1533,15 @@ mod tests {
         request
     }
 
-    struct TestResponse {
-        status: u16,
-        content_type: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
+    pub(crate) struct TestResponse {
+        pub(crate) status: u16,
+        pub(crate) content_type: String,
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: Vec<u8>,
     }
 
     impl TestResponse {
-        fn header(&self, name: &str) -> &str {
+        pub(crate) fn header(&self, name: &str) -> &str {
             self.headers
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case(name))
@@ -1545,7 +1550,10 @@ mod tests {
     }
 
     /// Run a request through the real router.
-    async fn route(request: axum::http::Request<Body>, state: &Arc<AppState>) -> TestResponse {
+    pub(crate) async fn route(
+        request: axum::http::Request<Body>,
+        state: &Arc<AppState>,
+    ) -> TestResponse {
         let response = router(state.clone()).oneshot(request).await.unwrap();
         let status = response.status().as_u16();
         let headers = response
@@ -2175,6 +2183,7 @@ mod tests {
             oauth: None,
             jmap_logins: Default::default(),
             shutdown: None,
+            assist_limiter: Default::default(),
         });
         let cookie = Some(format!(
             "{SESSION_COOKIE}={}",
@@ -2293,6 +2302,7 @@ mod tests {
             oauth: None,
             jmap_logins: Default::default(),
             shutdown: None,
+            assist_limiter: Default::default(),
         });
         let cookie = Some(format!(
             "{SESSION_COOKIE}={}",

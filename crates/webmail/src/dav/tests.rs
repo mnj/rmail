@@ -43,6 +43,7 @@ fn state_with(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) 
         oauth: None,
         jmap_logins: Default::default(),
         shutdown: None,
+        assist_limiter: Default::default(),
     })
 }
 

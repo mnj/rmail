@@ -147,4 +147,18 @@ for uid, name, email in [
     )
     urllib.request.urlopen(request, context=TLS).read()
 
+# Alice opts in to writing suggestions (the demo points them at fake_ai.py).
+webmail = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+    urllib.request.HTTPSHandler(context=TLS),
+)
+for path, method, body in [
+    ("/api/login", "POST", {"address": "alice@example.com", "password": PASSWORD}),
+    ("/api/compose/settings", "PUT", {"format": "html", "language": "", "undo_seconds": 0, "ai_suggestions": True}),
+]:
+    webmail.open(urllib.request.Request(
+        "https://127.0.0.1:18081" + path, method=method, data=json.dumps(body).encode(),
+        headers={"X-Rmail-Webmail": "1", "Content-Type": "application/json"},
+    )).read()
+
 print("seeded demo data")

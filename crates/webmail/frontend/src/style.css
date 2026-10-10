@@ -341,6 +341,21 @@ time { white-space: nowrap; }
 .signature-editor { border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; }
 .signature-editor .editor-root { min-height: 80px; max-height: 200px; }
 
+/* AI writing suggestions: ghost text after the caret (an overlay, never part
+   of the document) and the rewrite preview. */
+.rich-editor { position: relative; }
+.ghost-text { position: absolute; z-index: 2; overflow: hidden; color: var(--muted); opacity: .8; white-space: pre-wrap; overflow-wrap: anywhere; cursor: pointer; }
+.ghost-hint { display: inline-block; margin-left: 6px; padding: 0 5px; border: 1px solid var(--border-strong); border-radius: 4px; font-size: 10px; line-height: 15px; text-indent: 0; vertical-align: 1px; color: var(--muted); }
+.rewrite-menu { top: auto; bottom: calc(100% + 6px); min-width: 210px; }
+.rewrite-panel { margin: 0 12px 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); display: grid; gap: 6px; max-height: 40%; overflow-y: auto; }
+.rewrite-head { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+.rewrite-head .icon { padding: 2px; }
+.rewrite-result { margin: 0; white-space: pre-wrap; font-size: 14px; line-height: 1.5; color: var(--text); }
+.rewrite-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.rewrite-panel .error { margin: 0; }
+.check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 14px; font-weight: 600; color: var(--text-2); }
+.check-row span { display: inline-flex; align-items: center; gap: 6px; }
+
 /* Toast actions and compose settings. */
 .toast { display: flex; align-items: center; gap: 12px; }
 .toast-action { border: 0; background: none; color: #bdb4fe; font-weight: 700; padding: 2px 4px; }
@@ -376,6 +391,9 @@ time { white-space: nowrap; }
   .organize-table th:nth-child(4), .organize-table td:nth-child(4) { display: none; }
   .compose { inset: 0; width: auto; height: auto; border-radius: 0; }
   .compose header { border-radius: 0; }
+  /* Room for every footer button on one row at phone width. */
+  .compose footer { gap: 2px; padding: 10px 8px; }
+  .compose footer .secondary { white-space: nowrap; padding-inline: 10px; }
   .settings-grid { grid-template-columns: 1fr; }
   .suggestions { left: 14px; }
   .save-state { display: none; }

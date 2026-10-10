@@ -713,13 +713,39 @@ async fn compose_settings(app: State<Shared>, headers: HeaderMap) -> Response {
         Err(status) => return status.into_response(),
     };
     match blocking(move || {
-        compose_store::prefs(&state.mail_root, &session.domain, &session.localpart)
+        let prefs = compose_store::prefs(&state.mail_root, &session.domain, &session.localpart)?;
+        // Whether writing suggestions can be offered, and where the draft
+        // would go; the endpoint's key and full URL stay on the server.
+        let config = rmail_common::settings::open(&state.db_path)
+            .and_then(|conn| rmail_common::settings::compose_ai(&conn))
+            .unwrap_or_default();
+        Ok(ComposeSettings {
+            ai: AiAvailability {
+                available: config.available(),
+                provider: config.available().then(|| config.host()).flatten(),
+            },
+            prefs,
+        })
     })
     .await
     {
-        Ok(prefs) => Json(prefs).into_response(),
+        Ok(settings) => Json(settings).into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+#[derive(Serialize)]
+struct AiAvailability {
+    available: bool,
+    /// Host name of the AI service, told to users when they opt in.
+    provider: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ComposeSettings {
+    #[serde(flatten)]
+    prefs: compose_store::Prefs,
+    ai: AiAvailability,
 }
 
 async fn save_compose_settings(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
