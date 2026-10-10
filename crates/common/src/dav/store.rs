@@ -332,6 +332,22 @@ pub enum PutError {
     UnsupportedComponent,
     /// Another object in the collection has this UID (its name).
     UidConflict(String),
+    /// The request's If-Match/If-None-Match does not hold for the object as
+    /// it is now.
+    PreconditionFailed,
+}
+
+/// A request precondition, checked against the object's current ETag
+/// (`None` when it does not exist) inside the write transaction, so a
+/// concurrent change between reading and writing cannot slip past it.
+pub type Precondition<'a> = &'a dyn Fn(Option<&str>) -> bool;
+
+/// What a conditional delete did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    Deleted,
+    NotFound,
+    PreconditionFailed,
 }
 
 /// What a valid object says about itself.
@@ -426,6 +442,7 @@ pub fn put(
     collection: &Collection,
     name: &str,
     data: &str,
+    precondition: Precondition<'_>,
 ) -> Result<std::result::Result<(String, bool), PutError>> {
     if !valid_name(name) {
         return Ok(Err(PutError::InvalidData(
@@ -437,6 +454,10 @@ pub fn put(
         Err(error) => return Ok(Err(error)),
     };
     let tx = write_transaction(conn)?;
+    let current = object(&tx, collection, name)?;
+    if !precondition(current.as_ref().map(|object| object.etag.as_str())) {
+        return Ok(Err(PutError::PreconditionFailed));
+    }
     let conflict: Option<String> = tx
         .query_row(
             "SELECT name FROM dav_objects
@@ -448,7 +469,7 @@ pub fn put(
     if let Some(other) = conflict {
         return Ok(Err(PutError::UidConflict(other)));
     }
-    let existed = object(&tx, collection, name)?.is_some();
+    let existed = current.is_some();
     let seq = bump(&tx, collection)?;
     let tag = etag(data);
     tx.execute(
@@ -488,10 +509,18 @@ fn bump(conn: &Connection, collection: &Collection) -> Result<i64> {
 }
 
 /// Delete an object, leaving a tombstone for sync; false when absent.
-pub fn delete(conn: &Connection, collection: &Collection, name: &str) -> Result<bool> {
+pub fn delete(
+    conn: &Connection,
+    collection: &Collection,
+    name: &str,
+    precondition: Precondition<'_>,
+) -> Result<Deleted> {
     let tx = write_transaction(conn)?;
-    if object(&tx, collection, name)?.is_none() {
-        return Ok(false);
+    let Some(current) = object(&tx, collection, name)? else {
+        return Ok(Deleted::NotFound);
+    };
+    if !precondition(Some(&current.etag)) {
+        return Ok(Deleted::PreconditionFailed);
     }
     let seq = bump(&tx, collection)?;
     tx.execute(
@@ -518,7 +547,7 @@ pub fn delete(conn: &Connection, collection: &Collection, name: &str) -> Result<
         )?;
     }
     tx.commit()?;
-    Ok(true)
+    Ok(Deleted::Deleted)
 }
 
 /// A change for `sync-collection`.
@@ -579,6 +608,42 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_conditional_writes_cannot_both_win() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::imap_state::init_account(dir.path(), "example.test", "user").unwrap();
+        let conn = crate::imap_state::open_account(dir.path(), "example.test", "user").unwrap();
+        let calendar = collections(&conn, Kind::Calendar).unwrap().remove(0);
+        let (tag, _) = put(&conn, &calendar, "a.ics", &event("a", "Base"), &|_| true)
+            .unwrap()
+            .unwrap();
+        drop(conn);
+        // Two clients edit the version they both read.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = ["One", "Two"].map(|summary| {
+            let root = dir.path().to_path_buf();
+            let calendar = calendar.clone();
+            let tag = tag.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let conn = crate::imap_state::open_account(&root, "example.test", "user").unwrap();
+                barrier.wait();
+                put(
+                    &conn,
+                    &calendar,
+                    "a.ics",
+                    &event("a", summary),
+                    &|current| current == Some(tag.as_str()),
+                )
+                .unwrap()
+            })
+        });
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+        let wins = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(wins, 1, "{outcomes:?}");
+        assert!(outcomes.contains(&Err(PutError::PreconditionFailed)));
+    }
+
+    #[test]
     fn defaults_are_made_once_and_objects_sync() {
         let (_dir, conn) = conn();
         let calendars = collections(&conn, Kind::Calendar).unwrap();
@@ -588,16 +653,24 @@ mod tests {
         let calendar = calendars[0].clone();
         let start = calendar.sync_seq;
 
-        let (tag, created) = put(&conn, &calendar, "a.ics", &event("a", "One"))
+        let any = |_: Option<&str>| true;
+        let (tag, created) = put(&conn, &calendar, "a.ics", &event("a", "One"), &any)
             .unwrap()
             .unwrap();
         assert!(created && tag.starts_with('"'));
-        let (_, created) = put(&conn, &calendar, "a.ics", &event("a", "Two"))
+        // A precondition naming an older version is checked under the lock.
+        let stale = |current: Option<&str>| current == Some("\"old\"");
+        assert_eq!(
+            put(&conn, &calendar, "a.ics", &event("a", "Lost"), &stale).unwrap(),
+            Err(PutError::PreconditionFailed)
+        );
+        let matching = |current: Option<&str>| current == Some(tag.as_str());
+        let (_, created) = put(&conn, &calendar, "a.ics", &event("a", "Two"), &matching)
             .unwrap()
             .unwrap();
         assert!(!created);
         assert_eq!(
-            put(&conn, &calendar, "b.ics", &event("a", "Dup")).unwrap(),
+            put(&conn, &calendar, "b.ics", &event("a", "Dup"), &any).unwrap(),
             Err(PutError::UidConflict("a.ics".to_string()))
         );
         assert!(matches!(
@@ -605,7 +678,8 @@ mod tests {
                 &conn,
                 &calendar,
                 "c.ics",
-                "BEGIN:VCARD\r\nUID:x\r\nEND:VCARD\r\n"
+                "BEGIN:VCARD\r\nUID:x\r\nEND:VCARD\r\n",
+                &any
             )
             .unwrap(),
             Err(PutError::InvalidData(_))
@@ -616,8 +690,18 @@ mod tests {
         let since = changes_since(&conn, &calendar, start).unwrap().unwrap();
         assert_eq!(since.len(), 1);
         let middle = calendar.sync_seq;
-        assert!(delete(&conn, &calendar, "a.ics").unwrap());
-        assert!(!delete(&conn, &calendar, "a.ics").unwrap());
+        assert_eq!(
+            delete(&conn, &calendar, "a.ics", &stale).unwrap(),
+            Deleted::PreconditionFailed
+        );
+        assert_eq!(
+            delete(&conn, &calendar, "a.ics", &any).unwrap(),
+            Deleted::Deleted
+        );
+        assert_eq!(
+            delete(&conn, &calendar, "a.ics", &any).unwrap(),
+            Deleted::NotFound
+        );
         let calendar = collection(&conn, Kind::Calendar, "default")
             .unwrap()
             .unwrap();
