@@ -783,6 +783,102 @@ async fn an_attendee_cannot_take_over_another_organizers_event() {
     assert!(copies[0].1.contains("SUMMARY:Mine"));
 }
 
+/// A daily series organized by the user: `series` attends all of it,
+/// `day3` only the third day's override, which also lists `both`.
+fn series_meeting(series: &[&str], day3: &[&str], day3_summary: &str) -> String {
+    let lines = |who: &[&str]| {
+        who.iter()
+            .map(|who| format!("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{who}\r\n"))
+            .collect::<String>()
+    };
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+         BEGIN:VEVENT\r\nUID:series-1\r\nDTSTAMP:20261001T000000Z\r\n\
+         DTSTART:20261012T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n\
+         SUMMARY:Standup\r\nORGANIZER:mailto:{USER}\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:{USER}\r\n\
+         {}END:VEVENT\r\n\
+         BEGIN:VEVENT\r\nUID:series-1\r\nDTSTAMP:20261001T000000Z\r\n\
+         RECURRENCE-ID:20261014T090000Z\r\nDTSTART:20261014T110000Z\r\nDURATION:PT1H\r\n\
+         SUMMARY:{day3_summary}\r\nORGANIZER:mailto:{USER}\r\n\
+         ATTENDEE;PARTSTAT=ACCEPTED:mailto:{USER}\r\n{}END:VEVENT\r\nEND:VCALENDAR\r\n",
+        lines(series),
+        lines(day3)
+    )
+}
+
+#[tokio::test]
+async fn attendees_are_scheduled_for_their_own_instances() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let third = "third@example.test";
+    let other_calendar = "/dav/calendars/other@example.test/default/";
+    let third_calendar = "/dav/calendars/third@example.test/default/";
+    let third_inbox = "/dav/calendars/third@example.test/inbox/";
+    // Other attends the series; Third only the moved third day.
+    let path = format!("{CALENDAR}series.ics");
+    let first = series_meeting(&[OTHER], &[OTHER, third], "Standup (moved)");
+    assert_eq!(dav(&state, "PUT", &path, &[], &first).await.status, 201);
+    let other_copy = unfolded(&objects_in(&state, OTHER, other_calendar).await[0].1);
+    assert!(other_copy.contains("RRULE:") && other_copy.contains("RECURRENCE-ID:"));
+    let (third_href, third_copy) = objects_in(&state, third, third_calendar).await[0].clone();
+    let third_copy = unfolded(&third_copy);
+    assert!(!third_copy.contains("RRULE"), "{third_copy}");
+    assert_eq!(third_copy.matches("BEGIN:VEVENT").count(), 1);
+    assert!(third_copy.contains("RECURRENCE-ID:20261014T090000Z"));
+
+    // Third accepts their instance: the organizer's override shows it.
+    let accepted = third_copy.replace(
+        "PARTSTAT=NEEDS-ACTION:mailto:third@example.test",
+        "PARTSTAT=ACCEPTED:mailto:third@example.test",
+    );
+    let answer = dav_as(&state, third, "PUT", &third_href, &[], &accepted).await;
+    assert_eq!(answer.status, 204, "{}", answer.body);
+    let organizer_copy = unfolded(&dav(&state, "GET", &path, &[], "").await.body);
+    assert!(
+        organizer_copy.contains("PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:third@example.test"),
+        "{organizer_copy}"
+    );
+
+    // Other is dropped from the third day: only that instance is
+    // cancelled for them, and Third, whose view did not change, hears
+    // nothing.
+    let dropped = organizer_copy.replace(
+        "ATTENDEE;PARTSTAT=NEEDS-ACTION;SCHEDULE-STATUS=1.2:mailto:other@example.test\n\
+         ATTENDEE;PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:third@example.test",
+        "ATTENDEE;PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:third@example.test",
+    );
+    assert_ne!(dropped, organizer_copy);
+    assert_eq!(dav(&state, "PUT", &path, &[], &dropped).await.status, 204);
+    let other_copy = unfolded(&objects_in(&state, OTHER, other_calendar).await[0].1);
+    assert_eq!(
+        other_copy.matches("STATUS:CANCELLED").count(),
+        1,
+        "{other_copy}"
+    );
+    assert!(other_copy.contains("RRULE:"));
+    let other_inbox = objects_in(&state, OTHER, "/dav/calendars/other@example.test/inbox/").await;
+    assert_eq!(other_inbox.len(), 2);
+    assert!(
+        other_inbox
+            .iter()
+            .any(|(_, data)| data.contains("METHOD:CANCEL") && !data.contains("RRULE"))
+    );
+    assert_eq!(objects_in(&state, third, third_inbox).await.len(), 1);
+
+    // A change to the series alone does not reach Third either; a change
+    // to their instance does.
+    let renamed = dropped.replace("SUMMARY:Standup\n", "SUMMARY:Daily\n");
+    assert_ne!(renamed, dropped);
+    assert_eq!(dav(&state, "PUT", &path, &[], &renamed).await.status, 204);
+    assert_eq!(objects_in(&state, third, third_inbox).await.len(), 1);
+    let moved = renamed.replace("DTSTART:20261014T110000Z", "DTSTART:20261014T120000Z");
+    assert_eq!(dav(&state, "PUT", &path, &[], &moved).await.status, 204);
+    assert_eq!(objects_in(&state, third, third_inbox).await.len(), 2);
+    let third_copy = unfolded(&objects_in(&state, third, third_calendar).await[0].1);
+    assert!(third_copy.contains("DTSTART:20261014T120000Z"));
+    assert!(!third_copy.contains("RRULE"));
+}
+
 #[tokio::test]
 async fn free_busy_queries_answer_for_accounts_in_the_domain() {
     let td = tempfile::tempdir().unwrap();

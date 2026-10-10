@@ -178,6 +178,41 @@ pub fn attachment_data(bytes: &[u8], index: usize) -> Option<(Attachment, Vec<u8
         })
 }
 
+/// The first `text/calendar` part of a message (iMIP, RFC 6047).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarPart {
+    Missing,
+    /// Larger than the limit given; not decoded.
+    TooLarge,
+    /// The part as text, with LF line ends.
+    Found(String),
+}
+
+/// The first `text/calendar` part of a message, as text when its decoded
+/// size is at most `max` bytes. Attached messages are not looked into.
+pub fn calendar_part(bytes: &[u8], max: usize) -> CalendarPart {
+    let (head, body) = split_head(bytes);
+    let mut parts = Vec::new();
+    collect_leaves(parse_headers(head), body, 0, &mut parts);
+    let Some(part) = parts
+        .iter()
+        .find(|part| part.content_type() == "text/calendar")
+    else {
+        return CalendarPart::Missing;
+    };
+    // No transfer encoding more than triples the size: skip decoding what
+    // cannot fit.
+    if part.body.len() / 3 > max {
+        return CalendarPart::TooLarge;
+    }
+    let decoded = part.decoded();
+    if decoded.len() > max {
+        return CalendarPart::TooLarge;
+    }
+    let charset = part.param("content-type", "charset");
+    CalendarPart::Found(decode_charset(&decoded, charset.as_deref()).replace("\r\n", "\n"))
+}
+
 /// A file name safe to offer for download: no directories or control
 /// characters, at most 200 characters.
 pub(crate) fn sanitize_filename(name: &str) -> String {

@@ -6,6 +6,7 @@
 //! (DATA/BDAT through delivery). Handlers return a [`Flow`] telling the read
 //! loop whether to continue, close, or upgrade to TLS.
 
+mod calendar;
 mod delivery;
 mod etrn;
 mod feedback;

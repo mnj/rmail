@@ -6,7 +6,10 @@
 //!   their schedule inbox and their calendar copy updated at once.
 //! - Everyone else gets an iMIP email (RFC 6047) through this server's
 //!   submission service, with its checks and limits; replies from them
-//!   come back by email for the organizer's client to apply.
+//!   come back by email, where smtpd puts them in the organizer's schedule
+//!   inbox and applies those it can vouch for (`dav::imip`).
+//! - Each attendee gets only the instances they are invited to
+//!   (`itip::attendee_view`).
 //! - Accounts in other domains on this server are reached by email too, so
 //!   one domain cannot write into another's calendars or read its
 //!   free-busy times.
