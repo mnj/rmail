@@ -15,6 +15,7 @@ rmail_common = { path = "../common" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = { version = "0.3", default-features = false }
 hmac = "0.12"
+roxmltree = "0.20"
 rusqlite = "0.29"
 sha2 = "0.10"
 

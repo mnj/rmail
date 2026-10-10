@@ -90,6 +90,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(organize::routes())
         .merge(compose::routes())
         .merge(crate::jmap::routes())
+        .merge(crate::dav::routes())
         .fallback(fallback)
         .layer(middleware::from_fn(reject_cross_site))
         .layer(middleware::from_fn(security_headers))

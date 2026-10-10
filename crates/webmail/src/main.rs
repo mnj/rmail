@@ -20,6 +20,7 @@ macro_rules! webmail_log {
 
 mod api;
 mod assets;
+mod dav;
 mod jmap;
 use rmail_common::local_submit as submit;
 
