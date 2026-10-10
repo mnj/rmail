@@ -377,10 +377,7 @@ mod tests {
             Verified::Address("other@remote.test".into()),
         ] {
             let outcome = receive_as(&td, &reply, &verified);
-            assert!(
-                matches!(outcome, Outcome::Deposited { applied: false, .. }),
-                "{outcome:?}"
-            );
+            assert!(matches!(outcome, Outcome::Deposited { applied: false, .. }));
         }
         assert!(stored_event(&conn).contains("PARTSTAT=NEEDS-ACTION"));
         assert_eq!(inbox_size(&conn), 3);

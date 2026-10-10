@@ -342,6 +342,22 @@ fn instances(calendar: &Component, keys: &BTreeMap<String, Property>) -> Compone
     out
 }
 
+/// Whether the series of `calendar` has an occurrence starting at `id`
+/// (a `RECURRENCE-ID`), its exclusions and expansion limit applied.
+fn is_occurrence(calendar: &Component, id: &Property) -> bool {
+    let Some(at) = super::recur::instant(id) else {
+        return false;
+    };
+    let Some(series) = calendar.components.iter().position(|component| {
+        component.name != "VTIMEZONE" && component.property("RECURRENCE-ID").is_none()
+    }) else {
+        return false;
+    };
+    super::recur::occurrences(calendar, at, at + 1)
+        .iter()
+        .any(|found| found.component == series && found.start == at)
+}
+
 /// An override for the occurrence `id` of `series`, as the series has it:
 /// its start moved there, its length kept.
 fn occurrence(series: &Component, id: &Property) -> Component {
@@ -764,9 +780,11 @@ pub fn apply_reply(existing: &Component, message: &Component, attendee: &str) ->
             && let (Some(id), Some(series)) = (reply.property("RECURRENCE-ID"), master(&copy))
             && listed(series, attendee)
             && !excludes(series, id.value.trim())
+            && is_occurrence(&copy, id)
         {
             // An answer for one occurrence of the series: it gets an
-            // override of its own to hold it (RFC 6638 3.2).
+            // override of its own to hold it (RFC 6638 3.2). Only a real
+            // occurrence: a reply cannot add dates to the event.
             let instance = occurrence(series, id);
             copy.components.push(instance);
         }
@@ -1230,6 +1248,12 @@ mod tests {
         .unwrap();
         assert!(apply_reply(&excluded, &reply.calendar, BOB).is_none());
         assert!(apply_reply(&organized, &reply.calendar, CAROL).is_none());
+        // Nor for a date the series does not have: between occurrences,
+        // or after its last one.
+        for fake in ["20261014T100000Z", "20261020T090000Z"] {
+            let invented = text::parse(&reply.calendar.to_text().replace(DAY3, fake)).unwrap();
+            assert!(apply_reply(&organized, &invented, BOB).is_none(), "{fake}");
+        }
     }
 
     #[test]
