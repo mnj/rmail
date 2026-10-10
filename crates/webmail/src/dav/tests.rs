@@ -365,7 +365,7 @@ async fn events_are_stored_queried_and_synchronized() {
         "REPORT",
         CALENDAR,
         &[],
-        &sync("https://rmail.invalid/sync/999999".to_string()),
+        &sync("https://rmail.invalid/sync/1/999999".to_string()),
     )
     .await;
     assert_eq!(stale.status, 403);

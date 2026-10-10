@@ -141,7 +141,7 @@ fn sync(
     let since = if token.is_empty() {
         Some(0)
     } else {
-        store::parse_sync_token(token)
+        store::parse_sync_token(collection, token)
     };
     let invalid = || xml_response(StatusCode::FORBIDDEN, xml::error("<d:valid-sync-token/>"));
     let Some(since) = since else {

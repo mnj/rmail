@@ -34,7 +34,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS dav_collections(
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT NOT NULL,
             name TEXT NOT NULL,
             displayname TEXT,
@@ -87,18 +87,32 @@ pub struct Collection {
 }
 
 impl Collection {
-    /// The RFC 6578 sync token (a URI).
+    /// The RFC 6578 sync token (a URI). It names the collection too: ids
+    /// are never reused, so a token from a deleted collection at the same
+    /// URL is refused instead of hiding the difference.
     pub fn sync_token(&self) -> String {
-        format!("https://rmail.invalid/sync/{}", self.sync_seq)
+        format!("https://rmail.invalid/sync/{}/{}", self.id, self.sync_seq)
     }
 }
 
-/// The sequence number a sync token names.
-pub fn parse_sync_token(token: &str) -> Option<i64> {
-    token
+/// The sequence number a sync token names, if it is `collection`'s.
+pub fn parse_sync_token(collection: &Collection, token: &str) -> Option<i64> {
+    let (id, seq) = token
         .strip_prefix("https://rmail.invalid/sync/")?
-        .parse()
-        .ok()
+        .split_once('/')?;
+    if id.parse::<i64>().ok()? != collection.id {
+        return None;
+    }
+    seq.parse().ok()
+}
+
+/// A write transaction that takes the database lock at once, so checks
+/// made inside it (UID conflicts, existence) still hold at commit.
+fn write_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    Ok(rusqlite::Transaction::new_unchecked(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+    )?)
 }
 
 fn row_to_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<Collection> {
@@ -422,7 +436,8 @@ pub fn put(
         Ok(parsed) => parsed,
         Err(error) => return Ok(Err(error)),
     };
-    let conflict: Option<String> = conn
+    let tx = write_transaction(conn)?;
+    let conflict: Option<String> = tx
         .query_row(
             "SELECT name FROM dav_objects
              WHERE collection_id = ?1 AND uid = ?2 AND name != ?3 AND deleted = 0",
@@ -433,7 +448,6 @@ pub fn put(
     if let Some(other) = conflict {
         return Ok(Err(PutError::UidConflict(other)));
     }
-    let tx = conn.unchecked_transaction()?;
     let existed = object(&tx, collection, name)?.is_some();
     let seq = bump(&tx, collection)?;
     let tag = etag(data);
@@ -475,7 +489,7 @@ fn bump(conn: &Connection, collection: &Collection) -> Result<i64> {
 
 /// Delete an object, leaving a tombstone for sync; false when absent.
 pub fn delete(conn: &Connection, collection: &Collection, name: &str) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = write_transaction(conn)?;
     if object(&tx, collection, name)?.is_none() {
         return Ok(false);
     }
@@ -623,12 +637,17 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            parse_sync_token(&calendar.sync_token()),
+            parse_sync_token(&calendar, &calendar.sync_token()),
             Some(calendar.sync_seq)
         );
 
         // Deleting the defaults does not bring them back.
         delete_collection(&conn, &calendar).unwrap();
         assert!(collections(&conn, Kind::Calendar).unwrap().is_empty());
+        // A new collection at the same URL refuses the old one's tokens.
+        let old_token = calendar.sync_token();
+        let again = create(&conn, Kind::Calendar, "default", None, &["VEVENT"]).unwrap();
+        assert_ne!(again.id, calendar.id);
+        assert_eq!(parse_sync_token(&again, &old_token), None);
     }
 }
