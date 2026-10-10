@@ -58,6 +58,10 @@ demo_setting global.listeners.submission '["127.0.0.1:2587"]'
 demo_setting global.listeners.imap '["127.0.0.1:1143"]'
 demo_setting global.listeners.admin '["127.0.0.1:18080"]'
 demo_setting global.listeners.webmail '["127.0.0.1:18081"]'
+# Writing suggestions answered by a canned stand-in (fake_ai.py), not a real AI service.
+demo_setting compose_ai.enabled true
+demo_setting compose_ai.base_url http://127.0.0.1:18090/v1
+demo_setting compose_ai.model demo-model
 for mailbox in alice@example.com bob@example.com support@example.com ops@example.org; do
   "${ctl}" add-mailbox "${mailbox}" --password Demo-pass-123 --config config.toml >/dev/null
 done
@@ -71,6 +75,8 @@ done
 export RMAIL_CONFIG=config.toml RMAIL_MAIL_ROOT=mail
 export RMAIL_WEB_STATIC_DIR="${root}/crates/webui/frontend/dist"
 export RMAIL_WEBMAIL_STATIC_DIR="${root}/crates/webmail/frontend/dist"
+python3 "${here}/fake_ai.py" 18090 &
+pids+=("$!")
 for service in smtpd imapd web webmail outbound; do
   "${bin}/rmail_${service}" > "${service}.log" 2>&1 &
   pids+=("$!")

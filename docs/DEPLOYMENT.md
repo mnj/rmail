@@ -563,6 +563,56 @@ their inbox.
 A copy of each sent message (including Bcc) is saved to Sent; replies mark the original
 `\Answered` and forwards `$Forwarded`. Drafts are saved to Drafts and can be reopened and sent.
 
+### Writing suggestions (AI)
+
+Composing can offer AI suggestions: a short continuation shown in grey after the cursor when the
+user pauses typing (Tab or a tap accepts it, Esc or typing on dismisses it), in the rich-text and
+the plain-text editor, and a **Rewrite** menu that makes the selected text shorter, more formal,
+friendlier or fixes its grammar; the result is shown first and replaces the selection only when the
+user accepts it (one undo step).
+
+Suggestions come from any OpenAI-compatible Chat Completions endpoint: OpenAI, OpenRouter, or a
+local server such as Ollama or vLLM. They are off by default. Set them up under **Writing
+suggestions** on the admin console's Settings page (or the `compose_ai.*` settings); changes apply
+without a restart:
+
+| Setting | Meaning |
+| --- | --- |
+| `compose_ai.enabled` | Offer suggestions to users who opt in. |
+| `compose_ai.base_url` | API base; `/chat/completions` is appended. Default `https://api.openai.com/v1`; e.g. `https://openrouter.ai/api/v1`, or `http://127.0.0.1:11434/v1` for Ollama. |
+| `compose_ai.api_key` | Bearer token, write-only (the console only shows whether it is set). Empty for servers without keys. |
+| `compose_ai.model` | Model id at the provider. Empty keeps suggestions off. |
+| `compose_ai.timeout_ms` | A request taking longer is dropped (default 8000). |
+| `compose_ai.requests_per_minute` | Per user; continuations and rewrites both count (default 30). |
+
+Then each user turns on **Writing suggestions** in webmail's compose settings, which names the
+service's host so they know where their draft goes.
+
+Choosing a model: ghost text is only useful if it appears within a second or so of a pause, so
+small, fast, non-reasoning models suit it best (a "mini" or "nano" class model from a hosted
+provider, or a 1–8B instruction-tuned model on a local GPU). Reasoning models spend their small
+token budget thinking and add seconds. OpenRouter model ids look like `provider/model` (for example
+`openai/gpt-4.1-nano` or `meta-llama/llama-3.1-8b-instruct`); OpenAI's own API takes the bare name.
+Check that the model accepts the `max_tokens` parameter. Any model choice is yours; rMail does not
+pick one.
+
+How requests are made:
+
+- The browser only talks to webmail; webmail calls the provider, so the API key never reaches a
+  browser. A suggestion is requested about 400 ms after the last keystroke and asks for about 30
+  tokens (one sentence); each keystroke cancels the pending one. Webmail streams whitespace while
+  waiting, so a browser that has given up is noticed within half a second and the provider request
+  is dropped with it. Reverse proxies should not buffer `/api/compose/assist` (webmail sends
+  `X-Accel-Buffering: no` for nginx).
+- What is sent: the draft around the cursor (up to 2,000 characters before and 500 after, without
+  the signature), the subject and, in a reply, the start of the quoted original (up to 1,500
+  characters). A rewrite sends the selection and the subject; selections over 4,000 characters are refused rather than cut, since the result replaces the whole selection. Nothing else
+  from the mailbox is read. Webmail trims to these limits whatever the browser sends.
+- Prompts and answers are not logged. Failures are logged by kind with the provider's status and
+  error code only, since provider error messages can quote part of the key.
+- The quoted original was written by someone else and may try to instruct the model; suggestions
+  are only ever inserted as plain text after the user accepts them.
+
 ### JMAP
 
 Webmail also serves JMAP (RFC 8620, RFC 8621) for mail clients that speak it, on the same

@@ -16,8 +16,10 @@ import {
 
 /**
  * Something layered over the editor, attached once the editor exists; returns
- * its cleanup. Suggestions shown as ghost text (a later feature) plug in here:
- * a plugin listens to `input`/`pathChange` on `editor`, reads the text before
+ * its cleanup. AI suggestions shown as ghost text (`ghostTextPlugin` in
+ * assist.ts) plug in here:
+ * a plugin listens to the browser's `input` events on `root` (Squire's own
+ * `input` event also fires for changes it makes itself), reads the text before
  * the caret from `editor.getSelection()`, draws the suggestion in an overlay
  * positioned with `editor.getCursorPosition()` (never inside the document, so
  * getHTML() and undo stay clean) and inserts it with `editor.insertPlainText`
@@ -31,6 +33,12 @@ export type EditorHandle = {
   /** Plain text of the content, as the user sees it. */
   getText: () => string;
   insertHTML: (html: string) => void;
+  /**
+   * The selected text and a way to replace exactly that selection later
+   * (one undo step); `null` without a selection. Used by AI rewrites, which
+   * show the result before it replaces anything.
+   */
+  captureSelection: () => { text: string; replace: (text: string) => boolean } | null;
   insertImages: (files: File[]) => Promise<void>;
   focus: (where?: 'start' | 'end') => void;
 };
@@ -199,6 +207,29 @@ export const RichEditor = forwardRef<EditorHandle, Props>(function RichEditor(
     setHTML: (html) => editorRef.current?.setHTML(html),
     getText: () => rootRef.current?.innerText ?? '',
     insertHTML: (html) => editorRef.current?.insertHTML(html),
+    captureSelection: () => {
+      const editor = editorRef.current;
+      const root = rootRef.current;
+      if (!editor || !root) return null;
+      const range = editor.getSelection();
+      if (range.collapsed || !root.contains(range.commonAncestorContainer)) return null;
+      const text = contentText(range.cloneContents()).trim();
+      if (!text) return null;
+      const saved = range.cloneRange();
+      return {
+        text,
+        // False when the text was edited since; the old range would no
+        // longer cover what the user selected.
+        replace: (replacement) => {
+          if (!root.isConnected || !root.contains(saved.commonAncestorContainer) || contentText(saved.cloneContents()).trim() !== text) return false;
+          editor.focus();
+          editor.setSelection(saved);
+          editor.insertPlainText(replacement, false);
+          latest.current.onChange?.();
+          return true;
+        },
+      };
+    },
     insertImages,
     focus: (where) => {
       const editor = editorRef.current;
@@ -285,6 +316,46 @@ export const RichEditor = forwardRef<EditorHandle, Props>(function RichEditor(
     </div>
   );
 });
+
+const BLOCKS = new Set(['DIV', 'P', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'PRE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TABLE', 'TR', 'HR']);
+
+/**
+ * Text of editor content as the user sees it (blocks and <br> as line
+ * breaks), without elements matching `skip`. Works on detached fragments,
+ * unlike innerText.
+ */
+export function contentText(node: Node, skip?: string): string {
+  let out = '';
+  // A block's line break is written only when more text follows, so the text
+  // before the caret does not end in a break that is not there.
+  let pendingBreak = false;
+  const emit = (text: string) => {
+    if (!text) return;
+    if (pendingBreak && out && !out.endsWith('\n')) out += '\n';
+    pendingBreak = false;
+    out += text;
+  };
+  const walk = (current: Node) => {
+    if (current.nodeType === Node.TEXT_NODE) {
+      emit((current as Text).data.replace(/\u200B/g, '').replace(/\u00A0/g, ' '));
+      return;
+    }
+    let block = false;
+    if (current.nodeType === Node.ELEMENT_NODE) {
+      const element = current as Element;
+      if (skip && element.matches(skip)) return;
+      if (element.tagName === 'BR') { emit('\n'); return; }
+      block = BLOCKS.has(element.tagName);
+    } else if (current.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+      return;
+    }
+    if (block) pendingBreak = true;
+    current.childNodes.forEach(walk);
+    if (block) pendingBreak = true;
+  };
+  walk(node);
+  return out;
+}
 
 /** Escape text for HTML. */
 export function escapeHtml(text: string): string {

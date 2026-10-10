@@ -144,6 +144,11 @@ pub const GROUPS: &[SettingGroup] = &[
         description: "Folder suggestions from local or cloud models. Pick models and providers on the Organization page; changes apply without a restart.",
     },
     SettingGroup {
+        id: "compose_ai",
+        label: "Writing suggestions",
+        description: "AI continuations and rewrites while composing in webmail, from any OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Ollama, vLLM). Users opt in in their compose settings; only the draft around the cursor, the subject and a quoted original are sent. Changes apply without a restart.",
+    },
+    SettingGroup {
         id: "logging",
         label: "Logging",
         description: "Structured JSON logs written by every daemon, shown on the Logs page.",
@@ -1152,6 +1157,54 @@ pub const SETTINGS: &[SettingSpec] = &[
         CLASSIFIER,
     ),
     spec(
+        "compose_ai.enabled",
+        "compose_ai",
+        "Enabled",
+        "Offer writing suggestions to webmail users who opt in.",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "compose_ai.base_url",
+        "compose_ai",
+        "API base",
+        "OpenAI-compatible base URL; /chat/completions is appended. E.g. https://openrouter.ai/api/v1 or http://127.0.0.1:11434/v1 for Ollama.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "compose_ai.api_key",
+        "compose_ai",
+        "API key",
+        "Sent as a bearer token by the webmail server only; browsers never see it. Leave empty for local servers without keys.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "compose_ai.model",
+        "compose_ai",
+        "Model",
+        "Model id at the provider. Small, fast models suit suggestions as you type; OpenRouter ids look like provider/model. Empty keeps suggestions off.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "compose_ai.timeout_ms",
+        "compose_ai",
+        "Timeout (ms)",
+        "A suggestion that takes longer is dropped.",
+        int(500, 60_000),
+        LIVE,
+    ),
+    spec(
+        "compose_ai.requests_per_minute",
+        "compose_ai",
+        "Requests per user per minute",
+        "Suggestions are asked for after a short pause in typing; rewrites count too.",
+        int(1, 600),
+        LIVE,
+    ),
+    spec(
         "global.log_level",
         "logging",
         "Log level",
@@ -1345,6 +1398,21 @@ pub fn admin_password_policy(conn: &Connection) -> Result<crate::config::AdminPa
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
     serde_json::from_value(policy).context("invalid admin password policy")
+}
+
+/// The writing-suggestion settings, read per request by webmail.
+pub fn compose_ai(conn: &Connection) -> Result<crate::config::ComposeAiConfig> {
+    let stored = load_all(conn)?;
+    let tree = unflatten(
+        stored
+            .iter()
+            .filter(|(key, _)| key.starts_with("compose_ai.")),
+    );
+    let section = tree
+        .pointer("/compose_ai")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    serde_json::from_value(section).context("invalid writing suggestion settings")
 }
 
 pub fn get_string(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -1563,6 +1631,7 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
         bail!("global.http_redirect_url must start with https://");
     }
     crate::acme::validate_config(config)?;
+    crate::compose_ai::validate_config(&config.compose_ai)?;
     Ok(())
 }
 
@@ -2073,6 +2142,42 @@ mod tests {
     }
 
     #[test]
+    fn writing_suggestions_are_off_until_configured_and_hide_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rmail.db");
+        resolve_config(file(&db, ""), "test").unwrap();
+        let mut conn = open(&db).unwrap();
+        assert!(!compose_ai(&conn).unwrap().available());
+        assert!(
+            update(
+                &mut conn,
+                &BTreeMap::from([("compose_ai.base_url".to_string(), json!("ftp://x"))]),
+            )
+            .is_err()
+        );
+        update(
+            &mut conn,
+            &BTreeMap::from([
+                ("compose_ai.enabled".to_string(), json!(true)),
+                ("compose_ai.model".to_string(), json!("small")),
+                ("compose_ai.api_key".to_string(), json!("sk-hidden")),
+                (
+                    "compose_ai.base_url".to_string(),
+                    json!("http://127.0.0.1:11434/v1"),
+                ),
+            ]),
+        )
+        .unwrap();
+        let config = compose_ai(&conn).unwrap();
+        assert!(config.available());
+        assert_eq!(config.api_key.as_ref().unwrap().expose(), "sk-hidden");
+        assert_eq!(config.timeout_ms, 8_000);
+        assert!(!format!("{config:?}").contains("sk-hidden"));
+        let view = serde_json::to_string(&describe(&conn).unwrap()).unwrap();
+        assert!(!view.contains("sk-hidden"));
+    }
+
+    #[test]
     fn every_registry_key_round_trips_through_config() {
         let defaults = default_values();
         for spec in SETTINGS {
@@ -2099,6 +2204,7 @@ mod tests {
                         | "acme.dns.tsig_secret"
                         | "classifier.openrouter_api_key"
                         | "classifier.typesafe_api_key"
+                        | "compose_ai.api_key"
                 )
                 || spec.key.starts_with("global.listeners.")
             {

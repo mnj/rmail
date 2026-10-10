@@ -134,6 +134,24 @@ async function compose(page, name, mobile = false) {
   await shot(page, name);
 }
 
+// Writing suggestions (answered by fake_ai.py): ghost text after the caret,
+// then a rewrite of the selection.
+async function ghostText(page, name, mobile = false) {
+  if (mobile) await page.click('button[title=Folders]');
+  await page.click('.compose-button');
+  await page.waitForSelector('.compose .editor-root');
+  await page.fill('.compose input[aria-label=To]', 'Priya Raman <priya@northwind.test>');
+  await page.fill('.compose label:has-text("Subject") input', 'Re: Q4 infrastructure review — agenda');
+  await page.click('.compose .editor-root');
+  await page.keyboard.type('Hi Priya,');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('Thanks for the agenda. Could we add a short item on');
+  await page.waitForSelector('.ghost-text:not([hidden])');
+  await page.waitForTimeout(200);
+  await shot(page, name);
+}
+
 for (const theme of ['light', 'dark']) {
   const ctx = await browser.newContext(desktop);
   const page = await ctx.newPage();
@@ -148,6 +166,25 @@ for (const theme of ['light', 'dark']) {
   await page.waitForSelector('.settings-dialog .editor-root');
   await page.waitForTimeout(300);
   await shot(page, `webmail-compose-settings-${theme}`);
+  if (theme === 'light') {
+    await page.click('.settings-dialog button:has-text("Cancel")');
+    await ghostText(page, 'webmail-compose-ai');
+    await page.keyboard.press('Tab');
+    await page.evaluate(() => {
+      const root = document.querySelector('.compose .editor-root');
+      root.focus();
+      const block = [...root.children].find((element) => element.textContent.startsWith('Thanks'));
+      const range = document.createRange();
+      range.selectNodeContents(block);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+    });
+    await page.click('.compose button[aria-label="Rewrite selection"]');
+    await page.click('.rewrite-menu button:has-text("More formal")');
+    await page.waitForSelector('.rewrite-result');
+    await page.waitForTimeout(200);
+    await shot(page, 'webmail-compose-rewrite');
+  }
   await ctx.close();
 }
 
@@ -174,6 +211,10 @@ for (const theme of ['light', 'dark']) {
   await page.click('button[aria-label=Back]');
   await page.waitForTimeout(300);
   await compose(page, 'mobile-compose', true);
+  await page.keyboard.press('Escape');
+  await page.click('.compose button[aria-label="Discard"]');
+  await page.waitForSelector('.toast', { state: 'detached', timeout: 10000 });
+  await ghostText(page, 'mobile-compose-ai', true);
   await ctx.close();
 }
 

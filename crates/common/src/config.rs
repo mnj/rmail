@@ -239,6 +239,9 @@ pub struct Config {
     /// Automatic certificates from an ACME CA such as Let's Encrypt.
     #[serde(default)]
     pub acme: AcmeConfig,
+    /// AI writing suggestions in webmail's compose window.
+    #[serde(default)]
+    pub compose_ai: ComposeAiConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -1005,6 +1008,73 @@ fn default_classifier_autofile_confidence() -> u32 {
 }
 fn default_classifier_min_examples() -> u32 {
     5
+}
+
+/// AI writing suggestions while composing in webmail (ghost-text
+/// continuations and rewrites of a selection), from any OpenAI-compatible
+/// Chat Completions endpoint. Off until the admin enables it and names a
+/// model; each user then opts in. Webmail reads these per request, so
+/// changes apply without a restart.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ComposeAiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// API base, e.g. `https://api.openai.com/v1`; `/chat/completions` is
+    /// appended.
+    #[serde(default = "default_compose_ai_base_url")]
+    pub base_url: String,
+    /// Bearer token; local servers usually need none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretString>,
+    /// Model id at the provider; empty keeps the feature off.
+    #[serde(default)]
+    pub model: String,
+    /// How long one suggestion may take before it is abandoned.
+    #[serde(default = "default_compose_ai_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Suggestions and rewrites one user may request per minute.
+    #[serde(default = "default_compose_ai_requests_per_minute")]
+    pub requests_per_minute: u32,
+}
+
+impl Default for ComposeAiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_compose_ai_base_url(),
+            api_key: None,
+            model: String::new(),
+            timeout_ms: default_compose_ai_timeout_ms(),
+            requests_per_minute: default_compose_ai_requests_per_minute(),
+        }
+    }
+}
+
+impl ComposeAiConfig {
+    /// Enabled, with a model and a usable endpoint.
+    pub fn available(&self) -> bool {
+        self.enabled && !self.model.trim().is_empty() && self.host().is_some()
+    }
+
+    /// The endpoint's host name, shown to users when they opt in so they
+    /// know where their draft goes.
+    pub fn host(&self) -> Option<String> {
+        let url = reqwest::Url::parse(self.base_url.trim()).ok()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        url.host_str().map(str::to_string)
+    }
+}
+
+fn default_compose_ai_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+fn default_compose_ai_timeout_ms() -> u64 {
+    8_000
+}
+fn default_compose_ai_requests_per_minute() -> u32 {
+    30
 }
 
 impl Config {

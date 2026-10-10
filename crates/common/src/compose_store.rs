@@ -51,6 +51,11 @@ pub struct Prefs {
     pub language: String,
     /// Seconds a sent message waits so it can be undone (0 sends at once).
     pub undo_seconds: u32,
+    /// AI writing suggestions while composing. Off until the user turns it
+    /// on, and only offered when the server has them enabled
+    /// (`compose_ai.*` settings): the draft around the cursor then goes to
+    /// the provider the admin configured.
+    pub ai_suggestions: bool,
 }
 
 impl Default for Prefs {
@@ -59,6 +64,7 @@ impl Default for Prefs {
             format: "html".to_string(),
             language: String::new(),
             undo_seconds: 0,
+            ai_suggestions: false,
         }
     }
 }
@@ -302,11 +308,13 @@ mod tests {
                 format: "rtf".into(),
                 language: "da-DK".into(),
                 undo_seconds: 600,
+                ai_suggestions: true,
             },
         )
         .unwrap();
         assert_eq!(saved.format, "html");
         assert_eq!(saved.undo_seconds, MAX_UNDO_SECONDS);
+        assert!(saved.ai_suggestions);
         assert_eq!(prefs(root, "example.test", "ann").unwrap(), saved);
         let cleared = set_prefs(
             root,
@@ -316,6 +324,7 @@ mod tests {
                 format: "text".into(),
                 language: "\"><script>".into(),
                 undo_seconds: 10,
+                ai_suggestions: false,
             },
         )
         .unwrap();

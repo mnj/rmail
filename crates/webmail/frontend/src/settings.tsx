@@ -1,8 +1,9 @@
-// Compose settings: default format, spellchecking language, undo send,
-// names and signatures per identity, and messages waiting to be sent.
+// Compose settings: default format, spellchecking language, undo send, AI
+// writing suggestions (when the server offers them), names and signatures
+// per identity, and messages waiting to be sent.
 
 import { useEffect, useRef, useState } from 'react';
-import { CalendarClock, X } from 'lucide-react';
+import { CalendarClock, Sparkles, X } from 'lucide-react';
 import { EditorHandle, RichEditor } from './editor';
 import { Api, ComposePrefs, Identity, Scheduled, formatFullDate } from './types';
 
@@ -102,6 +103,18 @@ export function ComposeSettingsDialog({ api, prefs, identities, onClose, onSaved
           </label>
         </div>
         <p className="dialog-hint">Spelling is checked by your browser, in the language chosen here when the browser has a dictionary for it. With undo send, messages wait on the server for the chosen time (up to 15 seconds more) before they go out.</p>
+        {prefs.ai?.available && (
+          <>
+            <label className="check-row">
+              <input type="checkbox" checked={draft.ai_suggestions} onChange={(e) => setDraft({ ...draft, ai_suggestions: e.target.checked })} />
+              <span><Sparkles size={14} />Writing suggestions</span>
+            </label>
+            <p className="dialog-hint">
+              Grey suggestions appear after the cursor when you pause typing; Tab (or a tap) accepts them, Esc or typing on dismisses them. The rewrite button makes selected text shorter, more formal, friendlier or fixes its grammar.
+              {' '}While this is on, the text around the cursor, the subject and the message you reply to are sent to {prefs.ai.provider ? <strong>{prefs.ai.provider}</strong> : 'the AI service'} through this server. Nothing else from your mailbox is sent.
+            </p>
+          </>
+        )}
         <h3 className="dialog-section">Signatures</h3>
         {identities.map((identity) => (
           <SignatureEditor key={identity.id} identity={{ ...identity, name: names[identity.id] ?? identity.name }} lang={draft.language} editorRef={(handle) => { editors.current[identity.id] = handle; }} onName={(name) => setNames({ ...names, [identity.id]: name })} />

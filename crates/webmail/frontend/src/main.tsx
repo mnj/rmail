@@ -442,7 +442,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [moreOpen, setMoreOpen] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [compose, setCompose] = useState<ComposeSeed | null>(null);
-  const [prefs, setPrefs] = useState<ComposePrefs>({ format: 'html', language: '', undo_seconds: 0 });
+  const [prefs, setPrefs] = useState<ComposePrefs>({ format: 'html', language: '', undo_seconds: 0, ai_suggestions: false });
   const [identities, setIdentities] = useState<Identity[]>([]);
   const [composeSettings, setComposeSettings] = useState(false);
   const [remoteLoaded, setRemoteLoaded] = useState(false);

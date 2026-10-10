@@ -35,7 +35,9 @@ screenshots of every page, and a quick start.
   cleaned-up pastes from Word or Google Docs) that sends HTML with a generated plain-text
   alternative, a plain-text mode, signatures per identity, the browser's spellchecker in a chosen
   language, address suggestions from CardDAV contacts and recent recipients, autosaved drafts,
-  drag-and-drop attachments, undo send and send later.
+  drag-and-drop attachments, undo send and send later. Opt-in AI writing suggestions (grey
+  ghost-text continuations, accepted with Tab, and rewrites of a selection) come from any
+  OpenAI-compatible endpoint the admin configures, through the server so the key stays there.
 - **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
   search, sending, vacation response and push.
 - **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so

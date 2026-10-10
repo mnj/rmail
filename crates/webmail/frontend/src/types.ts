@@ -39,7 +39,13 @@ export type LabelPreview = { labels: LabelGuess[]; threshold: number; proposed: 
 
 // Composing
 export type Identity = { id: string; name: string; email: string; text_signature: string; html_signature: string };
-export type ComposePrefs = { format: 'html' | 'text'; language: string; undo_seconds: number };
+export type ComposePrefs = {
+  format: 'html' | 'text'; language: string; undo_seconds: number;
+  /** The user's opt-in to AI writing suggestions. */
+  ai_suggestions: boolean;
+  /** Whether the server offers them, and the AI service's host (read-only). */
+  ai?: { available: boolean; provider: string | null };
+};
 export type Contact = { name: string; email: string; source: 'contacts' | 'recent' };
 export type Scheduled = { id: string; send_at: number; recipients: string[]; subject: string };
 export type SendResult = { message_id: string; saved_copy: boolean; scheduled: Scheduled | null };

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { CalendarClock, ChevronDown, Paperclip, Send, Trash2, Type, X } from 'lucide-react';
-import { EditorHandle, RichEditor, escapeHtml, textToHtml } from './editor';
+import { CalendarClock, ChevronDown, Paperclip, Send, Sparkles, Trash2, Type, X } from 'lucide-react';
+import { REWRITE_STYLES, RewriteStyle, assist, attachTextareaGhost, ghostTextPlugin, insertIntoTextarea } from './assist';
+import { EditorHandle, EditorPlugin, RichEditor, escapeHtml, textToHtml } from './editor';
 import {
   Api, Attachment, ComposePrefs, Contact, Identity, MessageDetail, SendResult, formatAddress, formatFullDate, formatSize, splitAddress,
 } from './types';
@@ -8,10 +9,16 @@ import {
 const MAX_BYTES = 10 * 1024 * 1024;
 /** Seconds between automatic draft saves while there are unsaved changes. */
 const AUTOSAVE_SECONDS = 20;
+/** Longest selection a rewrite takes (rmail_common::compose_ai::MAX_SELECTION_CHARS). */
+const MAX_REWRITE_CHARS = 4000;
 
 type Upload = { filename: string; content_type: string; data: string; size: number };
 type Stored = { folder: string; uid: number; index: number; filename: string; size: number };
 type Format = 'html' | 'text';
+/** Selected text, and how to replace exactly it later (false when it has changed since). */
+type SelectedText = { text: string; replace: (text: string) => boolean };
+/** An AI rewrite of the selection, shown before it replaces anything. */
+type Rewrite = { style: RewriteStyle; label: string; selection: SelectedText; result: string | null; error: string; controller: AbortController };
 
 /** What the compose window starts from: blank, a reply, a forward or a draft. */
 export type ComposeSeed = {
@@ -228,6 +235,15 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
   const bodyRef = useRef<HTMLTextAreaElement>(null);
   const editorRef = useRef<EditorHandle>(null);
   const dirty = useRef(false);
+  // AI writing suggestions: offered by the server and turned on by the user.
+  const aiOn = Boolean(prefs.ai?.available && prefs.ai_suggestions);
+  const subjectRef = useRef(subject);
+  subjectRef.current = subject;
+  // The editor attaches plugins once, when it is created.
+  const plugins = useRef<EditorPlugin[] | null>(null);
+  plugins.current ??= aiOn ? [ghostTextPlugin(api, () => subjectRef.current)] : [];
+  const [rewriteOpen, setRewriteOpen] = useState(false);
+  const [rewrite, setRewrite] = useState<Rewrite | null>(null);
   const busyRef = useRef(busy);
   busyRef.current = busy;
   const total = uploads.reduce((sum, u) => sum + u.size, 0) + stored.reduce((sum, s) => sum + s.size, 0);
@@ -240,6 +256,70 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
     else if (bodyRef.current) { bodyRef.current.focus(); bodyRef.current.setSelectionRange(0, 0); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!aiOn || format !== 'text' || !bodyRef.current) return;
+    return attachTextareaGhost(api, () => subjectRef.current, bodyRef.current);
+  }, [aiOn, format, api]);
+
+  /** The selection in whichever editor is showing. */
+  function captureSelection(): SelectedText | null {
+    if (format === 'html') return editorRef.current?.captureSelection() ?? null;
+    const textarea = bodyRef.current;
+    if (!textarea) return null;
+    const [start, end] = [textarea.selectionStart, textarea.selectionEnd];
+    const selected = textarea.value.slice(start, end);
+    if (!selected.trim()) return null;
+    return {
+      text: selected,
+      replace: (value) => {
+        if (textarea.value.slice(start, end) !== selected) return false;
+        insertIntoTextarea(textarea, value, start, end);
+        return true;
+      },
+    };
+  }
+
+  async function runRewrite(style: RewriteStyle, label: string, selection: SelectedText | null) {
+    setRewriteOpen(false);
+    if (!selection) {
+      setError('Select the text to rewrite first.');
+      return;
+    }
+    // The server refuses longer selections rather than rewriting only their
+    // start, which would drop the rest on replace. UTF-16 length is at least
+    // the character count the server checks.
+    if (selection.text.trim().length > MAX_REWRITE_CHARS) {
+      setError(`Select at most ${MAX_REWRITE_CHARS} characters to rewrite.`);
+      return;
+    }
+    setError('');
+    rewrite?.controller.abort();
+    const controller = new AbortController();
+    const settle = (change: Partial<Rewrite>) => setRewrite((current) => (current?.controller === controller ? { ...current, ...change } : current));
+    setRewrite({ style, label, selection, result: null, error: '', controller });
+    try {
+      const text = await assist(api, { kind: 'rewrite', style, selection: selection.text, subject }, controller.signal);
+      if (!controller.signal.aborted) settle(text.trim() ? { result: text } : { error: 'No rewrite came back; try again.' });
+    } catch (err) {
+      if (!controller.signal.aborted) settle({ error: (err as Error).message });
+    }
+  }
+
+  function closeRewrite() {
+    rewrite?.controller.abort();
+    setRewrite(null);
+  }
+
+  function applyRewrite() {
+    if (!rewrite?.result) return;
+    if (!rewrite.selection.replace(rewrite.result)) {
+      setRewrite({ ...rewrite, result: null, error: 'The selected text has changed; select it again.' });
+      return;
+    }
+    touch();
+    setRewrite(null);
+  }
 
   const body = () => (format === 'html' ? { html: editorRef.current?.getHTML() || '', text: '' } : { text });
   const hasContent = () => Boolean(to.trim() || subject.trim() || (format === 'html' ? editorRef.current?.getText().trim() : text.trim()) || uploads.length);
@@ -341,6 +421,8 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
 
   function switchFormat(next: Format) {
     if (next === format) return;
+    // A pending rewrite belongs to the editor that is going away.
+    closeRewrite();
     if (next === 'text') {
       const plain = editorRef.current?.getText() || '';
       setText(plain.replace(/\n{3,}/g, '\n\n'));
@@ -377,7 +459,12 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
       role="dialog"
       aria-label={title}
       onKeyDown={(e) => {
-        if (e.key === 'Escape' && !e.defaultPrevented) { if (laterOpen) setLaterOpen(false); else close(); }
+        if (e.key === 'Escape' && !e.defaultPrevented) {
+          if (laterOpen) setLaterOpen(false);
+          else if (rewriteOpen) setRewriteOpen(false);
+          else if (rewrite) closeRewrite();
+          else close();
+        }
         // The editor handles its own Ctrl+Enter (and prevents the default).
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.defaultPrevented) { e.preventDefault(); send(); }
         if (e.key.toLowerCase() === 's' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveDraft(false); }
@@ -417,6 +504,7 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
           onChange={touch}
           onSubmit={() => send()}
           onFiles={addFiles}
+          plugins={plugins.current}
         />
       ) : (
         <textarea ref={bodyRef} className="compose-body" value={text} lang={prefs.language || undefined} spellCheck onChange={(e) => { setText(e.target.value); touch(); }} aria-label="Message" />
@@ -429,6 +517,25 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
           {uploads.map((u, i) => (
             <span className="file-chip" key={`u${i}`}><Paperclip size={12} />{u.filename}<small>{formatSize(u.size)}</small><button aria-label={`Remove ${u.filename}`} onClick={() => { touch(); setUploads((list) => list.filter((_, j) => j !== i)); }}><X size={12} /></button></span>
           ))}
+        </div>
+      )}
+      {rewrite && (
+        <div className="rewrite-panel" role="region" aria-label="Rewrite suggestion" aria-live="polite">
+          <div className="rewrite-head">
+            <Sparkles size={14} /><strong>{rewrite.label}</strong>
+            {!rewrite.result && !rewrite.error && <span className="muted small">Rewriting…</span>}
+            <span className="spacer" />
+            <button type="button" className="icon" aria-label="Discard rewrite" title="Discard" onClick={closeRewrite}><X size={14} /></button>
+          </div>
+          {rewrite.result && <p className="rewrite-result">{rewrite.result}</p>}
+          {rewrite.error && <p className="error">{rewrite.error}</p>}
+          {(rewrite.result || rewrite.error) && (
+            <div className="rewrite-actions">
+              {rewrite.result && <button type="button" className="primary small-button" onClick={applyRewrite}>Replace selection</button>}
+              <button type="button" className="secondary small-button" onClick={() => runRewrite(rewrite.style, rewrite.label, rewrite.selection)}>Try again</button>
+              {rewrite.result && <span className="muted small">{mod}Z undoes it</span>}
+            </div>
+          )}
         </div>
       )}
       {dragging && <div className="drop-hint" aria-hidden="true"><Paperclip size={18} />Drop files to attach (images dropped in the text are placed inline)</div>}
@@ -449,6 +556,18 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
         </span>
         <input ref={fileRef} type="file" multiple hidden onChange={(e) => { addFiles(Array.from(e.target.files || [])); e.target.value = ''; }} />
         <button className="icon" aria-label="Attach files" title="Attach files (or drop them here)" onClick={() => fileRef.current?.click()}><Paperclip size={16} /></button>
+        {aiOn && (
+          <span className="menu-anchor">
+            <button type="button" className={`icon ${rewriteOpen ? 'active' : ''}`} aria-label="Rewrite selection" title="Rewrite the selected text" aria-expanded={rewriteOpen} onMouseDown={(e) => e.preventDefault()} onClick={() => setRewriteOpen(!rewriteOpen)}><Sparkles size={16} /></button>
+            {rewriteOpen && (
+              <div className="menu rewrite-menu" role="menu" aria-label="Rewrite selection">
+                {REWRITE_STYLES.map(([style, label]) => (
+                  <button key={style} type="button" role="menuitem" onMouseDown={(e) => e.preventDefault()} onClick={() => runRewrite(style, label, captureSelection())}>{label}</button>
+                ))}
+              </div>
+            )}
+          </span>
+        )}
         <button className={`icon ${format === 'html' ? 'active' : ''}`} aria-pressed={format === 'html'} aria-label={format === 'html' ? 'Switch to plain text' : 'Switch to formatted text'} title={format === 'html' ? 'Formatted text (click for plain text)' : 'Plain text (click for formatted text)'} onClick={() => switchFormat(format === 'html' ? 'text' : 'html')}><Type size={16} /></button>
         <span className="spacer" />
         <span className="save-state muted small">{busy === 'draft' ? 'Saving…' : savedAt ? `Saved ${savedAt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}` : ''}</span>
