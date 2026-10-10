@@ -93,13 +93,6 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
 }
 
 /* Notice */
-.notice {
-  display: flex; gap: 12px; align-items: flex-start; margin: 32px auto 0;
-  background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text);
-  border-radius: 12px; padding: 14px 18px; font-size: 15px;
-}
-.notice strong { white-space: nowrap; }
-
 /* Sections */
 section.block { padding: 72px 0 0; }
 section.block:last-of-type { padding-bottom: 80px; }
@@ -185,5 +178,4 @@ dialog.lightbox .close {
 }
 @media (max-width: 520px) {
   .phones { gap: 10px; }
-  .notice { flex-direction: column; gap: 4px; }
 }

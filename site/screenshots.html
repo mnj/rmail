@@ -24,7 +24,7 @@
       </nav>
       <div class="page-hero">
         <h1>Screenshots</h1>
-        <p>Every page of the admin console and webmail, from a demo instance filled with sample mail. Click an image to see it full size.</p>
+        <p>Every page of the admin console and webmail, from a demo instance filled with sample mail, captured with <code>scripts/screenshots/capture.sh</code>. Click an image to see it full size.</p>
         <div class="jump">
           <a href="#admin">Admin console</a>
           <a href="#webmail">Webmail</a>
@@ -56,6 +56,11 @@
           <button type="button"><img src="assets/screenshots/admin-routing.webp" width="2880" height="1800" loading="lazy" alt="Routing: aliases and per-domain catchalls"></button>
           <h3>Routing</h3>
           <figcaption>Aliases to one or more mailboxes, and a catchall for each domain.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/admin-domains.webp" width="2880" height="1800" loading="lazy" alt="Domains and DNS: DKIM keys per domain and the DNS records to publish"></button>
+          <h3>Domains and DNS</h3>
+          <figcaption>DKIM keys (RSA and Ed25519) for each domain, and every DNS record to publish, ready to copy.</figcaption>
         </figure>
         <figure class="shot">
           <button type="button"><img src="assets/screenshots/admin-delivery.webp" width="2880" height="1800" loading="lazy" alt="Delivery: the outbound queue with deferred messages"></button>
@@ -108,6 +113,31 @@
           <figcaption>HTML mail renders in a sandbox, and remote images load only when the reader asks.</figcaption>
         </figure>
         <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-compose-light.webp" width="2880" height="1800" loading="lazy" alt="Composing a formatted message with a contact suggestion for the To field"></button>
+          <h3>Composing</h3>
+          <figcaption>A rich-text editor with lists, quotes, links and inline images, address suggestions from contacts and the browser's spellchecker.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-compose-dark.webp" width="2880" height="1800" loading="lazy" alt="The compose window in dark mode"></button>
+          <h3>Dark mode</h3>
+          <figcaption>Every page follows the system theme, or a light or dark choice.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-compose-settings-light.webp" width="2880" height="1800" loading="lazy" alt="Compose settings: message format, spellchecking language, undo send and signatures"></button>
+          <h3>Compose settings</h3>
+          <figcaption>The default format, the spellchecking language, undo send, a signature for each identity and messages scheduled to send later.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-shared.webp" width="2880" height="1800" loading="lazy" alt="A folder shared by another account under Shared with me"></button>
+          <h3>Shared folders</h3>
+          <figcaption>Folders other accounts share appear under “Shared with me”, here and in IMAP clients.</figcaption>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/webmail-share-dialog.webp" width="2880" height="1800" loading="lazy" alt="Sharing the inbox with another account, read-only"></button>
+          <h3>Sharing a folder</h3>
+          <figcaption>Share a folder with another account on the server, read-only or with more rights.</figcaption>
+        </figure>
+        <figure class="shot">
           <button type="button"><img src="assets/screenshots/webmail-login.webp" width="2880" height="1800" loading="lazy" alt="Webmail sign-in screen"></button>
           <h3>Sign in</h3>
           <figcaption>Users sign in with their mailbox address and password.</figcaption>
@@ -137,6 +167,10 @@
         <figure class="shot">
           <button type="button"><img src="assets/screenshots/mobile-remote-blocked.webp" width="1170" height="2532" loading="lazy" alt="Mobile webmail with remote images blocked"></button>
           <h3>Remote content blocked</h3>
+        </figure>
+        <figure class="shot">
+          <button type="button"><img src="assets/screenshots/mobile-compose.webp" width="1170" height="2532" loading="lazy" alt="Composing a formatted message in webmail on a phone"></button>
+          <h3>Composing</h3>
         </figure>
       </div>
     </section>
