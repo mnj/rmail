@@ -457,10 +457,7 @@ pub fn record(
     now: i64,
 ) -> Result<Option<i64>> {
     let conn = crate::sqlite_pool::connection(db_path)?;
-    conn.execute(
-        "DELETE FROM feedback_reports WHERE received_at < ?1",
-        params![now - RETENTION_SECS],
-    )?;
+    prune_with(&conn, now)?;
     let joined = |values: &[String]| (!values.is_empty()).then(|| values.join(", "));
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO feedback_reports (received_at, recipient, reporter, feedback_type, \
@@ -508,8 +505,28 @@ pub fn account_complaints(db_path: &Path, account: &str, since: i64) -> Result<u
     Ok(count.max(0) as u64)
 }
 
+/// Forget reports older than [`RETENTION_SECS`]; returns how many went.
+/// Run periodically, so the limit holds when no new reports arrive.
+pub fn prune(db_path: &Path, now: i64) -> Result<usize> {
+    let conn = crate::sqlite_pool::connection(db_path)?;
+    prune_with(&conn, now)
+}
+
+fn prune_with(conn: &rusqlite::Connection, now: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM feedback_reports WHERE received_at < ?1",
+        params![now - RETENTION_SECS],
+    )?)
+}
+
+/// The oldest `received_at` still within the retention period.
+fn retained_since() -> i64 {
+    chrono::Utc::now().timestamp() - RETENTION_SECS
+}
+
 /// The newest reports, optionally only those about `account` (or, for an
-/// entry without `@`, a domain).
+/// entry without `@`, a domain). Reports past retention are never shown,
+/// even before they are pruned.
 pub fn list(db_path: &Path, filter: Option<&str>, limit: usize) -> Result<Vec<StoredReport>> {
     let conn = crate::sqlite_pool::connection(db_path)?;
     let filter = filter.map(|value| value.trim().to_lowercase());
@@ -518,10 +535,10 @@ pub fn list(db_path: &Path, filter: Option<&str>, limit: usize) -> Result<Vec<St
          source_ip, arrival_date, original_mail_from, original_rcpt_to, reported_domain, \
          auth_failure, original_from, original_subject, original_message_id, account, domain, \
          attributed_by, authenticated FROM feedback_reports \
-         WHERE ?1 IS NULL OR account = ?1 OR domain = ?1 \
+         WHERE (?1 IS NULL OR account = ?1 OR domain = ?1) AND received_at >= ?3 \
          ORDER BY received_at DESC, id DESC LIMIT ?2",
     )?;
-    let rows = statement.query_map(params![filter, limit as i64], |row| {
+    let rows = statement.query_map(params![filter, limit as i64, retained_since()], |row| {
         Ok(StoredReport {
             id: row.get(0)?,
             received_at: row.get(1)?,
@@ -570,7 +587,7 @@ pub fn summary(db_path: &Path, since: i64) -> Result<Vec<SenderSummary>> {
          AND feedback_type IN ('abuse', 'fraud', 'virus', 'other') \
          GROUP BY sender ORDER BY 2 DESC, 3 DESC, sender LIMIT 100",
     )?;
-    let rows = statement.query_map(params![since], |row| {
+    let rows = statement.query_map(params![since.max(retained_since())], |row| {
         Ok(SenderSummary {
             sender: row.get(0)?,
             complaints: row.get(1)?,
@@ -978,6 +995,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list(&db, None, 10).unwrap().len(), 1);
+
+        // Without new reports, expired ones are hidden at once and removed by
+        // the periodic prune.
+        let real_now = chrono::Utc::now().timestamp();
+        let mut expired = report.clone();
+        expired.report_message_id = Some("report-6@example.com".into());
+        let conn = crate::sqlite_pool::connection(&db).unwrap();
+        conn.execute("DELETE FROM feedback_reports", []).unwrap();
+        drop(conn);
+        record(
+            &db,
+            "fbl@example.org",
+            &expired,
+            &attribution,
+            true,
+            real_now - RETENTION_SECS - 60,
+        )
+        .unwrap();
+        assert!(list(&db, None, 10).unwrap().is_empty());
+        assert!(summary(&db, 0).unwrap().is_empty());
+        assert_eq!(prune(&db, real_now).unwrap(), 1);
+        assert_eq!(prune(&db, real_now).unwrap(), 0);
     }
 
     #[test]

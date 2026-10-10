@@ -915,7 +915,8 @@ fn run_feedback(
             }
         }
         FeedbackAction::Summary { days } => {
-            let since = chrono::Utc::now().timestamp() - days.clamp(1, 3650) * 24 * 3600;
+            let days = days.clamp(1, 3650);
+            let since = chrono::Utc::now().timestamp() - days * 24 * 3600;
             let senders = feedback::summary(db_path, since)?;
             if senders.is_empty() {
                 writeln!(out, "No complaints in the last {days} days")?;

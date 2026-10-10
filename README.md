@@ -23,7 +23,7 @@ screenshots of every page, and a quick start.
   AUTH, per-domain relays).
 - **Anti-abuse**: greylisting, DNSBL checks for unauthenticated clients, per-account and
   per-domain submission caps, and complaint feedback loops: abuse reports (ARF) from mailbox
-  providers are recorded and tied to the account that sent the mail.
+  providers are recorded and tied to the sending account or domain when it can be found.
 - **Domains & DNS**: DKIM keys (RSA and Ed25519) generated in the console, and the DNS records to
   publish per domain (MX, SPF, DKIM, DMARC, SRV, `_mta-sts`, `_smtp._tls`); MTA-STS policy hosting,
   Thunderbird autoconfig and Outlook autodiscover.
