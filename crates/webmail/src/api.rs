@@ -1698,7 +1698,7 @@ mod tests {
         assert_eq!(
             received["shared"],
             serde_json::json!([{
-                "kind": "calendar", "owner": "user@example.test",
+                "kind": "calendar", "owner": "user@example.test", "name": "default",
                 "displayname": "Calendar", "access": "edit",
             }])
         );
