@@ -5,6 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::AsyncStream;
+pub(crate) use rmail_common::mime_section::header_value;
+use rmail_common::mime_section::{
+    MimeNode, content_type_parts, extract_section, locate_mime_part, multipart_boundary,
+    parse_header_params, parse_mime_tree, split_multipart_parts,
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const FETCH_STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -672,23 +677,6 @@ fn header_body_offset(header: &[u8]) -> usize {
     }
 }
 
-pub(crate) fn header_value(data: &[u8], field: &str) -> Option<String> {
-    let header_end = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(data.len());
-    let header = String::from_utf8_lossy(&data[..header_end]);
-    for line in header.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case(field) {
-            return Some(value.trim().replace(['\\', '"'], ""));
-        }
-    }
-    None
-}
-
 fn nstring(value: Option<&str>) -> String {
     match value {
         Some(value) if !value.is_empty() => {
@@ -770,23 +758,6 @@ fn envelope_response(data: &[u8]) -> String {
     )
 }
 
-fn parse_header_params(value: &str) -> (String, Vec<(String, String)>) {
-    let mut parts = value.split(';');
-    let main = parts
-        .next()
-        .unwrap_or("text/plain")
-        .trim()
-        .to_ascii_lowercase();
-    let params = parts
-        .filter_map(|part| {
-            let (name, value) = part.split_once('=')?;
-            let value = value.trim().trim_matches('"').to_string();
-            Some((name.trim().to_ascii_uppercase(), value))
-        })
-        .collect();
-    (main, params)
-}
-
 fn imap_param_list(params: &[(String, String)]) -> String {
     if params.is_empty() {
         "NIL".to_string()
@@ -797,16 +768,6 @@ fn imap_param_list(params: &[(String, String)]) -> String {
             .collect::<Vec<_>>();
         format!("({})", values.join(" "))
     }
-}
-
-fn content_type_parts(data: &[u8]) -> (String, String, Vec<(String, String)>) {
-    let raw = header_value(data, "Content-Type").unwrap_or_else(|| "text/plain".to_string());
-    let (main, params) = parse_header_params(&raw);
-    let (typ, subtype) = main
-        .split_once('/')
-        .map(|(typ, subtype)| (typ.to_ascii_uppercase(), subtype.to_ascii_uppercase()))
-        .unwrap_or_else(|| ("TEXT".to_string(), "PLAIN".to_string()));
-    (typ, subtype, params)
 }
 
 fn content_disposition(data: &[u8]) -> String {
@@ -833,163 +794,17 @@ fn bytecount_newlines(data: &[u8]) -> usize {
     data.iter().filter(|b| **b == b'\n').count()
 }
 
-fn multipart_boundary(params: &[(String, String)]) -> Option<String> {
-    params
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("BOUNDARY"))
-        .map(|(_, value)| value.clone())
-}
-
-fn split_multipart_parts(body: &[u8], boundary: &str) -> Vec<Vec<u8>> {
-    let text = String::from_utf8_lossy(body);
-    let marker = format!("--{}", boundary);
-    let closing = format!("--{}--", boundary);
-    let mut parts = Vec::new();
-    let mut current = Vec::new();
-    let mut in_part = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed == marker {
-            if in_part && !current.is_empty() {
-                parts.push(current.join("").into_bytes());
-                current.clear();
-            }
-            in_part = true;
-        } else if trimmed == closing {
-            if in_part && !current.is_empty() {
-                parts.push(current.join("").into_bytes());
-            }
-            break;
-        } else if in_part {
-            current.push(line);
-        }
-    }
-    parts
-}
-
-#[derive(Debug, Clone)]
-struct MimeNode {
-    header: Vec<u8>,
-    body: Vec<u8>,
-    children: Vec<MimeNode>,
-    embedded: Option<Box<MimeNode>>,
-}
-
-fn split_header_body(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-        (data[..pos + 4].to_vec(), data[pos + 4..].to_vec())
-    } else if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
-        (data[..pos + 2].to_vec(), data[pos + 2..].to_vec())
-    } else {
-        (data.to_vec(), Vec::new())
-    }
-}
-
-fn parse_mime_tree(data: &[u8]) -> MimeNode {
-    let (header, body) = split_header_body(data);
-    let (typ, subtype, params) = content_type_parts(data);
-    let children = if typ == "MULTIPART" {
-        multipart_boundary(&params)
-            .as_ref()
-            .map(|boundary| {
-                split_multipart_parts(&body, boundary)
-                    .into_iter()
-                    .map(|part| parse_mime_tree(&part))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let embedded =
-        (typ == "MESSAGE" && subtype == "RFC822").then(|| Box::new(parse_mime_tree(&body)));
-    MimeNode {
-        header,
-        body,
-        children,
-        embedded,
-    }
-}
-
 fn parse_body_section(section_name: &str) -> Option<String> {
     let start = section_name.find('[')?;
     let end = section_name[start + 1..].find(']')? + start + 1;
     Some(section_name[start + 1..end].trim().to_ascii_uppercase())
 }
 
-fn locate_mime_part<'a>(root: &'a MimeNode, path: &[usize]) -> Option<&'a MimeNode> {
-    let mut current = root;
-    for (position, idx) in path.iter().enumerate() {
-        if *idx == 0 {
-            return None;
-        }
-        if current.children.is_empty() {
-            if position == 0 && *idx == 1 {
-                continue;
-            }
-            current = current.embedded.as_deref()?;
-            if current.children.is_empty() {
-                if *idx != 1 {
-                    return None;
-                }
-            } else {
-                current = current.children.get(idx - 1)?;
-            }
-        } else {
-            current = current.children.get(idx - 1)?;
-        }
-    }
-    Some(current)
-}
-
-pub(crate) fn extract_catenate_section(data: &[u8], section: &str) -> Option<Vec<u8>> {
-    let section = section.trim().to_ascii_uppercase();
-    if section.is_empty() {
-        return Some(data.to_vec());
-    }
-    let root = parse_mime_tree(data);
-    if section == "TEXT" {
-        return Some(root.body);
-    }
-    if section == "HEADER" || section == "MIME" {
-        return Some(root.header);
-    }
-
-    let mut path = Vec::new();
-    let mut suffix = None;
-    for segment in section.split('.') {
-        if let Ok(idx) = segment.parse::<usize>() {
-            path.push(idx);
-        } else {
-            suffix = Some(segment);
-            break;
-        }
-    }
-    let part = locate_mime_part(&root, &path)?;
-    match suffix {
-        Some("MIME") => Some(part.header.clone()),
-        Some("HEADER") => Some(
-            part.embedded
-                .as_deref()
-                .map(|embedded| embedded.header.clone())
-                .unwrap_or_else(|| part.header.clone()),
-        ),
-        Some("TEXT") => Some(
-            part.embedded
-                .as_deref()
-                .map(|embedded| embedded.body.clone())
-                .unwrap_or_else(|| part.body.clone()),
-        ),
-        Some(_) => None,
-        None => Some(part.body.clone()),
-    }
-}
-
 fn extract_mime_section(data: &[u8], literal_name: &str) -> Vec<u8> {
     let Some(section) = parse_body_section(literal_name) else {
         return data.to_vec();
     };
-    extract_catenate_section(data, &section).unwrap_or_default()
+    extract_section(data, &section).unwrap_or_default()
 }
 
 fn decode_quoted_printable(input: &[u8]) -> Option<Vec<u8>> {

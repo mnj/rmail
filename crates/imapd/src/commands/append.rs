@@ -998,7 +998,7 @@ async fn resolve_catenate_url(
         }
         let data = std::fs::read(message.path)?;
         parsed.section.map_or(Ok(data.clone()), |section| {
-            mailbox::extract_catenate_section(&data, &section)
+            rmail_common::mime_section::extract_section(&data, &section)
                 .ok_or_else(|| anyhow::anyhow!("message section not found"))
         })
     })

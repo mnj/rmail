@@ -16,8 +16,7 @@ use rmail_common::imap_state::{self, FolderSummary};
 
 use crate::mailbox;
 
-/// The prefix of the other users' namespace, without its trailing `/`.
-pub(crate) const OTHER_USERS: &str = "Other Users";
+pub(crate) use rmail_common::acl::{OTHER_USERS, split_shared_name};
 
 /// A mailbox name resolved to its storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,13 +44,6 @@ impl Target {
     pub(crate) fn visible(&self) -> bool {
         !self.is_shared() || self.rights.intersects(Rights::LOOKUP.union(Rights::READ))
     }
-}
-
-/// Split `Other Users/<owner>/<rest>` into the owner and the rest, which is
-/// empty for the owner's own node.
-pub(crate) fn split_shared_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix(OTHER_USERS)?.strip_prefix('/')?;
-    Some(rest.split_once('/').unwrap_or((rest, "")))
 }
 
 /// The name a shared mailbox has in the user's view.

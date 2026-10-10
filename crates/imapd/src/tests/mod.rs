@@ -21,6 +21,7 @@ mod scram;
 mod search;
 mod sync;
 mod uidonly;
+mod urlauth;
 
 use crate::response::{CapabilityPhase, capability_tokens};
 use crate::{process_stream, process_stream_inner, process_stream_with_policy};

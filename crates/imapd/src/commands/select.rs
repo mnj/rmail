@@ -199,6 +199,11 @@ pub(crate) async fn handle(
         .status(
             StatusLine::untagged(Status::Ok, "Mailbox ID")
                 .with_code(format!("MAILBOXID ({})", selected.mailbox_id)),
+        )
+        // RFC 4467 section 8: the URLAUTH mechanisms, on SELECT and EXAMINE.
+        .status(
+            StatusLine::untagged(Status::Ok, "URLAUTH mechanisms")
+                .with_code(crate::commands::urlauth::URLMECH),
         );
     // UNSEEN carries a message sequence number, which UIDONLY forbids
     // (RFC 9586 §3).
