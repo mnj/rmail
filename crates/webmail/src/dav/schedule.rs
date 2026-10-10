@@ -244,7 +244,7 @@ fn uid_of(calendar: &text::Component) -> Option<String> {
 
 /// Put a message in `account`'s inbox and apply it to their copy of the
 /// event (RFC 6638 4.1).
-fn deliver_local(dav: &Dav, account: &User, message: &Message) -> anyhow::Result<()> {
+pub(super) fn deliver_local(dav: &Dav, account: &User, message: &Message) -> anyhow::Result<()> {
     let conn =
         rmail_common::jmap::store::open(&dav.app.mail_root, &account.domain, &account.localpart)?;
     store::inbox_add(&conn, &message.calendar.to_text())?;
@@ -252,68 +252,64 @@ fn deliver_local(dav: &Dav, account: &User, message: &Message) -> anyhow::Result
         return Ok(());
     };
     let sender = dav.user.address.as_str();
-    let found = store::find_by_uid(&conn, &uid)?;
-    let existing = found.as_ref().and_then(|(collection, object)| {
-        Some((
-            collection.clone(),
-            object.name.clone(),
-            text::parse(&object.data).ok()?,
-        ))
-    });
-    let (collection, name, data, tag) = match message.method {
-        Method::Request | Method::Cancel => {
-            // Only the event's organizer changes an existing copy.
-            if let Some((_, _, copy)) = &existing
-                && itip::organizer(copy).as_deref() != Some(sender)
-            {
-                return Ok(());
-            }
-            match (message.method, existing) {
-                (Method::Request, Some((collection, name, copy))) => (
-                    collection,
-                    name,
-                    itip::apply_request(Some(&copy), &message.calendar),
-                    ScheduleTag::New,
-                ),
-                (Method::Request, None) => (
-                    store::default_calendar(&conn)?,
-                    format!("{}.ics", random_name()),
-                    itip::apply_request(None, &message.calendar),
-                    ScheduleTag::New,
-                ),
-                (_, Some((collection, name, copy))) => (
-                    collection,
-                    name,
-                    itip::apply_cancel(&copy, &message.calendar),
-                    ScheduleTag::New,
-                ),
-                (_, None) => return Ok(()),
-            }
-        }
-        Method::Reply => {
-            let Some((collection, name, copy)) = existing else {
-                return Ok(());
-            };
-            if itip::role(&copy, &account.address) != Role::Organizer {
-                return Ok(());
-            }
-            let Some(updated) = itip::apply_reply(&copy, &message.calendar, sender) else {
-                return Ok(());
-            };
-            (collection, name, updated, ScheduleTag::Keep)
-        }
+    // The lookup only picks where the copy is; the message is applied to
+    // the version the write transaction holds, so concurrent replies or
+    // the recipient's own edits are not lost.
+    let (collection, name) = match store::find_by_uid(&conn, &uid)? {
+        Some((collection, object)) => (collection, object.name),
+        None if message.method == Method::Request => (
+            store::default_calendar(&conn)?,
+            format!("{}.ics", random_name()),
+        ),
+        None => return Ok(()),
     };
-    let data = data.to_text();
-    let stored = store::put_with(&conn, &collection, &name, &mut |_| {
-        Ok(Prepared {
-            data: data.clone(),
-            schedule_tag: tag,
-        })
+    let stored = store::put_with(&conn, &collection, &name, &mut |current| {
+        let copy = current.and_then(|object| text::parse(&object.data).ok());
+        apply(message, copy.as_ref(), sender, &account.address)
+            .ok_or(store::PutError::PreconditionFailed)
     })?;
-    if let Err(error) = stored {
-        anyhow::bail!("storing the event: {error:?}");
+    match stored {
+        // Nothing for this account to change.
+        Ok(_) | Err(store::PutError::PreconditionFailed) => Ok(()),
+        Err(error) => anyhow::bail!("storing the event: {error:?}"),
     }
-    Ok(())
+}
+
+/// The recipient's copy after a message from `sender`, or `None` when the
+/// message does not change it: only the event's organizer changes an
+/// existing copy, and a reply only reaches the organizer's own copy.
+fn apply(
+    message: &Message,
+    copy: Option<&text::Component>,
+    sender: &str,
+    recipient: &str,
+) -> Option<Prepared> {
+    let organized_by_sender = |copy: &text::Component| {
+        itip::organizer(copy).is_some_and(|organizer| organizer.eq_ignore_ascii_case(sender))
+    };
+    let (calendar, schedule_tag) = match (message.method, copy) {
+        (Method::Request, None) => (
+            itip::apply_request(None, &message.calendar),
+            ScheduleTag::New,
+        ),
+        (Method::Request, Some(copy)) if organized_by_sender(copy) => (
+            itip::apply_request(Some(copy), &message.calendar),
+            ScheduleTag::New,
+        ),
+        (Method::Cancel, Some(copy)) if organized_by_sender(copy) => (
+            itip::apply_cancel(copy, &message.calendar),
+            ScheduleTag::New,
+        ),
+        (Method::Reply, Some(copy)) if itip::role(copy, recipient) == Role::Organizer => (
+            itip::apply_reply(copy, &message.calendar, sender)?,
+            ScheduleTag::Keep,
+        ),
+        _ => return None,
+    };
+    Some(Prepared {
+        data: calendar.to_text(),
+        schedule_tag,
+    })
 }
 
 fn random_name() -> String {

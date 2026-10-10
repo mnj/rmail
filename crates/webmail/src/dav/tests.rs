@@ -21,7 +21,12 @@ fn state(td: &tempfile::TempDir) -> Arc<AppState> {
 fn state_with(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) -> Arc<AppState> {
     let db_path = td.path().join("accounts.sqlite");
     db::init_db(&db_path).unwrap();
-    for address in [USER, "other@example.test", "far@elsewhere.test"] {
+    for address in [
+        USER,
+        "other@example.test",
+        "third@example.test",
+        "far@elsewhere.test",
+    ] {
         db::add_mailbox(&db_path, address, Some("plain:secret"), None, None).unwrap();
     }
     let mail_root = td.path().join("mail");
@@ -876,4 +881,74 @@ async fn remote_attendees_get_invitations_by_email() {
     let (_, data) = received.recv().await.unwrap();
     assert!(data.contains("Subject: Cancelled: Planning"));
     assert!(data.contains("method=CANCEL"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_answers_both_reach_the_organizer() {
+    use rmail_common::dav::{itip, text};
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let third = "third@example.test";
+    let account = |address: &str| {
+        let (localpart, domain) = address.split_once('@').unwrap();
+        crate::jmap::User {
+            address: address.to_string(),
+            domain: domain.to_string(),
+            localpart: localpart.to_string(),
+        }
+    };
+    for round in 0..20 {
+        let uid = format!("race-{round}");
+        let invite = meeting(
+            &[(OTHER, "NEEDS-ACTION"), (third, "NEEDS-ACTION")],
+            "Planning",
+            "",
+        )
+        .replace("UID:meet-1", &format!("UID:{uid}"));
+        let path = format!("{CALENDAR}{uid}.ics");
+        assert_eq!(dav(&state, "PUT", &path, &[], &invite).await.status, 201);
+        // Both attendees' replies are delivered at the same moment.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads = [OTHER, third].map(|attendee| {
+            let (state, barrier, uid) = (state.clone(), barrier.clone(), uid.clone());
+            let attendee = account(attendee);
+            std::thread::spawn(move || {
+                let conn = rmail_common::jmap::store::open(
+                    &state.mail_root,
+                    &attendee.domain,
+                    &attendee.localpart,
+                )
+                .unwrap();
+                let (_, object) = rmail_common::dav::store::find_by_uid(&conn, &uid)
+                    .unwrap()
+                    .unwrap();
+                let before = text::parse(&object.data).unwrap();
+                let after = text::parse(&unfolded(&object.data).replace(
+                    &format!("PARTSTAT=NEEDS-ACTION:mailto:{}", attendee.address),
+                    &format!("PARTSTAT=ACCEPTED:mailto:{}", attendee.address),
+                ))
+                .unwrap();
+                let reply =
+                    itip::attendee_reply(Some(&before), Some(&after), &attendee.address).unwrap();
+                let dav = super::Dav {
+                    user: attendee,
+                    conn,
+                    app: state,
+                };
+                barrier.wait();
+                super::schedule::deliver_local(&dav, &account(USER), &reply).unwrap();
+            })
+        });
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let organizer_copy = unfolded(&dav(&state, "GET", &path, &[], "").await.body);
+        for attendee in [OTHER, third] {
+            let line = organizer_copy
+                .lines()
+                .find(|line| line.ends_with(&format!("mailto:{attendee}")))
+                .unwrap();
+            assert!(line.contains("PARTSTAT=ACCEPTED"), "round {round}: {line}");
+        }
+    }
 }
