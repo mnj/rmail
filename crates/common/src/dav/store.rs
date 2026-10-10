@@ -71,6 +71,13 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_dav_objects_modseq ON dav_objects(collection_id, modseq);
         ",
     )?;
+    // Databases from before scheduling lack the schedule tag.
+    let has_schedule_tag = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dav_objects') WHERE name = 'schedule_tag'")?
+        .exists([])?;
+    if !has_schedule_tag {
+        conn.execute_batch("ALTER TABLE dav_objects ADD COLUMN schedule_tag TEXT")?;
+    }
     Ok(())
 }
 
@@ -823,6 +830,31 @@ mod tests {
         let wins = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
         assert_eq!(wins, 1, "{outcomes:?}");
         assert!(outcomes.contains(&Err(PutError::PreconditionFailed)));
+    }
+
+    #[test]
+    fn older_databases_gain_the_schedule_tag() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dav_objects(collection_id INTEGER NOT NULL, name TEXT NOT NULL,
+                 uid TEXT, etag TEXT NOT NULL, data TEXT NOT NULL, component TEXT,
+                 start_at INTEGER, end_at INTEGER, modseq INTEGER NOT NULL,
+                 modified INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(collection_id, name));
+             INSERT INTO dav_objects VALUES(1, 'a.ics', 'a', '\"e\"', 'x', NULL, NULL, NULL, 1, 0, 0);",
+        )
+        .unwrap();
+        ensure_schema(&conn).unwrap();
+        // Running it again leaves the migrated table alone.
+        ensure_schema(&conn).unwrap();
+        let tag: Option<String> = conn
+            .query_row(
+                "SELECT schedule_tag FROM dav_objects WHERE name = 'a.ics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag, None);
     }
 
     #[test]
