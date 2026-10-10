@@ -8,3 +8,7 @@ config/certs/
 **/plan.md
 mail_test/
 config/rmail_test.db*
+# Working notes in the repository root stay local; only these are tracked.
+/*.md
+!/README.md
+!/AGENTS.md
