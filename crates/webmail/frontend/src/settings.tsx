@@ -51,8 +51,12 @@ export function ComposeSettingsDialog({ api, prefs, identities, onClose, onSaved
     try {
       await api('/api/compose/settings', { method: 'PUT', body: JSON.stringify(draft) });
       for (const identity of identities) {
-        const html = editors.current[identity.id]?.getHTML() ?? identity.html_signature;
-        await api(`/api/identities/${encodeURIComponent(identity.id)}`, { method: 'PUT', body: JSON.stringify({ name: names[identity.id] ?? identity.name, html_signature: html, text_signature: identity.text_signature }) });
+        const handle = editors.current[identity.id];
+        const html = handle?.getHTML() ?? identity.html_signature;
+        // The text version follows what is in the editor, so clearing the
+        // signature clears it for plain-text messages too.
+        const text = handle ? handle.getText().replace(/\n+$/, '') : identity.text_signature;
+        await api(`/api/identities/${encodeURIComponent(identity.id)}`, { method: 'PUT', body: JSON.stringify({ name: names[identity.id] ?? identity.name, html_signature: html, text_signature: text }) });
       }
       onSaved();
       onClose();

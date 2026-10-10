@@ -223,6 +223,9 @@ enum Token<'a> {
 /// the content of raw-text elements is skipped.
 fn tokenize(input: &str) -> Vec<Token<'_>> {
     let bytes = input.as_bytes();
+    // ASCII lowercasing keeps byte offsets, so one copy serves every search
+    // for a raw-text end tag (copying the rest per tag would be quadratic).
+    let lower_input = input.to_ascii_lowercase();
     let mut tokens = Vec::new();
     let mut i = 0;
     let mut text_start = 0;
@@ -274,8 +277,8 @@ fn tokenize(input: &str) -> Vec<Token<'_>> {
                 && RAW_TEXT.contains(&name.as_str())
             {
                 // Skip to `</name`; the end tag itself is read normally.
-                let lower = input[i..].to_ascii_lowercase();
-                let skip = lower.find(&format!("</{name}")).unwrap_or(lower.len());
+                let rest = &lower_input[i..];
+                let skip = rest.find(&format!("</{name}")).unwrap_or(rest.len());
                 i += skip;
                 text_start = i;
             }
@@ -1178,6 +1181,16 @@ mod tests {
             },
         )
         .html
+    }
+
+    #[test]
+    fn many_raw_text_elements_are_skipped_in_linear_time() {
+        // Each skipped element used to copy the rest of the document.
+        let html = "<STYLE>p{}</Style><script>x()</SCRIPT>ok ".repeat(20_000);
+        let started = std::time::Instant::now();
+        let body = send(&html).html;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(body.contains("ok") && !body.contains("x()") && !body.contains("p{}"));
     }
 
     #[test]
