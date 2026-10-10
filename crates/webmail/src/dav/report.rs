@@ -4,12 +4,12 @@
 
 use axum::http::StatusCode;
 use axum::response::Response;
-use rmail_common::dav::store::{self, Change, Collection, Kind, Object};
+use rmail_common::dav::store::{self, Change, Kind, Object};
 use rmail_common::dav::text::{self, Component, Property};
 
 use super::props::{self, Resource, Wanted};
 use super::xml::{self, CALDAV, CARDDAV, DAV};
-use super::{Dav, Target, href_segments, object_href, xml_response};
+use super::{Dav, Place, Target, href_segments, object_href, xml_response};
 
 pub(crate) fn report(
     dav: &Dav,
@@ -35,17 +35,17 @@ pub(crate) fn report(
     };
     if let Some(kind) = query {
         // A query runs over a collection (Depth 1) or one object (Depth 0).
-        let (collection, objects) = match target {
-            Target::Collection(collection) if collection.kind == kind => {
+        let (place, objects) = match target {
+            Target::Collection(place) if place.collection.kind == kind => {
                 let objects = if depth == Some("0") {
                     Vec::new()
                 } else {
-                    store::objects(&dav.conn, &collection)?
+                    store::objects(dav.conn_of(&place), &place.collection)?
                 };
-                (collection, objects)
+                (place, objects)
             }
-            Target::Object(collection, Some(object), _) if collection.kind == kind => {
-                (collection, vec![*object])
+            Target::Object(place, Some(object), _) if place.collection.kind == kind => {
+                (place, vec![*object])
             }
             Target::NotFound | Target::Object(_, None, _) | Target::NewCollection(..) => {
                 return Ok(super::status(StatusCode::NOT_FOUND));
@@ -76,7 +76,7 @@ pub(crate) fn report(
                 }
                 responses.push(props::describe(
                     dav,
-                    &Resource::Object(&collection, object),
+                    &Resource::Object(&place, object),
                     &wanted,
                 ));
             }
@@ -87,10 +87,10 @@ pub(crate) fn report(
         ));
     }
     if xml::is(root, DAV, "sync-collection") {
-        let Target::Collection(collection) = target else {
+        let Target::Collection(place) = target else {
             return Ok(super::status(StatusCode::FORBIDDEN));
         };
-        return sync(dav, root, &collection, &wanted);
+        return sync(dav, root, &place, &wanted);
     }
     Ok(xml_response(
         StatusCode::FORBIDDEN,
@@ -131,7 +131,7 @@ fn multiget(dav: &Dav, root: roxmltree::Node<'_, '_>, wanted: &Wanted) -> anyhow
 fn sync(
     dav: &Dav,
     root: roxmltree::Node<'_, '_>,
-    collection: &Collection,
+    place: &Place,
     wanted: &Wanted,
 ) -> anyhow::Result<Response> {
     let token = xml::child(root, DAV, "sync-token")
@@ -141,13 +141,13 @@ fn sync(
     let since = if token.is_empty() {
         Some(0)
     } else {
-        store::parse_sync_token(collection, token)
+        store::parse_sync_token(&place.collection, token)
     };
     let invalid = || xml_response(StatusCode::FORBIDDEN, xml::error("<d:valid-sync-token/>"));
     let Some(since) = since else {
         return Ok(invalid());
     };
-    let Some(changes) = store::changes_since(&dav.conn, collection, since)? else {
+    let Some(changes) = store::changes_since(dav.conn_of(place), &place.collection, since)? else {
         return Ok(invalid());
     };
     let mut responses = Vec::new();
@@ -155,11 +155,11 @@ fn sync(
         match change {
             Change::Changed(object) => responses.push(props::describe(
                 dav,
-                &Resource::Object(collection, &object),
+                &Resource::Object(place, &object),
                 wanted,
             )),
             Change::Deleted(name) => {
-                let mut gone = xml::Response::new(&object_href(&dav.user, collection, &name));
+                let mut gone = xml::Response::new(&object_href(&dav.user, place, &name));
                 gone.status = Some(404);
                 responses.push(gone);
             }
@@ -167,7 +167,7 @@ fn sync(
     }
     Ok(xml_response(
         StatusCode::MULTI_STATUS,
-        xml::multistatus(&responses, Some(&collection.sync_token())),
+        xml::multistatus(&responses, Some(&place.collection.sync_token())),
     ))
 }
 

@@ -106,6 +106,10 @@ pub(crate) fn router(state: Shared) -> Router {
                 .delete(delete_account),
         )
         .route("/api/sharing", get(sharing).delete(delete_sharing))
+        .route(
+            "/api/dav-sharing",
+            get(dav_sharing).delete(delete_dav_sharing),
+        )
         .route("/api/routing", get(routing))
         .route("/api/routing/alias", post(save_alias).delete(delete_alias))
         .route(
@@ -1001,6 +1005,78 @@ async fn delete_sharing(State(state): State<Shared>, body: Bytes) -> Response {
             )? {
                 anyhow::bail!(
                     "{} does not share that folder with {}",
+                    input.owner,
+                    input.grantee
+                );
+            }
+            Ok(json!({"result": "ok"}))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Every calendar and address book an account shares with another.
+async fn dav_sharing(State(state): State<Shared>) -> Response {
+    use rmail_common::dav::{share, store};
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let root = state.mail_root.clone();
+    outcome(
+        blocking(move || {
+            let grants = share::all_grants(std::path::Path::new(&db))?;
+            // Grants on collections deleted since are not shown.
+            Ok(share::with_collections(&root, grants)?
+                .into_iter()
+                .map(|(grant, collection)| {
+                    json!({
+                        "owner": grant.owner,
+                        "kind": match collection.kind {
+                            store::Kind::Calendar => "calendar",
+                            store::Kind::AddressBook => "addressbook",
+                        },
+                        "name": collection.displayname.unwrap_or(collection.name),
+                        "collection_id": grant.collection_id,
+                        "grantee": grant.grantee,
+                        "access": grant.access.as_str(),
+                    })
+                })
+                .collect::<Vec<_>>())
+        })
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+#[derive(Deserialize)]
+struct DavSharingDelete {
+    owner: String,
+    collection_id: i64,
+    grantee: String,
+}
+
+/// Stop sharing a calendar or address book with one account.
+async fn delete_dav_sharing(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: DavSharingDelete = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            if !rmail_common::dav::share::delete(
+                std::path::Path::new(&db),
+                &input.owner,
+                input.collection_id,
+                &input.grantee,
+            )? {
+                anyhow::bail!(
+                    "{} does not share that collection with {}",
                     input.owner,
                     input.grantee
                 );

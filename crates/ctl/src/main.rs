@@ -86,8 +86,8 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
-    /// Mailbox sharing (IMAP ACL): which folders an account shares, and
-    /// with whom
+    /// Sharing: which folders (IMAP ACL), calendars and address books an
+    /// account shares, and with whom
     Share {
         #[command(subcommand)]
         action: ShareAction,
@@ -208,8 +208,25 @@ enum TransportAction {
 
 #[derive(Subcommand)]
 enum ShareAction {
-    /// Folders ADDRESS shares, and folders shared with it
+    /// Folders, calendars and address books ADDRESS shares, and those
+    /// shared with it
     List { address: String },
+    /// Give GRANTEE ACCESS (read, read-write or none to stop sharing) to
+    /// OWNER's calendar NAME (its URL segment, e.g. default)
+    Calendar {
+        owner: String,
+        name: String,
+        grantee: String,
+        access: String,
+    },
+    /// Give GRANTEE ACCESS (read, read-write or none to stop sharing) to
+    /// OWNER's address book NAME (its URL segment, e.g. default)
+    Addressbook {
+        owner: String,
+        name: String,
+        grantee: String,
+        access: String,
+    },
     /// Give GRANTEE exactly RIGHTS (RFC 4314 letters, e.g. lr to read, lrswite
     /// to read and change) on OWNER's FOLDER; `none` stops sharing
     Set {
@@ -692,6 +709,7 @@ fn run_share(
     mail_root: &std::path::Path,
     db_path: &std::path::Path,
 ) -> Result<()> {
+    use rmail_common::dav::{share, store};
     use rmail_common::{acl, imap_state};
     let account = |address: &str| -> Result<(String, String)> {
         let address = rmail_common::domain::canonicalize_mailbox_address(address)?;
@@ -721,6 +739,35 @@ fn run_share(
                 );
                 shown = true;
             }
+            let collection_label = |collection: &store::Collection| {
+                let kind = match collection.kind {
+                    store::Kind::Calendar => "calendar",
+                    store::Kind::AddressBook => "addressbook",
+                };
+                format!("{kind} {}", collection.name)
+            };
+            let granted =
+                share::with_collections(mail_root, share::granted_by(db_path, &address)?)?;
+            for (grant, collection) in granted {
+                println!(
+                    "shares   {:<24} with {} ({})",
+                    collection_label(&collection),
+                    grant.grantee,
+                    grant.access.as_str()
+                );
+                shown = true;
+            }
+            let received =
+                share::with_collections(mail_root, share::shared_with(db_path, &address)?)?;
+            for (grant, collection) in received {
+                println!(
+                    "receives {:<24} from {} ({})",
+                    collection_label(&collection),
+                    grant.owner,
+                    grant.access.as_str()
+                );
+                shown = true;
+            }
             if !shown {
                 println!("Nothing shared by or with {address}.");
             }
@@ -746,6 +793,71 @@ fn run_share(
                 println!("{grantee} now has {rights} on {folder} of {owner}");
             }
         }
+        ShareAction::Calendar {
+            owner,
+            name,
+            grantee,
+            access,
+        } => share_collection(
+            mail_root,
+            db_path,
+            store::Kind::Calendar,
+            &owner,
+            &name,
+            &grantee,
+            &access,
+        )?,
+        ShareAction::Addressbook {
+            owner,
+            name,
+            grantee,
+            access,
+        } => share_collection(
+            mail_root,
+            db_path,
+            store::Kind::AddressBook,
+            &owner,
+            &name,
+            &grantee,
+            &access,
+        )?,
+    }
+    Ok(())
+}
+
+/// `rmail_ctl share calendar|addressbook`: grant or stop sharing one of
+/// OWNER's collections.
+fn share_collection(
+    mail_root: &std::path::Path,
+    db_path: &std::path::Path,
+    kind: rmail_common::dav::store::Kind,
+    owner: &str,
+    name: &str,
+    grantee: &str,
+    access: &str,
+) -> Result<()> {
+    use rmail_common::dav::share;
+    let owner = rmail_common::domain::canonicalize_mailbox_address(owner)?;
+    if !rmail_common::db::mailbox_exists(db_path, &owner)? {
+        anyhow::bail!("no mailbox {owner}");
+    }
+    let collection = share::own_collections(mail_root, &owner, kind)?
+        .into_iter()
+        .find(|collection| collection.name == name)
+        .with_context(|| format!("{owner} has no such collection {name}"))?;
+    let access = match access {
+        "none" => None,
+        access => {
+            Some(share::Access::parse(access).context("access must be read, read-write or none")?)
+        }
+    };
+    share::set_access(db_path, &owner, collection.id, grantee, access)?;
+    match access {
+        None => println!("{name} of {owner} is no longer shared with {grantee}"),
+        Some(access) => println!(
+            "{grantee} now has {} access to {name} of {owner}",
+            access.as_str()
+        ),
     }
     Ok(())
 }

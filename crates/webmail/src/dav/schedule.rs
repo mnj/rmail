@@ -11,6 +11,13 @@
 //!   one domain cannot write into another's calendars or read its
 //!   free-busy times.
 //! - The stored copy records each recipient's `SCHEDULE-STATUS`.
+//! - A change in a calendar shared with read-write access is scheduled as
+//!   the calendar's owner (RFC 6638 3.2), whoever makes it: the owner is
+//!   the organizer or attendee the event names, so messages come from the
+//!   owner's address. Granting read-write access thus lets the sharee
+//!   invite and answer in the owner's name for that calendar's events, as
+//!   a delegate. Recipients still apply a message only when it comes from
+//!   their copy's organizer.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -52,6 +59,8 @@ impl Route {
 
 /// A message and where each of its recipients gets it.
 pub(crate) struct Outgoing {
+    /// The calendar user it is from: the owner of the calendar changed.
+    sender: User,
     message: Message,
     routes: Vec<(String, Route)>,
 }
@@ -62,7 +71,7 @@ fn same_domain(user: &User, domain: &str) -> bool {
 
 /// The account in `sender`'s domain an address reaches, directly or as an
 /// alias with one target.
-fn local_account(dav: &Dav, address: &str) -> Option<User> {
+fn local_account(dav: &Dav, sender: &User, address: &str) -> Option<User> {
     let canonical = rmail_common::domain::canonicalize_mailbox_address(address).ok()?;
     let target = if db::mailbox_exists(&dav.app.db_path, &canonical).ok()? {
         canonical
@@ -79,15 +88,15 @@ fn local_account(dav: &Dav, address: &str) -> Option<User> {
         }
     };
     let (localpart, domain) = target.rsplit_once('@')?;
-    same_domain(&dav.user, domain).then(|| User {
+    same_domain(sender, domain).then(|| User {
         address: target.clone(),
         domain: domain.to_string(),
         localpart: localpart.to_string(),
     })
 }
 
-fn route(dav: &Dav, address: &str) -> Route {
-    if let Some(user) = local_account(dav, address) {
+fn route(dav: &Dav, sender: &User, address: &str) -> Route {
+    if let Some(user) = local_account(dav, sender, address) {
         return Route::Local(user);
     }
     if dav.app.submission.is_some() {
@@ -98,7 +107,7 @@ fn route(dav: &Dav, address: &str) -> Route {
     }
 }
 
-fn plan(dav: &Dav, messages: Vec<Message>) -> Vec<Outgoing> {
+fn plan(dav: &Dav, sender: &User, messages: Vec<Message>) -> Vec<Outgoing> {
     let mut budget = MAX_RECIPIENTS;
     messages
         .into_iter()
@@ -106,26 +115,32 @@ fn plan(dav: &Dav, messages: Vec<Message>) -> Vec<Outgoing> {
             let routes = message
                 .recipients
                 .iter()
-                .filter(|recipient| !recipient.eq_ignore_ascii_case(&dav.user.address))
+                .filter(|recipient| !recipient.eq_ignore_ascii_case(&sender.address))
                 .map(|recipient| {
                     let route = if budget == 0 {
                         Route::Refused("5.1")
                     } else {
                         budget -= 1;
-                        route(dav, recipient)
+                        route(dav, sender, recipient)
                     };
                     (recipient.clone(), route)
                 })
                 .collect();
-            Outgoing { message, routes }
+            Outgoing {
+                sender: sender.clone(),
+                message,
+                routes,
+            }
         })
         .collect()
 }
 
-/// What a PUT of calendar data stores and which messages it sends, given
-/// the version it replaces (inside the write transaction).
+/// What a PUT of calendar data stores and which messages it sends as
+/// `owner`, the calendar's owner, given the version it replaces (inside
+/// the write transaction).
 pub(crate) fn prepare_put(
     dav: &Dav,
+    owner: &User,
     current: Option<&Object>,
     data: &str,
 ) -> (Prepared, Vec<Outgoing>) {
@@ -137,7 +152,7 @@ pub(crate) fn prepare_put(
     let Ok(mut calendar) = text::parse(data) else {
         return (unchanged(ScheduleTag::None), Vec::new());
     };
-    let user = dav.user.address.as_str();
+    let user = owner.address.as_str();
     let previous = current.and_then(|object| text::parse(&object.data).ok());
     let role_now = itip::role(&calendar, user);
     let role_before = previous
@@ -160,7 +175,7 @@ pub(crate) fn prepare_put(
             "ORGANIZER",
         )
     };
-    let outgoing = plan(dav, messages);
+    let outgoing = plan(dav, owner, messages);
     let statuses = outgoing
         .iter()
         .flat_map(|outgoing| &outgoing.routes)
@@ -187,12 +202,12 @@ pub(crate) fn prepare_put(
 }
 
 /// The messages deleting an event sends: cancellations from the organizer,
-/// a decline from an attendee.
-pub(crate) fn prepare_delete(dav: &Dav, previous: &Object) -> Vec<Outgoing> {
+/// a decline from an attendee; `owner` is the calendar's owner.
+pub(crate) fn prepare_delete(dav: &Dav, owner: &User, previous: &Object) -> Vec<Outgoing> {
     let Ok(previous) = text::parse(&previous.data) else {
         return Vec::new();
     };
-    let user = dav.user.address.as_str();
+    let user = owner.address.as_str();
     let messages = match itip::role(&previous, user) {
         Role::Organizer => itip::organizer_messages(Some(&previous), None, user),
         Role::Attendee => itip::attendee_reply(Some(&previous), None, user)
@@ -200,18 +215,23 @@ pub(crate) fn prepare_delete(dav: &Dav, previous: &Object) -> Vec<Outgoing> {
             .collect(),
         Role::None => Vec::new(),
     };
-    plan(dav, messages)
+    plan(dav, owner, messages)
 }
 
 /// Send what a stored change implies. Failures are logged: the change is
 /// stored either way.
 pub(crate) fn deliver(dav: &Dav, outgoing: Vec<Outgoing>) {
-    for Outgoing { message, routes } in outgoing {
+    for Outgoing {
+        sender,
+        message,
+        routes,
+    } in outgoing
+    {
         let mut by_email = Vec::new();
         for (recipient, route) in routes {
             match route {
                 Route::Local(account) => {
-                    if let Err(error) = deliver_local(dav, &account, &message) {
+                    if let Err(error) = deliver_local(dav, &sender, &account, &message) {
                         webmail_log!("warn", "scheduling_delivery_failed", {
                             "recipient": account.address,
                             "error": format!("{error:#}")
@@ -223,10 +243,10 @@ pub(crate) fn deliver(dav: &Dav, outgoing: Vec<Outgoing>) {
             }
         }
         if !by_email.is_empty()
-            && let Err(error) = send_email(dav, &message, &by_email)
+            && let Err(error) = send_email(dav, &sender, &message, &by_email)
         {
             webmail_log!("warn", "scheduling_mail_failed", {
-                "sender": dav.user.address,
+                "sender": sender.address,
                 "error": format!("{error:#}")
             });
         }
@@ -244,14 +264,19 @@ fn uid_of(calendar: &text::Component) -> Option<String> {
 
 /// Put a message in `account`'s inbox and apply it to their copy of the
 /// event (RFC 6638 4.1).
-pub(super) fn deliver_local(dav: &Dav, account: &User, message: &Message) -> anyhow::Result<()> {
+pub(super) fn deliver_local(
+    dav: &Dav,
+    sender: &User,
+    account: &User,
+    message: &Message,
+) -> anyhow::Result<()> {
     let conn =
         rmail_common::jmap::store::open(&dav.app.mail_root, &account.domain, &account.localpart)?;
     store::inbox_add(&conn, &message.calendar.to_text())?;
     let Some(uid) = uid_of(&message.calendar) else {
         return Ok(());
     };
-    let sender = dav.user.address.as_str();
+    let sender = sender.address.as_str();
     // The lookup only picks where the copy is; the message is applied to
     // the version the write transaction holds, so concurrent replies or
     // the recipient's own edits are not lost.
@@ -319,12 +344,17 @@ fn random_name() -> String {
 }
 
 /// An iMIP email (RFC 6047) with the message as a `text/calendar` part.
-fn send_email(dav: &Dav, message: &Message, recipients: &[String]) -> anyhow::Result<()> {
+fn send_email(
+    dav: &Dav,
+    sender: &User,
+    message: &Message,
+    recipients: &[String],
+) -> anyhow::Result<()> {
     let Some(submission) = dav.app.submission else {
         anyhow::bail!("sending is off");
     };
     let (summary, details) = itip::summary_text(&message.calendar);
-    let sender = dav.user.address.as_str();
+    let sender = sender.address.as_str();
     let (subject, intro) = match message.method {
         Method::Request => (
             format!("Invitation: {summary}"),
@@ -456,7 +486,7 @@ pub(crate) fn post(
     for attendee in query.properties_named("ATTENDEE").take(MAX_RECIPIENTS) {
         let (status, data) = match itip::address(&attendee.value) {
             None => ("3.7;Invalid calendar user", None),
-            Some(address) => match local_account(dav, &address) {
+            Some(address) => match local_account(dav, &dav.user, &address) {
                 Some(account) => (
                     "2.0;Success",
                     Some(freebusy_reply(dav, &account, query, attendee, start, end)?),

@@ -36,7 +36,8 @@ screenshots of every page, and a quick start.
 - **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so
   Thunderbird, Apple devices and DAVx⁵ keep calendars and address books in sync, and server-side
   scheduling (RFC 6638): invitations, replies and free-busy between accounts, by email for
-  everyone else.
+  everyone else. Calendars and address books can be shared between accounts, read-only or
+  read-write.
 - **Operations**: structured JSON logs, live `rmail_ctl watch`, per-message tracking, built-in
   ACME certificates (Let's Encrypt over HTTP or DNS, renewed and hot-reloaded), and `.deb`
   packages for amd64 and arm64 published on every merge.
@@ -284,9 +285,15 @@ starts with a calendar and an address book and can create more.
 | RFC 6764 | Service discovery | 100% | `/.well-known/caldav` and `/.well-known/carddav` redirect to `/dav/`; `_caldavs._tcp`/`_carddavs._tcp` SRV and `path=/dav/` TXT records are suggested per domain; Thunderbird autoconfig lists both. |
 | RFC 6638 | Scheduling | 80% | Implicit scheduling on PUT and DELETE: the organizer's changes send `REQUEST` (to every attendee on significant changes, else only to added ones) and `CANCEL` (to removed attendees, or everyone on deletion), an attendee's changed `PARTSTAT` sends `REPLY`, deleting declines. Attendees with an account in the organizer's domain get the message in their schedule inbox and their calendar copy updated at once; everyone else gets an iMIP email (RFC 6047) through the submission service. `SCHEDULE-STATUS`, `SCHEDULE-AGENT`, `SCHEDULE-FORCE-SEND`, `Schedule-Tag` with `If-Schedule-Tag-Match`, `Schedule-Reply: F`, and free-busy queries posted to the outbox (time zones and recurrences expanded) for accounts in the same domain. Each attendee gets the whole event rather than only their instances; iMIP mail received from other servers is left to the client. |
 | RFC 5397 | `current-user-principal` | 100% | Reported on every resource. |
+| RFC 3744 | `current-user-privilege-set` | 40% | Reported on every resource: every privilege on the user's own, `read` only in a read-only share. Writes a share does not allow fail with `need-privileges` naming the missing `bind`, `unbind` or `write-content`. No `ACL` method or `acl` property; grants are made by sharing, not ACEs. |
+| CalendarServer sharing | `calendarserver-sharing` | 70% | A POST of `CS:share` to an own calendar or address book sets or removes sharees (accounts on the server, by `mailto:` or principal URL) with `CS:read` or `CS:read-write`; `CS:invite`, `CS:allowed-sharing-modes` and the `CS:shared`/`CS:shared-owner` resource types are reported. Grants take effect at once: there are no invitation notifications to accept or decline, and every sharee shows as accepted. |
 
-Sharing calendars between accounts is not offered. The CalendarServer `getctag` and Apple
-calendar color and order properties are supported for older clients.
+Shared calendars and address books appear in the sharee's home as `<owner>~<name>/`, so every
+client finds them as it finds its own; the sharee's name, color and order for them are kept per
+sharee. Deleting one there leaves the share. Changes in a calendar shared read-write are scheduled
+as its owner (RFC 6638 section 3.2). Sharing is managed from webmail, Apple Calendar, the admin
+console and `rmail_ctl share`. The CalendarServer `getctag` and Apple calendar color and order
+properties are supported for older clients.
 
 Repeatable storage and queue performance workloads are documented in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `rmail_bench` provides live IMAP, SMTP, BDAT, IDLE,

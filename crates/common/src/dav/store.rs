@@ -221,6 +221,20 @@ pub fn collection(conn: &Connection, kind: Kind, name: &str) -> Result<Option<Co
         .optional()?)
 }
 
+/// The calendar or address book with this id (never the schedule inbox),
+/// as sharing grants name them.
+pub fn collection_by_id(conn: &Connection, id: i64) -> Result<Option<Collection>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLLECTION_COLUMNS} FROM dav_collections WHERE id = ?1 AND kind != ?2"
+            ),
+            params![id, INBOX_KIND],
+            row_to_collection,
+        )
+        .optional()?)
+}
+
 /// The account's schedule inbox, created on first use.
 pub fn inbox(conn: &Connection) -> Result<Collection> {
     conn.execute(
