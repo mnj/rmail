@@ -17,6 +17,7 @@ pub mod compose_store;
 pub mod config;
 pub mod dav;
 pub mod db;
+pub mod deliverability;
 pub mod discovery;
 pub mod dkim;
 pub mod dnsbl;

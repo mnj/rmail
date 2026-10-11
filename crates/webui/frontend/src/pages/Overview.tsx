@@ -100,8 +100,12 @@ export function OverviewPage({ navigate }: { navigate: (page: Page) => void }) {
     else if (cert.self_signed) attention.push({ key: 'cert-self-signed', tone: 'warn', text: <>The TLS certificate is self-signed; mail clients will warn about it</>, page: 'certificates' });
     if (certs.data.enabled && certs.data.status.consecutive_failures > 0) attention.push({ key: 'cert-renewal', tone: 'warn', text: <>Certificate renewal has failed {plural(certs.data.status.consecutive_failures, 'time')} in a row</>, page: 'certificates' });
   }
+  for (const step of dns.data?.server || []) {
+    // The certificate has its own entries above.
+    if (step.state !== 'todo' || step.id === 'certificate' || step.need === 'optional') continue;
+    if (step.need === 'required' || step.id === 'reverse_dns') attention.push({ key: `server-${step.id}`, tone: step.need === 'required' ? 'error' : 'warn', text: <>{step.detail || step.title}</>, page: step.page || 'delivery' });
+  }
   for (const domain of dns.data?.domains || []) {
-    // The certificate has its own entries above; these are the domain's.
     const todo = domain.steps.filter((step) => step.need === 'required' && step.state === 'todo');
     if (todo.length) attention.push({ key: `dns-${domain.domain}`, tone: 'error', text: <><strong>{domain.domain}</strong> is not set up for reliable mail: {todo.map((step) => step.title).join(', ')}</>, page: 'domains' });
     const wrong = domain.records.filter((record) => record.need !== 'required' && (record.status === 'problem' || record.status === 'different'));

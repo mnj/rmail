@@ -220,10 +220,32 @@ are logged by `rmail_web` as `dns_check_failed`. A change you just made can take
 TTL runs out to show, because the resolver in front of the server remembers the old answer.
 
 The overview's **Setup checklist** builds on the same checks: for the server, a trusted
-certificate, reverse DNS that names `global.hostname`, and a feedback-loop address; for each
+certificate, the deliverability checks below, and a feedback-loop address; for each
 domain, MX, SPF, DKIM and DMARC (required), then MTA-STS with TLS reports and the client
 auto-setup records (recommended). DANE, a smarthost and AI writing suggestions are listed as
 optional and never count against the server.
+
+### Deliverability checks
+
+Three things outside the domain's own DNS decide whether mail from a new server is accepted, and
+the console checks them on the same schedule (results are on the **Delivery** page):
+
+- **Outbound port 25.** `rmail_web` connects to the MX hosts of gmail.com and outlook.com on
+  port 25, over IPv4 and IPv6, says `EHLO` and `QUIT`, and sends nothing else. If none answers,
+  the port is blocked (common at cloud and home providers): ask the provider to open it or
+  set a smarthost under **Routing**.
+- **Reverse DNS.** The address the server sends from must have a PTR record naming
+  `global.hostname`, and that name must resolve back to the address. A valid PTR with another
+  name is reported as "Can improve". The sending address is the one the probed server reports
+  seeing, or else the machine's own public address, or else the host name's address record.
+  IPv6 is only judged when the server can actually send over it.
+- **Blocklists.** The sending address is looked up in Spamhaus ZEN, SpamCop, Barracuda and PSBL.
+  Spamhaus refuses queries that arrive through large public resolvers; those show as "not
+  checked" rather than as clean.
+
+A blocked port or a listing appears under **Needs attention** and in the log as
+`dns_check_failed`. With a default smarthost route (`*`), none of this is probed: receivers see
+the smarthost's address, not the server's.
 
 Optional outbound-worker tuning in `/etc/default/rmail`:
 

@@ -1,6 +1,6 @@
-//! Live DNS checks and the setup checklist built on them.
+//! Live DNS and deliverability checks, and the setup checklist built on them.
 //!
-//! Looking every record up takes a moment, so the answers are kept in memory
+//! Looking every record up and knocking on port 25 takes a moment, so the answers are kept in memory
 //! and refreshed on a timer, on request, and whenever the records this server
 //! expects change (a new DKIM key, another domain). The checklist's other
 //! steps (certificate, settings) are cheap and read fresh on every request.
@@ -14,10 +14,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use rmail_common::config::Config;
+use rmail_common::deliverability::{self, Deliverability, Listed, Reach};
 use rmail_common::discovery::{DnsRecord, MtaStsMode};
-use rmail_common::dnscheck::{
-    self, Dns, Host, Lookup, Need, RecordCheck, ReverseCheck, Status, SystemDns,
-};
+use rmail_common::dnscheck::{self, Dns, Host, Lookup, Need, RecordCheck, Status, SystemDns};
 use rmail_common::transport::{self, RouteAction};
 use serde::Serialize;
 
@@ -27,6 +26,7 @@ use super::{ApiError, Shared, blocking, require_db};
 const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Give the listeners and the resolver time to settle before the first pass.
 const FIRST_CHECK: Duration = Duration::from_secs(90);
+const SMTP_PORT: u16 = 25;
 
 pub(crate) fn routes() -> Router<Shared> {
     Router::new().route("/api/dns-checks", get(cached).post(recheck))
@@ -41,7 +41,9 @@ pub(crate) struct Cache(tokio::sync::Mutex<Option<Arc<Snapshot>>>);
 pub(crate) struct Snapshot {
     checked_at: i64,
     host: Host,
-    reverse: Vec<ReverseCheck>,
+    /// How the server looks from outside; `None` when a smarthost sends its
+    /// mail, so its own address is not what receivers see.
+    outbound: Option<Deliverability>,
     /// Per domain, in the order of `expected`.
     domains: Vec<(String, Vec<RecordCheck>)>,
     /// The records looked up; a different set means the snapshot is stale.
@@ -123,7 +125,12 @@ fn now() -> i64 {
 
 async fn take_snapshot(dns: &impl Dns, inputs: &Inputs) -> Snapshot {
     let host = Host::resolve(dns, &inputs.hostname).await;
-    let reverse = dnscheck::check_reverse(dns, &host).await;
+    let outbound = if inputs.smarthost {
+        None
+    } else {
+        let port25 = deliverability::probe_port25(dns, &host.name, SMTP_PORT).await;
+        Some(deliverability::check(dns, &host, port25).await)
+    };
     let mut domains = Vec::with_capacity(inputs.domains.len());
     for entry in &inputs.domains {
         let checks = dnscheck::check_domain(dns, &entry.domain, &host, &entry.records).await;
@@ -132,7 +139,7 @@ async fn take_snapshot(dns: &impl Dns, inputs: &Inputs) -> Snapshot {
     Snapshot {
         checked_at: now(),
         host,
-        reverse,
+        outbound,
         domains,
         expected: inputs.expected(),
     }
@@ -148,8 +155,8 @@ impl Snapshot {
         now() - self.checked_at < CHECK_INTERVAL.as_secs() as i64
     }
 
-    /// Required records whose lookup failed, as the `domain: name TYPE `
-    /// prefix their entry in `failures` would have.
+    /// Required checks that got no answer, as the prefix their entry in
+    /// `failures` would have.
     fn unchecked(&self) -> Vec<String> {
         self.domains
             .iter()
@@ -159,13 +166,28 @@ impl Snapshot {
                     .filter(|check| check.need == Need::Required && check.status == Status::Unknown)
                     .map(move |check| format!("{domain}: {} {} ", check.name, check.kind))
             })
+            .chain(self.outbound.iter().flat_map(|outbound| {
+                let port25 = [&outbound.port25.v4, &outbound.port25.v6]
+                    .into_iter()
+                    .any(|reach| matches!(reach, Reach::Unknown { .. }))
+                    .then(|| "server: port 25 ".to_string());
+                let lists = outbound.addresses.iter().flat_map(|address| {
+                    address
+                        .blocklists
+                        .iter()
+                        .filter(|list| list.status == Listed::Unknown)
+                        .map(move |list| format!("server: {} {} ", address.address, list.zone))
+                });
+                port25.into_iter().chain(lists).collect::<Vec<_>>()
+            }))
             .collect()
     }
 
     /// Required records that are published wrongly or not at all, as
     /// `domain: name TYPE status`.
     fn failures(&self) -> Vec<String> {
-        self.domains
+        let records = self
+            .domains
             .iter()
             .flat_map(|(domain, checks)| {
                 checks
@@ -187,7 +209,32 @@ impl Snapshot {
                         )
                     })
             })
+            .collect::<Vec<_>>();
+        records
+            .into_iter()
+            .chain(self.outbound_failures())
             .collect()
+    }
+
+    /// What stops mail leaving or being accepted, as `server: what state`.
+    fn outbound_failures(&self) -> Vec<String> {
+        let Some(outbound) = &self.outbound else {
+            return Vec::new();
+        };
+        let mut failures = Vec::new();
+        let blocked = |reach: &Reach| matches!(reach, Reach::Blocked { .. });
+        if !outbound.port25.open() && (blocked(&outbound.port25.v4) || blocked(&outbound.port25.v6))
+        {
+            failures.push("server: port 25 blocked".to_string());
+        }
+        for address in &outbound.addresses {
+            for list in &address.blocklists {
+                if list.status == Listed::Listed {
+                    failures.push(format!("server: {} {} listed", address.address, list.zone));
+                }
+            }
+        }
+        failures
     }
 }
 
@@ -228,6 +275,7 @@ struct Report<'a> {
     addresses: Vec<String>,
     server: Vec<Step>,
     domains: Vec<DomainReport<'a>>,
+    outbound: Option<&'a Deliverability>,
 }
 
 fn describe(check: &RecordCheck) -> String {
@@ -373,49 +421,126 @@ fn domain_steps(checks: &[RecordCheck], dkim_keys: usize, mta_sts: bool) -> Vec<
     steps
 }
 
-fn reverse_step(host: &Host, reverse: &[ReverseCheck]) -> (StepState, Option<String>) {
-    match &host.addresses {
-        Lookup::Found(_) => {}
-        Lookup::Missing => {
-            return (
-                StepState::Todo,
-                Some(format!(
-                    "{} has no address record, so there is nothing to check yet.",
-                    host.name
-                )),
-            );
+/// The steps about sending mail directly: reaching other servers, and how
+/// the sending address looks to them.
+fn outbound_steps(outbound: &Deliverability) -> Vec<Step> {
+    let port25 = &outbound.port25;
+    let (reachable, reachable_detail) = match (&port25.v4, &port25.v6) {
+        (Reach::Open { .. }, _) | (Reach::Unavailable, Reach::Open { .. }) => {
+            (StepState::Done, None)
         }
-        Lookup::Failed(error) => {
-            return (
-                StepState::Unknown,
-                Some(format!("Could not resolve {}: {error}", host.name)),
-            );
-        }
-    }
-    let wrong = reverse
+        (Reach::Blocked { .. }, Reach::Open { .. }) => (
+            StepState::Todo,
+            Some("Port 25 is open over IPv6 only. Most mail servers are reached over IPv4, where it is blocked: ask your hosting provider to open it, or send through a smarthost.".to_string()),
+        ),
+        (Reach::Blocked { .. }, _) | (Reach::Unavailable, Reach::Blocked { .. }) => (
+            StepState::Todo,
+            Some("No mail server could be reached on port 25, so outgoing mail will sit in the queue. Hosting providers often block the port by default: ask yours to open it, or send through a smarthost (Routing).".to_string()),
+        ),
+        (Reach::Unavailable, Reach::Unavailable) => (
+            StepState::Todo,
+            Some("This server has no route to the internet.".to_string()),
+        ),
+        (Reach::Unknown { error }, _) | (_, Reach::Unknown { error }) => (
+            StepState::Unknown,
+            Some(format!("Could not find a mail server to try: {error}")),
+        ),
+    };
+
+    let reverses = outbound.addresses.iter().map(|address| &address.reverse);
+    let (reverse, reverse_detail) = if outbound.addresses.is_empty() {
+        (
+            StepState::Unknown,
+            Some("The address this server sends from could not be determined.".to_string()),
+        )
+    } else if let Some(wrong) = reverses.clone().find(|reverse| {
+        matches!(
+            reverse.status,
+            Status::Missing | Status::Different | Status::Problem
+        )
+    }) {
+        (StepState::Todo, wrong.detail.clone())
+    } else if let Some(unknown) = reverses
+        .clone()
+        .find(|reverse| reverse.status == Status::Unknown)
+    {
+        (StepState::Unknown, unknown.detail.clone())
+    } else {
+        let advice = reverses
+            .clone()
+            .find(|reverse| reverse.status == Status::Improve)
+            .and_then(|reverse| reverse.detail.clone());
+        (StepState::Done, advice)
+    };
+
+    let lists = outbound
+        .addresses
         .iter()
-        .find(|check| matches!(check.status, Status::Missing | Status::Different));
-    if let Some(check) = wrong {
-        let found = if check.published.is_empty() {
-            "has no reverse DNS".to_string()
-        } else {
-            format!("reverses to {}", check.published.join(", "))
-        };
-        return (
+        .flat_map(|address| address.blocklists.iter().map(move |list| (address, list)))
+        .collect::<Vec<_>>();
+    let listed = lists
+        .iter()
+        .filter(|(_, list)| list.status == Listed::Listed)
+        .map(|(address, list)| format!("{} is on {}", address.address, list.name))
+        .collect::<Vec<_>>();
+    let unchecked = lists
+        .iter()
+        .filter(|(_, list)| list.status == Listed::Unknown)
+        .count();
+    let (blocklists, blocklists_detail) = if !listed.is_empty() {
+        (
             StepState::Todo,
             Some(format!(
-                "{} {found}. Ask whoever provides the address (usually your hosting provider) to set its PTR record to {}.",
-                check.address, host.name
+                "{}. Receivers that use the list reject or junk your mail until the address is removed.",
+                listed.join(", ")
             )),
-        );
-    }
-    if reverse.iter().any(|check| check.status == Status::Unknown) {
-        return (
+        )
+    } else if lists.is_empty() || unchecked == lists.len() {
+        (
             StepState::Unknown,
-            Some("The reverse lookup failed.".to_string()),
-        );
-    }
-    (StepState::Done, None)
+            Some("None of the blocklists could be checked.".to_string()),
+        )
+    } else if unchecked > 0 {
+        (
+            StepState::Done,
+            Some(format!(
+                "Not listed where it could be checked; {unchecked} of {} lookups got no answer.",
+                lists.len()
+            )),
+        )
+    } else {
+        (StepState::Done, None)
+    };
+
+    vec![
+        Step {
+            id: "port25",
+            need: Need::Required,
+            title: "Outbound port 25",
+            why: "Mail is handed to other servers on port 25. Many cloud and home providers block it by default to stop spam.",
+            state: reachable,
+            detail: reachable_detail,
+            page: Some("delivery"),
+        },
+        Step {
+            id: "reverse_dns",
+            need: Need::Recommended,
+            title: "Reverse DNS (PTR)",
+            why: "Receivers look up the name behind the sending address. Mail from an address that does not reverse to this server's name is often rejected or filed as spam.",
+            state: reverse,
+            detail: reverse_detail,
+            page: Some("delivery"),
+        },
+        Step {
+            id: "blocklists",
+            need: Need::Required,
+            title: "Not on a blocklist",
+            why: "Receivers check the sending address against lists of known spam sources. A new server can inherit a listing from whoever had the address before.",
+            state: blocklists,
+            detail: blocklists_detail,
+            page: Some("delivery"),
+        },
+    ]
 }
 
 fn server_steps(inputs: &Inputs, snapshot: &Snapshot) -> Vec<Step> {
@@ -438,11 +563,10 @@ fn server_steps(inputs: &Inputs, snapshot: &Snapshot) -> Vec<Step> {
             Some("No certificate is installed.".to_string()),
         ),
     };
-    let (reverse, reverse_detail) = reverse_step(&snapshot.host, &snapshot.reverse);
     let setting = |on: bool| {
         if on { StepState::Done } else { StepState::Todo }
     };
-    vec![
+    let mut steps = vec![
         Step {
             id: "certificate",
             need: Need::Required,
@@ -451,15 +575,6 @@ fn server_steps(inputs: &Inputs, snapshot: &Snapshot) -> Vec<Step> {
             state: certificate,
             detail: certificate_detail,
             page: Some("certificates"),
-        },
-        Step {
-            id: "reverse_dns",
-            need: Need::Recommended,
-            title: "Reverse DNS (PTR)",
-            why: "Receivers look up the name behind the sending address. Mail from an address that does not reverse to this server's name is often rejected or filed as spam.",
-            state: reverse,
-            detail: reverse_detail,
-            page: None,
         },
         Step {
             id: "feedback_loop",
@@ -497,7 +612,22 @@ fn server_steps(inputs: &Inputs, snapshot: &Snapshot) -> Vec<Step> {
             detail: None,
             page: Some("settings"),
         },
-    ]
+    ];
+    // After the certificate, ahead of the settings-only steps.
+    let outbound = match &snapshot.outbound {
+        Some(outbound) => outbound_steps(outbound),
+        None => vec![Step {
+            id: "port25",
+            need: Need::Required,
+            title: "Outbound port 25",
+            why: "Mail is handed to other servers on port 25. Many cloud and home providers block it by default to stop spam.",
+            state: StepState::Done,
+            detail: Some("Outgoing mail leaves through the smarthost, so this server needs neither port 25 nor a good reputation for its own address.".to_string()),
+            page: Some("routing"),
+        }],
+    };
+    steps.splice(1..1, outbound);
+    steps
 }
 
 fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
@@ -519,6 +649,7 @@ fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
                 steps: domain_steps(records, input.dkim_keys, inputs.mta_sts),
             })
             .collect(),
+        outbound: snapshot.outbound.as_ref(),
     }
 }
 
@@ -760,7 +891,10 @@ mod tests {
         let report = report(&inputs, &snapshot);
         assert_eq!(report.hostname, HOST);
         assert_eq!(report.addresses, ["203.0.113.5"]);
-        assert!(snapshot.failures().is_empty() && snapshot.unchecked().is_empty());
+        // The probe targets do not resolve in this zone, so port 25 is the
+        // one thing left unchecked.
+        assert!(snapshot.failures().is_empty());
+        assert_eq!(snapshot.unchecked(), ["server: port 25 "]);
 
         let steps = &report.domains[0].steps;
         let ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
@@ -786,7 +920,9 @@ mod tests {
 
         let server = &report.server;
         assert_eq!(step(server, "certificate").state, StepState::Done);
+        assert_eq!(step(server, "port25").state, StepState::Unknown);
         assert_eq!(step(server, "reverse_dns").state, StepState::Done);
+        assert_eq!(step(server, "blocklists").state, StepState::Done);
         assert_eq!(step(server, "feedback_loop").state, StepState::Done);
         for id in ["dane", "smarthost", "compose_ai"] {
             let step = step(server, id);
@@ -844,6 +980,143 @@ mod tests {
                 .unwrap()
                 .starts_with("203.0.113.5 has no reverse DNS")
         );
+    }
+
+    fn outbound(v4: Reach, v6: Reach, listed: bool) -> Deliverability {
+        use rmail_common::deliverability::{Address, Blocklist, Port25, Reverse, Source};
+        Deliverability {
+            port25: Port25 { v4, v6 },
+            addresses: vec![Address {
+                address: "203.0.113.5".parse().unwrap(),
+                source: Source::Seen,
+                reverse: Reverse {
+                    status: Status::Improve,
+                    names: vec!["static.provider.net".into()],
+                    detail: Some("reverses to static.provider.net".into()),
+                },
+                blocklists: vec![
+                    Blocklist {
+                        zone: "zen.spamhaus.org",
+                        name: "Spamhaus ZEN",
+                        status: if listed {
+                            Listed::Listed
+                        } else {
+                            Listed::Unknown
+                        },
+                        code: None,
+                        detail: None,
+                    },
+                    Blocklist {
+                        zone: "bl.spamcop.net",
+                        name: "SpamCop",
+                        status: Listed::Clean,
+                        code: None,
+                        detail: None,
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn open() -> Reach {
+        Reach::Open {
+            target: "mx.example.net".into(),
+            local: "203.0.113.5".parse().unwrap(),
+            seen_as: None,
+        }
+    }
+
+    fn blocked() -> Reach {
+        Reach::Blocked {
+            error: "mx.example.net: no answer".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_steps_follow_the_probe() {
+        let mut inputs = inputs();
+        let mut snapshot = take_snapshot(&zone(), &inputs).await;
+
+        snapshot.outbound = Some(outbound(blocked(), Reach::Unavailable, true));
+        assert_eq!(
+            snapshot.failures(),
+            [
+                "server: port 25 blocked",
+                "server: 203.0.113.5 zen.spamhaus.org listed"
+            ]
+        );
+        let steps = server_steps(&inputs, &snapshot);
+        let ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "certificate",
+                "port25",
+                "reverse_dns",
+                "blocklists",
+                "feedback_loop",
+                "dane",
+                "smarthost",
+                "compose_ai"
+            ]
+        );
+        let port25 = step(&steps, "port25");
+        assert_eq!(
+            (port25.state, port25.need),
+            (StepState::Todo, Need::Required)
+        );
+        assert!(port25.detail.as_deref().unwrap().contains("smarthost"));
+        let lists = step(&steps, "blocklists");
+        assert_eq!(lists.state, StepState::Todo);
+        assert!(
+            lists
+                .detail
+                .as_deref()
+                .unwrap()
+                .starts_with("203.0.113.5 is on Spamhaus ZEN.")
+        );
+        // A valid name that is not the host's: done, with the advice kept.
+        let reverse = step(&steps, "reverse_dns");
+        assert_eq!(reverse.state, StepState::Done);
+        assert!(reverse.detail.is_some());
+
+        // Open over IPv6 alone is not enough; a list that will not answer
+        // does not hide the ones that did.
+        snapshot.outbound = Some(outbound(blocked(), open(), false));
+        assert!(snapshot.failures().is_empty());
+        assert_eq!(
+            snapshot.unchecked(),
+            ["server: 203.0.113.5 zen.spamhaus.org "]
+        );
+        let steps = server_steps(&inputs, &snapshot);
+        let port25 = step(&steps, "port25");
+        assert_eq!(port25.state, StepState::Todo);
+        assert!(port25.detail.as_deref().unwrap().contains("IPv6 only"));
+        let lists = step(&steps, "blocklists");
+        assert_eq!(lists.state, StepState::Done);
+        assert!(lists.detail.as_deref().unwrap().contains("1 of 2"));
+
+        snapshot.outbound = Some(outbound(open(), blocked(), false));
+        assert_eq!(
+            step(&server_steps(&inputs, &snapshot), "port25").state,
+            StepState::Done
+        );
+
+        // With a smarthost nothing is probed, and the server's own address
+        // is nobody's concern.
+        inputs.smarthost = true;
+        let snapshot = take_snapshot(&zone(), &inputs).await;
+        assert!(snapshot.outbound.is_none());
+        let steps = server_steps(&inputs, &snapshot);
+        let port25 = step(&steps, "port25");
+        assert_eq!(port25.state, StepState::Done);
+        assert!(port25.detail.as_deref().unwrap().contains("smarthost"));
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.id != "reverse_dns" && step.id != "blocklists")
+        );
+        assert_eq!(step(&steps, "smarthost").state, StepState::Done);
     }
 
     #[tokio::test]

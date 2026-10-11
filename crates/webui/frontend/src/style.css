@@ -425,6 +425,11 @@ button.kpi:hover { border-color: var(--focus); box-shadow: var(--shadow-sm), 0 0
 .queueTable col.queueActions { width: 148px; }
 .queueNameCell code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .metricList { padding: 6px 16px 14px; display: grid; gap: 2px; }
+.metric span small { display: block; margin-top: 2px; color: var(--muted); white-space: normal; overflow-wrap: anywhere; }
+.outboundTable { min-width: 720px; border-top: 1px solid var(--border); }
+.outboundTable td { vertical-align: top; }
+.outboundTable td small { margin-top: 6px; max-width: 520px; }
+.outboundTable .ptrName { margin-left: 8px; }
 .metric { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); }
 .metric:last-child { border-bottom: 0; }
 .metric span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); }

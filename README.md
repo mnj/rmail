@@ -30,6 +30,9 @@ screenshots of every page, and a quick start.
   OK, missing, different or broken (two SPF records, SPF that does not cover the server, a DKIM key
   that is not the signing key, MX pointing elsewhere, a name behind Cloudflare's proxy), and turns
   the result into a setup checklist per domain.
+- **Deliverability checks**: whether outbound port 25 is open (over IPv4 and IPv6), whether the
+  address the server sends from has forward-confirmed reverse DNS naming it, and whether that
+  address is on Spamhaus, SpamCop, Barracuda or PSBL.
 - **Load balancers**: HAProxy PROXY protocol v1/v2 on the mail listeners.
 - **Admin console** for mailboxes, quotas, aliases, catchalls, the outbound queue, database-stored
   settings, logs, Prometheus metrics and readiness checks.

@@ -123,13 +123,21 @@ export type DnsStatus = 'ok' | 'improve' | 'missing' | 'different' | 'problem' |
 export type Need = 'required' | 'recommended' | 'optional';
 /** The live verdict on one suggested record; name, type and value match its DnsRecord. */
 export type DnsCheck = { name: string; type: string; value: string; need: Need; status: DnsStatus; published: string[]; detail: string | null };
-export type SetupStep = { id: string; need: Need; title: string; why: string; state: 'done' | 'todo' | 'unknown'; detail: string | null; page: 'domains' | 'settings' | 'certificates' | 'routing' | null };
+export type SetupStep = { id: string; need: Need; title: string; why: string; state: 'done' | 'todo' | 'unknown'; detail: string | null; page: 'domains' | 'settings' | 'certificates' | 'routing' | 'delivery' | null };
+/** Whether other mail servers answer on port 25 over one address family. */
+export type Reach = { state: 'open'; target: string } | { state: 'blocked'; error: string } | { state: 'unavailable' } | { state: 'unknown'; error: string };
+export type BlocklistResult = { zone: string; name: string; status: 'clean' | 'listed' | 'unknown'; code: string | null; detail: string | null };
+/** An address the server sends from: reported by the probed server, read from the interface, or taken from the host's DNS record. */
+export type OutboundAddress = { address: string; source: 'seen' | 'local' | 'dns'; reverse: { status: DnsStatus; names: string[]; detail: string | null }; blocklists: BlocklistResult[] };
+export type Deliverability = { port25: { v4: Reach; v6: Reach }; addresses: OutboundAddress[] };
 export type DnsChecks = {
   checked_at: number;
   hostname: string;
   addresses: string[];
   server: SetupStep[];
   domains: { domain: string; records: DnsCheck[]; steps: SetupStep[] }[];
+  /** Null when a smarthost sends the mail, so the server's own address does not matter. */
+  outbound: Deliverability | null;
 };
 /** Required records that are published wrongly or not at all. */
 export function failingRequired(records: DnsCheck[]): DnsCheck[] {

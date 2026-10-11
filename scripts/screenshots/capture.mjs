@@ -31,16 +31,27 @@ async function shot(page, name) {
 const desktop = { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2, ignoreHTTPSErrors: true };
 const mobile = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, ignoreHTTPSErrors: true };
 
-// The console checks the demo domains' DNS live, but example.com's real zone
-// says nothing about this server. Rewrite the answer to what an admin who
-// published the suggested records would see, with a little left to do, so the
-// shots do not depend on the network.
+// The console checks the demo domains' DNS and the machine's own address
+// live, but example.com's real zone says nothing about this server and the
+// build machine's address has no place in a published image. Rewrite the
+// answer to what an admin who published the suggested records would see, with
+// a little left to do, so the shots do not depend on the network.
 async function showPublishedZone(route) {
   const response = await route.fetch();
   const report = await response.json();
   report.addresses = ['203.0.113.25'];
+  const lists = [['zen.spamhaus.org', 'Spamhaus ZEN'], ['bl.spamcop.net', 'SpamCop'], ['b.barracudacentral.org', 'Barracuda'], ['psbl.surriel.com', 'PSBL']];
+  report.outbound = {
+    port25: { v4: { state: 'open', target: 'gmail-smtp-in.l.google.com' }, v6: { state: 'unavailable' } },
+    addresses: [{
+      address: '203.0.113.25',
+      source: 'seen',
+      reverse: { status: 'ok', names: ['mail.example.com'], detail: null },
+      blocklists: lists.map(([zone, name]) => ({ zone, name, status: 'clean', code: null, detail: null })),
+    }],
+  };
   for (const step of report.server) {
-    if (step.id === 'reverse_dns') Object.assign(step, { state: 'done', detail: null });
+    if (['port25', 'reverse_dns', 'blocklists'].includes(step.id)) Object.assign(step, { state: 'done', detail: null });
   }
   for (const domain of report.domains) {
     const second = domain.domain !== 'example.com';
@@ -88,6 +99,8 @@ async function showPublishedZone(route) {
   ]) {
     await page.goto(admin + path);
     await page.waitForSelector('.sidebar');
+    // The checks behind the checklist take a few seconds on a cold start.
+    if (path === '/') await page.waitForSelector('.checklist');
     await page.waitForTimeout(1200);
     await shot(page, name);
   }
