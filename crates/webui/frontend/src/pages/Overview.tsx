@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertTriangle, CheckCircle2, Circle, HardDrive, HelpCircle, LockKeyhole, RefreshCw, Send, Users } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Circle, HardDrive, HelpCircle, Lightbulb, LockKeyhole, RefreshCw, Send, Users } from 'lucide-react';
 import { api, Certificates, DnsChecks, Overview, readiness, SettingsView, SetupStep, Stats } from '../api';
 import { Empty, ErrorBanner, formatBytes, numberFmt, Panel, plural, useResource } from '../ui';
 import type { Page } from '../main';
@@ -155,6 +155,20 @@ export function OverviewPage({ navigate }: { navigate: (page: Page) => void }) {
           <Empty>Checking…</Empty>
         )}
       </Panel>
+
+      {dns.data && dns.data.recommendations.length > 0 && (
+        <Panel title="Recommendations" subtitle="Suggestions based on what this server has seen">
+          <ul className="attentionList recommendations">
+            {dns.data.recommendations.map((item) => (
+              <li key={item.id}>
+                <Lightbulb size={16} aria-hidden="true" />
+                <span><strong>{item.title}</strong><small>{item.detail}</small></span>
+                <button className="linkButton" onClick={() => navigate(item.page)}>Open</button>
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      )}
 
       <Panel title="Setup checklist" subtitle="What this server and each domain need so mail arrives and is trusted" actions={dns.loading ? <RefreshCw size={16} className="spin muted" aria-label="Checking DNS" /> : undefined}>
         {dns.data ? (

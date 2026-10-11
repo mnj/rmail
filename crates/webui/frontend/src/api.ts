@@ -130,14 +130,19 @@ export type BlocklistResult = { zone: string; name: string; status: 'clean' | 'l
 /** An address the server sends from: reported by the probed server, read from the interface, or taken from the host's DNS record. */
 export type OutboundAddress = { address: string; source: 'seen' | 'local' | 'dns'; reverse: { status: DnsStatus; names: string[]; detail: string | null }; blocklists: BlocklistResult[] };
 export type Deliverability = { port25: { v4: Reach; v6: Reach }; addresses: OutboundAddress[] };
+/** Totals of the DMARC aggregate reports other mail systems sent about a domain. */
+export type DmarcReportSummary = { domain: string; reports: number; reporters: string[]; messages: number; passed: number; begin: number; end: number; failing: { source_ip: string; messages: number; dkim: string; spf: string }[] };
+/** Something the server noticed that the admin may want to act on. */
+export type Recommendation = { id: string; title: string; detail: string; page: 'domains' | 'settings' | 'certificates' | 'routing' | 'delivery' };
 export type DnsChecks = {
   checked_at: number;
   hostname: string;
   addresses: string[];
   server: SetupStep[];
-  domains: { domain: string; records: DnsCheck[]; steps: SetupStep[] }[];
+  domains: { domain: string; records: DnsCheck[]; steps: SetupStep[]; dmarc_reports: DmarcReportSummary | null }[];
   /** Null when a smarthost sends the mail, so the server's own address does not matter. */
   outbound: Deliverability | null;
+  recommendations: Recommendation[];
 };
 /** Required records that are published wrongly or not at all. */
 export function failingRequired(records: DnsCheck[]): DnsCheck[] {
@@ -170,6 +175,8 @@ export type Setting = {
   value: unknown;
   default: unknown;
   is_set: boolean;
+  /** Whether the feature is worth turning on for most servers, or is clearly optional. */
+  advice: { level: 'recommended' | 'optional'; why: string } | null;
 };
 
 export type ServiceState = {

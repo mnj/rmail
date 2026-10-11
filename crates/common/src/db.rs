@@ -255,6 +255,34 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS feedback_reports_message
             ON feedback_reports (report_message_id) WHERE report_message_id IS NOT NULL;
 
+        -- Totals of the DMARC aggregate reports other mail systems sent about
+        -- hosted domains (see dmarc_reports.rs). A report sent twice is stored once.
+        CREATE TABLE IF NOT EXISTS dmarc_received_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at INTEGER NOT NULL,
+            reporter TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            begin_at INTEGER NOT NULL,
+            end_at INTEGER NOT NULL,
+            policy TEXT,
+            messages INTEGER NOT NULL,
+            passed INTEGER NOT NULL,
+            failing TEXT NOT NULL DEFAULT '[]',
+            authenticated INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (reporter, report_id, domain, authenticated)
+        );
+        CREATE INDEX IF NOT EXISTS dmarc_received_reports_domain
+            ON dmarc_received_reports (domain, end_at);
+
+        -- Abuse reports (ARF) that arrived while no feedback-loop address was
+        -- configured, counted per recipient so the console can suggest one.
+        CREATE TABLE IF NOT EXISTS feedback_unrecorded (
+            recipient TEXT PRIMARY KEY,
+            reports INTEGER NOT NULL,
+            last_received_at INTEGER NOT NULL
+        );
+
         -- Calendar and address book sharing (see dav/share.rs).
         CREATE TABLE IF NOT EXISTS dav_shares (
             owner TEXT NOT NULL,

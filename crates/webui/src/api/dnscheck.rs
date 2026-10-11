@@ -16,7 +16,9 @@ use axum::{Json, Router};
 use rmail_common::config::Config;
 use rmail_common::deliverability::{self, Deliverability, Listed, Reach};
 use rmail_common::discovery::{DnsRecord, MtaStsMode};
+use rmail_common::dmarc_reports::{self, DomainSummary};
 use rmail_common::dnscheck::{self, Dns, Host, Lookup, Need, RecordCheck, Status, SystemDns};
+use rmail_common::feedback::{self, Unrecorded};
 use rmail_common::transport::{self, RouteAction};
 use serde::Serialize;
 
@@ -27,6 +29,15 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Give the listeners and the resolver time to settle before the first pass.
 const FIRST_CHECK: Duration = Duration::from_secs(90);
 const SMTP_PORT: u16 = 25;
+/// The stretch of DMARC reports a recommendation is based on.
+const DMARC_WINDOW: Duration = Duration::from_secs(14 * 24 * 3600);
+/// Fewer reported messages than this say too little to advise on.
+const DMARC_MIN_MESSAGES: u64 = 20;
+/// The reports must span about a week, so weekday-only senders are in them.
+const DMARC_MIN_SPAN_SECS: i64 = 6 * 24 * 3600;
+/// Independent reporters that must agree before advising a policy change.
+const DMARC_MIN_REPORTERS: usize = 2;
+const FEEDBACK_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 
 pub(crate) fn routes() -> Router<Shared> {
     Router::new().route("/api/dns-checks", get(cached).post(recheck))
@@ -60,6 +71,11 @@ struct Inputs {
     dane: bool,
     smarthost: bool,
     compose_ai: bool,
+    acme: bool,
+    /// What other mail systems reported about each domain's mail lately.
+    dmarc_reports: Vec<DomainSummary>,
+    /// Abuse reports that arrived with no feedback-loop address to record them.
+    unrecorded_feedback: Vec<Unrecorded>,
 }
 
 struct DomainInput {
@@ -106,6 +122,15 @@ impl Inputs {
             dane: config.security.dane_enabled,
             smarthost,
             compose_ai: config.compose_ai.available(),
+            acme: config.acme.enabled,
+            dmarc_reports: dmarc_reports::summary(
+                std::path::Path::new(db),
+                now() - DMARC_WINDOW.as_secs() as i64,
+            )?,
+            unrecorded_feedback: feedback::unrecorded(
+                std::path::Path::new(db),
+                now() - FEEDBACK_WINDOW.as_secs() as i64,
+            )?,
         })
     }
 
@@ -266,6 +291,18 @@ struct DomainReport<'a> {
     domain: &'a str,
     records: &'a [RecordCheck],
     steps: Vec<Step>,
+    /// Totals of the DMARC reports received about the domain, when any came.
+    dmarc_reports: Option<&'a DomainSummary>,
+}
+
+/// Something the server noticed that the admin may want to act on. Unlike a
+/// checklist step it comes from what happened, not from what is configured.
+#[derive(Debug, Serialize)]
+struct Recommendation {
+    id: String,
+    title: String,
+    detail: String,
+    page: &'static str,
 }
 
 #[derive(Serialize)]
@@ -276,6 +313,7 @@ struct Report<'a> {
     server: Vec<Step>,
     domains: Vec<DomainReport<'a>>,
     outbound: Option<&'a Deliverability>,
+    recommendations: Vec<Recommendation>,
 }
 
 fn describe(check: &RecordCheck) -> String {
@@ -630,6 +668,154 @@ fn server_steps(inputs: &Inputs, snapshot: &Snapshot) -> Vec<Step> {
     steps
 }
 
+/// The policy (`p=`) of the DMARC record a domain publishes, when the check
+/// found a working one of its own.
+fn published_dmarc_policy(checks: &[RecordCheck]) -> Option<String> {
+    let check = checks
+        .iter()
+        .find(|check| check.name.starts_with("_dmarc.") && check.status.works())?;
+    check.published.first()?.split(';').find_map(|tag| {
+        let (name, value) = tag.split_once('=')?;
+        (name.trim().eq_ignore_ascii_case("p")).then(|| value.trim().to_ascii_lowercase())
+    })
+}
+
+fn dmarc_recommendation(
+    domain: &str,
+    policy: Option<&str>,
+    summary: &DomainSummary,
+) -> Option<Recommendation> {
+    if summary.messages < DMARC_MIN_MESSAGES {
+        return None;
+    }
+    let days = DMARC_WINDOW.as_secs() / 86400;
+    let failed = summary.messages - summary.passed.min(summary.messages);
+    let seen = format!(
+        "In the last {days} days, {} from {} covered {} messages claiming to be from {domain}",
+        plural(summary.reports, "DMARC report"),
+        reporters(summary),
+        summary.messages
+    );
+    // Forgeries always fail, so "all passing" allows for a little noise.
+    if summary.passed.saturating_mul(100) >= summary.messages.saturating_mul(98) {
+        // One sender's word is not enough to change a policy on: a report
+        // is only authenticated as coming from its sender, and anyone with
+        // a domain can send one.
+        if policy != Some("none")
+            || summary.end - summary.begin < DMARC_MIN_SPAN_SECS
+            || summary.reporters.len() < DMARC_MIN_REPORTERS
+        {
+            return None;
+        }
+        return Some(Recommendation {
+            id: format!("dmarc-tighten-{domain}"),
+            title: format!("Tighten the DMARC policy of {domain}"),
+            detail: format!(
+                "{seen}, and {} passed. Your own mail is authenticating, so it is safe to change p=none to p=quarantine in the _dmarc.{domain} record: receivers will then junk forgeries instead of delivering them.",
+                if failed == 0 {
+                    "all of them".to_string()
+                } else {
+                    format!("all but {failed}")
+                }
+            ),
+            page: "domains",
+        });
+    }
+    if summary.passed.saturating_mul(100) >= summary.messages.saturating_mul(90) {
+        return None;
+    }
+    let sources = summary
+        .failing
+        .iter()
+        .take(3)
+        .map(|source| format!("{} ({})", source.source_ip, source.messages))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Recommendation {
+        id: format!("dmarc-failing-{domain}"),
+        title: format!("Mail from {domain} is failing DMARC"),
+        detail: format!(
+            "{seen}, and {failed} failed, mostly from {sources}. If those are servers of yours, add them to the SPF record or have them sign with DKIM. If they are not, they are forgeries, which a stricter policy would stop{}.",
+            if policy == Some("none") {
+                " once your own mail passes"
+            } else {
+                ""
+            }
+        ),
+        page: "domains",
+    })
+}
+
+/// Who vouches for the numbers, so the admin can judge whether to believe
+/// them: reports are only as trustworthy as their senders.
+fn reporters(summary: &DomainSummary) -> String {
+    let shown = summary
+        .reporters
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match summary.reporters.len() {
+        0..=4 => shown,
+        more => format!("{shown} and {} more", more - 4),
+    }
+}
+
+fn plural(count: u64, word: &str) -> String {
+    format!("{count} {word}{}", if count == 1 { "" } else { "s" })
+}
+
+fn recommendations(inputs: &Inputs, snapshot: &Snapshot) -> Vec<Recommendation> {
+    let mut found = Vec::new();
+    if !inputs.acme
+        && matches!(
+            inputs.certificate,
+            Certificate::SelfSigned | Certificate::None
+        )
+    {
+        found.push(Recommendation {
+            id: "acme".to_string(),
+            title: "Turn on automatic certificates".to_string(),
+            detail: "The server has no certificate from a certificate authority, so mail apps warn about it. Let's Encrypt issues them free of charge and this server can request and renew one by itself.".to_string(),
+            page: "certificates",
+        });
+    }
+    for (domain, checks) in &snapshot.domains {
+        let Some(summary) = inputs
+            .dmarc_reports
+            .iter()
+            .find(|summary| &summary.domain == domain)
+        else {
+            continue;
+        };
+        let policy = published_dmarc_policy(checks);
+        found.extend(dmarc_recommendation(domain, policy.as_deref(), summary));
+    }
+    if !inputs.feedback_loop
+        && let Some(busiest) = inputs.unrecorded_feedback.first()
+    {
+        let total = inputs
+            .unrecorded_feedback
+            .iter()
+            .map(|entry| entry.reports)
+            .sum::<u64>();
+        found.push(Recommendation {
+            id: "feedback-loop".to_string(),
+            title: "Record the abuse reports you are receiving".to_string(),
+            detail: format!(
+                "{} arrived in the last {} days, most at {}. They were delivered but not recorded, because no feedback-loop address is configured. Add {} under Settings (Filtering) and each complaint is tied to the account that sent the reported mail.",
+                plural(total, "abuse report"),
+                FEEDBACK_WINDOW.as_secs() / 86400,
+                busiest.recipient,
+                busiest.recipient
+            ),
+            page: "settings",
+        });
+    }
+    found
+}
+
 fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
     Report {
         checked_at: snapshot.checked_at,
@@ -647,9 +833,14 @@ fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
                 domain,
                 records,
                 steps: domain_steps(records, input.dkim_keys, inputs.mta_sts),
+                dmarc_reports: inputs
+                    .dmarc_reports
+                    .iter()
+                    .find(|summary| &summary.domain == domain),
             })
             .collect(),
         outbound: snapshot.outbound.as_ref(),
+        recommendations: recommendations(inputs, snapshot),
     }
 }
 
@@ -854,6 +1045,9 @@ mod tests {
             dane: false,
             smarthost: false,
             compose_ai: false,
+            acme: false,
+            dmarc_reports: Vec::new(),
+            unrecorded_feedback: Vec::new(),
         }
     }
 
@@ -1117,6 +1311,131 @@ mod tests {
                 .all(|step| step.id != "reverse_dns" && step.id != "blocklists")
         );
         assert_eq!(step(&steps, "smarthost").state, StepState::Done);
+    }
+
+    fn reports(messages: u64, passed: u64, days: i64) -> DomainSummary {
+        DomainSummary {
+            domain: "example.com".to_string(),
+            reports: 9,
+            reporters: vec![
+                "google.com".into(),
+                "outlook.com".into(),
+                "yahoo.com".into(),
+            ],
+            messages,
+            passed,
+            begin: 1_790_000_000,
+            end: 1_790_000_000 + days * 86400,
+            failing: vec![
+                dmarc_reports::FailingSource {
+                    source_ip: "198.51.100.9".into(),
+                    messages: 40,
+                    dkim: "fail".into(),
+                    spf: "fail".into(),
+                },
+                dmarc_reports::FailingSource {
+                    source_ip: "192.0.2.77".into(),
+                    messages: 3,
+                    dkim: "fail".into(),
+                    spf: "fail".into(),
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn recommendations_come_from_what_the_server_saw() {
+        let mut inputs = inputs();
+        let snapshot = take_snapshot(&zone(), &inputs).await;
+        // Trusted certificate, a feedback address, no reports: nothing to say.
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+        assert_eq!(
+            published_dmarc_policy(&snapshot.domains[0].1).as_deref(),
+            Some("none")
+        );
+
+        // A week of reports with nearly everything passing, at p=none.
+        inputs.dmarc_reports = vec![reports(1210, 1204, 13)];
+        let found = recommendations(&inputs, &snapshot);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "dmarc-tighten-example.com");
+        assert_eq!(found[0].page, "domains");
+        assert!(
+            found[0]
+                .detail
+                .contains("9 DMARC reports from google.com, outlook.com, yahoo.com covered")
+        );
+        // A single sender's reports do not justify changing the policy.
+        let mut lone = reports(1210, 1204, 13);
+        lone.reporters.truncate(1);
+        inputs.dmarc_reports = vec![lone];
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+        inputs.dmarc_reports = vec![reports(1210, 1204, 13)];
+        assert!(found[0].detail.contains("all but 6 passed"));
+        assert!(found[0].detail.contains("p=quarantine"));
+        let report = report(&inputs, &snapshot);
+        assert_eq!(report.domains[0].dmarc_reports.unwrap().messages, 1210);
+        assert_eq!(report.recommendations.len(), 1);
+
+        // Too few messages, or too short a stretch, is not enough to go on.
+        inputs.dmarc_reports = vec![reports(19, 19, 13)];
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+        inputs.dmarc_reports = vec![reports(1210, 1210, 2)];
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+        // Reports about a domain that is not hosted here are ignored.
+        let mut foreign = reports(1210, 1210, 13);
+        foreign.domain = "example.net".to_string();
+        inputs.dmarc_reports = vec![foreign];
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+
+        // A lot failing: say who, and do not suggest tightening.
+        inputs.dmarc_reports = vec![reports(200, 157, 13)];
+        let found = recommendations(&inputs, &snapshot);
+        assert_eq!(found[0].id, "dmarc-failing-example.com");
+        assert!(found[0].detail.contains("43 failed"));
+        assert!(
+            found[0]
+                .detail
+                .contains("198.51.100.9 (40), 192.0.2.77 (3)")
+        );
+        // In between (a few forwarders failing) there is nothing useful to say.
+        inputs.dmarc_reports = vec![reports(200, 190, 13)];
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+
+        // Already past p=none: nothing to tighten on this evidence.
+        assert!(
+            dmarc_recommendation("example.com", Some("quarantine"), &reports(500, 500, 13))
+                .is_none()
+        );
+        assert!(dmarc_recommendation("example.com", None, &reports(500, 500, 13)).is_none());
+
+        // Self-signed with ACME off; abuse reports with nowhere to go.
+        inputs.dmarc_reports.clear();
+        inputs.certificate = Certificate::SelfSigned;
+        inputs.feedback_loop = false;
+        inputs.unrecorded_feedback = vec![
+            Unrecorded {
+                recipient: "abuse@example.com".into(),
+                reports: 4,
+                last_received_at: 0,
+            },
+            Unrecorded {
+                recipient: "postmaster@example.com".into(),
+                reports: 1,
+                last_received_at: 0,
+            },
+        ];
+        let found = recommendations(&inputs, &snapshot);
+        let ids = found.iter().map(|rec| rec.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, ["acme", "feedback-loop"]);
+        assert!(found[1].detail.starts_with(
+            "5 abuse reports arrived in the last 30 days, most at abuse@example.com."
+        ));
+        // With ACME on the certificate is on its way; with an address set
+        // the reports are being recorded.
+        inputs.acme = true;
+        inputs.feedback_loop = true;
+        assert!(recommendations(&inputs, &snapshot).is_empty());
     }
 
     #[tokio::test]

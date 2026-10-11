@@ -225,6 +225,33 @@ domain, MX, SPF, DKIM and DMARC (required), then MTA-STS with TLS reports and th
 auto-setup records (recommended). DANE, a smarthost and AI writing suggestions are listed as
 optional and never count against the server.
 
+### Recommendations and received DMARC reports
+
+The DMARC record suggested for each domain sends aggregate reports (`rua=`) to
+`postmaster@<domain>`. Large receivers mail one a day. They are delivered like any other message,
+and when one is about a hosted domain `rmail_smtpd` also keeps its totals (messages, how many
+passed DMARC, and the sources that failed most) for 180 days. Reports are recognised by the
+subject the RFC prescribes (`Report Domain: ...`) and may be gzip, zip or plain XML. A report whose
+own message fails DMARC is stored but not counted. One that passes is filed under the domain it was
+authenticated as, not the name it gives itself, and the console names those domains: nothing in the
+protocol proves a reporter is entitled to report on your domain, so judge the numbers by who sent
+them.
+
+**Domains & DNS** shows the last 14 days per domain, and the overview's **Recommendations** panel
+turns what the server has seen into suggestions:
+
+- **Tighten DMARC**: the domain is at `p=none`, the reports come from at least two senders, span
+  about a week and at least 20 messages, and 98% or more passed. Change `p=none` to `p=quarantine`.
+- **Mail is failing DMARC**: fewer than 90% passed. The suggestion names the top failing sources,
+  which are either servers of yours missing from SPF and DKIM, or forgeries.
+- **Turn on automatic certificates**: the certificate is self-signed or missing and ACME is off.
+- **Record the abuse reports you are receiving**: ARF reports arrived (and passed DMARC) while
+  `security.feedback_addresses` is empty. They were delivered but not recorded; the suggestion
+  names the address they came to.
+
+On the **Settings** page, features an admin is likely to wonder about carry a *Recommended* or
+*Optional* label with a sentence on why, so optional features do not look like unfinished setup.
+
 ### Deliverability checks
 
 Three things outside the domain's own DNS decide whether mail from a new server is accepted, and

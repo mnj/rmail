@@ -491,6 +491,48 @@ pub fn record(
     Ok((inserted > 0).then(|| conn.last_insert_rowid()))
 }
 
+/// An abuse report that arrived while no feedback-loop address was
+/// configured, so it was delivered but not recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unrecorded {
+    pub recipient: String,
+    pub reports: u64,
+    pub last_received_at: i64,
+}
+
+/// Count a report that could not be recorded for want of a configured
+/// address. Only the count per recipient is kept.
+pub fn note_unrecorded(db_path: &Path, recipient: &str, now: i64) -> Result<()> {
+    let conn = crate::sqlite_pool::connection(db_path)?;
+    conn.execute(
+        "DELETE FROM feedback_unrecorded WHERE last_received_at < ?1",
+        params![now - RETENTION_SECS],
+    )?;
+    conn.execute(
+        "INSERT INTO feedback_unrecorded (recipient, reports, last_received_at) VALUES (?1, 1, ?2) \
+         ON CONFLICT(recipient) DO UPDATE SET reports = reports + 1, last_received_at = ?2",
+        params![recipient, now],
+    )?;
+    Ok(())
+}
+
+/// Recipients that received unrecorded reports since `since`, busiest first.
+pub fn unrecorded(db_path: &Path, since: i64) -> Result<Vec<Unrecorded>> {
+    let conn = crate::sqlite_pool::connection(db_path)?;
+    let mut statement = conn.prepare(
+        "SELECT recipient, reports, last_received_at FROM feedback_unrecorded \
+         WHERE last_received_at >= ?1 ORDER BY reports DESC, recipient LIMIT 20",
+    )?;
+    let rows = statement.query_map(params![since], |row| {
+        Ok(Unrecorded {
+            recipient: row.get(0)?,
+            reports: row.get::<_, i64>(1)?.max(0) as u64,
+            last_received_at: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Authenticated complaints (see [`is_complaint`]) about `account` since
 /// `since`, counting each report's incidents.
 pub fn account_complaints(db_path: &Path, account: &str, since: i64) -> Result<u64> {
@@ -1032,6 +1074,42 @@ mod tests {
         crate::db::init_db(&db).unwrap();
         crate::db::init_db(&db).unwrap();
         assert!(list(&db, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrecorded_reports_are_counted_per_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rmail.db");
+        crate::db::init_db(&db).unwrap();
+        // A database from before the counter existed gains the table.
+        crate::sqlite_pool::connection(&db)
+            .unwrap()
+            .execute_batch("DROP TABLE feedback_unrecorded;")
+            .unwrap();
+        crate::db::init_db(&db).unwrap();
+        let now = 1_790_000_000;
+        note_unrecorded(&db, "abuse@example.com", now - 50).unwrap();
+        note_unrecorded(&db, "abuse@example.com", now).unwrap();
+        note_unrecorded(&db, "fbl@example.com", now - 100).unwrap();
+        assert_eq!(
+            unrecorded(&db, 0).unwrap(),
+            [
+                Unrecorded {
+                    recipient: "abuse@example.com".into(),
+                    reports: 2,
+                    last_received_at: now
+                },
+                Unrecorded {
+                    recipient: "fbl@example.com".into(),
+                    reports: 1,
+                    last_received_at: now - 100
+                },
+            ]
+        );
+        assert_eq!(unrecorded(&db, now - 60).unwrap().len(), 1);
+        // Counts past retention go when the next report arrives.
+        note_unrecorded(&db, "new@example.com", now + RETENTION_SECS + 1).unwrap();
+        assert_eq!(unrecorded(&db, 0).unwrap().len(), 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { AlertTriangle, Check, CheckCircle2, CircleDashed, Copy, HelpCircle, KeyRound, RefreshCw, ShieldCheck, Trash2, XCircle } from 'lucide-react';
-import { api, DkimKey, Discovery, DnsCheck, DnsChecks, DnsRecord, DnsStatus, failingRequired } from '../api';
-import { Empty, ErrorBanner, Field, formatRelative, IconButton, Modal, Panel, plural, SkeletonRows, useFeedback, useResource } from '../ui';
+import { api, DkimKey, Discovery, DmarcReportSummary, DnsCheck, DnsChecks, DnsRecord, DnsStatus, failingRequired } from '../api';
+import { Empty, ErrorBanner, Field, formatRelative, IconButton, Modal, numberFmt, Panel, plural, SkeletonRows, useFeedback, useResource } from '../ui';
 
 function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false);
@@ -140,6 +140,19 @@ function CheckDetail({ check }: { check: DnsCheck | undefined }) {
   );
 }
 
+/** What other mail systems reported about the domain's mail in the last two weeks. */
+function DmarcReports({ summary }: { summary: DmarcReportSummary }) {
+  const failed = summary.messages - summary.passed;
+  const percent = summary.messages ? Math.floor((summary.passed / summary.messages) * 100) : 0;
+  return (
+    <p className="panelNote dmarcReports">
+      <strong>DMARC reports, last 14 days:</strong>{' '}
+      {numberFmt.format(summary.passed)} of {numberFmt.format(summary.messages)} messages passed ({percent}%), according to {plural(summary.reports, 'report')} from {summary.reporters.join(', ')}.
+      {failed > 0 && summary.failing.length > 0 && <> Failing most: {summary.failing.map((source) => <code key={source.source_ip}>{source.source_ip} ({numberFmt.format(source.messages)})</code>)}</>}
+    </p>
+  );
+}
+
 function domainSummary(records: DnsRecord[], checks: Map<string, DnsCheck>, loading: boolean): React.ReactNode {
   const found = records.map((record) => checks.get(recordKey(record))).filter((check): check is DnsCheck => !!check);
   if (!found.length) return loading ? 'Checking DNS…' : 'DNS not checked';
@@ -158,6 +171,7 @@ export function DomainsPage() {
   const [rechecking, setRechecking] = useState(false);
   const data = discovery.data;
   const checks = new Map<string, DnsCheck>();
+  const reports = new Map((dns.data?.domains || []).map((domain) => [domain.domain, domain.dmarc_reports]));
   for (const domain of dns.data?.domains || []) for (const check of domain.records) checks.set(recordKey(check), check);
   const checking = dns.loading || rechecking;
 
@@ -218,6 +232,7 @@ export function DomainsPage() {
                 </tbody>
               </table>
             </div>
+            {reports.get(entry.domain) && <DmarcReports summary={reports.get(entry.domain)!} />}
           </Panel>
         ))}
         {data && (
