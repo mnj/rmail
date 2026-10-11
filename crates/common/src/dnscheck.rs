@@ -96,16 +96,22 @@ pub enum Provider {
 pub async fn dns_provider(dns: &impl Dns, domain: &str) -> Option<Provider> {
     let mut zone = domain;
     loop {
-        if let Lookup::Found(servers) = dns.ns(zone).await {
-            return servers.iter().find_map(|server| {
-                if server.ends_with(".ns.cloudflare.com") {
-                    Some(Provider::Cloudflare)
-                } else if server.contains(".awsdns-") {
-                    Some(Provider::Route53)
-                } else {
-                    None
-                }
-            });
+        match dns.ns(zone).await {
+            Lookup::Found(servers) => {
+                return servers.iter().find_map(|server| {
+                    if server.ends_with(".ns.cloudflare.com") {
+                        Some(Provider::Cloudflare)
+                    } else if server.contains(".awsdns-") {
+                        Some(Provider::Route53)
+                    } else {
+                        None
+                    }
+                });
+            }
+            Lookup::Missing => {}
+            // Not knowing whether this name is its own zone, the parent's
+            // provider would be a guess.
+            Lookup::Failed(_) => return None,
         }
         match zone.split_once('.') {
             Some((_, parent)) if parent.contains('.') => zone = parent,
@@ -1495,6 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_dns_provider_is_read_from_the_name_servers() {
+        /// Name servers per zone; a zone listed with none fails to resolve.
         struct Servers(&'static [(&'static str, &'static [&'static str])]);
         impl Dns for Servers {
             async fn txt(&self, _: &str) -> Lookup<String> {
@@ -1522,6 +1529,9 @@ mod tests {
                 self.0.iter().find(|(zone, _)| *zone == name).map_or(
                     Lookup::Missing,
                     |(_, servers)| {
+                        if servers.is_empty() {
+                            return Lookup::Failed("SERVFAIL".to_string());
+                        }
                         Lookup::Found(servers.iter().map(|server| server.to_string()).collect())
                     },
                 )
@@ -1537,6 +1547,7 @@ mod tests {
                 &["ns-12.awsdns-01.org", "ns-900.awsdns-55.co.uk"],
             ),
             ("example.net", &["ns1.registrar.example"]),
+            ("broken.example.com", &[]),
         ]);
         assert_eq!(
             dns_provider(&dns, "example.com").await,
@@ -1553,6 +1564,9 @@ mod tests {
             Some(Provider::Cloudflare)
         );
         assert_eq!(dns_provider(&dns, "unknown.test").await, None);
+        // A failed lookup may hide a delegation, so the parent's provider
+        // is not assumed.
+        assert_eq!(dns_provider(&dns, "broken.example.com").await, None);
         // A source that knows nothing about name servers gives no hint.
         assert_eq!(dns_provider(&perfect(), "example.com").await, None);
     }

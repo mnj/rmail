@@ -2880,6 +2880,26 @@ mod tests {
             "{zone}"
         );
 
+        // An internationalized domain is found however it is spelled.
+        rmail_common::db::add_mailbox(
+            td.path().join("rmail.db"),
+            "anna@xn--bcher-kva.example",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        for spelling in ["xn--bcher-kva.example", "b%C3%BCcher.example"] {
+            let idn = send_to_state(
+                state.clone(),
+                "t",
+                get(&format!("/api/discovery/zone?domain={spelling}")),
+            )
+            .await;
+            assert!(idn.starts_with("HTTP/1.1 200"), "{spelling}: {idn}");
+            assert!(idn.contains("$ORIGIN xn--bcher-kva.example."), "{idn}");
+        }
+
         // Not hosted here, or no domain at all: nothing to export, and the
         // request's text never reaches a header.
         for path in [

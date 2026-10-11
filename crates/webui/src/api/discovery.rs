@@ -290,10 +290,14 @@ async fn zone_file(
     let Some(path) = state.config_path.clone() else {
         return error(StatusCode::BAD_REQUEST, "no configuration file is loaded");
     };
-    let wanted = query
+    // Hosted domains are stored in canonical (ASCII) form, so an
+    // internationalized name is matched however it was typed.
+    let Some(wanted) = query
         .get("domain")
-        .map(|domain| domain.trim().to_ascii_lowercase())
-        .unwrap_or_default();
+        .and_then(|domain| rmail_common::domain::canonicalize_domain(domain.trim()).ok())
+    else {
+        return not_found();
+    };
     let result = blocking(move || {
         let config = Config::load(&path)?;
         Ok(suggested_records(&config, &db)?

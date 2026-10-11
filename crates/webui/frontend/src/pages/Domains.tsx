@@ -154,7 +154,7 @@ const providerHints: Record<DnsProvider, { name: string; hints: string[] }> = {
     hints: [
       'Put TXT values in double quotes. A value over 255 characters, such as a DKIM key, must be split into several quoted strings; the zone file is already split that way.',
       'Several TXT values for one name (SPF next to a site verification, say) go into a single record, one per line.',
-      'To add them all at once, use “Import zone file” on the hosted zone.',
+      'To add them all at once, use “Import zone file” on the hosted zone. Route 53 refuses the whole import if any of the records already exists, so delete or edit those by hand first.',
     ],
   },
 };

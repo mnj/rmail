@@ -164,12 +164,19 @@ async fn take_snapshot(dns: &impl Dns, inputs: &Inputs) -> Snapshot {
         Some(deliverability::check(dns, &host, port25).await)
     };
     let mut domains = Vec::with_capacity(inputs.domains.len());
-    let mut providers = Vec::with_capacity(inputs.domains.len());
     for entry in &inputs.domains {
         let checks = dnscheck::check_domain(dns, &entry.domain, &host, &entry.records).await;
         domains.push((entry.domain.clone(), checks));
-        providers.push(dnscheck::dns_provider(dns, &entry.domain).await);
     }
+    // Only hints depend on these, so they run side by side: slow name
+    // servers must not add a wait per domain to every report.
+    let providers = futures_util::future::join_all(
+        inputs
+            .domains
+            .iter()
+            .map(|entry| dnscheck::dns_provider(dns, &entry.domain)),
+    )
+    .await;
     Snapshot {
         checked_at: now(),
         host,
@@ -938,6 +945,10 @@ struct TestCheck {
     detail: String,
 }
 
+/// The result shown when a check could not be made; the console renders it
+/// as neither passed nor failed.
+const NOT_CHECKED: &str = "not checked";
+
 /// Explain an authentication test to someone who does not read
 /// Authentication-Results headers. `address` is where the mail would come
 /// from; without one SPF was not evaluated.
@@ -955,12 +966,12 @@ fn explain_test(
     };
     let (spf, spf_ok, spf_detail) = match (address, results.spf.as_deref().unwrap_or("none")) {
         (None, _) if smarthost => (
-            "not checked".to_string(),
+            NOT_CHECKED.to_string(),
             false,
             "Mail leaves through the smarthost, so SPF depends on the smarthost's addresses, which are its provider's to tell you.".to_string(),
         ),
         (None, _) => (
-            "not checked".to_string(),
+            NOT_CHECKED.to_string(),
             false,
             "The address this server sends from is not known, so SPF could not be evaluated.".to_string(),
         ),
@@ -996,7 +1007,7 @@ fn explain_test(
             "Neither DKIM nor SPF passed for the From domain, or it has no DMARC record. Receivers decide for themselves what to do with such mail."
         }
     };
-    vec![
+    let mut checks = vec![
         TestCheck {
             name: "DKIM",
             result: if signed {
@@ -1019,7 +1030,19 @@ fn explain_test(
             ok: dmarc == "pass",
             detail: dmarc_detail.to_string(),
         },
-    ]
+    ];
+    // A failed lookup is no verdict: neither a broken signature nor a
+    // record that forbids the address.
+    for check in &mut checks {
+        if check.result == "temperror" {
+            check.result = NOT_CHECKED.to_string();
+            check.ok = false;
+            check.detail =
+                "A DNS lookup failed while checking, so there is no verdict either way. Try again."
+                    .to_string();
+        }
+    }
+    checks
 }
 
 /// The address a receiver would see mail from this server arrive from:
@@ -1044,12 +1067,13 @@ async fn test_message(State(state): State<Shared>, body: axum::body::Bytes) -> R
         Ok(inputs) => inputs,
         Err(err) => return err.into_response(),
     };
-    let wanted = request.domain.trim().to_ascii_lowercase();
+    // Canonical (ASCII) form, as hosted domains are stored.
+    let wanted = rmail_common::domain::canonicalize_domain(request.domain.trim()).ok();
     let Some(domain) = inputs
         .domains
         .iter()
         .map(|entry| entry.domain.clone())
-        .find(|domain| *domain == wanted)
+        .find(|domain| Some(domain) == wanted.as_ref())
     else {
         return ApiError(
             StatusCode::NOT_FOUND,
@@ -1655,6 +1679,22 @@ mod tests {
         assert!(checks[1].detail.contains("smarthost"));
         let checks = explain_test(&results("pass", "none", "pass"), true, None, false);
         assert!(checks[1].detail.contains("not known"));
+
+        // A failed lookup is no verdict.
+        let checks = explain_test(
+            &results("temperror", "temperror", "temperror"),
+            true,
+            address,
+            false,
+        );
+        for check in &checks {
+            assert_eq!(
+                (check.result.as_str(), check.ok),
+                ("not checked", false),
+                "{check:?}"
+            );
+            assert!(check.detail.contains("lookup failed"), "{check:?}");
+        }
     }
 
     #[tokio::test]
