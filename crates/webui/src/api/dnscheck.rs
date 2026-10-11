@@ -148,12 +148,18 @@ impl Snapshot {
         now() - self.checked_at < CHECK_INTERVAL.as_secs() as i64
     }
 
-    /// Every required record got an answer, so `failures` is the whole story.
-    fn conclusive(&self) -> bool {
+    /// Required records whose lookup failed, as the `domain: name TYPE `
+    /// prefix their entry in `failures` would have.
+    fn unchecked(&self) -> Vec<String> {
         self.domains
             .iter()
-            .flat_map(|(_, checks)| checks)
-            .all(|check| check.need != Need::Required || check.status != Status::Unknown)
+            .flat_map(|(domain, checks)| {
+                checks
+                    .iter()
+                    .filter(|check| check.need == Need::Required && check.status == Status::Unknown)
+                    .map(move |check| format!("{domain}: {} {} ", check.name, check.kind))
+            })
+            .collect()
     }
 
     /// Required records that are published wrongly or not at all, as
@@ -565,6 +571,23 @@ async fn recheck(State(state): State<Shared>) -> Response {
     respond(state, true).await
 }
 
+/// What is known to be broken after a pass: what it found, plus what was
+/// reported before for records it could not look up. A resolver outage hides
+/// broken records, it does not fix them.
+fn known_failures(
+    reported: &[String],
+    mut found: Vec<String>,
+    unchecked: &[String],
+) -> Vec<String> {
+    for earlier in reported {
+        if unchecked.iter().any(|record| earlier.starts_with(record)) {
+            found.push(earlier.clone());
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Keep the snapshot current, and say so in the log when a domain's required
 /// records break or recover, so it is noticed without anyone opening the
 /// console.
@@ -576,10 +599,9 @@ pub(crate) fn spawn_check_task(state: Shared) {
             match load_inputs(&state).await {
                 Ok(inputs) => {
                     let snapshot = snapshot_for(&state, &inputs, true).await;
-                    let failures = snapshot.failures();
-                    // A pass with failed lookups says nothing new: an outage
-                    // hides broken records, it does not fix them.
-                    if snapshot.conclusive() && failures != reported {
+                    let failures =
+                        known_failures(&reported, snapshot.failures(), &snapshot.unchecked());
+                    if failures != reported {
                         if failures.is_empty() {
                             web_log!("info", "dns_check_recovered", {});
                         } else {
@@ -738,7 +760,7 @@ mod tests {
         let report = report(&inputs, &snapshot);
         assert_eq!(report.hostname, HOST);
         assert_eq!(report.addresses, ["203.0.113.5"]);
-        assert!(snapshot.failures().is_empty() && snapshot.conclusive());
+        assert!(snapshot.failures().is_empty() && snapshot.unchecked().is_empty());
 
         let steps = &report.domains[0].steps;
         let ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
@@ -833,7 +855,31 @@ mod tests {
         // A resolver outage must not be reported as broken records, nor as
         // their recovery.
         assert!(snapshot.failures().is_empty());
-        assert!(!snapshot.conclusive());
+        let unchecked = snapshot.unchecked();
+        assert!(unchecked.contains(&"example.com: example.com MX ".to_string()));
+
+        // What was broken before the outage stays reported, a record that
+        // was looked up and is fine now drops out, and one newly found
+        // broken is added even though other lookups failed.
+        let reported = vec![
+            "example.com: example.com MX problem".to_string(),
+            "example.org: example.org MX missing".to_string(),
+        ];
+        assert_eq!(
+            known_failures(&reported, Vec::new(), &unchecked),
+            ["example.com: example.com MX problem"]
+        );
+        assert_eq!(
+            known_failures(
+                &reported,
+                vec!["example.net: example.net TXT missing".to_string()],
+                &unchecked
+            ),
+            [
+                "example.com: example.com MX problem",
+                "example.net: example.net TXT missing"
+            ]
+        );
         let report = report(&inputs, &snapshot);
         assert!(report.addresses.is_empty());
         for id in ["mx", "spf", "dkim", "dmarc", "clients"] {
