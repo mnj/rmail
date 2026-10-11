@@ -32,7 +32,7 @@ pub struct FailureReportRequest {
     pub spf_aligned: bool,
 }
 
-fn authenticator() -> Result<&'static MessageAuthenticator> {
+pub(crate) fn authenticator() -> Result<&'static MessageAuthenticator> {
     AUTHENTICATOR.get_or_try_init(|| {
         MessageAuthenticator::new_system_conf().context("loading the system DNS configuration")
     })

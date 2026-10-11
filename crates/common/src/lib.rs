@@ -20,6 +20,7 @@ pub mod db;
 pub mod discovery;
 pub mod dkim;
 pub mod dnsbl;
+pub mod dnscheck;
 pub mod domain;
 pub mod etrn;
 pub mod feedback;

@@ -28,6 +28,7 @@ use crate::*;
 
 pub(crate) mod certificates;
 mod discovery;
+pub(crate) mod dnscheck;
 mod feedback;
 mod organization;
 
@@ -58,6 +59,7 @@ pub(crate) struct AdminState {
     pub revoked: websession::RevocationList,
     basic_cache: Mutex<HashMap<[u8; 32], Instant>>,
     downloads: organization::Downloads,
+    pub(crate) dns_checks: dnscheck::Cache,
 }
 
 impl AdminState {
@@ -82,6 +84,7 @@ impl AdminState {
             revoked: websession::RevocationList::default(),
             basic_cache: Mutex::new(HashMap::new()),
             downloads: organization::Downloads::default(),
+            dns_checks: dnscheck::Cache::default(),
         }
     }
 }
@@ -127,6 +130,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(organization::routes())
         .merge(feedback::routes())
         .merge(discovery::protected_routes())
+        .merge(dnscheck::routes())
         .merge(certificates::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let app = Router::new()

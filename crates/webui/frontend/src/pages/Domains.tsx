@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { Check, Copy, KeyRound, ShieldCheck, Trash2 } from 'lucide-react';
-import { api, DkimKey, Discovery } from '../api';
-import { Empty, ErrorBanner, Field, formatRelative, IconButton, Modal, Panel, SkeletonRows, useFeedback, useResource } from '../ui';
+import { AlertTriangle, Check, CheckCircle2, CircleDashed, Copy, HelpCircle, KeyRound, RefreshCw, ShieldCheck, Trash2, XCircle } from 'lucide-react';
+import { api, DkimKey, Discovery, DnsCheck, DnsChecks, DnsRecord, DnsStatus, failingRequired } from '../api';
+import { Empty, ErrorBanner, Field, formatRelative, IconButton, Modal, Panel, plural, SkeletonRows, useFeedback, useResource } from '../ui';
 
 function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false);
@@ -103,38 +103,118 @@ function KeyRows({ keys, onChanged }: { keys: DkimKey[]; onChanged: () => void }
   );
 }
 
+const statusLabel: Record<DnsStatus, string> = { ok: 'OK', improve: 'Can improve', missing: 'Missing', different: 'Different', problem: 'Problem', unknown: 'Not checked' };
+const statusIcon: Record<DnsStatus, React.ElementType> = { ok: CheckCircle2, improve: CheckCircle2, missing: CircleDashed, different: AlertTriangle, problem: XCircle, unknown: HelpCircle };
+
+function statusTone(check: DnsCheck): string {
+  switch (check.status) {
+    case 'ok': return 'ok';
+    case 'improve': return 'warn';
+    case 'problem': return 'error';
+    case 'missing': return check.need === 'required' ? 'error' : '';
+    case 'different': return check.need === 'required' ? 'error' : 'warn';
+    default: return '';
+  }
+}
+
+function StatusPill({ check, checking }: { check: DnsCheck | undefined; checking: boolean }) {
+  if (!check) return <span className="pill">{checking ? 'Checking…' : 'Not checked'}</span>;
+  const Icon = statusIcon[check.status];
+  return <span className={`pill ${statusTone(check)}`}><Icon size={13} aria-hidden="true" /> {statusLabel[check.status]}</span>;
+}
+
+function recordKey(record: { name: string; type: string; value: string }): string {
+  return `${record.name} ${record.type} ${record.value}`;
+}
+
+/** What DNS has instead, and why it matters, under the value we expect. */
+function CheckDetail({ check }: { check: DnsCheck | undefined }) {
+  if (!check || check.status === 'ok') return null;
+  const showPublished = check.published.length > 0 && !check.published.includes(check.value);
+  if (!check.detail && !showPublished) return null;
+  return (
+    <div className={`checkDetail ${statusTone(check)}`}>
+      {check.detail && <p>{check.detail}</p>}
+      {showPublished && <p>In DNS now: {check.published.map((value) => <code key={value}>{value}</code>)}</p>}
+    </div>
+  );
+}
+
+function domainSummary(records: DnsRecord[], checks: Map<string, DnsCheck>, loading: boolean): React.ReactNode {
+  const found = records.map((record) => checks.get(recordKey(record))).filter((check): check is DnsCheck => !!check);
+  if (!found.length) return loading ? 'Checking DNS…' : 'DNS not checked';
+  const failing = failingRequired(found).length;
+  if (failing) return `${plural(failing, 'required record')} missing or wrong`;
+  if (found.some((check) => check.status === 'unknown')) return 'Some records could not be checked';
+  const published = found.filter((check) => check.status === 'ok' || check.status === 'improve').length;
+  return published === found.length ? 'All records are published' : `Required records are in place · ${published} of ${found.length} published`;
+}
+
 export function DomainsPage() {
+  const { run } = useFeedback();
   const discovery = useResource(() => api<Discovery>('/api/discovery'), []);
+  const dns = useResource(() => api<DnsChecks>('/api/dns-checks'), [], 300000, 'dns-checks');
   const [adding, setAdding] = useState<string | null>(null);
+  const [rechecking, setRechecking] = useState(false);
   const data = discovery.data;
+  const checks = new Map<string, DnsCheck>();
+  for (const domain of dns.data?.domains || []) for (const check of domain.records) checks.set(recordKey(check), check);
+  const checking = dns.loading || rechecking;
+
+  // A new or deleted key changes the expected records, which the server
+  // notices and looks up afresh.
+  function keysChanged() {
+    discovery.reload();
+    dns.reload();
+  }
+
+  async function recheck() {
+    setRechecking(true);
+    await run(async () => dns.setData(await api<DnsChecks>('/api/dns-checks', 'POST')), 'DNS checked again');
+    setRechecking(false);
+  }
 
   return (
     <>
       <ErrorBanner error={discovery.error} />
       <section className="routingPage">
+        {data && data.domains.length > 0 && (
+          <div className="dnsBar">
+            <span className="muted">
+              {dns.error ? `DNS could not be checked: ${dns.error}`
+                : !dns.data ? 'Looking the records up…'
+                : <>Checked {formatRelative(dns.data.checked_at)} · <code>{dns.data.hostname}</code> {dns.data.addresses.length ? <>resolves to {dns.data.addresses.join(', ')}</> : 'does not resolve'}</>}
+            </span>
+            <button className="button" onClick={recheck} disabled={checking}><RefreshCw size={16} className={checking ? 'spin' : undefined} />Check again</button>
+          </div>
+        )}
         {!data && !discovery.error && <Panel title="Domains"><table><tbody><SkeletonRows rows={4} cols={3} /></tbody></table></Panel>}
         {data && !data.domains.length && <Panel title="Domains"><Empty>No hosted domains yet. Add a mailbox and its domain appears here.</Empty></Panel>}
         {data?.domains.map((entry) => (
           <Panel
             key={entry.domain}
             title={entry.domain}
-            subtitle={entry.dkim.length ? `Signed with ${entry.dkim.length} DKIM key${entry.dkim.length === 1 ? '' : 's'}` : 'Outbound mail is not DKIM-signed'}
+            subtitle={<>{entry.dkim.length ? `Signed with ${entry.dkim.length} DKIM key${entry.dkim.length === 1 ? '' : 's'}` : 'Outbound mail is not DKIM-signed'} · {domainSummary(entry.records, checks, checking)}</>}
             actions={<button className="button" onClick={() => setAdding(entry.domain)}><KeyRound size={16} />{entry.dkim.length ? 'Add key' : 'Set up DKIM'}</button>}
           >
-            {entry.dkim.length > 0 && <KeyRows keys={entry.dkim} onChanged={discovery.reload} />}
+            {entry.dkim.length > 0 && <KeyRows keys={entry.dkim} onChanged={keysChanged} />}
             <h3 className="subheading">DNS records to publish</h3>
             <div className="tableScroll">
-              <table>
-                <thead><tr><th>Name</th><th>Type</th><th>Value</th><th><span className="visuallyHidden">Copy</span></th></tr></thead>
+              <table className="dnsTable">
+                <thead><tr><th>Status</th><th>Name</th><th>Type</th><th>Value</th><th><span className="visuallyHidden">Copy</span></th></tr></thead>
                 <tbody>
-                  {entry.records.map((record) => (
-                    <tr key={`${record.name} ${record.type} ${record.value}`} title={record.purpose}>
-                      <td className="nowrap"><code>{record.name}</code></td>
-                      <td><span className="pill">{record.type}</span></td>
-                      <td className="breakAll"><code>{record.value}</code><small className="fieldHint">{record.purpose}</small></td>
-                      <td className="rowActions"><CopyButton value={record.value} label={`Copy ${record.type} value for ${record.name}`} /></td>
-                    </tr>
-                  ))}
+                  {entry.records.map((record) => {
+                    const check = checks.get(recordKey(record));
+                    return (
+                      <tr key={recordKey(record)}>
+                        <td className="nowrap"><StatusPill check={check} checking={checking} /></td>
+                        <td className="nowrap"><code>{record.name}</code>{check?.need === 'required' && <small>Required</small>}</td>
+                        <td><span className="pill">{record.type}</span></td>
+                        <td className="breakAll"><code>{record.value}</code><small className="fieldHint">{record.purpose}</small><CheckDetail check={check} /></td>
+                        <td className="rowActions"><CopyButton value={record.value} label={`Copy ${record.type} value for ${record.name}`} /></td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -143,10 +223,11 @@ export function DomainsPage() {
         {data && (
           <p className="muted">
             Records point at <code>{data.hostname}</code>. Publish them at your DNS provider; MTA-STS and SRV rows appear once those listeners or policies are enabled.
+            A change can take a while to show here, because resolvers remember the old answer for as long as the record's TTL says.
           </p>
         )}
       </section>
-      {adding && <AddKeyModal domain={adding} onClose={() => setAdding(null)} onSaved={discovery.reload} />}
+      {adding && <AddKeyModal domain={adding} onClose={() => setAdding(null)} onSaved={keysChanged} />}
     </>
   );
 }

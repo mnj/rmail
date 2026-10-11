@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, FolderTree, Gauge, Globe, LockKeyhole, LogOut, Menu, Monitor, Moon, Network, Send, Server, SlidersHorizontal, Sun, Users, X } from 'lucide-react';
-import { api, errorMessage, onUnauthorized, QueueSummary, Session, SettingsView } from './api';
+import { api, DnsChecks, errorMessage, failingRequired, onUnauthorized, QueueSummary, Session, SettingsView } from './api';
 import { confirmLeave, FeedbackProvider, Field, useResource } from './ui';
 import { OverviewPage } from './pages/Overview';
 import { AccountsPage } from './pages/Accounts';
@@ -92,11 +92,14 @@ function ThemeSwitch() {
 function useNavBadges(): Partial<Record<Page, { count: number; tone: 'warn' | 'error'; label: string }>> {
   const queue = useResource(() => api<QueueSummary>('/api/queue/summary'), [], 60000, 'queue');
   const settings = useResource(() => api<SettingsView>('/api/settings'), [], 60000, 'settings');
+  const dns = useResource(() => api<DnsChecks>('/api/dns-checks'), [], 300000, 'dns-checks');
   const badges: ReturnType<typeof useNavBadges> = {};
   if (queue.data?.failed) badges.delivery = { count: queue.data.failed, tone: 'error', label: `${queue.data.failed} failed` };
   const view = settings.data;
   const restarts = view ? view.services.filter((service) => service.restart_required).length : 0;
   if (restarts) badges.settings = { count: restarts, tone: 'warn', label: `${restarts} service${restarts === 1 ? '' : 's'} need a restart` };
+  const failing = (dns.data?.domains || []).reduce((count, domain) => count + failingRequired(domain.records).length, 0);
+  if (failing) badges.domains = { count: failing, tone: 'error', label: `${failing} required DNS record${failing === 1 ? '' : 's'} missing or wrong` };
   return badges;
 }
 

@@ -3329,6 +3329,7 @@ dependencies = [
  "criterion",
  "encoding_rs",
  "flate2",
+ "futures-util",
  "hmac",
  "hyper",
  "hyper-util",

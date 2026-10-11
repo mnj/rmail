@@ -206,6 +206,52 @@ async fn outlook(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -
     ([(header::CONTENT_TYPE, "text/xml; charset=utf-8")], xml).into_response()
 }
 
+/// One hosted domain's suggested DNS records and the DKIM keys behind them.
+pub(super) struct DomainRecords {
+    pub domain: String,
+    pub records: Vec<discovery::DnsRecord>,
+    pub dkim: Vec<dkim::DkimKey>,
+}
+
+/// The records every hosted domain should publish, sorted by domain. A
+/// domain is hosted when it has mailboxes, aliases, a catchall or a DKIM key.
+pub(super) fn suggested_records(config: &Config, db: &str) -> anyhow::Result<Vec<DomainRecords>> {
+    let endpoints = ServiceEndpoints::from_global(&config.global);
+    let keys = dkim::list_keys(std::path::Path::new(db))?;
+    let mut domains = rmail_common::db::local_domains(db)?;
+    domains.extend(keys.iter().map(|key| key.domain.clone()));
+    domains.sort();
+    domains.dedup();
+    Ok(domains
+        .into_iter()
+        .map(|domain| {
+            let dkim = keys
+                .iter()
+                .filter(|key| key.domain == domain)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut records = discovery::dns_records(
+                &domain,
+                &endpoints,
+                config.security.mta_sts_mode,
+                config.security.mta_sts_max_age_secs,
+                &format!("postmaster@{domain}"),
+            );
+            records.extend(dkim.iter().map(|key| discovery::DnsRecord {
+                name: key.dns_name(),
+                kind: "TXT",
+                value: key.dns_record.clone(),
+                purpose: "DKIM public key that verifies this server's signatures",
+            }));
+            DomainRecords {
+                domain,
+                records,
+                dkim,
+            }
+        })
+        .collect())
+}
+
 /// DNS records to publish, per hosted domain.
 async fn records(State(state): State<Shared>) -> Response {
     let db = match require_db(&state) {
@@ -217,36 +263,11 @@ async fn records(State(state): State<Shared>) -> Response {
     };
     let result = blocking(move || {
         let config = Config::load(&path)?;
-        let endpoints = ServiceEndpoints::from_global(&config.global);
-        let keys = dkim::list_keys(std::path::Path::new(&db))?;
-        let mut domains = rmail_common::db::local_domains(&db)?;
-        domains.extend(keys.iter().map(|key| key.domain.clone()));
-        domains.sort();
-        domains.dedup();
-        let per_domain = domains
+        let per_domain = suggested_records(&config, &db)?
             .into_iter()
-            .map(|domain| {
-                let domain_keys = keys
-                    .iter()
-                    .filter(|key| key.domain == domain)
-                    .collect::<Vec<_>>();
-                let mut records = discovery::dns_records(
-                    &domain,
-                    &endpoints,
-                    config.security.mta_sts_mode,
-                    config.security.mta_sts_max_age_secs,
-                    &format!("postmaster@{domain}"),
-                );
-                records.extend(domain_keys.iter().map(|key| discovery::DnsRecord {
-                    name: key.dns_name(),
-                    kind: "TXT",
-                    value: key.dns_record.clone(),
-                    purpose: "DKIM public key that verifies this server's signatures",
-                }));
-                json!({ "domain": domain, "records": records, "dkim": domain_keys })
-            })
+            .map(|entry| json!({ "domain": entry.domain, "records": entry.records, "dkim": entry.dkim }))
             .collect::<Vec<_>>();
-        Ok(json!({ "hostname": endpoints.hostname, "domains": per_domain }))
+        Ok(json!({ "hostname": config.global.server_hostname(), "domains": per_domain }))
     })
     .await;
     match result {
