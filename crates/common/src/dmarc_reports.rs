@@ -30,6 +30,9 @@ const MAX_TEXT_CHARS: usize = 200;
 const MAX_PARTS: usize = 16;
 /// How long totals are kept.
 pub const RETENTION_SECS: i64 = 180 * 24 * 3600;
+/// The longest period one report may cover. Reports are daily; a few
+/// senders batch a week.
+const MAX_PERIOD_SECS: i64 = 8 * 24 * 3600;
 
 /// A source address whose mail failed DMARC at the reporter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,12 +246,18 @@ fn parse_xml(xml: &[u8]) -> Option<AggregateReport> {
     });
     failing.truncate(MAX_FAILING);
 
+    let begin: i64 = text(range, "begin")?.parse().ok()?;
+    let end: i64 = text(range, "end")?.parse().ok()?;
+    // A report claiming months of mail could outweigh every real one.
+    if end <= begin || end - begin > MAX_PERIOD_SECS {
+        return None;
+    }
     Some(AggregateReport {
         reporter: text(metadata, "org_name")?,
         report_id: text(metadata, "report_id")?,
         domain,
-        begin: text(range, "begin")?.parse().ok()?,
-        end: text(range, "end")?.parse().ok()?,
+        begin,
+        end,
         policy: text(published, "p").map(|policy| policy.to_ascii_lowercase()),
         messages,
         passed,
@@ -278,15 +287,24 @@ pub fn parse(message: &[u8]) -> Option<AggregateReport> {
 }
 
 /// Store a report's totals. Returns `false` when the same report (reporter,
-/// id and domain) was stored before. `authenticated` says the message
-/// carrying it passed DMARC, so it really came from the reporter; only those
-/// count in [`summary`]. Totals past [`RETENTION_SECS`] are pruned.
+/// id and domain) was stored before, or when it claims to cover the future.
+///
+/// `sender` is the domain the message carrying the report was authenticated
+/// as (DMARC pass), if it was. Only such reports count in [`summary`], and
+/// they are filed under that domain rather than under the name the report
+/// gives itself, which anyone can write: a forger can then neither pose as
+/// a well-known reporter nor count as more than the domains they control.
+/// Totals past [`RETENTION_SECS`] are pruned.
 pub fn record(
     db_path: &Path,
     report: &AggregateReport,
-    authenticated: bool,
+    sender: Option<&str>,
     now: i64,
 ) -> Result<bool> {
+    if report.end > now + 86400 {
+        return Ok(false);
+    }
+    let authenticated = sender.is_some();
     let conn = crate::sqlite_pool::connection(db_path)?;
     conn.execute(
         "DELETE FROM dmarc_received_reports WHERE received_at < ?1",
@@ -298,7 +316,7 @@ pub fn record(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             now,
-            report.reporter,
+            sender.unwrap_or(&report.reporter).to_ascii_lowercase(),
             report.report_id,
             report.domain,
             report.begin,
@@ -318,8 +336,8 @@ pub fn record(
 pub struct DomainSummary {
     pub domain: String,
     pub reports: u64,
-    /// Distinct reporting organizations.
-    pub reporters: u64,
+    /// The authenticated domains the reports came from.
+    pub reporters: Vec<String>,
     pub messages: u64,
     pub passed: u64,
     /// The span the reports cover.
@@ -329,13 +347,14 @@ pub struct DomainSummary {
     pub failing: Vec<FailingSource>,
 }
 
-/// Per-domain totals of the authenticated reports whose period ended at or
+/// Per-domain totals of the authenticated reports whose period lies at or
 /// after `since`, sorted by domain.
 pub fn summary(db_path: &Path, since: i64) -> Result<Vec<DomainSummary>> {
     let conn = crate::sqlite_pool::connection(db_path)?;
     let mut statement = conn.prepare(
         "SELECT domain, reporter, begin_at, end_at, messages, passed, failing \
-         FROM dmarc_received_reports WHERE authenticated = 1 AND end_at >= ?1 ORDER BY domain",
+         FROM dmarc_received_reports WHERE authenticated = 1 AND begin_at >= ?1 \
+         ORDER BY domain, reporter",
     )?;
     let rows = statement.query_map(params![since], |row| {
         Ok((
@@ -359,7 +378,7 @@ pub fn summary(db_path: &Path, since: i64) -> Result<Vec<DomainSummary>> {
                 DomainSummary {
                     domain,
                     reports: 0,
-                    reporters: 0,
+                    reporters: Vec::new(),
                     messages: 0,
                     passed: 0,
                     begin,
@@ -371,8 +390,8 @@ pub fn summary(db_path: &Path, since: i64) -> Result<Vec<DomainSummary>> {
             )
         });
         summary.reports += 1;
-        summary.messages += messages.max(0) as u64;
-        summary.passed += passed.max(0) as u64;
+        summary.messages = summary.messages.saturating_add(messages.max(0) as u64);
+        summary.passed = summary.passed.saturating_add(passed.max(0) as u64);
         summary.begin = summary.begin.min(begin);
         summary.end = summary.end.max(end);
         if !reporters.contains(&reporter) {
@@ -381,14 +400,14 @@ pub fn summary(db_path: &Path, since: i64) -> Result<Vec<DomainSummary>> {
         for source in serde_json::from_str::<Vec<FailingSource>>(&failing).unwrap_or_default() {
             sources
                 .entry(source.source_ip.clone())
-                .and_modify(|known| known.messages += source.messages)
+                .and_modify(|known| known.messages = known.messages.saturating_add(source.messages))
                 .or_insert(source);
         }
     }
     Ok(domains
         .into_values()
         .map(|(mut summary, reporters, sources)| {
-            summary.reporters = reporters.len() as u64;
+            summary.reporters = reporters;
             summary.failing = sources.into_values().collect();
             summary.failing.sort_by(|a, b| {
                 b.messages
@@ -538,6 +557,14 @@ mod tests {
         let bad_count = XML.replace("<count>40</count>", "<count>lots</count>");
         let report = parse(&attached("text/xml", bad_count.as_bytes())).unwrap();
         assert_eq!((report.messages, report.passed), (9, 2));
+        // A period of months, or one that ends before it begins.
+        for end in ["1795000000", "1789999999"] {
+            let long = XML.replace("<end>1790086399</end>", &format!("<end>{end}</end>"));
+            assert!(
+                parse(&attached("text/xml", long.as_bytes())).is_none(),
+                "{end}"
+            );
+        }
         let oversized = vec![b'a'; MAX_MESSAGE_BYTES + 1];
         assert!(parse(&oversized).is_none());
     }
@@ -562,9 +589,9 @@ mod tests {
         crate::db::init_db(&db).unwrap();
         let report = parse(&attached("text/xml", XML.as_bytes())).unwrap();
         let now = 1790100000;
-        assert!(record(&db, &report, true, now).unwrap());
+        assert!(record(&db, &report, Some("google.com"), now).unwrap());
         // Sent again after a temporary failure.
-        assert!(!record(&db, &report, true, now).unwrap());
+        assert!(!record(&db, &report, Some("Google.com"), now).unwrap());
 
         let mut second = report.clone();
         second.reporter = "Outlook.com".into();
@@ -579,22 +606,39 @@ mod tests {
             dkim: "fail".into(),
             spf: "fail".into(),
         }];
-        assert!(record(&db, &second, true, now).unwrap());
-        // Anyone can mail a forged report; it is kept but does not count.
+        assert!(record(&db, &second, Some("outlook.com"), now + 86400).unwrap());
+        // Anyone can mail a forged report; unauthenticated, it is kept but
+        // does not count, and cannot take the place of the real one.
         let mut forged = report.clone();
-        forged.report_id = "forged".into();
         forged.messages = 1_000_000;
-        assert!(record(&db, &forged, false, now).unwrap());
+        assert!(record(&db, &forged, None, now).unwrap());
+        // Authenticated as some other domain, it counts as that domain's
+        // word, whatever name the report gives itself.
+        let mut posing = report.clone();
+        posing.report_id = "posing".into();
+        posing.messages = 5;
+        posing.passed = 5;
+        posing.failing.clear();
+        assert!(record(&db, &posing, Some("attacker.example"), now).unwrap());
+        // A report from the future is refused.
+        let mut early = report.clone();
+        early.report_id = "early".into();
+        early.end = now + 2 * 86400;
+        assert!(!record(&db, &early, Some("google.com"), now).unwrap());
         let mut other = report.clone();
         other.domain = "example.org".into();
-        assert!(record(&db, &other, true, now).unwrap());
+        assert!(record(&db, &other, Some("google.com"), now).unwrap());
 
         let summaries = summary(&db, 0).unwrap();
         assert_eq!(summaries.len(), 2);
         let first = &summaries[0];
         assert_eq!(first.domain, "example.com");
-        assert_eq!((first.reports, first.reporters), (2, 2));
-        assert_eq!((first.messages, first.passed), (59, 52));
+        assert_eq!(first.reports, 3);
+        assert_eq!(
+            first.reporters,
+            ["attacker.example", "google.com", "outlook.com"]
+        );
+        assert_eq!((first.messages, first.passed), (64, 57));
         assert_eq!((first.begin, first.end), (1790000000, 1790086399 + 86400));
         assert_eq!(
             first
@@ -604,15 +648,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("198.51.100.9", 7), ("192.0.2.77", 1)]
         );
-        // Only reports whose period reaches into the window count.
-        let recent = summary(&db, 1790086399 + 1).unwrap();
+        // Only reports whose whole period lies in the window count.
+        let recent = summary(&db, 1790000000 + 1).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].reports, 1);
+        assert_eq!(recent[0].reporters, ["outlook.com"]);
+
+        // Totals saturate instead of wrapping.
+        let mut huge = report.clone();
+        for id in ["huge-1", "huge-2", "huge-3"] {
+            huge.report_id = id.into();
+            huge.messages = u64::MAX;
+            huge.passed = u64::MAX;
+            assert!(record(&db, &huge, Some("google.com"), now).unwrap());
+        }
+        assert_eq!(summary(&db, 0).unwrap()[0].messages, u64::MAX);
 
         // Old totals go when a new report arrives.
         let mut later = report.clone();
         later.report_id = "later".into();
-        assert!(record(&db, &later, true, now + RETENTION_SECS + 1).unwrap());
+        later.begin += RETENTION_SECS;
+        later.end += RETENTION_SECS;
+        assert!(
+            record(
+                &db,
+                &later,
+                Some("google.com"),
+                now + RETENTION_SECS + 86400 + 1
+            )
+            .unwrap()
+        );
         assert_eq!(summary(&db, 0).unwrap()[0].reports, 1);
     }
 }

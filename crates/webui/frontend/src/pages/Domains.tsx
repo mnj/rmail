@@ -147,7 +147,7 @@ function DmarcReports({ summary }: { summary: DmarcReportSummary }) {
   return (
     <p className="panelNote dmarcReports">
       <strong>DMARC reports, last 14 days:</strong>{' '}
-      {numberFmt.format(summary.passed)} of {numberFmt.format(summary.messages)} messages passed ({percent}%), according to {plural(summary.reports, 'report')} from {plural(summary.reporters, 'mail system')}.
+      {numberFmt.format(summary.passed)} of {numberFmt.format(summary.messages)} messages passed ({percent}%), according to {plural(summary.reports, 'report')} from {summary.reporters.join(', ')}.
       {failed > 0 && summary.failing.length > 0 && <> Failing most: {summary.failing.map((source) => <code key={source.source_ip}>{source.source_ip} ({numberFmt.format(source.messages)})</code>)}</>}
     </p>
   );

@@ -35,6 +35,8 @@ const DMARC_WINDOW: Duration = Duration::from_secs(14 * 24 * 3600);
 const DMARC_MIN_MESSAGES: u64 = 20;
 /// The reports must span about a week, so weekday-only senders are in them.
 const DMARC_MIN_SPAN_SECS: i64 = 6 * 24 * 3600;
+/// Independent reporters that must agree before advising a policy change.
+const DMARC_MIN_REPORTERS: usize = 2;
 const FEEDBACK_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 
 pub(crate) fn routes() -> Router<Shared> {
@@ -691,12 +693,18 @@ fn dmarc_recommendation(
     let seen = format!(
         "In the last {days} days, {} from {} covered {} messages claiming to be from {domain}",
         plural(summary.reports, "DMARC report"),
-        plural(summary.reporters, "mail system"),
+        reporters(summary),
         summary.messages
     );
     // Forgeries always fail, so "all passing" allows for a little noise.
-    if summary.passed * 100 >= summary.messages * 98 {
-        if policy != Some("none") || summary.end - summary.begin < DMARC_MIN_SPAN_SECS {
+    if summary.passed.saturating_mul(100) >= summary.messages.saturating_mul(98) {
+        // One sender's word is not enough to change a policy on: a report
+        // is only authenticated as coming from its sender, and anyone with
+        // a domain can send one.
+        if policy != Some("none")
+            || summary.end - summary.begin < DMARC_MIN_SPAN_SECS
+            || summary.reporters.len() < DMARC_MIN_REPORTERS
+        {
             return None;
         }
         return Some(Recommendation {
@@ -713,7 +721,7 @@ fn dmarc_recommendation(
             page: "domains",
         });
     }
-    if summary.passed * 100 >= summary.messages * 90 {
+    if summary.passed.saturating_mul(100) >= summary.messages.saturating_mul(90) {
         return None;
     }
     let sources = summary
@@ -736,6 +744,22 @@ fn dmarc_recommendation(
         ),
         page: "domains",
     })
+}
+
+/// Who vouches for the numbers, so the admin can judge whether to believe
+/// them: reports are only as trustworthy as their senders.
+fn reporters(summary: &DomainSummary) -> String {
+    let shown = summary
+        .reporters
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match summary.reporters.len() {
+        0..=4 => shown,
+        more => format!("{shown} and {} more", more - 4),
+    }
 }
 
 fn plural(count: u64, word: &str) -> String {
@@ -1293,7 +1317,11 @@ mod tests {
         DomainSummary {
             domain: "example.com".to_string(),
             reports: 9,
-            reporters: 3,
+            reporters: vec![
+                "google.com".into(),
+                "outlook.com".into(),
+                "yahoo.com".into(),
+            ],
             messages,
             passed,
             begin: 1_790_000_000,
@@ -1335,8 +1363,14 @@ mod tests {
         assert!(
             found[0]
                 .detail
-                .contains("9 DMARC reports from 3 mail systems")
+                .contains("9 DMARC reports from google.com, outlook.com, yahoo.com covered")
         );
+        // A single sender's reports do not justify changing the policy.
+        let mut lone = reports(1210, 1204, 13);
+        lone.reporters.truncate(1);
+        inputs.dmarc_reports = vec![lone];
+        assert!(recommendations(&inputs, &snapshot).is_empty());
+        inputs.dmarc_reports = vec![reports(1210, 1204, 13)];
         assert!(found[0].detail.contains("all but 6 passed"));
         assert!(found[0].detail.contains("p=quarantine"));
         let report = report(&inputs, &snapshot);

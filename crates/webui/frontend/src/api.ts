@@ -131,7 +131,7 @@ export type BlocklistResult = { zone: string; name: string; status: 'clean' | 'l
 export type OutboundAddress = { address: string; source: 'seen' | 'local' | 'dns'; reverse: { status: DnsStatus; names: string[]; detail: string | null }; blocklists: BlocklistResult[] };
 export type Deliverability = { port25: { v4: Reach; v6: Reach }; addresses: OutboundAddress[] };
 /** Totals of the DMARC aggregate reports other mail systems sent about a domain. */
-export type DmarcReportSummary = { domain: string; reports: number; reporters: number; messages: number; passed: number; begin: number; end: number; failing: { source_ip: string; messages: number; dkim: string; spf: string }[] };
+export type DmarcReportSummary = { domain: string; reports: number; reporters: string[]; messages: number; passed: number; begin: number; end: number; failing: { source_ip: string; messages: number; dkim: string; spf: string }[] };
 /** Something the server noticed that the admin may want to act on. */
 export type Recommendation = { id: string; title: string; detail: string; page: 'domains' | 'settings' | 'certificates' | 'routing' | 'delivery' };
 export type DnsChecks = {

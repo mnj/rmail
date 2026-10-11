@@ -67,9 +67,14 @@ impl Session {
         let Some(db_path) = self.db_path.clone() else {
             return;
         };
-        // Kept either way, but only authenticated reports count: anyone can
-        // mail a forged one.
-        let authenticated = auth.dmarc.as_deref() == Some("pass");
+        // Kept either way, but only authenticated reports count, and under
+        // the domain they were authenticated as: anyone can mail a report
+        // and call themselves a well-known reporter in it.
+        let sender = (auth.dmarc.as_deref() == Some("pass"))
+            .then(|| auth.header_from.as_deref()?.rsplit_once('@'))
+            .flatten()
+            .map(|(_, domain)| domain.trim_end_matches('>').to_ascii_lowercase());
+        let authenticated = sender.is_some();
         let data = data.clone();
         let stored = tokio::task::spawn_blocking(move || {
             let Some(report) = dmarc_reports::parse(&data) else {
@@ -82,7 +87,7 @@ impl Session {
             let new = dmarc_reports::record(
                 std::path::Path::new(&db_path),
                 &report,
-                authenticated,
+                sender.as_deref(),
                 chrono::Utc::now().timestamp(),
             )?;
             anyhow::Ok(Some((report, new)))

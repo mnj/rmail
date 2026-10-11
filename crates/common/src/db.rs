@@ -270,7 +270,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
             passed INTEGER NOT NULL,
             failing TEXT NOT NULL DEFAULT '[]',
             authenticated INTEGER NOT NULL DEFAULT 0,
-            UNIQUE (reporter, report_id, domain)
+            UNIQUE (reporter, report_id, domain, authenticated)
         );
         CREATE INDEX IF NOT EXISTS dmarc_received_reports_domain
             ON dmarc_received_reports (domain, end_at);

@@ -3308,9 +3308,9 @@ async fn dmarc_aggregate_reports_about_hosted_domains_are_delivered_and_recorded
     let db = std::path::Path::new(&db_path);
     let hosted = parse("example.test", "r1");
     assert_eq!((hosted.messages, hosted.passed), (12, 12));
-    assert!(!rmail_common::dmarc_reports::record(db, &hosted, false, 1790100000).unwrap());
+    assert!(!rmail_common::dmarc_reports::record(db, &hosted, None, 1790100000).unwrap());
     let foreign = parse("elsewhere.example", "r2");
-    assert!(rmail_common::dmarc_reports::record(db, &foreign, false, 1790100000).unwrap());
+    assert!(rmail_common::dmarc_reports::record(db, &foreign, None, 1790100000).unwrap());
     // The test peer cannot pass DMARC, so the stored report does not count,
     // and neither it nor anything else prompted a feedback-loop suggestion.
     assert!(

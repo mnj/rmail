@@ -57,12 +57,12 @@ async function showPublishedZone(route) {
   report.recommendations.push({
     id: 'dmarc-tighten-example.com',
     title: 'Tighten the DMARC policy of example.com',
-    detail: 'In the last 14 days, 26 DMARC reports from 3 mail systems covered 1210 messages claiming to be from example.com, and all but 6 passed. Your own mail is authenticating, so it is safe to change p=none to p=quarantine in the _dmarc.example.com record: receivers will then junk forgeries instead of delivering them.',
+    detail: 'In the last 14 days, 26 DMARC reports from google.com, outlook.com, yahoo.com covered 1210 messages claiming to be from example.com, and all but 6 passed. Your own mail is authenticating, so it is safe to change p=none to p=quarantine in the _dmarc.example.com record: receivers will then junk forgeries instead of delivering them.',
     page: 'domains',
   });
   for (const domain of report.domains) {
     const second = domain.domain !== 'example.com';
-    if (!second) domain.dmarc_reports = { domain: domain.domain, reports: 26, reporters: 3, messages: 1210, passed: 1204, begin: 0, end: 0, failing: [{ source_ip: '198.51.100.9', messages: 6, dkim: 'fail', spf: 'fail' }] };
+    if (!second) domain.dmarc_reports = { domain: domain.domain, reports: 26, reporters: ['google.com', 'outlook.com', 'yahoo.com'], messages: 1210, passed: 1204, begin: 0, end: 0, failing: [{ source_ip: '198.51.100.9', messages: 6, dkim: 'fail', spf: 'fail' }] };
     for (const record of domain.records) {
       Object.assign(record, { status: 'ok', published: [record.value], detail: null });
       if (record.name.startsWith('_dmarc.')) {
