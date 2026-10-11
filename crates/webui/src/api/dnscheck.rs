@@ -21,7 +21,7 @@ use rmail_common::dnscheck::{
 use rmail_common::transport::{self, RouteAction};
 use serde::Serialize;
 
-use super::{Shared, blocking, error, require_db};
+use super::{ApiError, Shared, blocking, require_db};
 
 /// How often the background task looks everything up again.
 const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -146,6 +146,14 @@ impl Snapshot {
 
     fn fresh(&self) -> bool {
         now() - self.checked_at < CHECK_INTERVAL.as_secs() as i64
+    }
+
+    /// Every required record got an answer, so `failures` is the whole story.
+    fn conclusive(&self) -> bool {
+        self.domains
+            .iter()
+            .flat_map(|(_, checks)| checks)
+            .all(|check| check.need != Need::Required || check.status != Status::Unknown)
     }
 
     /// Required records that are published wrongly or not at all, as
@@ -508,17 +516,17 @@ fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
     }
 }
 
-async fn load_inputs(state: &Shared) -> Result<Inputs, Response> {
-    let db = require_db(state).map_err(IntoResponse::into_response)?;
+async fn load_inputs(state: &Shared) -> Result<Inputs, ApiError> {
+    let db = require_db(state)?;
     let Some(path) = state.config_path.clone() else {
-        return Err(error(
+        return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "no configuration file is loaded",
+            "no configuration file is loaded".to_string(),
         ));
     };
     blocking(move || Inputs::load(&path, &db))
         .await
-        .map_err(|err| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))
+        .map_err(|err| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))
 }
 
 /// The snapshot for `inputs`, looked up again when `force` is set or the
@@ -543,7 +551,7 @@ async fn snapshot_for(state: &Shared, inputs: &Inputs, force: bool) -> Arc<Snaps
 async fn respond(state: Shared, force: bool) -> Response {
     let inputs = match load_inputs(&state).await {
         Ok(inputs) => inputs,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
     let snapshot = snapshot_for(&state, &inputs, force).await;
     Json(report(&inputs, &snapshot)).into_response()
@@ -567,8 +575,11 @@ pub(crate) fn spawn_check_task(state: Shared) {
         loop {
             match load_inputs(&state).await {
                 Ok(inputs) => {
-                    let failures = snapshot_for(&state, &inputs, true).await.failures();
-                    if failures != reported {
+                    let snapshot = snapshot_for(&state, &inputs, true).await;
+                    let failures = snapshot.failures();
+                    // A pass with failed lookups says nothing new: an outage
+                    // hides broken records, it does not fix them.
+                    if snapshot.conclusive() && failures != reported {
                         if failures.is_empty() {
                             web_log!("info", "dns_check_recovered", {});
                         } else {
@@ -577,8 +588,8 @@ pub(crate) fn spawn_check_task(state: Shared) {
                         reported = failures;
                     }
                 }
-                Err(response) => {
-                    web_log!("warn", "dns_check_skipped", { "status": response.status().as_u16() })
+                Err(err) => {
+                    web_log!("warn", "dns_check_skipped", { "error": err.1 })
                 }
             }
             tokio::time::sleep(CHECK_INTERVAL).await;
@@ -727,7 +738,7 @@ mod tests {
         let report = report(&inputs, &snapshot);
         assert_eq!(report.hostname, HOST);
         assert_eq!(report.addresses, ["203.0.113.5"]);
-        assert!(snapshot.failures().is_empty());
+        assert!(snapshot.failures().is_empty() && snapshot.conclusive());
 
         let steps = &report.domains[0].steps;
         let ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
@@ -819,8 +830,10 @@ mod tests {
         let mut zone = zone();
         zone.down = true;
         let snapshot = take_snapshot(&zone, &inputs).await;
-        // A resolver outage must not be reported as broken records.
+        // A resolver outage must not be reported as broken records, nor as
+        // their recovery.
         assert!(snapshot.failures().is_empty());
+        assert!(!snapshot.conclusive());
         let report = report(&inputs, &snapshot);
         assert!(report.addresses.is_empty());
         for id in ["mx", "spf", "dkim", "dmarc", "clients"] {
