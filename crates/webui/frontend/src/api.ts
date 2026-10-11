@@ -132,6 +132,10 @@ export type OutboundAddress = { address: string; source: 'seen' | 'local' | 'dns
 export type Deliverability = { port25: { v4: Reach; v6: Reach }; addresses: OutboundAddress[] };
 /** Totals of the DMARC aggregate reports other mail systems sent about a domain. */
 export type DmarcReportSummary = { domain: string; reports: number; reporters: string[]; messages: number; passed: number; begin: number; end: number; failing: { source_ip: string; messages: number; dkim: string; spf: string }[] };
+/** A DNS host whose control panel has quirks the console can warn about. */
+export type DnsProvider = 'cloudflare' | 'route53';
+/** How a signed test message from a domain fared when verified like inbound mail. */
+export type AuthTest = { domain: string; address: string | null; checks: { name: string; result: string; ok: boolean; detail: string }[] };
 /** Something the server noticed that the admin may want to act on. */
 export type Recommendation = { id: string; title: string; detail: string; page: 'domains' | 'settings' | 'certificates' | 'routing' | 'delivery' };
 export type DnsChecks = {
@@ -139,7 +143,7 @@ export type DnsChecks = {
   hostname: string;
   addresses: string[];
   server: SetupStep[];
-  domains: { domain: string; records: DnsCheck[]; steps: SetupStep[]; dmarc_reports: DmarcReportSummary | null }[];
+  domains: { domain: string; records: DnsCheck[]; steps: SetupStep[]; dmarc_reports: DmarcReportSummary | null; provider: DnsProvider | null }[];
   /** Null when a smarthost sends the mail, so the server's own address does not matter. */
   outbound: Deliverability | null;
   recommendations: Recommendation[];

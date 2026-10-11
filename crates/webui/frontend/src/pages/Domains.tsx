@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { AlertTriangle, Check, CheckCircle2, CircleDashed, Copy, HelpCircle, KeyRound, RefreshCw, ShieldCheck, Trash2, XCircle } from 'lucide-react';
-import { api, DkimKey, Discovery, DmarcReportSummary, DnsCheck, DnsChecks, DnsRecord, DnsStatus, failingRequired } from '../api';
+import { AlertTriangle, Check, CheckCircle2, CircleDashed, Copy, Download, FlaskConical, HelpCircle, KeyRound, RefreshCw, ShieldCheck, Trash2, XCircle } from 'lucide-react';
+import { api, AuthTest, DkimKey, Discovery, DmarcReportSummary, DnsCheck, DnsChecks, DnsProvider, DnsRecord, DnsStatus, errorMessage, failingRequired } from '../api';
 import { Empty, ErrorBanner, Field, formatRelative, IconButton, Modal, numberFmt, Panel, plural, SkeletonRows, useFeedback, useResource } from '../ui';
 
 function CopyButton({ value, label }: { value: string; label: string }) {
@@ -140,6 +140,69 @@ function CheckDetail({ check }: { check: DnsCheck | undefined }) {
   );
 }
 
+const providerHints: Record<DnsProvider, { name: string; hints: string[] }> = {
+  cloudflare: {
+    name: 'Cloudflare',
+    hints: [
+      'Keep every record below on “DNS only” (grey cloud). A proxied record sends mail apps to Cloudflare instead of this server.',
+      'Type TXT values without the surrounding quotes, and host names without the final dot.',
+      'To add them all at once, use DNS → Records → Import and Export with the zone file.',
+    ],
+  },
+  route53: {
+    name: 'Amazon Route 53',
+    hints: [
+      'Put TXT values in double quotes. A value over 255 characters, such as a DKIM key, must be split into several quoted strings; the zone file is already split that way.',
+      'Several TXT values for one name (SPF next to a site verification, say) go into a single record, one per line.',
+      'To add them all at once, use “Import zone file” on the hosted zone.',
+    ],
+  },
+};
+
+function ProviderHints({ provider }: { provider: DnsProvider }) {
+  const { name, hints } = providerHints[provider];
+  return (
+    <div className="providerHints">
+      <strong>This domain's DNS is at {name}.</strong>
+      <ul>{hints.map((hint) => <li key={hint}>{hint}</li>)}</ul>
+    </div>
+  );
+}
+
+/** Signs a test message and shows how a receiving server would judge it. Nothing is sent. */
+function AuthTestModal({ domain, onClose }: { domain: string; onClose: () => void }) {
+  const [result, setResult] = useState<AuthTest | null>(null);
+  const [error, setError] = useState('');
+  React.useEffect(() => {
+    let current = true;
+    api<AuthTest>('/api/dns-checks/test', 'POST', { domain })
+      .then((value) => { if (current) setResult(value); })
+      .catch((err) => { if (current) setError(errorMessage(err)); });
+    return () => { current = false; };
+  }, [domain]);
+
+  return (
+    <Modal title={`Test message from ${domain}`} onClose={onClose} footer={<button className="button primary" type="button" onClick={onClose}>Close</button>}>
+      <p className="muted">
+        A test message is signed the way outgoing mail is, then checked the way a receiving server checks it, against what DNS says right now. Nothing is sent.
+        {result?.address && <> It is treated as arriving from <code>{result.address}</code>.</>}
+      </p>
+      <ErrorBanner error={error} />
+      {!result && !error && <Empty>Checking…</Empty>}
+      {result && (
+        <ul className="authTest">
+          {result.checks.map((check) => (
+            <li key={check.name} className={check.ok ? 'ok' : check.result === 'not checked' ? '' : 'error'}>
+              {check.ok ? <CheckCircle2 size={18} aria-label="Passed" /> : check.result === 'not checked' ? <HelpCircle size={18} aria-label="Not checked" /> : <XCircle size={18} aria-label="Failed" />}
+              <div><strong>{check.name} <span className="pill">{check.result}</span></strong><small>{check.detail}</small></div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Modal>
+  );
+}
+
 /** What other mail systems reported about the domain's mail in the last two weeks. */
 function DmarcReports({ summary }: { summary: DmarcReportSummary }) {
   const failed = summary.messages - summary.passed;
@@ -168,10 +231,12 @@ export function DomainsPage() {
   const discovery = useResource(() => api<Discovery>('/api/discovery'), []);
   const dns = useResource(() => api<DnsChecks>('/api/dns-checks'), [], 300000, 'dns-checks');
   const [adding, setAdding] = useState<string | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
   const [rechecking, setRechecking] = useState(false);
   const data = discovery.data;
   const checks = new Map<string, DnsCheck>();
   const reports = new Map((dns.data?.domains || []).map((domain) => [domain.domain, domain.dmarc_reports]));
+  const providers = new Map((dns.data?.domains || []).map((domain) => [domain.domain, domain.provider]));
   for (const domain of dns.data?.domains || []) for (const check of domain.records) checks.set(recordKey(check), check);
   const checking = dns.loading || rechecking;
 
@@ -209,10 +274,15 @@ export function DomainsPage() {
             key={entry.domain}
             title={entry.domain}
             subtitle={<>{entry.dkim.length ? `Signed with ${entry.dkim.length} DKIM key${entry.dkim.length === 1 ? '' : 's'}` : 'Outbound mail is not DKIM-signed'} · {domainSummary(entry.records, checks, checking)}</>}
-            actions={<button className="button" onClick={() => setAdding(entry.domain)}><KeyRound size={16} />{entry.dkim.length ? 'Add key' : 'Set up DKIM'}</button>}
+            actions={<>
+              <button className="button" onClick={() => setTesting(entry.domain)}><FlaskConical size={16} />Test a message</button>
+              <a className="button" href={`/api/discovery/zone?domain=${encodeURIComponent(entry.domain)}`} download={`${entry.domain}.zone`}><Download size={16} />Zone file</a>
+              <button className="button" onClick={() => setAdding(entry.domain)}><KeyRound size={16} />{entry.dkim.length ? 'Add key' : 'Set up DKIM'}</button>
+            </>}
           >
             {entry.dkim.length > 0 && <KeyRows keys={entry.dkim} onChanged={keysChanged} />}
             <h3 className="subheading">DNS records to publish</h3>
+            {providers.get(entry.domain) && <ProviderHints provider={providers.get(entry.domain)!} />}
             <div className="tableScroll">
               <table className="dnsTable">
                 <thead><tr><th>Status</th><th>Name</th><th>Type</th><th>Value</th><th><span className="visuallyHidden">Copy</span></th></tr></thead>
@@ -242,6 +312,7 @@ export function DomainsPage() {
           </p>
         )}
       </section>
+      {testing && <AuthTestModal domain={testing} onClose={() => setTesting(null)} />}
       {adding && <AddKeyModal domain={adding} onClose={() => setAdding(null)} onSaved={keysChanged} />}
     </>
   );

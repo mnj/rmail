@@ -64,6 +64,7 @@ pub(crate) fn public_routes() -> Router<Shared> {
 pub(crate) fn protected_routes() -> Router<Shared> {
     Router::new()
         .route("/api/discovery", get(records))
+        .route("/api/discovery/zone", get(zone_file))
         .route(
             "/api/dkim",
             axum::routing::post(add_dkim_key).delete(delete_dkim_key),
@@ -272,6 +273,57 @@ async fn records(State(state): State<Shared>) -> Response {
     .await;
     match result {
         Ok(value) => Json(value).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
+    }
+}
+
+/// One hosted domain's suggested records as a zone file to import at a DNS
+/// provider. `?domain=` must be a hosted domain.
+async fn zone_file(
+    State(state): State<Shared>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let Some(path) = state.config_path.clone() else {
+        return error(StatusCode::BAD_REQUEST, "no configuration file is loaded");
+    };
+    let wanted = query
+        .get("domain")
+        .map(|domain| domain.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let result = blocking(move || {
+        let config = Config::load(&path)?;
+        Ok(suggested_records(&config, &db)?
+            .into_iter()
+            .find(|entry| entry.domain == wanted)
+            .map(|entry| {
+                (
+                    discovery::zone_file(&entry.domain, &entry.records),
+                    entry.domain,
+                )
+            }))
+    })
+    .await;
+    match result {
+        // The file name is the hosted domain as stored, never request text.
+        Ok(Some((zone, domain))) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8".to_string(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{domain}.zone\""),
+                ),
+            ],
+            zone,
+        )
+            .into_response(),
+        Ok(None) => not_found(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
     }
 }

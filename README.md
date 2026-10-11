@@ -37,6 +37,9 @@ screenshots of every page, and a quick start.
   the domain's mail passing, turn on ACME when the certificate is self-signed, and set a
   feedback-loop address when abuse reports arrive without one. Settings are labelled Recommended or
   Optional with a plain explanation.
+- **DNS conveniences**: download a domain's records as a BIND zone file to import in one go, hints
+  for Cloudflare and Route 53 when the domain is hosted there, and a test that signs a message and
+  reports how SPF, DKIM and DMARC would come out at a receiver.
 - **Load balancers**: HAProxy PROXY protocol v1/v2 on the mail listeners.
 - **Admin console** for mailboxes, quotas, aliases, catchalls, the outbound queue, database-stored
   settings, logs, Prometheus metrics and readiness checks.

@@ -2846,6 +2846,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zone_file_and_auth_test_answer_only_for_hosted_domains() {
+        let td = tempdir().unwrap();
+        let mut state = Arc::into_inner(discovery_state(&td, "testing")).unwrap();
+        state.file_admin = Some(("admin".into(), hash("correct horse battery")));
+        let state = Arc::new(state);
+        let basic = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "admin:correct horse battery",
+        );
+        let get =
+            |path: &str| format!("GET {path} HTTP/1.1\r\nAuthorization: Basic {basic}\r\n\r\n");
+
+        let zone = send_to_state(
+            state.clone(),
+            "t",
+            get("/api/discovery/zone?domain=Example.com"),
+        )
+        .await;
+        assert!(zone.starts_with("HTTP/1.1 200"), "{zone}");
+        let lower = zone.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-disposition: attachment; filename=\"example.com.zone\""),
+            "{zone}"
+        );
+        assert!(zone.contains("$ORIGIN example.com."), "{zone}");
+        assert!(
+            zone.contains("example.com.\tIN\tMX\t10 mail.example.com."),
+            "{zone}"
+        );
+        assert!(
+            zone.contains("example.com.\tIN\tTXT\t\"v=spf1 mx -all\""),
+            "{zone}"
+        );
+
+        // Not hosted here, or no domain at all: nothing to export, and the
+        // request's text never reaches a header.
+        for path in [
+            "/api/discovery/zone?domain=elsewhere.example",
+            "/api/discovery/zone?domain=x%22%0d%0aX-Injected:%201",
+            "/api/discovery/zone",
+        ] {
+            let missing = send_to_state(state.clone(), "t", get(path)).await;
+            assert!(missing.starts_with("HTTP/1.1 404"), "{path}: {missing}");
+            assert!(!missing.contains("X-Injected"), "{missing}");
+        }
+        let anonymous = send_to_state(
+            state.clone(),
+            "t",
+            "GET /api/discovery/zone?domain=example.com HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+
+        // The authentication test refuses other people's domains before
+        // looking anything up.
+        let foreign = send_to_state(
+            state,
+            "t",
+            post(
+                "/api/dns-checks/test",
+                r#"{"domain":"elsewhere.example"}"#,
+                &format!("Authorization: Basic {basic}\r\n"),
+            ),
+        )
+        .await;
+        assert!(foreign.starts_with("HTTP/1.1 404"), "{foreign}");
+        assert!(foreign.contains("not hosted here"), "{foreign}");
+    }
+
+    #[tokio::test]
     async fn mta_sts_is_not_published_when_mode_is_none() {
         let td = tempdir().unwrap();
         let response = send_to_state(

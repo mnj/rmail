@@ -375,6 +375,17 @@ button.kpi:hover { border-color: var(--focus); box-shadow: var(--shadow-sm), 0 0
 .attentionList.recommendations li > svg { margin-top: 2px; color: var(--accent); }
 .attentionList.recommendations small { display: block; margin-top: 3px; color: var(--muted); }
 .dmarcReports { border-top: 1px solid var(--border); }
+.providerHints { margin: 4px 18px 10px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--info-border); background: var(--info-bg); color: var(--info-text); font-size: 13px; }
+.providerHints ul { margin: 6px 0 0; padding-left: 18px; }
+.providerHints li + li { margin-top: 3px; }
+.authTest { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 12px; }
+.authTest li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; align-items: start; }
+.authTest li > svg { margin-top: 1px; color: var(--muted); }
+.authTest li.ok > svg { color: var(--ok); }
+.authTest li.error > svg { color: var(--danger); }
+.authTest strong { display: flex; align-items: center; gap: 8px; }
+.authTest small { display: block; margin-top: 3px; color: var(--muted); }
+a.button { text-decoration: none; }
 .dmarcReports code { margin-left: 6px; }
 .allClear { display: flex; align-items: center; gap: 10px; padding: 16px 18px; color: var(--ok-text); font-weight: 600; }
 .checklists { display: grid; }

@@ -225,6 +225,22 @@ domain, MX, SPF, DKIM and DMARC (required), then MTA-STS with TLS reports and th
 auto-setup records (recommended). DANE, a smarthost and AI writing suggestions are listed as
 optional and never count against the server.
 
+### Zone file, provider hints and the authentication test
+
+Each domain on **Domains & DNS** has three helpers:
+
+- **Zone file** downloads the suggested records in BIND format (also at
+  `/api/discovery/zone?domain=<domain>`), with long TXT values such as DKIM keys already split into
+  255-byte strings. Most DNS providers can import it. It holds only the records mail needs, so
+  import it into the zone rather than replacing the zone with it.
+- When the domain's name servers belong to **Cloudflare** or **Amazon Route 53**, the page shows
+  the quirks of that provider's control panel (proxied records, quoting of TXT values, how to
+  import).
+- **Test a message** signs a test message with the domain's DKIM keys, as outgoing mail is signed,
+  and verifies it the way inbound mail is verified: against live DNS, as if it arrived from the
+  server's sending address. It reports DKIM, SPF and DMARC with a sentence each. Nothing is sent,
+  so it tests your DNS and keys, not a particular receiver's filtering.
+
 ### Recommendations and received DMARC reports
 
 The DMARC record suggested for each domain sends aggregate reports (`rua=`) to

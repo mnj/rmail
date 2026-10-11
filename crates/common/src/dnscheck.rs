@@ -76,6 +76,42 @@ pub trait Dns {
     async fn ptr(&self, ip: IpAddr) -> Lookup<String>;
     /// Evaluate `domain`'s SPF policy for mail arriving from `ip`.
     async fn spf(&self, domain: &str, ip: IpAddr, helo: &str) -> SpfVerdict;
+    /// The name servers of a zone. Only used for hints, so a source that
+    /// cannot say simply has none.
+    async fn ns(&self, _name: &str) -> Lookup<String> {
+        Lookup::Missing
+    }
+}
+
+/// A DNS host whose control panel has quirks worth pointing out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Cloudflare,
+    Route53,
+}
+
+/// Who hosts `domain`'s DNS, going by its name servers. A subdomain without
+/// name servers of its own is in its parent's zone.
+pub async fn dns_provider(dns: &impl Dns, domain: &str) -> Option<Provider> {
+    let mut zone = domain;
+    loop {
+        if let Lookup::Found(servers) = dns.ns(zone).await {
+            return servers.iter().find_map(|server| {
+                if server.ends_with(".ns.cloudflare.com") {
+                    Some(Provider::Cloudflare)
+                } else if server.contains(".awsdns-") {
+                    Some(Provider::Route53)
+                } else {
+                    None
+                }
+            });
+        }
+        match zone.split_once('.') {
+            Some((_, parent)) if parent.contains('.') => zone = parent,
+            _ => return None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -939,6 +975,21 @@ mod system {
             .await
         }
 
+        async fn ns(&self, name: &str) -> Lookup<String> {
+            let resolver = match resolver() {
+                Ok(resolver) => resolver,
+                Err(error) => return Lookup::Failed(error),
+            };
+            ask(
+                resolver.resolver().ns_lookup(fqdn(name)),
+                |data| match data {
+                    RData::NS(server) => Some(host(&server.0)),
+                    _ => None,
+                },
+            )
+            .await
+        }
+
         async fn spf(&self, domain: &str, ip: IpAddr, helo: &str) -> SpfVerdict {
             let Ok(resolver) = resolver() else {
                 return SpfVerdict::Unknown;
@@ -1440,6 +1491,70 @@ mod tests {
             find(&checks, "_caldavs._tcp.example.com", "TXT").status,
             Status::Different
         );
+    }
+
+    #[tokio::test]
+    async fn the_dns_provider_is_read_from_the_name_servers() {
+        struct Servers(&'static [(&'static str, &'static [&'static str])]);
+        impl Dns for Servers {
+            async fn txt(&self, _: &str) -> Lookup<String> {
+                Lookup::Missing
+            }
+            async fn mx(&self, _: &str) -> Lookup<(u16, String)> {
+                Lookup::Missing
+            }
+            async fn cname(&self, _: &str) -> Lookup<String> {
+                Lookup::Missing
+            }
+            async fn srv(&self, _: &str) -> Lookup<Srv> {
+                Lookup::Missing
+            }
+            async fn ips(&self, _: &str) -> Lookup<IpAddr> {
+                Lookup::Missing
+            }
+            async fn ptr(&self, _: IpAddr) -> Lookup<String> {
+                Lookup::Missing
+            }
+            async fn spf(&self, _: &str, _: IpAddr, _: &str) -> SpfVerdict {
+                SpfVerdict::Unknown
+            }
+            async fn ns(&self, name: &str) -> Lookup<String> {
+                self.0.iter().find(|(zone, _)| *zone == name).map_or(
+                    Lookup::Missing,
+                    |(_, servers)| {
+                        Lookup::Found(servers.iter().map(|server| server.to_string()).collect())
+                    },
+                )
+            }
+        }
+        let dns = Servers(&[
+            (
+                "example.com",
+                &["amy.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+            ),
+            (
+                "example.org",
+                &["ns-12.awsdns-01.org", "ns-900.awsdns-55.co.uk"],
+            ),
+            ("example.net", &["ns1.registrar.example"]),
+        ]);
+        assert_eq!(
+            dns_provider(&dns, "example.com").await,
+            Some(Provider::Cloudflare)
+        );
+        assert_eq!(
+            dns_provider(&dns, "example.org").await,
+            Some(Provider::Route53)
+        );
+        assert_eq!(dns_provider(&dns, "example.net").await, None);
+        // A subdomain lives in its parent's zone; a top-level domain is not asked.
+        assert_eq!(
+            dns_provider(&dns, "lists.eu.example.com").await,
+            Some(Provider::Cloudflare)
+        );
+        assert_eq!(dns_provider(&dns, "unknown.test").await, None);
+        // A source that knows nothing about name servers gives no hint.
+        assert_eq!(dns_provider(&perfect(), "example.com").await, None);
     }
 
     #[test]
