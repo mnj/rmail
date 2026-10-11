@@ -199,6 +199,32 @@ redirects) and adds an ARC-Authentication-Results, ARC-Message-Signature, and AR
 chain with invalid continuity is forwarded unchanged rather than being extended with a misleading
 local seal. `rmail_ctl dkim clear-arc` turns sealing off.
 
+### Checking the published DNS records
+
+The admin console's **Domains & DNS** page lists the records each hosted domain should publish and
+looks every one of them up, with the server's own resolver. Each record is marked:
+
+- **OK**, or **Can improve** when it works but is weak (DMARC still at `p=none`, or without a
+  reporting address);
+- **Missing**;
+- **Different**, when something else is published (the page shows it next to the expected value);
+- **Problem**, when what is published breaks the feature: more than one SPF record, an SPF record
+  that does not cover the address `global.hostname` resolves to, a DKIM key that is not the one the
+  server signs with, MX pointing at another host, or a service name behind Cloudflare's proxy;
+- **Not checked**, when the lookup itself failed.
+
+Records are judged by what they do rather than by their text, so an SPF record of your own that
+covers the server is fine. The checks run every 30 minutes and when you press **Check again**;
+broken required records (MX, SPF, DKIM, DMARC) appear under **Needs attention** on the overview and
+are logged by `rmail_web` as `dns_check_failed`. A change you just made can take until the record's
+TTL runs out to show, because the resolver in front of the server remembers the old answer.
+
+The overview's **Setup checklist** builds on the same checks: for the server, a trusted
+certificate, reverse DNS that names `global.hostname`, and a feedback-loop address; for each
+domain, MX, SPF, DKIM and DMARC (required), then MTA-STS with TLS reports and the client
+auto-setup records (recommended). DANE, a smarthost and AI writing suggestions are listed as
+optional and never count against the server.
+
 Optional outbound-worker tuning in `/etc/default/rmail`:
 
 - `RMAIL_OUTBOUND_CONCURRENCY` — maximum simultaneous delivery tasks (default: `20`)

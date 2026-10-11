@@ -119,6 +119,22 @@ export type FeedbackOverview = { addresses: string[]; threshold: number; days: n
 export type DnsRecord = { name: string; type: string; value: string; purpose: string };
 export type DkimKey = { domain: string; selector: string; algorithm: 'rsa' | 'ed25519'; arc: boolean; created_at: number; dns_record: string };
 export type Discovery = { hostname: string; domains: { domain: string; records: DnsRecord[]; dkim: DkimKey[] }[] };
+export type DnsStatus = 'ok' | 'improve' | 'missing' | 'different' | 'problem' | 'unknown';
+export type Need = 'required' | 'recommended' | 'optional';
+/** The live verdict on one suggested record; name, type and value match its DnsRecord. */
+export type DnsCheck = { name: string; type: string; value: string; need: Need; status: DnsStatus; published: string[]; detail: string | null };
+export type SetupStep = { id: string; need: Need; title: string; why: string; state: 'done' | 'todo' | 'unknown'; detail: string | null; page: 'domains' | 'settings' | 'certificates' | 'routing' | null };
+export type DnsChecks = {
+  checked_at: number;
+  hostname: string;
+  addresses: string[];
+  server: SetupStep[];
+  domains: { domain: string; records: DnsCheck[]; steps: SetupStep[] }[];
+};
+/** Required records that are published wrongly or not at all. */
+export function failingRequired(records: DnsCheck[]): DnsCheck[] {
+  return records.filter((record) => record.need === 'required' && ['missing', 'different', 'problem'].includes(record.status));
+}
 export type Route =
   | { domain: string; action: 'relay'; host: string; port: number; implicit_tls: boolean; username: string | null; has_password: boolean }
   | { domain: string; action: 'reject'; reply: string; has_password: boolean };

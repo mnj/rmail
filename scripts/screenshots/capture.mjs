@@ -31,9 +31,44 @@ async function shot(page, name) {
 const desktop = { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2, ignoreHTTPSErrors: true };
 const mobile = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, ignoreHTTPSErrors: true };
 
+// The console checks the demo domains' DNS live, but example.com's real zone
+// says nothing about this server. Rewrite the answer to what an admin who
+// published the suggested records would see, with a little left to do, so the
+// shots do not depend on the network.
+async function showPublishedZone(route) {
+  const response = await route.fetch();
+  const report = await response.json();
+  report.addresses = ['203.0.113.25'];
+  for (const step of report.server) {
+    if (step.id === 'reverse_dns') Object.assign(step, { state: 'done', detail: null });
+  }
+  for (const domain of report.domains) {
+    const second = domain.domain !== 'example.com';
+    for (const record of domain.records) {
+      Object.assign(record, { status: 'ok', published: [record.value], detail: null });
+      if (record.name.startsWith('_dmarc.')) {
+        Object.assign(record, {
+          status: 'improve',
+          detail: 'The policy is still p=none: receivers report forgeries but deliver them. Once the reports show your own mail passing, tighten it to quarantine or reject.',
+        });
+      }
+      if (second && record.type === 'SRV') Object.assign(record, { status: 'missing', published: [] });
+    }
+    for (const step of domain.steps) {
+      if (step.id === 'mta_sts') continue; // off in the demo's settings
+      if (step.id === 'dkim' && second) continue; // no signing key for this domain
+      Object.assign(step, { state: 'done', detail: null });
+      if (step.id === 'dmarc') step.detail = domain.records.find((record) => record.name.startsWith('_dmarc.')).detail;
+      if (step.id === 'clients' && second) Object.assign(step, { state: 'todo', detail: '5 of 9 records are missing or wrong.' });
+    }
+  }
+  await route.fulfill({ response, json: report });
+}
+
 // Admin console
 {
   const ctx = await browser.newContext(desktop);
+  await ctx.route('**/api/dns-checks', showPublishedZone);
   const page = await ctx.newPage();
   await page.goto(admin);
   await page.waitForSelector('input[type=password]');

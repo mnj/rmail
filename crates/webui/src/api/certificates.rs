@@ -58,18 +58,23 @@ struct Overview {
     warnings: Vec<String>,
 }
 
+/// The certificate the services present, and why it could not be read if
+/// one is configured but unusable.
+pub(super) fn installed_certificate(config: &Config) -> (Option<CertificateInfo>, Option<String>) {
+    let (cert_path, _, unset) = acme::certificate_paths(config);
+    if unset && !cert_path.exists() {
+        return (None, None);
+    }
+    match acme::cert::inspect_file(&cert_path) {
+        Ok(info) => (Some(info), None),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    }
+}
+
 fn build_overview(config: &Config) -> anyhow::Result<Overview> {
     let status = acme::load_status(&config.global.db_path)?;
     let (cert_path, key_path, unset) = acme::certificate_paths(config);
-    let tls_configured = !unset;
-    let (certificate, certificate_error) = if tls_configured || cert_path.exists() {
-        match acme::cert::inspect_file(&cert_path) {
-            Ok(info) => (Some(info), None),
-            Err(err) => (None, Some(format!("{err:#}"))),
-        }
-    } else {
-        (None, None)
-    };
+    let (certificate, certificate_error) = installed_certificate(config);
     let (names, names_error) = match acme::certificate_names(config) {
         Ok(names) => (names, None),
         Err(err) => (Vec::new(), Some(format!("{err:#}"))),

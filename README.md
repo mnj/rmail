@@ -26,7 +26,10 @@ screenshots of every page, and a quick start.
   providers are recorded and tied to the sending account or domain when it can be found.
 - **Domains & DNS**: DKIM keys (RSA and Ed25519) generated in the console, and the DNS records to
   publish per domain (MX, SPF, DKIM, DMARC, SRV, `_mta-sts`, `_smtp._tls`); MTA-STS policy hosting,
-  Thunderbird autoconfig and Outlook autodiscover.
+  Thunderbird autoconfig and Outlook autodiscover. The console looks every record up and marks it
+  OK, missing, different or broken (two SPF records, SPF that does not cover the server, a DKIM key
+  that is not the signing key, MX pointing elsewhere, a name behind Cloudflare's proxy), and turns
+  the result into a setup checklist per domain.
 - **Load balancers**: HAProxy PROXY protocol v1/v2 on the mail listeners.
 - **Admin console** for mailboxes, quotas, aliases, catchalls, the outbound queue, database-stored
   settings, logs, Prometheus metrics and readiness checks.

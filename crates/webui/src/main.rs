@@ -1261,8 +1261,9 @@ async fn main() -> Result<()> {
     }
     let state = Arc::new(state);
     let app = api::router(state.clone());
-    let http_app = api::certificates::http_router(state);
+    let http_app = api::certificates::http_router(state.clone());
     api::certificates::spawn_renewal_task(cfg_path.clone());
+    api::dnscheck::spawn_check_task(state);
 
     rmail_common::tls::spawn_web_tls_reloader(
         tls.0.clone(),
@@ -2155,6 +2156,49 @@ mod tests {
         )
         .await;
         assert!(cross_origin.starts_with("HTTP/1.1 403"), "{cross_origin}");
+    }
+
+    #[tokio::test]
+    async fn dns_checks_are_admin_only_and_need_a_database() {
+        let td = tempdir().unwrap();
+        let state = Arc::new(api::AdminState::new(
+            td.path().to_path_buf(),
+            None,
+            Some(("admin".into(), hash("correct horse battery"))),
+            ReadinessConfig::default(),
+        ));
+        let anonymous = send_to_state(
+            state.clone(),
+            "t",
+            "GET /api/dns-checks HTTP/1.1\r\n\r\n".into(),
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+
+        let basic = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "admin:correct horse battery",
+        );
+        // Re-checking sends DNS queries, so it is not open to cross-site posts.
+        let no_csrf = send_to_state(
+            state.clone(),
+            "t",
+            format!(
+                "POST /api/dns-checks HTTP/1.1\r\nAuthorization: Basic {basic}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(no_csrf.starts_with("HTTP/1.1 403"), "{no_csrf}");
+
+        // Without a database there are no domains to check, and nothing is looked up.
+        let no_db = send_to_state(
+            state,
+            "t",
+            format!("GET /api/dns-checks HTTP/1.1\r\nAuthorization: Basic {basic}\r\n\r\n"),
+        )
+        .await;
+        assert!(no_db.starts_with("HTTP/1.1 400"), "{no_db}");
+        assert!(no_db.contains("no database is configured"), "{no_db}");
     }
 
     #[tokio::test]
