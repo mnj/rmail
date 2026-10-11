@@ -174,6 +174,7 @@ impl Session {
         // when the scanner quarantined them.
         if report.any_accepted && !quarantine {
             self.record_feedback(&data, &auth).await;
+            self.record_dmarc_report(&data, &auth).await;
         }
         self.finish_message(reader, &report).await?;
         self.reset_transaction();

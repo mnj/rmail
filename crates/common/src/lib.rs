@@ -20,6 +20,7 @@ pub mod db;
 pub mod deliverability;
 pub mod discovery;
 pub mod dkim;
+pub mod dmarc_reports;
 pub mod dnsbl;
 pub mod dnscheck;
 pub mod domain;

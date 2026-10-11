@@ -1806,10 +1806,99 @@ pub fn update(conn: &mut Connection, changes: &BTreeMap<String, Value>) -> Resul
     write_raw(conn, &writes)
 }
 
+/// How much a setting matters to an ordinary installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdviceLevel {
+    /// Worth turning on for nearly every server.
+    Recommended,
+    /// A feature some servers want; nothing is wrong without it.
+    Optional,
+}
+
+/// A plain-language note on whether a setting is worth changing, so that
+/// optional features do not look like unfinished setup.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Advice {
+    pub level: AdviceLevel,
+    pub why: &'static str,
+}
+
+/// The advice for a setting, for the features an admin is most likely to
+/// wonder about. Most settings have none: their defaults are simply fine.
+pub fn advice(key: &str) -> Option<Advice> {
+    use AdviceLevel::{Optional, Recommended};
+    let (level, why) = match key {
+        "acme.enabled" => (
+            Recommended,
+            "Gets a free certificate from Let's Encrypt and renews it by itself. Without a trusted certificate mail apps show warnings.",
+        ),
+        "security.mta_sts_mode" => (
+            Recommended,
+            "Tells other servers to insist on encryption when delivering to you. Start with testing, which only reports problems, then move to enforce.",
+        ),
+        "security.tls_rpt_enabled" => (
+            Recommended,
+            "A courtesy to other domains that costs nothing: it tells them when delivery to them could not be encrypted.",
+        ),
+        "security.feedback_addresses" => (
+            Recommended,
+            "Lets you see which account a spam complaint is about. Worth setting as soon as you register with a mailbox provider's feedback loop.",
+        ),
+        "security.submission_require_from_alignment" => (
+            Recommended,
+            "Stops one user sending mail under another user's address. Leave it off only if people legitimately send as shared addresses.",
+        ),
+        "global.enforce_dmarc" => (
+            Recommended,
+            "Rejects or junks forged mail when the real sender's domain asks for that, which is how most phishing is stopped.",
+        ),
+        "security.dane_enabled" => (
+            Optional,
+            "Extra verification for the few recipient domains that publish DANE records. It needs a resolver that validates DNSSEC; mail is encrypted without it too.",
+        ),
+        "security.greylist_enabled" => (
+            Optional,
+            "Cuts some spam by making unknown senders try twice, at the price of delaying first-time legitimate mail by a few minutes.",
+        ),
+        "security.clamav_enabled" => (
+            Optional,
+            "Virus scanning. Needs ClamAV installed and running separately.",
+        ),
+        "security.rspamd_enabled" => (
+            Optional,
+            "Spam scoring. Needs rspamd installed and running separately.",
+        ),
+        "security.dnsbl_zones" => (
+            Optional,
+            "Refuses mail from addresses on a blocklist. Effective against spam, but a list's mistakes become your rejected mail.",
+        ),
+        "security.dmarc_failure_reports" => (
+            Optional,
+            "Helps other domains debug their mail. Few domains ask for these reports, and nothing of yours depends on sending them.",
+        ),
+        "security.oauth.introspection_url" => (
+            Optional,
+            "Only for sign-in through an identity provider. Passwords work without it.",
+        ),
+        "classifier.enabled" => (
+            Optional,
+            "Automatic sorting of mail into folders for users who opt in. Uses noticeable memory and CPU.",
+        ),
+        "compose_ai.enabled" => (
+            Optional,
+            "Writing help in webmail, using a language model you choose. Drafts are sent to that model's provider.",
+        ),
+        _ => return None,
+    };
+    Some(Advice { level, why })
+}
+
 #[derive(Debug, Serialize)]
 pub struct SettingView {
     #[serde(flatten)]
     pub spec: SettingSpec,
+    pub advice: Option<Advice>,
     /// Stored value, or `null` when the built-in default applies. Secrets are
     /// never returned.
     pub value: Option<Value>,
@@ -1856,6 +1945,7 @@ pub fn describe(conn: &Connection) -> Result<SettingsView> {
             let secret = matches!(spec.kind, SettingKind::Secret);
             SettingView {
                 spec: *spec,
+                advice: advice(spec.key),
                 is_set: stored_value.is_some(),
                 value: if secret { None } else { stored_value },
                 default: if secret {
@@ -2044,6 +2134,43 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn advice_marks_real_settings_as_recommended_or_optional() {
+        // Every key with advice must be a setting, or the advice is never shown.
+        let advised = SETTINGS
+            .iter()
+            .filter(|spec| advice(spec.key).is_some())
+            .count();
+        assert_eq!(advised, 15);
+        assert_eq!(
+            advice("acme.enabled").unwrap().level,
+            AdviceLevel::Recommended
+        );
+        assert_eq!(
+            advice("compose_ai.enabled").unwrap().level,
+            AdviceLevel::Optional
+        );
+        assert!(advice("global.hostname").is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path().join("rmail.db")).unwrap();
+        let view = serde_json::to_value(describe(&conn).unwrap()).unwrap();
+        let setting = |key: &str| {
+            view["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|setting| setting["key"] == key)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            setting("security.dane_enabled")["advice"]["level"],
+            "optional"
+        );
+        assert!(setting("global.hostname")["advice"].is_null());
     }
 
     #[test]

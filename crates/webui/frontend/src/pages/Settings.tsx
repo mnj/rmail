@@ -257,8 +257,9 @@ export function SettingsPage() {
                       return (
                         <div className={`settingRow ${draft ? 'dirty' : ''}`} key={setting.key}>
                           <div className="settingInfo">
-                            <strong>{setting.label}{custom && <span className="badge">custom</span>}{draft && <span className="badge dirty">unsaved</span>}</strong>
+                            <strong>{setting.label}{setting.advice && <span className={`badge ${setting.advice.level}`}>{setting.advice.level === 'recommended' ? 'Recommended' : 'Optional'}</span>}{custom && <span className="badge">custom</span>}{draft && <span className="badge dirty">unsaved</span>}</strong>
                             {setting.help && <p>{setting.help}</p>}
+                            {setting.advice && <p className="settingAdvice">{setting.advice.why}</p>}
                             <small><code>{setting.key}</code> · {setting.services.length ? `applies to ${setting.services.join(', ')} on restart` : 'applies immediately'}{setting.kind.type !== 'secret' && setting.default !== null && setting.default !== undefined ? ` · default ${describe(setting.default)}` : ''}</small>
                           </div>
                           <div className="settingControl">

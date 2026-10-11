@@ -3245,6 +3245,86 @@ async fn feedback_reports_to_configured_addresses_are_delivered_and_recorded() {
     assert!(!report.authenticated);
 }
 
+fn dmarc_aggregate_report(domain: &str, report_id: &str) -> String {
+    format!(
+        "From: noreply-dmarc@reporter.example\r\n\
+         To: postmaster@example.test\r\n\
+         Subject: Report Domain: {domain} Submitter: reporter.example Report-ID: {report_id}\r\n\
+         Message-ID: <{report_id}@reporter.example>\r\n\
+         Date: Mon, 5 Oct 2026 10:00:00 +0000\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: text/xml\r\n\
+         \r\n\
+         <feedback><report_metadata><org_name>reporter.example</org_name>\
+         <report_id>{report_id}</report_id>\
+         <date_range><begin>1790000000</begin><end>1790086399</end></date_range></report_metadata>\
+         <policy_published><domain>{domain}</domain><p>none</p></policy_published>\
+         <record><row><source_ip>192.0.2.25</source_ip><count>12</count>\
+         <policy_evaluated><dkim>pass</dkim><spf>fail</spf></policy_evaluated></row></record>\
+         </feedback>\r\n"
+    )
+}
+
+#[tokio::test]
+async fn dmarc_aggregate_reports_about_hosted_domains_are_delivered_and_recorded() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    let input = format!(
+        "EHLO mx.reporter.example\r\n\
+         MAIL FROM:<>\r\nRCPT TO:<postmaster@example.test>\r\nDATA\r\n{}.\r\n\
+         MAIL FROM:<>\r\nRCPT TO:<postmaster@example.test>\r\nDATA\r\n{}.\r\n\
+         QUIT\r\n",
+        dmarc_aggregate_report("example.test", "r1"),
+        dmarc_aggregate_report("elsewhere.example", "r2"),
+    );
+    let (responses, td) = run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path.clone(),
+    )
+    .await;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|line| line.starts_with("250 2.0.0"))
+            .count(),
+        2,
+        "{responses:?}"
+    );
+    // Reports are ordinary mail too.
+    let inbox = td.path().join("mail/example.test/postmaster/Maildir/new");
+    assert_eq!(std::fs::read_dir(inbox).expect("maildir").count(), 2);
+
+    // The report about the hosted domain was stored (storing it again is a
+    // duplicate); the one about someone else's domain was not.
+    let parse = |domain, id| {
+        rmail_common::dmarc_reports::parse(dmarc_aggregate_report(domain, id).as_bytes())
+            .expect("a report")
+    };
+    let db = std::path::Path::new(&db_path);
+    let hosted = parse("example.test", "r1");
+    assert_eq!((hosted.messages, hosted.passed), (12, 12));
+    assert!(!rmail_common::dmarc_reports::record(db, &hosted, false, 1790100000).unwrap());
+    let foreign = parse("elsewhere.example", "r2");
+    assert!(rmail_common::dmarc_reports::record(db, &foreign, false, 1790100000).unwrap());
+    // The test peer cannot pass DMARC, so the stored report does not count,
+    // and neither it nor anything else prompted a feedback-loop suggestion.
+    assert!(
+        rmail_common::dmarc_reports::summary(db, 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rmail_common::feedback::unrecorded(db, 0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn queued_control_priorities(td: &tempfile::TempDir) -> Vec<i32> {
     let queue = td.path().join("mail/outbound/maildrop/queue");
     std::fs::read_dir(queue)
