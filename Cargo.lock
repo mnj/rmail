@@ -3498,6 +3498,7 @@ dependencies = [
  "argon2 0.5.3",
  "axum",
  "base64 0.21.7",
+ "futures-util",
  "rand 0.8.8",
  "reqwest",
  "rmail_common",

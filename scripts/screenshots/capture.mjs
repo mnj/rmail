@@ -62,6 +62,7 @@ async function showPublishedZone(route) {
   });
   for (const domain of report.domains) {
     const second = domain.domain !== 'example.com';
+    domain.provider = second ? null : 'cloudflare';
     if (!second) domain.dmarc_reports = { domain: domain.domain, reports: 26, reporters: ['google.com', 'outlook.com', 'yahoo.com'], messages: 1210, passed: 1204, begin: 0, end: 0, failing: [{ source_ip: '198.51.100.9', messages: 6, dkim: 'fail', spf: 'fail' }] };
     for (const record of domain.records) {
       Object.assign(record, { status: 'ok', published: [record.value], detail: null });

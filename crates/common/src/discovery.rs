@@ -334,6 +334,56 @@ pub fn dns_records(
     records
 }
 
+/// A TXT value as zone-file character-strings: quoted, escaped, and cut
+/// into pieces of at most 255 bytes, the limit of one string (RFC 1035
+/// section 3.3.14). DKIM keys are longer than that.
+fn zone_txt(value: &str) -> String {
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut length = 0;
+    for c in value.chars() {
+        if length + c.len_utf8() > 255 {
+            pieces.push(std::mem::take(&mut piece));
+            length = 0;
+        }
+        length += c.len_utf8();
+        if matches!(c, '"' | '\\') {
+            piece.push('\\');
+        }
+        piece.push(c);
+    }
+    pieces.push(piece);
+    pieces
+        .iter()
+        .map(|piece| format!("\"{piece}\""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `records` as a BIND zone file (RFC 1035 section 5), which most DNS
+/// providers can import, so a domain's records need not be typed one by one.
+/// Each record carries its purpose as a comment.
+pub fn zone_file(domain: &str, records: &[DnsRecord]) -> String {
+    let mut out = format!(
+        "; DNS records for {domain}, as suggested by rMail.\n\
+         ; Import this file at your DNS provider. It lists only the records mail needs;\n\
+         ; it is not the whole zone, so do not replace an existing zone with it.\n\
+         $ORIGIN {domain}.\n$TTL 3600\n"
+    );
+    for record in records {
+        let value = if record.kind == "TXT" {
+            zone_txt(&record.value)
+        } else {
+            record.value.clone()
+        };
+        out.push_str(&format!(
+            "\n; {}\n{}.\tIN\t{}\t{value}\n",
+            record.purpose, record.name, record.kind
+        ));
+    }
+    out
+}
+
 /// `mta-sts.example.com` -> `example.com`; `autoconfig.`/`autodiscover.` likewise.
 /// The host may carry a port. Returns a lowercase domain.
 pub fn domain_from_host(host: &str, prefix: &str) -> Option<String> {
@@ -437,6 +487,53 @@ mod tests {
         assert_eq!(mta_sts_id(&a).len(), 16);
         assert_ne!(mta_sts_id(&a), mta_sts_id(&b));
         assert_eq!(mta_sts_id(&a), mta_sts_id(&a));
+    }
+
+    #[test]
+    fn zone_file_lists_every_record_in_importable_form() {
+        let key = format!("v=DKIM1; k=rsa; p={}", "A".repeat(400));
+        let records = vec![
+            DnsRecord {
+                name: "example.com".to_string(),
+                kind: "MX",
+                value: "10 mail.example.com.".to_string(),
+                purpose: "Deliver mail for the domain to this server",
+            },
+            DnsRecord {
+                name: "mail2026._domainkey.example.com".to_string(),
+                kind: "TXT",
+                value: key.clone(),
+                purpose: "DKIM public key",
+            },
+            DnsRecord {
+                name: "note.example.com".to_string(),
+                kind: "TXT",
+                value: r#"say "hi" \o/"#.to_string(),
+                purpose: "Quoting",
+            },
+        ];
+        let zone = zone_file("example.com", &records);
+        assert!(zone.contains("$ORIGIN example.com.\n$TTL 3600\n"));
+        assert!(zone.contains(
+            "\n; Deliver mail for the domain to this server\nexample.com.\tIN\tMX\t10 mail.example.com.\n"
+        ));
+        // A long key becomes several strings of at most 255 bytes that join
+        // back into the value.
+        let line = zone
+            .lines()
+            .find(|line| line.starts_with("mail2026._domainkey.example.com.\tIN\tTXT\t"))
+            .unwrap();
+        let strings = line
+            .split('\t')
+            .nth(3)
+            .unwrap()
+            .split("\" \"")
+            .map(|piece| piece.trim_matches('"'))
+            .collect::<Vec<_>>();
+        assert_eq!(strings.len(), 2);
+        assert!(strings.iter().all(|piece| piece.len() <= 255));
+        assert_eq!(strings.concat(), key);
+        assert!(zone.contains(r#"note.example.com.	IN	TXT	"say \"hi\" \\o/""#));
     }
 
     #[test]

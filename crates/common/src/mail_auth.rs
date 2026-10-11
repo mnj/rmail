@@ -342,6 +342,48 @@ pub fn sign_outbound<'a>(data: &'a [u8], envelope_from: Option<&str>) -> Result<
     sign_with_keys(&db_path, data, sender_domain)
 }
 
+/// A message as `domain` would send it, signed with the domain's keys the
+/// way outbound mail is. The flag says whether there was a key to sign with.
+pub fn test_message(
+    db_path: &std::path::Path,
+    domain: &str,
+    host: &str,
+) -> Result<(Vec<u8>, bool)> {
+    let domain = crate::domain::canonicalize_domain(domain)?;
+    let message = format!(
+        "From: Postmaster <postmaster@{domain}>\r\n\
+         To: postmaster@{domain}\r\n\
+         Subject: rMail authentication test\r\n\
+         Date: {date}\r\n\
+         Message-ID: <auth-test-{id:016x}@{host}>\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         This message was generated to check how mail from {domain} authenticates.\r\n",
+        date = chrono::Utc::now().to_rfc2822(),
+        id = rand::random::<u64>(),
+    );
+    let signed = sign_with_keys(db_path, message.as_bytes(), &domain)?;
+    let was_signed = matches!(signed, Cow::Owned(_));
+    Ok((signed.into_owned(), was_signed))
+}
+
+/// What a receiving server would conclude about mail from `domain` sent by
+/// this server from `peer_ip`: sign a test message, then verify it against
+/// live DNS exactly as inbound mail is verified. Nothing is sent. Without a
+/// `peer_ip` SPF is not evaluated (and reads `none`).
+pub async fn self_test(
+    db_path: &std::path::Path,
+    domain: &str,
+    peer_ip: Option<IpAddr>,
+    host: &str,
+) -> Result<(AuthenticationResults, bool)> {
+    let (message, signed) = test_message(db_path, domain, host)?;
+    let sender = format!("postmaster@{}", domain.to_ascii_lowercase());
+    let results = analyze_message(&message, peer_ip, Some(host), host, Some(&sender)).await?;
+    Ok((results, signed))
+}
+
 fn sign_with_keys<'a>(
     db_path: &std::path::Path,
     data: &'a [u8],
@@ -529,6 +571,31 @@ qZzGsIxVP+sEVRWZmW6KNFSdVUpk3qzK0Tz/WjQMe5z0UunY9Ax9/4PVhp/j61bf
 eAYXunajbBSOLlx4D+TunwJBANkPI5S9iylsbLs6NkaMHV6k5ioHBBmgCak95JGX
 GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
 -----END RSA PRIVATE KEY-----"#;
+
+    #[test]
+    fn test_messages_are_signed_like_outbound_mail() {
+        let (_dir, db) = key_db();
+        let (unsigned, signed) = test_message(&db, "Example.COM", "mail.example.com").unwrap();
+        assert!(!signed);
+        let text = String::from_utf8(unsigned).unwrap();
+        assert!(text.starts_with("From: Postmaster <postmaster@example.com>\r\n"));
+        assert!(text.contains("@mail.example.com>\r\n"));
+
+        crate::dkim::add_key(
+            &db,
+            "example.com",
+            "mail2026",
+            crate::dkim::Algorithm::Ed25519,
+            None,
+        )
+        .unwrap();
+        let (message, signed) = test_message(&db, "example.com", "mail.example.com").unwrap();
+        assert!(signed);
+        let text = String::from_utf8(message).unwrap();
+        assert!(text.starts_with("DKIM-Signature:"));
+        assert!(text.contains("d=example.com") && text.contains("s=mail2026"));
+        assert!(test_message(&db, "not a domain", "mail.example.com").is_err());
+    }
 
     fn configure_arc() -> (tempfile::TempDir, std::path::PathBuf) {
         let (dir, db) = key_db();

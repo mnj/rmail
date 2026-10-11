@@ -17,7 +17,9 @@ use rmail_common::config::Config;
 use rmail_common::deliverability::{self, Deliverability, Listed, Reach};
 use rmail_common::discovery::{DnsRecord, MtaStsMode};
 use rmail_common::dmarc_reports::{self, DomainSummary};
-use rmail_common::dnscheck::{self, Dns, Host, Lookup, Need, RecordCheck, Status, SystemDns};
+use rmail_common::dnscheck::{
+    self, Dns, Host, Lookup, Need, Provider, RecordCheck, Status, SystemDns,
+};
 use rmail_common::feedback::{self, Unrecorded};
 use rmail_common::transport::{self, RouteAction};
 use serde::Serialize;
@@ -40,7 +42,9 @@ const DMARC_MIN_REPORTERS: usize = 2;
 const FEEDBACK_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 
 pub(crate) fn routes() -> Router<Shared> {
-    Router::new().route("/api/dns-checks", get(cached).post(recheck))
+    Router::new()
+        .route("/api/dns-checks", get(cached).post(recheck))
+        .route("/api/dns-checks/test", axum::routing::post(test_message))
 }
 
 /// The last round of lookups. Holding the lock while checking makes
@@ -57,6 +61,9 @@ pub(crate) struct Snapshot {
     outbound: Option<Deliverability>,
     /// Per domain, in the order of `expected`.
     domains: Vec<(String, Vec<RecordCheck>)>,
+    /// Who hosts each domain's DNS, in the same order, when it is a
+    /// provider there are hints for.
+    providers: Vec<Option<Provider>>,
     /// The records looked up; a different set means the snapshot is stale.
     expected: Vec<(String, Vec<DnsRecord>)>,
 }
@@ -161,11 +168,21 @@ async fn take_snapshot(dns: &impl Dns, inputs: &Inputs) -> Snapshot {
         let checks = dnscheck::check_domain(dns, &entry.domain, &host, &entry.records).await;
         domains.push((entry.domain.clone(), checks));
     }
+    // Only hints depend on these, so they run side by side: slow name
+    // servers must not add a wait per domain to every report.
+    let providers = futures_util::future::join_all(
+        inputs
+            .domains
+            .iter()
+            .map(|entry| dnscheck::dns_provider(dns, &entry.domain)),
+    )
+    .await;
     Snapshot {
         checked_at: now(),
         host,
         outbound,
         domains,
+        providers,
         expected: inputs.expected(),
     }
 }
@@ -293,6 +310,8 @@ struct DomainReport<'a> {
     steps: Vec<Step>,
     /// Totals of the DMARC reports received about the domain, when any came.
     dmarc_reports: Option<&'a DomainSummary>,
+    /// The domain's DNS host, when the console has hints for it.
+    provider: Option<Provider>,
 }
 
 /// Something the server noticed that the admin may want to act on. Unlike a
@@ -829,7 +848,8 @@ fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
             .domains
             .iter()
             .zip(&inputs.domains)
-            .map(|((domain, records), input)| DomainReport {
+            .zip(&snapshot.providers)
+            .map(|(((domain, records), input), provider)| DomainReport {
                 domain,
                 records,
                 steps: domain_steps(records, input.dkim_keys, inputs.mta_sts),
@@ -837,6 +857,7 @@ fn report<'a>(inputs: &'a Inputs, snapshot: &'a Snapshot) -> Report<'a> {
                     .dmarc_reports
                     .iter()
                     .find(|summary| &summary.domain == domain),
+                provider: *provider,
             })
             .collect(),
         outbound: snapshot.outbound.as_ref(),
@@ -908,6 +929,180 @@ fn known_failures(
     }
     found.sort();
     found
+}
+
+#[derive(serde::Deserialize)]
+struct TestRequest {
+    domain: String,
+}
+
+/// One line of an authentication test's outcome.
+#[derive(Debug, Serialize)]
+struct TestCheck {
+    name: &'static str,
+    result: String,
+    ok: bool,
+    detail: String,
+}
+
+/// The result shown when a check could not be made; the console renders it
+/// as neither passed nor failed.
+const NOT_CHECKED: &str = "not checked";
+
+/// Explain an authentication test to someone who does not read
+/// Authentication-Results headers. `address` is where the mail would come
+/// from; without one SPF was not evaluated.
+fn explain_test(
+    results: &rmail_common::mail_auth::AuthenticationResults,
+    signed: bool,
+    address: Option<std::net::IpAddr>,
+    smarthost: bool,
+) -> Vec<TestCheck> {
+    let dkim = results.dkim.as_deref().unwrap_or("none");
+    let dkim_detail = match (signed, dkim) {
+        (false, _) => "The message was not signed: the domain has no DKIM key. Create one on this page.".to_string(),
+        (true, "pass") => "The signature verified against the key published in DNS.".to_string(),
+        (true, _) => "The message was signed, but the signature did not verify. The key in DNS is missing or is not the signing key.".to_string(),
+    };
+    let (spf, spf_ok, spf_detail) = match (address, results.spf.as_deref().unwrap_or("none")) {
+        (None, _) if smarthost => (
+            NOT_CHECKED.to_string(),
+            false,
+            "Mail leaves through the smarthost, so SPF depends on the smarthost's addresses, which are its provider's to tell you.".to_string(),
+        ),
+        (None, _) => (
+            NOT_CHECKED.to_string(),
+            false,
+            "The address this server sends from is not known, so SPF could not be evaluated.".to_string(),
+        ),
+        (Some(address), "pass") => (
+            "pass".to_string(),
+            true,
+            format!("The domain's SPF record allows mail from {address}."),
+        ),
+        (Some(address), "none") => (
+            "none".to_string(),
+            false,
+            format!("The domain publishes no SPF record, so nothing says {address} may send for it."),
+        ),
+        (Some(address), other) => (
+            other.to_string(),
+            false,
+            format!("The domain's SPF record does not allow mail from {address}."),
+        ),
+    };
+    let dmarc = results.dmarc.as_deref().unwrap_or("none");
+    let dmarc_detail = match dmarc {
+        "pass" => {
+            "DKIM or SPF passed for the domain in the From address, which is what DMARC asks."
+        }
+        "reject" => {
+            "Neither DKIM nor SPF passed for the From domain. Its policy tells receivers to reject such mail."
+        }
+        "quarantine" => {
+            "Neither DKIM nor SPF passed for the From domain. Its policy tells receivers to put such mail in the junk folder."
+        }
+        "temperror" => "A DNS lookup failed while evaluating; try again.",
+        _ => {
+            "Neither DKIM nor SPF passed for the From domain, or it has no DMARC record. Receivers decide for themselves what to do with such mail."
+        }
+    };
+    let mut checks = vec![
+        TestCheck {
+            name: "DKIM",
+            result: if signed {
+                dkim.to_string()
+            } else {
+                "not signed".to_string()
+            },
+            ok: signed && dkim == "pass",
+            detail: dkim_detail,
+        },
+        TestCheck {
+            name: "SPF",
+            result: spf,
+            ok: spf_ok,
+            detail: spf_detail,
+        },
+        TestCheck {
+            name: "DMARC",
+            result: dmarc.to_string(),
+            ok: dmarc == "pass",
+            detail: dmarc_detail.to_string(),
+        },
+    ];
+    // A failed lookup is no verdict: neither a broken signature nor a
+    // record that forbids the address.
+    for check in &mut checks {
+        if check.result == "temperror" {
+            check.result = NOT_CHECKED.to_string();
+            check.ok = false;
+            check.detail =
+                "A DNS lookup failed while checking, so there is no verdict either way. Try again."
+                    .to_string();
+        }
+    }
+    checks
+}
+
+/// The address a receiver would see mail from this server arrive from:
+/// IPv4 for preference, since that is how most mail travels.
+fn sending_address(snapshot: &Snapshot) -> Option<std::net::IpAddr> {
+    let outbound = snapshot.outbound.as_ref()?;
+    let addresses = outbound.addresses.iter().map(|entry| entry.address);
+    addresses
+        .clone()
+        .find(std::net::IpAddr::is_ipv4)
+        .or_else(|| addresses.clone().next())
+}
+
+/// Sign a test message for a hosted domain and verify it the way a receiving
+/// server would, against live DNS. Nothing is sent.
+async fn test_message(State(state): State<Shared>, body: axum::body::Bytes) -> Response {
+    let request: TestRequest = match super::parse(&body) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    let inputs = match load_inputs(&state).await {
+        Ok(inputs) => inputs,
+        Err(err) => return err.into_response(),
+    };
+    // Canonical (ASCII) form, as hosted domains are stored.
+    let wanted = rmail_common::domain::canonicalize_domain(request.domain.trim()).ok();
+    let Some(domain) = inputs
+        .domains
+        .iter()
+        .map(|entry| entry.domain.clone())
+        .find(|domain| Some(domain) == wanted.as_ref())
+    else {
+        return ApiError(
+            StatusCode::NOT_FOUND,
+            "that domain is not hosted here".to_string(),
+        )
+        .into_response();
+    };
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let snapshot = snapshot_for(&state, &inputs, false).await;
+    let address = sending_address(&snapshot);
+    let outcome = rmail_common::mail_auth::self_test(
+        std::path::Path::new(&db),
+        &domain,
+        address,
+        &snapshot.host.name,
+    )
+    .await;
+    match outcome {
+        Ok((results, signed)) => Json(serde_json::json!({
+            "domain": domain,
+            "address": address.map(|address| address.to_string()),
+            "checks": explain_test(&results, signed, address, inputs.smarthost),
+        }))
+        .into_response(),
+        Err(err) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response(),
+    }
 }
 
 /// Keep the snapshot current, and say so in the log when a domain's required
@@ -1436,6 +1631,70 @@ mod tests {
         inputs.acme = true;
         inputs.feedback_loop = true;
         assert!(recommendations(&inputs, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn authentication_tests_are_explained_in_plain_words() {
+        use rmail_common::mail_auth::AuthenticationResults;
+        let results = |dkim: &str, spf: &str, dmarc: &str| AuthenticationResults {
+            dkim: Some(dkim.into()),
+            spf: Some(spf.into()),
+            dmarc: Some(dmarc.into()),
+            ..AuthenticationResults::default()
+        };
+        let address = Some("203.0.113.5".parse().unwrap());
+        let checks = explain_test(&results("pass", "pass", "pass"), true, address, false);
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| (check.name, check.ok))
+                .collect::<Vec<_>>(),
+            [("DKIM", true), ("SPF", true), ("DMARC", true)]
+        );
+        assert!(checks[1].detail.contains("203.0.113.5"));
+
+        // No key: said plainly, whatever the verifier called it.
+        let checks = explain_test(
+            &results("none", "softfail", "quarantine"),
+            false,
+            address,
+            false,
+        );
+        assert_eq!(checks[0].result, "not signed");
+        assert!(!checks[0].ok && checks[0].detail.contains("no DKIM key"));
+        assert_eq!(
+            (checks[1].result.as_str(), checks[1].ok),
+            ("softfail", false)
+        );
+        assert!(checks[2].detail.contains("junk folder"));
+
+        // Signed, but DNS has another key.
+        let checks = explain_test(&results("fail", "pass", "pass"), true, address, false);
+        assert!(!checks[0].ok && checks[0].detail.contains("did not verify"));
+
+        // Without a sending address SPF is not judged, and with a smarthost
+        // the reason is the smarthost.
+        let checks = explain_test(&results("pass", "none", "pass"), true, None, true);
+        assert_eq!(checks[1].result, "not checked");
+        assert!(checks[1].detail.contains("smarthost"));
+        let checks = explain_test(&results("pass", "none", "pass"), true, None, false);
+        assert!(checks[1].detail.contains("not known"));
+
+        // A failed lookup is no verdict.
+        let checks = explain_test(
+            &results("temperror", "temperror", "temperror"),
+            true,
+            address,
+            false,
+        );
+        for check in &checks {
+            assert_eq!(
+                (check.result.as_str(), check.ok),
+                ("not checked", false),
+                "{check:?}"
+            );
+            assert!(check.detail.contains("lookup failed"), "{check:?}");
+        }
     }
 
     #[tokio::test]
