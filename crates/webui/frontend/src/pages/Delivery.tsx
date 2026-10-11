@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { ArrowUpToLine, RotateCcw, Trash2, Wand2 } from 'lucide-react';
-import { api, DmarcRow, QueueItem, QueueSummary, Spool } from '../api';
+import { ArrowUpToLine, RefreshCw, RotateCcw, Trash2, Wand2 } from 'lucide-react';
+import { api, BlocklistResult, DmarcRow, DnsChecks, DnsStatus, OutboundAddress, QueueItem, QueueSummary, Reach, Spool } from '../api';
 import { FeedbackPanel } from './FeedbackReports';
 import { Empty, ErrorBanner, formatRelative, IconButton, invalidate, numberFmt, Panel, SkeletonRows, useFeedback, useResource } from '../ui';
 
@@ -12,6 +12,86 @@ const spools: { id: Spool; label: string; help: string }[] = [
 ];
 
 type Action = 'requeue' | 'promote' | 'delete';
+
+function ReachRow({ label, reach }: { label: string; reach: Reach }) {
+  const [tone, text, note] =
+    reach.state === 'open' ? ['ok', 'Open', `Reached ${reach.target}`]
+    : reach.state === 'blocked' ? ['error', 'Blocked', reach.error]
+    : reach.state === 'unavailable' ? ['', 'Not in use', 'This server has no connectivity of this kind']
+    : ['', 'Not checked', reach.error];
+  return <div className="metric"><span>{label}<small>{note}</small></span><strong><span className={`pill ${tone}`}>{text}</span></strong></div>;
+}
+
+const sourceLabel: Record<OutboundAddress['source'], string> = {
+  seen: 'As the receiving server saw it',
+  local: "This server's own address",
+  dns: "From the host name's DNS record",
+};
+const reverseLabel: Record<DnsStatus, [string, string]> = {
+  ok: ['ok', 'OK'], improve: ['warn', 'Can improve'], missing: ['error', 'Missing'], different: ['error', 'Wrong'], problem: ['error', 'Problem'], unknown: ['', 'Not checked'],
+};
+const listTone: Record<BlocklistResult['status'], string> = { clean: 'ok', listed: 'error', unknown: '' };
+
+/** How the server looks from outside: can it reach port 25, and is its address trusted. */
+function DeliverabilityPanel() {
+  const { run } = useFeedback();
+  const dns = useResource(() => api<DnsChecks>('/api/dns-checks'), [], 300000, 'dns-checks');
+  const [rechecking, setRechecking] = useState(false);
+  const checking = dns.loading || rechecking;
+  const outbound = dns.data?.outbound;
+
+  async function recheck() {
+    setRechecking(true);
+    await run(async () => dns.setData(await api<DnsChecks>('/api/dns-checks', 'POST')), 'Checked again');
+    setRechecking(false);
+  }
+
+  return (
+    <Panel
+      title="Deliverability"
+      subtitle={dns.data ? `How this server looks to the servers it sends to · checked ${formatRelative(dns.data.checked_at)}` : 'How this server looks to the servers it sends to'}
+      actions={<button className="button" onClick={recheck} disabled={checking}><RefreshCw size={16} className={checking ? 'spin' : undefined} />Check again</button>}
+    >
+      {!dns.data ? <Empty>{dns.error ? `Could not be checked: ${dns.error}` : 'Checking…'}</Empty>
+        : !outbound ? <Empty>Outgoing mail leaves through the smarthost, so receivers see its address rather than this server's. There is nothing to check here.</Empty>
+        : (
+          <>
+            <div className="metricList">
+              <ReachRow label="Port 25 over IPv4" reach={outbound.port25.v4} />
+              <ReachRow label="Port 25 over IPv6" reach={outbound.port25.v6} />
+            </div>
+            {outbound.addresses.length > 0 ? (
+              <div className="tableScroll">
+                <table className="outboundTable">
+                  <thead><tr><th>Sending address</th><th>Reverse DNS</th><th>Blocklists</th></tr></thead>
+                  <tbody>
+                    {outbound.addresses.map((entry) => {
+                      const [tone, label] = reverseLabel[entry.reverse.status];
+                      const listed = entry.blocklists.filter((list) => list.status === 'listed');
+                      return (
+                        <tr key={entry.address}>
+                          <td><code>{entry.address}</code><small>{sourceLabel[entry.source]}</small></td>
+                          <td>
+                            <span className={`pill ${tone}`}>{label}</span>
+                            {entry.reverse.names.map((name) => <code key={name} className="ptrName">{name}</code>)}
+                            {entry.reverse.detail && <small>{entry.reverse.detail}</small>}
+                          </td>
+                          <td>
+                            <div className="tagList">{entry.blocklists.map((list) => <span key={list.zone} className={`pill ${listTone[list.status]}`} title={list.detail || list.zone}>{list.name}: {list.status === 'clean' ? 'not listed' : list.status === 'listed' ? 'listed' : 'not checked'}</span>)}</div>
+                            {listed.map((list) => <small key={list.zone}>{list.detail}</small>)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : <p className="panelNote">The address this server sends from could not be determined, so its reverse DNS and reputation were not checked.</p>}
+          </>
+        )}
+    </Panel>
+  );
+}
 
 export function DeliveryPage() {
   const { run, confirm } = useFeedback();
@@ -75,6 +155,8 @@ export function DeliveryPage() {
         </div>
         {listing.data !== null && entries.length === 0 && <Empty>No messages in this spool.</Empty>}
       </Panel>
+
+      <DeliverabilityPanel />
 
       <section className="grid">
         <Panel title="Bulk actions" subtitle="Apply an action to every spool entry whose name matches a pattern (* wildcards).">

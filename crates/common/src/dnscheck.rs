@@ -780,37 +780,6 @@ pub async fn check_domain(
     .await
 }
 
-/// Reverse DNS of one of the server's addresses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReverseCheck {
-    pub address: IpAddr,
-    pub status: Status,
-    /// The PTR names found.
-    pub published: Vec<String>,
-}
-
-/// Whether each of the host's addresses has reverse DNS naming the host.
-/// Receivers compare the two, so a provider's default name counts as wrong.
-pub async fn check_reverse(dns: &impl Dns, host: &Host) -> Vec<ReverseCheck> {
-    let Lookup::Found(addresses) = &host.addresses else {
-        return Vec::new();
-    };
-    join_all(addresses.iter().map(|address| async move {
-        let (status, published) = match dns.ptr(*address).await {
-            Lookup::Found(names) if names.contains(&host.name) => (Status::Ok, names),
-            Lookup::Found(names) => (Status::Different, names),
-            Lookup::Missing => (Status::Missing, Vec::new()),
-            Lookup::Failed(_) => (Status::Unknown, Vec::new()),
-        };
-        ReverseCheck {
-            address: *address,
-            status,
-            published,
-        }
-    }))
-    .await
-}
-
 /// The process-wide resolver, as [`Dns`].
 pub struct SystemDns;
 
@@ -1471,33 +1440,6 @@ mod tests {
             find(&checks, "_caldavs._tcp.example.com", "TXT").status,
             Status::Different
         );
-    }
-
-    #[tokio::test]
-    async fn reverse_dns_must_name_the_host() {
-        let v6 = "2001:db8::25";
-        let mut dns = FakeDns::default().ips(HOST, &[IP, v6, "203.0.113.6"]);
-        dns.ptr.insert(IP.parse().unwrap(), vec![HOST.to_string()]);
-        dns.ptr.insert(
-            "203.0.113.6".parse().unwrap(),
-            vec!["static-6.provider.net".to_string()],
-        );
-        let host = Host::resolve(&dns, HOST).await;
-        let statuses = check_reverse(&dns, &host)
-            .await
-            .into_iter()
-            .map(|check| (check.address.to_string(), check.status))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            statuses,
-            [
-                (IP.to_string(), Status::Ok),
-                (v6.to_string(), Status::Missing),
-                ("203.0.113.6".to_string(), Status::Different),
-            ]
-        );
-        let unresolved = Host::resolve(&FakeDns::default(), HOST).await;
-        assert!(check_reverse(&dns, &unresolved).await.is_empty());
     }
 
     #[test]
