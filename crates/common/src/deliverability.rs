@@ -25,6 +25,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const GREETING_TIMEOUT: Duration = Duration::from_secs(6);
 /// A greeting and an EHLO reply fit in far less; the rest is not read.
 const MAX_REPLY_BYTES: u64 = 16 * 1024;
+/// Addresses tried per mail host and address family.
+const MAX_ADDRESSES_PER_HOST: usize = 3;
 
 /// Blocklists that large receivers consult, with whether they list IPv6.
 const BLOCKLISTS: &[(&str, &str, bool)] = &[
@@ -197,13 +199,13 @@ async fn ask_own_address(stream: TcpStream, helo: &str) -> Option<IpAddr> {
 }
 
 /// Whether an error means "this machine has no such network" rather than
-/// "something in the way dropped the connection".
+/// "something in the way dropped the connection". "Host unreachable" is
+/// deliberately not here: it is also what a firewall's ICMP rejection of
+/// port 25 looks like, and that is a blocked port.
 fn no_route(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::NetworkUnreachable
-            | std::io::ErrorKind::HostUnreachable
-            | std::io::ErrorKind::AddrNotAvailable
+        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::AddrNotAvailable
     )
 }
 
@@ -297,9 +299,13 @@ pub async fn probe_port25(dns: &impl Dns, helo: &str, port: u16) -> Port25 {
         }
     }
     let family = |want_v4: bool| {
-        let attempts = targets.iter().filter_map(move |(host, addresses)| {
-            let address = addresses.iter().find(|ip| ip.is_ipv4() == want_v4)?;
-            Some(knock(host, SocketAddr::new(*address, port), helo))
+        // One dead address among a host's several must not read as blocked.
+        let attempts = targets.iter().flat_map(move |(host, addresses)| {
+            addresses
+                .iter()
+                .filter(move |ip| ip.is_ipv4() == want_v4)
+                .take(MAX_ADDRESSES_PER_HOST)
+                .map(move |address| knock(host, SocketAddr::new(*address, port), helo))
         });
         join_all(attempts)
     };
@@ -707,6 +713,32 @@ mod tests {
             "{result:?}"
         );
         assert!(matches!(result.v6, Reach::Unknown { .. }));
+    }
+
+    #[tokio::test]
+    async fn probe_tries_every_address_of_a_mail_host() {
+        let (port, _server) = smtp_server(&["220 mx.example.net ESMTP\r\n", "250 ok\r\n"]).await;
+        // Nothing listens on 127.0.0.2; the host's second address answers.
+        let dns = FakeDns::default()
+            .mx("gmail.com", "mx.example.net")
+            .ips("mx.example.net", &["127.0.0.2", "127.0.0.1"]);
+        let result = probe_port25(&dns, HOST, port).await;
+        assert_eq!(result.v4, open("127.0.0.1", None));
+    }
+
+    #[test]
+    fn only_a_missing_network_counts_as_no_route() {
+        use std::io::{Error, ErrorKind};
+        assert!(no_route(&Error::from(ErrorKind::NetworkUnreachable)));
+        assert!(no_route(&Error::from(ErrorKind::AddrNotAvailable)));
+        // What a firewall rejecting port 25 with ICMP produces: blocked.
+        for blocked in [
+            ErrorKind::HostUnreachable,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(!no_route(&Error::from(blocked)), "{blocked:?}");
+        }
     }
 
     #[test]
