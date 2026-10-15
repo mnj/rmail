@@ -13,7 +13,9 @@
 //!   the `From` domain) or address (sent by that account here). Otherwise
 //!   it only goes to the inbox.
 //! - Only messages addressed to the account are kept: it must be an
-//!   attendee of a `REQUEST` or `CANCEL` and the organizer of a `REPLY`.
+//!   attendee of a `REQUEST` or `CANCEL` and the organizer of a `REPLY`,
+//!   under its own address or an alias that delivers only to it
+//!   (`db::calendar_addresses`).
 
 use std::path::Path;
 
@@ -81,26 +83,27 @@ pub enum Outcome {
     },
 }
 
-/// Look for an iTIP message in mail delivered to `account` and keep it in
-/// the account's schedule inbox (see the module documentation). The
+/// Look for an iTIP message in mail delivered to an account and keep it in
+/// the account's schedule inbox (see the module documentation).
+/// `addresses` are the account's calendar addresses, its own first. The
 /// account's state is only opened when there is something to keep.
 pub fn receive(
     mail_root: &Path,
     domain: &str,
     localpart: &str,
-    account: &str,
+    addresses: &[String],
     message: &[u8],
     verified: &Verified,
 ) -> Result<Outcome> {
     if !mentions_calendar(message) {
         return Ok(Outcome::None);
     }
-    let (method, calendar) = match scheduling_message(message, account)? {
+    let (method, calendar, account) = match scheduling_message(message, addresses)? {
         Ok(found) => found,
         Err(outcome) => return Ok(outcome),
     };
     let conn = crate::jmap::store::open(mail_root, domain, localpart)?;
-    deposit(&conn, account, method, &calendar, verified)
+    deposit(&conn, &account, method, &calendar, verified)
 }
 
 /// Cheaply rule out mail without a calendar part before parsing it.
@@ -111,11 +114,12 @@ fn mentions_calendar(message: &[u8]) -> bool {
         .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
-/// The iTIP message in `message`, if it is one for `account`.
+/// The iTIP message in `message` and the address it reaches the account
+/// at, if it is one for the account.
 fn scheduling_message(
     message: &[u8],
-    account: &str,
-) -> Result<std::result::Result<(Method, Component), Outcome>> {
+    addresses: &[String],
+) -> Result<std::result::Result<(Method, Component, String), Outcome>> {
     let data = match mime::calendar_part(message, MAX_CALENDAR_BYTES) {
         CalendarPart::Missing => return Ok(Err(Outcome::None)),
         CalendarPart::TooLarge => return Ok(Err(Outcome::Skipped("calendar part too large"))),
@@ -156,6 +160,9 @@ fn scheduling_message(
     let Some(organizer) = itip::organizer(&calendar) else {
         return Ok(Err(Outcome::Skipped("no organizer")));
     };
+    let Some(account) = itip::own_address(&calendar, addresses) else {
+        return Ok(Err(Outcome::Skipped("not addressed to the account")));
+    };
     let addressed = match method {
         Method::Request | Method::Cancel => {
             !same_address(&organizer, account) && itip::role(&calendar, account) == Role::Attendee
@@ -165,7 +172,7 @@ fn scheduling_message(
     if !addressed {
         return Ok(Err(Outcome::Skipped("not addressed to the account")));
     }
-    Ok(Ok((method, calendar)))
+    Ok(Ok((method, calendar, account.to_string())))
 }
 
 /// Put the message in the inbox and apply a vouched-for reply.
@@ -255,6 +262,8 @@ mod tests {
 
     const ORGANIZER: &str = "user@example.test";
     const ATTENDEE: &str = "guest@remote.test";
+    /// An alias that delivers only to the account.
+    const ALIAS: &str = "sales@example.test";
 
     fn account(td: &tempfile::TempDir) -> crate::sqlite_pool::SqliteConnection {
         crate::jmap::store::open(td.path(), "example.test", "user").unwrap()
@@ -288,7 +297,7 @@ mod tests {
             td.path(),
             "example.test",
             "user",
-            ORGANIZER,
+            &[ORGANIZER.to_string(), ALIAS.to_string()],
             message,
             verified,
         )
@@ -317,6 +326,39 @@ mod tests {
             .unwrap()
             .unwrap()
             .data
+    }
+
+    #[test]
+    fn invitations_and_replies_reach_the_account_at_its_alias() {
+        let td = tempfile::tempdir().unwrap();
+        let invite = calendar("REQUEST", ATTENDEE, ALIAS, "NEEDS-ACTION");
+        assert!(matches!(
+            receive_as(&td, &mail(&invite), &Verified::Nobody),
+            Outcome::Deposited {
+                method: Method::Request,
+                ..
+            }
+        ));
+
+        // The account's own event, organized under the alias.
+        let conn = account(&td);
+        let event =
+            calendar("REQUEST", ALIAS, ATTENDEE, "NEEDS-ACTION").replace("METHOD:REQUEST\r\n", "");
+        let collection = store::default_calendar(&conn).unwrap();
+        store::put(&conn, &collection, "ext.ics", &event, &|_| true)
+            .unwrap()
+            .unwrap();
+        let reply = calendar("REPLY", ALIAS, ATTENDEE, "ACCEPTED");
+        let outcome = receive_as(&td, &mail(&reply), &Verified::Domain("remote.test".into()));
+        assert_eq!(
+            outcome,
+            Outcome::Deposited {
+                method: Method::Reply,
+                applied: true,
+                why: None
+            }
+        );
+        assert!(stored_event(&conn).contains("PARTSTAT=ACCEPTED"));
     }
 
     #[test]
@@ -355,7 +397,7 @@ mod tests {
                 td.path(),
                 "example.test",
                 "user",
-                ORGANIZER,
+                &[ORGANIZER.to_string()],
                 &mail("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n"),
                 &Verified::Nobody,
             )

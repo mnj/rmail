@@ -62,19 +62,20 @@ pub async fn lookup_ip_addrs(name: &str) -> Result<Vec<IpAddr>> {
 }
 
 /// Return true when a message has at least one RFC 5322 From mailbox and all
-/// parsed From mailboxes match the authenticated submission identity.
-pub fn submission_from_matches(data: &[u8], authenticated_user: &str) -> bool {
-    let Ok(authenticated_user) = crate::domain::canonicalize_mailbox_address(authenticated_user)
-    else {
-        return false;
-    };
+/// parsed From mailboxes are among the addresses the authenticated submitter
+/// may send as (their own and their aliases).
+pub fn submission_from_matches(data: &[u8], allowed: &[String]) -> bool {
     let Some(message) = AuthenticatedMessage::parse(data) else {
         return false;
     };
     !message.from.is_empty()
         && message.from.iter().all(|from| {
-            crate::domain::canonicalize_mailbox_address(from)
-                .is_ok_and(|from| from.eq_ignore_ascii_case(&authenticated_user))
+            crate::domain::canonicalize_mailbox_address(from).is_ok_and(|from| {
+                allowed.iter().any(|allowed| {
+                    crate::domain::canonicalize_mailbox_address(allowed)
+                        .is_ok_and(|allowed| allowed.eq_ignore_ascii_case(&from))
+                })
+            })
         })
 }
 
@@ -628,17 +629,30 @@ GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
 
     #[test]
     fn submission_from_alignment_uses_parsed_mailboxes() {
+        let user = |address: &str| vec![address.to_string()];
         assert!(submission_from_matches(
             b"From: Display Name <User@B\xC3\x9CCHER.example>\r\nSubject: test\r\n\r\nbody",
-            "user@xn--bcher-kva.example"
+            &user("user@xn--bcher-kva.example")
         ));
         assert!(!submission_from_matches(
             b"From: user@example.test, other@example.test\r\n\r\nbody",
-            "user@example.test"
+            &user("user@example.test")
         ));
         assert!(!submission_from_matches(
             b"Subject: missing author\r\n\r\nbody",
-            "user@example.test"
+            &user("user@example.test")
+        ));
+        let with_alias = vec![
+            "user@example.test".to_string(),
+            "Sales@example.test".to_string(),
+        ];
+        assert!(submission_from_matches(
+            b"From: Sales <sales@EXAMPLE.test>\r\n\r\nbody",
+            &with_alias
+        ));
+        assert!(submission_from_matches(
+            b"From: user@example.test, sales@example.test\r\n\r\nbody",
+            &with_alias
         ));
     }
 

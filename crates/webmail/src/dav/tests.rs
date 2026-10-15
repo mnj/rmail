@@ -1033,7 +1033,8 @@ async fn simultaneous_answers_both_reach_the_organizer() {
                     app: state,
                 };
                 barrier.wait();
-                super::schedule::deliver_local(&dav, &dav.user, &account(USER), &reply).unwrap();
+                super::schedule::deliver_local(&dav, &dav.user.address, &account(USER), &reply)
+                    .unwrap();
             })
         });
         for thread in threads {
@@ -1443,4 +1444,43 @@ async fn own_collections_named_with_an_at_sign_stay_reachable() {
     )
     .await;
     assert_eq!(put.status, 201, "{}", put.body);
+}
+
+#[tokio::test]
+async fn attendees_invited_at_an_alias_answer_as_it() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    db::add_alias(&state.db_path, "sales@example.test", &[OTHER]).unwrap();
+    let principal = dav_as(
+        &state,
+        OTHER,
+        "PROPFIND",
+        "/dav/principals/other@example.test/",
+        &[("depth", "0")],
+        r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop>
+           <c:calendar-user-address-set/></d:prop></d:propfind>"#,
+    )
+    .await;
+    assert!(principal.body.contains("mailto:other@example.test"));
+    assert!(principal.body.contains("mailto:sales@example.test"));
+
+    let invite = meeting(&[("sales@example.test", "NEEDS-ACTION")], "Pricing", "");
+    let path = format!("{CALENDAR}pricing.ics");
+    let created = dav(&state, "PUT", &path, &[], &invite).await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let copies = objects_in(&state, OTHER, "/dav/calendars/other@example.test/default/").await;
+    assert_eq!(copies.len(), 1, "delivered to the alias's account");
+    let (copy_href, copy) = copies[0].clone();
+    let accepted = unfolded(&copy).replace(
+        "PARTSTAT=NEEDS-ACTION:mailto:sales@example.test",
+        "PARTSTAT=ACCEPTED:mailto:sales@example.test",
+    );
+    assert!(accepted.contains("ACCEPTED:mailto:sales"), "{accepted}");
+    let answer = dav_as(&state, OTHER, "PUT", &copy_href, &[], &accepted).await;
+    assert!(answer.status < 300, "{}", answer.body);
+    let organizer = unfolded(&dav(&state, "GET", &path, &[], "").await.body);
+    assert!(
+        organizer.contains("PARTSTAT=ACCEPTED") && organizer.contains("mailto:sales@example.test"),
+        "the reply under the alias reached the organizer: {organizer}"
+    );
 }

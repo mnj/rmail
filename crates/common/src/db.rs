@@ -888,6 +888,40 @@ pub fn get_alias_targets<P: AsRef<Path>>(path: P, address: &str) -> Result<Optio
     }
 }
 
+/// The addresses `user` may send as: their own, then every alias that
+/// delivers to them (alone or with others), as webmail identities allow.
+pub fn sender_addresses<P: AsRef<Path>>(path: P, user: &str) -> Result<Vec<String>> {
+    let user = crate::domain::canonicalize_mailbox_address(user)?;
+    let mut out = vec![user.clone()];
+    for (address, targets) in list_aliases(path)? {
+        if targets
+            .iter()
+            .any(|target| target.eq_ignore_ascii_case(&user))
+            && !address.eq_ignore_ascii_case(&user)
+        {
+            out.push(address);
+        }
+    }
+    Ok(out)
+}
+
+/// The account's own address followed by the aliases that deliver only to
+/// it: the addresses it can be invited at and answer from in calendars. An
+/// alias with several targets is a group, not another name for one person.
+pub fn calendar_addresses<P: AsRef<Path>>(path: P, account: &str) -> Result<Vec<String>> {
+    let account = crate::domain::canonicalize_mailbox_address(account)?;
+    let mut out = vec![account.clone()];
+    for (address, targets) in list_aliases(path)? {
+        if let [target] = targets.as_slice()
+            && target.eq_ignore_ascii_case(&account)
+            && !address.eq_ignore_ascii_case(&account)
+        {
+            out.push(address);
+        }
+    }
+    Ok(out)
+}
+
 /// Remove an alias mapping
 pub fn remove_alias<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
     let address = crate::domain::canonicalize_mailbox_address(address)?;
@@ -1325,6 +1359,35 @@ mod tests {
                 assert_eq!(metadata.permissions().mode() & 0o777, 0o600, "{suffix}");
             }
         }
+    }
+
+    #[test]
+    fn calendar_addresses_are_the_account_and_its_own_aliases() {
+        let td = tempdir().expect("tempdir");
+        let db = td.path().join("aliases.db");
+        init_db(&db).expect("init db");
+        add_alias(&db, "Sales@Example.com", &["bob@example.com"]).unwrap();
+        add_alias(
+            &db,
+            "team@example.com",
+            &["bob@example.com", "eve@example.com"],
+        )
+        .unwrap();
+        add_alias(&db, "other@example.com", &["eve@example.com"]).unwrap();
+        assert_eq!(
+            super::calendar_addresses(&db, "Bob@Example.com").unwrap(),
+            ["Bob@example.com", "Sales@example.com"],
+            "groups and other people's aliases are left out"
+        );
+        assert_eq!(
+            super::calendar_addresses(&db, "nobody@example.com").unwrap(),
+            ["nobody@example.com"]
+        );
+        assert_eq!(
+            super::sender_addresses(&db, "bob@example.com").unwrap(),
+            ["bob@example.com", "Sales@example.com", "team@example.com"],
+            "every alias reaching the user may be sent as"
+        );
     }
 
     #[test]

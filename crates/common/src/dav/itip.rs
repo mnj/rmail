@@ -113,6 +113,16 @@ pub enum Role {
     None,
 }
 
+/// Which of an account's addresses (its own first, then its aliases) a
+/// calendar involves it under; the account's own when none does.
+pub fn own_address<'a>(calendar: &Component, addresses: &'a [String]) -> Option<&'a str> {
+    addresses
+        .iter()
+        .find(|address| role(calendar, address) != Role::None)
+        .or(addresses.first())
+        .map(String::as_str)
+}
+
 pub fn role(calendar: &Component, user: &str) -> Role {
     let Some(organizer) = organizer(calendar) else {
         return Role::None;
@@ -909,6 +919,15 @@ mod tests {
             Some("bob@example.test".into())
         );
         assert_eq!(address("urn:uuid:1"), None);
+
+        let carol = [
+            "carol@example.test".to_string(),
+            "bob@example.test".to_string(),
+        ];
+        assert_eq!(own_address(&calendar, &carol), Some("bob@example.test"));
+        let dave = ["dave@example.test".to_string()];
+        assert_eq!(own_address(&calendar, &dave), Some("dave@example.test"));
+        assert_eq!(own_address(&calendar, &[]), None);
     }
 
     #[test]
