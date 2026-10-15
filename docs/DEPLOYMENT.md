@@ -897,7 +897,8 @@ Organization page (or the `classifier.*` settings):
   `classifier.background_tier` set to `flex`, the background worker's chat calls (labels and
   fallback decisions for new mail) use OpenAI's flex tier: billed at batch rates, but queued, and
   refused with 429 when OpenAI is short of capacity. Those are retried with growing pauses, then
-  sent at the standard tier; a model without the flex tier is sent at the standard tier at once.
+  sent at the standard tier; a model without the flex tier, or a flex request that gets no
+  answer within 15 minutes, goes to the standard tier at once. Other errors (a bad key) are not retried.
   Calls a user waits for (summaries and labels asked for in webmail) always use the standard tier.
 - **Anthropic** (`classifier.anthropic_api_key`, `classifier.anthropic_chat_model`, default
   `claude-haiku-5-5`) uses the Messages API with the same JSON schemas (`output_config.format`)

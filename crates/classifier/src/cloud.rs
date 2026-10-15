@@ -50,7 +50,10 @@ enum Sent {
     Done(Value),
     /// Rate limited, overloaded or a server error: worth another try.
     Retry(anyhow::Error, Option<Duration>),
-    Failed(anyhow::Error),
+    /// No answer: the connection failed or timed out.
+    Transport(anyhow::Error),
+    /// Refused with this status, or an unreadable answer (no status).
+    Failed(anyhow::Error, Option<u16>),
 }
 
 /// A JSON-over-HTTPS endpoint with a key, retried on rate limits and
@@ -96,13 +99,13 @@ impl Api {
         };
         let response = match request.send() {
             Ok(response) => response,
-            Err(error) => return Sent::Retry(anyhow!("{url}: {error}"), None),
+            Err(error) => return Sent::Transport(anyhow!("{url}: {error}")),
         };
         let status = response.status();
         if status.is_success() {
             return match response.json::<Value>() {
                 Ok(value) => Sent::Done(value),
-                Err(error) => Sent::Failed(anyhow!("{url}: reading response: {error}")),
+                Err(error) => Sent::Failed(anyhow!("{url}: reading response: {error}"), None),
             };
         }
         let retry_after = response
@@ -116,13 +119,21 @@ impl Api {
         if status.as_u16() == 429 || status.as_u16() == 529 || status.is_server_error() {
             Sent::Retry(error, retry_after)
         } else {
-            Sent::Failed(error)
+            Sent::Failed(error, Some(status.as_u16()))
         }
     }
 
-    /// Send with `attempts` tries and growing pauses between them.
-    fn retried(&self, path: &str, body: &Value, timeout: Duration, attempts: u32) -> Sent {
-        let mut last = Sent::Failed(anyhow!("no attempt made"));
+    /// Send with `attempts` tries and growing pauses between them; with
+    /// `transport`, failed connections are tried again too.
+    fn retried(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        attempts: u32,
+        transport: bool,
+    ) -> Sent {
+        let mut last = Sent::Failed(anyhow!("no attempt made"), None);
         for attempt in 0..attempts {
             if attempt > 0 {
                 let pause = match &last {
@@ -132,7 +143,8 @@ impl Api {
                 std::thread::sleep(pause);
             }
             last = self.send(path, body, timeout);
-            if !matches!(last, Sent::Retry(..)) {
+            if !(matches!(last, Sent::Retry(..)) || transport && matches!(last, Sent::Transport(_)))
+            {
                 break;
             }
         }
@@ -140,22 +152,29 @@ impl Api {
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        match self.retried(path, body, TIMEOUT, ATTEMPTS) {
+        match self.retried(path, body, TIMEOUT, ATTEMPTS, true) {
             Sent::Done(value) => Ok(value),
-            Sent::Retry(error, _) | Sent::Failed(error) => Err(error),
+            Sent::Retry(error, _) | Sent::Transport(error) | Sent::Failed(error, _) => Err(error),
         }
     }
 
     /// OpenAI flex processing: billed at batch rates, but queued and refused
-    /// with 429 when capacity is short (those are not billed). After the
-    /// retries, or when the model does not take the flex tier, the request
-    /// goes out at the standard tier so the work still gets done.
+    /// with 429 when capacity is short (those are not billed). Those and
+    /// server errors are retried, then the request goes out at the standard
+    /// tier so the work still gets done. A 400 (a model without the flex
+    /// tier) or no answer at all (a flex request that timed out) goes to the
+    /// standard tier at once, so one slow request cannot hold up the cycle
+    /// for the whole retry budget. Other refusals, such as a bad key, would
+    /// fail at the standard tier too and are returned as they are.
     fn post_flex(&self, path: &str, body: &Value) -> Result<Value> {
         let mut flex = body.clone();
         flex["service_tier"] = Value::from("flex");
-        match self.retried(path, &flex, FLEX_TIMEOUT, FLEX_ATTEMPTS) {
+        match self.retried(path, &flex, FLEX_TIMEOUT, FLEX_ATTEMPTS, false) {
             Sent::Done(value) => Ok(value),
-            Sent::Retry(..) | Sent::Failed(..) => self.post(path, body),
+            Sent::Retry(..) | Sent::Transport(_) | Sent::Failed(_, Some(400)) => {
+                self.post(path, body)
+            }
+            Sent::Failed(error, _) => Err(error),
         }
     }
 }
@@ -966,6 +985,23 @@ mod tests {
         assert_eq!(chooser.summarize("x").unwrap(), "A flight.");
         assert_eq!(requests.recv().unwrap().1["service_tier"], "flex");
         assert!(requests.recv().unwrap().1.get("service_tier").is_none());
+
+        // A bad key fails at once, without a second request.
+        let denied = json!({"error": {"message": "Incorrect API key"}}).to_string();
+        let (base, requests) = serve(vec![(401, denied)]);
+        let chooser = OpenAiChooser::load(&base, "sk", "gpt").unwrap().flex();
+        assert!(
+            chooser
+                .summarize("x")
+                .unwrap_err()
+                .to_string()
+                .contains("401")
+        );
+        requests.recv().unwrap();
+        assert!(
+            requests.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no standard-tier retry"
+        );
 
         // Without flex nothing extra is sent.
         let plain = json!({"choices": [{"message": {"content": "A flight."}}]}).to_string();
