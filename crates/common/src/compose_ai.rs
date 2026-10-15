@@ -71,7 +71,8 @@ fn refuses_classic_shape(status: u16, body: &[u8]) -> bool {
     };
     let param = value.pointer("/error/param").and_then(Value::as_str);
     let code = value.pointer("/error/code").and_then(Value::as_str);
-    matches!(param, Some("max_tokens" | "temperature")) || code == Some("unsupported_parameter")
+    matches!(param, Some("max_tokens" | "temperature"))
+        && matches!(code, Some("unsupported_parameter" | "unsupported_value"))
 }
 
 /// How a rewrite should change the selection.
@@ -316,10 +317,15 @@ impl Request {
                 (system, user, tokens, 0.3)
             }
         };
+        // Reasoning models take their instructions as `developer` messages.
+        let instructions = match shape {
+            Shape::Classic => "system",
+            Shape::Reasoning => "developer",
+        };
         let mut body = json!({
             "model": model,
             "messages": [
-                {"role": "system", "content": system},
+                {"role": instructions, "content": system},
                 {"role": "user", "content": user},
             ],
             "stream": false,
@@ -729,7 +735,13 @@ mod tests {
             reasoning["max_completion_tokens"],
             CONTINUATION_TOKENS + REASONING_TOKENS
         );
-        assert_eq!(reasoning["messages"], classic["messages"]);
+        assert_eq!(classic["messages"][0]["role"], "system");
+        assert_eq!(reasoning["messages"][0]["role"], "developer");
+        assert_eq!(
+            reasoning["messages"][0]["content"],
+            classic["messages"][0]["content"]
+        );
+        assert_eq!(reasoning["messages"][1], classic["messages"][1]);
 
         let openai = br#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}"#;
         assert!(refuses_classic_shape(400, openai));
@@ -738,6 +750,8 @@ mod tests {
         assert!(!refuses_classic_shape(401, openai), "only a 400");
         let other = br#"{"error":{"param":"model","code":"model_not_found"}}"#;
         assert!(!refuses_classic_shape(400, other));
+        let unrelated = br#"{"error":{"param":"logprobs","code":"unsupported_parameter"}}"#;
+        assert!(!refuses_classic_shape(400, unrelated), "another parameter");
         assert!(!refuses_classic_shape(400, b"<html>"));
     }
 
