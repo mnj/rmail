@@ -544,16 +544,8 @@ async fn put_filters(
             return Ok(None);
         }
         // A hand-written script named like ours is kept under another name.
-        if current.mode == "script" && current.script_name.as_deref() == Some(SCRIPT_NAME) {
-            let kept = format!(
-                "{SCRIPT_NAME}-{}",
-                chrono::Utc::now().format("%Y%m%d%H%M%S")
-            );
-            db::set_active_sieve_script(&state.db_path, &session.address, None)?;
-            db::rename_sieve_script(&state.db_path, &session.address, SCRIPT_NAME, &kept)?;
-        }
-        db::put_sieve_script(&state.db_path, &session.address, SCRIPT_NAME, &source)?;
-        db::set_active_sieve_script(&state.db_path, &session.address, Some(SCRIPT_NAME))?;
+        let keep = current.mode == "script" && current.script_name.as_deref() == Some(SCRIPT_NAME);
+        db::save_active_sieve_script(&state.db_path, &session.address, SCRIPT_NAME, &source, keep)?;
         load_filters(&state.db_path, &session.address).map(Some)
     })
     .await;
@@ -601,8 +593,13 @@ async fn put_script(
         let name = current
             .script_name
             .unwrap_or_else(|| SCRIPT_NAME.to_string());
-        db::put_sieve_script(&state.db_path, &session.address, &name, &input.script)?;
-        db::set_active_sieve_script(&state.db_path, &session.address, Some(&name))?;
+        db::save_active_sieve_script(
+            &state.db_path,
+            &session.address,
+            &name,
+            &input.script,
+            false,
+        )?;
         load_filters(&state.db_path, &session.address)
     })
     .await;
@@ -835,6 +832,36 @@ mod tests {
                 .as_deref(),
             Some("discard;"),
             "the hand-written script is kept, inactive"
+        );
+
+        // Ours edited by hand is kept under a free name when replaced.
+        let edited = db::get_sieve_script(&state.db_path, "user@example.test", "webmail")
+            .unwrap()
+            .unwrap()
+            + "keep;\n";
+        db::put_sieve_script(&state.db_path, "user@example.test", "webmail-1", "keep;").unwrap();
+        db::put_sieve_script(&state.db_path, "user@example.test", "webmail", &edited).unwrap();
+        let (_, filters) = call("GET", "/api/filters", String::new()).await;
+        assert_eq!(filters["mode"], "script");
+        let replace = rules.replace(r#"{"rules""#, r#"{"replace_script":true,"rules""#);
+        let (status, filters) = call("PUT", "/api/filters", replace).await;
+        assert_eq!(status, 200);
+        assert_eq!(filters["mode"], "rules");
+        let scripts = db::list_sieve_scripts(&state.db_path, "user@example.test").unwrap();
+        assert_eq!(
+            scripts,
+            [
+                ("mine".to_string(), false),
+                ("webmail".to_string(), true),
+                ("webmail-1".to_string(), false),
+                ("webmail-2".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            db::get_sieve_script(&state.db_path, "user@example.test", "webmail-2")
+                .unwrap()
+                .as_deref(),
+            Some(edited.as_str())
         );
     }
 

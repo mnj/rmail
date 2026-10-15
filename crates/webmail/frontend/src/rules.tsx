@@ -75,10 +75,10 @@ export function VacationDialog({ api, initial, onClose, onSaved }: { api: Api; i
 
   return (
     <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
-      <form className="dialog" role="dialog" aria-label="Out of office" onSubmit={save}>
+      <form className="dialog" role="dialog" aria-modal="true" aria-label="Out of office" onSubmit={save}>
         <header><h2>Out of office</h2><button type="button" className="icon" aria-label="Close" title="Close" onClick={onClose}><X size={16} /></button></header>
         <p className="dialog-intro">People who write to you get this reply once a week each. Mailing lists, automated mail and your own messages get none.</p>
-        <label className="check-row"><input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /><span>Send out-of-office replies</span></label>
+        <label className="check-row"><input type="checkbox" autoFocus checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /><span>Send out-of-office replies</span></label>
         <fieldset className="rules-fieldset" disabled={!draft.enabled}>
           <div className="settings-grid two">
             <label className="field"><span>From (optional)</span><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></label>
@@ -266,8 +266,8 @@ export function FiltersDialog({ api, folders, labels, onClose }: { api: Api; fol
   const showScript = filters?.mode === 'script' && !replacing;
   return (
     <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
-      <section className="dialog filters-dialog" role="dialog" aria-label="Filters">
-        <header><h2>Filters</h2><button type="button" className="icon" aria-label="Close" title="Close" onClick={onClose}><X size={16} /></button></header>
+      <section className="dialog filters-dialog" role="dialog" aria-modal="true" aria-label="Filters">
+        <header><h2>Filters</h2><button type="button" className="icon" aria-label="Close" title="Close" autoFocus onClick={onClose}><X size={16} /></button></header>
         {filters === null && !error && <p className="muted">Loading…</p>}
         {showScript && <>
           <p className="dialog-intro">Your filters are a Sieve script{filters.script_name ? <> named <strong>{filters.script_name}</strong></> : null}, probably set up in another mail app. Edit it here, or replace it with rules (the script is kept, switched off).</p>
