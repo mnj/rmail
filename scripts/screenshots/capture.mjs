@@ -166,7 +166,35 @@ async function signIn(page) {
   await page.click('.share-add button');
   await page.waitForSelector('.share-list li');
   await shot(page, 'webmail-share-dialog');
-  await page.keyboard.press('Escape');
+  await page.click('.dialog button[aria-label="Close"]');
+  await page.waitForSelector('.dialog-scrim', { state: 'detached' });
+  // Filters: a rule that files a newsletter and marks it read.
+  await page.click('.sidebar-link:has-text("Filters")');
+  await page.waitForSelector('.filters-dialog >> text=No rules yet.');
+  await page.click('.filters-dialog button:has-text("New rule")');
+  await page.fill('.rule-editor input[placeholder="e.g. Newsletters"]', 'Newsletters');
+  await page.fill('.rule-editor input[aria-label=Value]', 'news@northwind.test');
+  await page.selectOption('.rule-editor select[aria-label=Folder]', 'Archive');
+  await page.click('.rule-editor button:has-text("Add action")');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-filters');
+  await page.click('.rule-editor button:has-text("Done")');
+  await page.click('.filters-dialog button.primary');
+  await page.waitForSelector('.filters-dialog', { state: 'detached' });
+  // Out of office until a week from now.
+  await page.click('.sidebar-link:has-text("Out of office")');
+  await page.check('.dialog[aria-label="Out of office"] input[type=checkbox]');
+  const week = new Date(Date.now() + 7 * 86400000);
+  const pad = (n) => String(n).padStart(2, '0');
+  await page.fill('.dialog[aria-label="Out of office"] input[type=date] >> nth=1', `${week.getFullYear()}-${pad(week.getMonth() + 1)}-${pad(week.getDate())}`);
+  await page.fill('.dialog[aria-label="Out of office"] label:has-text("Subject") input', 'Out of office');
+  await page.fill('.dialog[aria-label="Out of office"] textarea', "Hi,\n\nI'm at a conference this week with limited email. For anything urgent, please contact bob@example.com.\n\nAlice");
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-vacation');
+  await page.click('.dialog[aria-label="Out of office"] button.primary');
+  await page.waitForSelector('.away-banner');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-away');
   await ctx.close();
 }
 

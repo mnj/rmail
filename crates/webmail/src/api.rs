@@ -26,6 +26,7 @@ pub(crate) mod assist;
 mod calendars;
 mod compose;
 mod invitations;
+mod mail_rules;
 mod organize;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
@@ -100,6 +101,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(compose::routes())
         .merge(assist::routes())
         .merge(calendars::routes())
+        .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())
         .fallback(fallback)
@@ -479,7 +481,7 @@ struct PatchMessage {
 
 /// A user keyword: a non-empty IMAP atom that is not a system flag or a
 /// reserved `$` keyword.
-fn is_user_keyword(keyword: &str) -> bool {
+pub(crate) fn is_user_keyword(keyword: &str) -> bool {
     !keyword.is_empty()
         && keyword.len() <= 100
         && !keyword.starts_with(['\\', '$'])

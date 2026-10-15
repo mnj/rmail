@@ -589,6 +589,53 @@ pub fn set_active_sieve_script<P: AsRef<Path>>(
     Ok(true)
 }
 
+/// Store `content` as `name` and make it the only active script, in one
+/// transaction, so a failure never leaves the account without its filters.
+/// With `keep_existing`, a script already called `name` is first renamed to
+/// the first free `<name>-<n>` (returned) rather than overwritten.
+pub fn save_active_sieve_script<P: AsRef<Path>>(
+    path: P,
+    account: &str,
+    name: &str,
+    content: &str,
+    keep_existing: bool,
+) -> Result<Option<String>> {
+    let mut conn = Connection::open(path)?;
+    let tx = conn.transaction()?;
+    let account = account.to_ascii_lowercase();
+    let exists = |tx: &rusqlite::Transaction, name: &str| -> rusqlite::Result<bool> {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sieve_scripts WHERE account = ?1 AND name = ?2)",
+            params![account, name],
+            |row| row.get(0),
+        )
+    };
+    let mut kept = None;
+    if keep_existing && exists(&tx, name)? {
+        let free = (1..)
+            .map(|n| format!("{name}-{n}"))
+            .find(|candidate| !exists(&tx, candidate).unwrap_or(true))
+            .expect("an unused name");
+        tx.execute(
+            "UPDATE sieve_scripts SET name = ?3, updated_at = ?4 WHERE account = ?1 AND name = ?2",
+            params![account, name, free, unix_now()],
+        )?;
+        kept = Some(free);
+    }
+    tx.execute(
+        "UPDATE sieve_scripts SET active = 0 WHERE account = ?1",
+        params![account],
+    )?;
+    tx.execute(
+        "INSERT INTO sieve_scripts (account, name, content, active, updated_at) VALUES (?1, ?2, ?3, 1, ?4)
+         ON CONFLICT(account, name) DO UPDATE SET content = excluded.content, active = 1,
+             updated_at = excluded.updated_at",
+        params![account, name, content, unix_now()],
+    )?;
+    tx.commit()?;
+    Ok(kept)
+}
+
 /// Rename a script, keeping its active flag. Returns false when `from` does
 /// not exist; fails when `to` already does.
 pub fn rename_sieve_script<P: AsRef<Path>>(
