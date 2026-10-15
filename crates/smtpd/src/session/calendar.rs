@@ -13,14 +13,21 @@ use super::{Session, session_log};
 
 impl Session {
     /// Who this delivery vouches the message is from, for applying replies:
-    /// the submitting account when the `From` header names it, else the
-    /// `From` domain when DMARC passed for it.
+    /// the address the `From` header names when the submitting account may
+    /// send as it (its own or an alias), else the `From` domain when DMARC
+    /// passed for it.
     pub(super) fn itip_sender(&self, data: &Bytes, auth: &AuthenticationResults) -> Verified {
-        if let Some(user) = &self.authenticated_user {
-            return if rmail_common::mail_auth::submission_from_matches(data, user) {
-                Verified::Address(user.clone())
-            } else {
-                Verified::Nobody
+        if self.authenticated_user.is_some() {
+            return match auth.header_from.as_deref() {
+                Some(from)
+                    if rmail_common::mail_auth::submission_from_matches(
+                        data,
+                        &self.sender_addresses,
+                    ) =>
+                {
+                    Verified::Address(from.to_ascii_lowercase())
+                }
+                _ => Verified::Nobody,
             };
         }
         match (auth.dmarc.as_deref(), auth.header_from.as_deref()) {

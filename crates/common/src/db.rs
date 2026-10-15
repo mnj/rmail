@@ -888,6 +888,23 @@ pub fn get_alias_targets<P: AsRef<Path>>(path: P, address: &str) -> Result<Optio
     }
 }
 
+/// The addresses `user` may send as: their own, then every alias that
+/// delivers to them (alone or with others), as webmail identities allow.
+pub fn sender_addresses<P: AsRef<Path>>(path: P, user: &str) -> Result<Vec<String>> {
+    let user = crate::domain::canonicalize_mailbox_address(user)?;
+    let mut out = vec![user.clone()];
+    for (address, targets) in list_aliases(path)? {
+        if targets
+            .iter()
+            .any(|target| target.eq_ignore_ascii_case(&user))
+            && !address.eq_ignore_ascii_case(&user)
+        {
+            out.push(address);
+        }
+    }
+    Ok(out)
+}
+
 /// The account's own address followed by the aliases that deliver only to
 /// it: the addresses it can be invited at and answer from in calendars. An
 /// alias with several targets is a group, not another name for one person.
@@ -1365,6 +1382,11 @@ mod tests {
         assert_eq!(
             super::calendar_addresses(&db, "nobody@example.com").unwrap(),
             ["nobody@example.com"]
+        );
+        assert_eq!(
+            super::sender_addresses(&db, "bob@example.com").unwrap(),
+            ["bob@example.com", "Sales@example.com", "team@example.com"],
+            "every alias reaching the user may be sent as"
         );
     }
 

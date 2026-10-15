@@ -109,7 +109,7 @@ Mail-protocol resource limits are the `security.*` settings:
 - `smtp_max_recipients` — recipients per port-25 transaction (default: `100`)
 - `submission_max_recipients` — recipients per authenticated submission transaction (default: `50`)
 - `submission_max_messages_per_minute` — accepted messages per authenticated account in a rolling minute (default: `30`)
-- `submission_require_from_alignment` — when `true`, every parsed RFC 5322 `From` mailbox on authenticated submission must equal the authenticated mailbox; missing, malformed, or mismatched author fields are rejected (default: `false`)
+- `submission_require_from_alignment` — when `true`, every parsed RFC 5322 `From` mailbox on authenticated submission must be the authenticated mailbox or an alias that delivers to it; missing, malformed, or mismatched author fields are rejected (default: `false`)
 - `admin_password_policy` — rules for the admin console password, applied when it is set or changed: `min_length` (default `10`), `max_length` (`128`), `require_lowercase`, `require_uppercase`, `require_digit`, `require_symbol` (all `false`) and `forbid_username` (`true`). Also editable in the console under Settings → Authentication.
 
 OAuth bearer authentication uses an RFC 7662 token-introspection authority configured under
@@ -638,8 +638,8 @@ over loopback with SASL `X-RMAIL-WEBMAIL`, presenting a shared secret and acting
 - `rmail_smtpd` accepts the mechanism only on the submission service and only from a loopback
   address, never advertises it, and counts failures towards the usual authentication lockout.
 - After that the session is an ordinary authenticated submission for that user: the sender must be
-  the user's own address, and rate limits, content scanning, DKIM signing and local, alias and
-  remote routing all apply as for any mail client.
+  the user's own address or an alias that delivers to them, and rate limits, content scanning, DKIM
+  signing and local, alias and remote routing all apply as for any mail client.
 - Webmail needs a submission listener it can reach on loopback: a wildcard (`0.0.0.0:587`,
   `[::]:587`) or loopback address in `listeners.submission`. Without one, sending is off and webmail
   hides Compose. Restart webmail after changing the submission listeners.

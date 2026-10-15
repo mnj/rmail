@@ -121,10 +121,8 @@ impl Session {
 
         if self.service == SmtpService::Submission
             && self.security.submission_require_from_alignment
-            && !self
-                .authenticated_user
-                .as_deref()
-                .is_some_and(|user| rmail_common::mail_auth::submission_from_matches(&data, user))
+            && !(self.authenticated_user.is_some()
+                && rmail_common::mail_auth::submission_from_matches(&data, &self.sender_addresses))
         {
             send(
                 reader,

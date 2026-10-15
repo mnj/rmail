@@ -131,6 +131,9 @@ pub(super) struct Session {
     helo_name: Option<String>,
     extended_smtp: bool,
     authenticated_user: Option<String>,
+    /// The addresses the authenticated user may send as: their own and the
+    /// aliases that deliver to them (`db::sender_addresses`).
+    sender_addresses: Vec<String>,
     /// Webmail on this host authenticated with the local submission secret
     /// (`X-RMAIL-WEBMAIL`); loopback traffic stands in for TLS.
     local_trusted: bool,
@@ -243,6 +246,7 @@ pub(crate) async fn process_stream_with_bindings(
         helo_name: None,
         extended_smtp: false,
         authenticated_user: None,
+        sender_addresses: Vec::new(),
         local_trusted: false,
         message_id: None,
         tx: Transaction::default(),
@@ -725,7 +729,7 @@ impl Session {
             }
             if let Some(user) = outcome.authenticated_user {
                 session_log!(self, "info", "authentication_succeeded", { "user": user, "mechanism": authenticate::WEBMAIL_MECHANISM });
-                self.authenticated_user = Some(user);
+                self.signed_in(user).await;
                 self.local_trusted = true;
             }
             return Ok(Flow::Continue);
@@ -814,9 +818,25 @@ impl Session {
         }
         if let Some(user) = outcome.authenticated_user {
             session_log!(self, "info", "authentication_succeeded", { "user": user });
-            self.authenticated_user = Some(user);
+            self.signed_in(user).await;
         }
         Ok(Flow::Continue)
+    }
+
+    /// Record a successful authentication and the addresses `user` may send
+    /// as. Without the database (or if it fails) only their own address.
+    async fn signed_in(&mut self, user: String) {
+        let db_path = self.db_path.clone();
+        let lookup = user.clone();
+        let addresses = tokio::task::spawn_blocking(move || {
+            db_path.and_then(|db_path| rmail_common::db::sender_addresses(&db_path, &lookup).ok())
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| vec![user.clone()]);
+        self.sender_addresses = addresses;
+        self.authenticated_user = Some(user);
     }
 
     /// Blocklist check for unauthenticated inbound (port 25) clients only.
@@ -982,10 +1002,13 @@ impl Session {
         self.tx.mail_from = parsed.sender;
         if self.service == SmtpService::Submission {
             let user = self.authenticated_user.as_deref();
-            let sender_matches_identity =
-                self.tx.mail_from.as_deref().is_some_and(|sender| {
-                    user.is_some_and(|user| sender.eq_ignore_ascii_case(user))
-                });
+            let sender_matches_identity = self.tx.mail_from.as_deref().is_some_and(|sender| {
+                user.is_some()
+                    && self.sender_addresses.iter().any(|own| {
+                        rmail_common::domain::canonicalize_mailbox_address(sender)
+                            .is_ok_and(|sender| sender.eq_ignore_ascii_case(own))
+                    })
+            });
             if !sender_matches_identity {
                 self.tx.mail_from = None;
                 self.tx.active = false;

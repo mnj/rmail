@@ -495,6 +495,47 @@ async fn submission_option_enforces_visible_from_for_data_and_bdat() {
 }
 
 #[tokio::test]
+async fn submitters_may_send_as_their_aliases() {
+    let security = SecurityConfig {
+        submission_require_from_alignment: true,
+        ..SecurityConfig::default()
+    };
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::add_alias(&db_path, "sales@example.test", &["user@example.test"]).unwrap();
+    rmail_common::db::add_alias(&db_path, "boss@example.test", &["other@example.test"]).unwrap();
+    let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
+    let input = format!(
+        "EHLO localhost\r\n{auth}\
+         MAIL FROM:<boss@example.test>\r\n\
+         MAIL FROM:<Sales@example.test>\r\nRCPT TO:<user@example.test>\r\n\
+         DATA\r\nFrom: Sales <sales@example.test>\r\nSubject: as alias\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+    );
+    let (responses, _td) = run_prepared_session(
+        input.into_bytes(),
+        16 * 1024,
+        security,
+        true,
+        SmtpService::Submission,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("553 5.7.1 Sender address not owned")),
+        "someone else's alias is refused: {responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|line| line.starts_with("250 2.0.0 Message accepted")),
+        "{responses:?}"
+    );
+}
+
+#[tokio::test]
 async fn futurerelease_holds_submitted_mail_until_its_time() {
     crate::enable_future_release();
     let auth = "AUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n";
