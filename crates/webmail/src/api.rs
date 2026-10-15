@@ -25,6 +25,7 @@ use rmail_common::mime::{
 pub(crate) mod assist;
 mod calendars;
 mod compose;
+mod invitations;
 mod organize;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
@@ -86,6 +87,10 @@ pub(crate) fn router(state: Shared) -> Router {
             get(attachment),
         )
         .route("/api/folders/{folder}/messages/{uid}/raw", get(raw_message))
+        .route(
+            "/api/folders/{folder}/messages/{uid}/invitation",
+            post(answer_invitation),
+        )
         .route(
             "/api/folders/{folder}/messages/{uid}/ai",
             post(organize::ai_action),
@@ -436,6 +441,9 @@ struct MessageDetail {
     /// The HTML references remote images or styles, which are blocked unless
     /// the reader asks for them (`?remote_content=1`) to prevent tracking.
     has_remote_content: bool,
+    /// The calendar invitation, cancellation or reply the message carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invitation: Option<invitations::Invitation>,
 }
 
 #[derive(Deserialize)]
@@ -991,7 +999,9 @@ async fn message_detail(
             .into_iter()
             .find(|message| message.uid == uid)
             .ok_or_else(|| anyhow::anyhow!("no such message"))?;
-        let parsed = parse_message(&std::fs::read(&message.path)?);
+        let bytes = std::fs::read(&message.path)?;
+        let invitation = invitation_card(&state, &session, &bytes, !location.shared);
+        let parsed = parse_message(&bytes);
         let labels = labels_for(
             &organize::labels(&state.mail_root, &session.domain, &session.localpart),
             &message.flags,
@@ -1014,6 +1024,7 @@ async fn message_detail(
             attachments: parsed.attachments,
             labels,
             text_body: parsed.text_body,
+            invitation,
             has_remote_content: parsed.html_body.as_deref().is_some_and(has_remote_content),
             html_body: parsed
                 .html_body
@@ -1024,6 +1035,99 @@ async fn message_detail(
     match result {
         Ok(detail) => Json(detail).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The invitation card for a message, judged against the signed-in user's
+/// calendars. Failures only lose the card.
+fn invitation_card(
+    state: &AppState,
+    session: &Session,
+    message: &[u8],
+    can_act: bool,
+) -> Option<invitations::Invitation> {
+    const NEEDLE: &[u8] = b"text/calendar";
+    if !message
+        .windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
+    {
+        return None;
+    }
+    let conn =
+        rmail_common::jmap::store::open(&state.mail_root, &session.domain, &session.localpart)
+            .ok()?;
+    let own = db::calendar_addresses(&state.db_path, &session.address).ok()?;
+    invitations::invitation(message, &conn, &own, can_act)
+}
+
+#[derive(Deserialize)]
+struct InvitationAction {
+    /// `accepted`, `tentative`, `declined`, `cancel` or `apply`.
+    action: String,
+}
+
+/// Answer the invitation in a message, mark a cancellation or apply a
+/// reply; the updated card comes back.
+async fn answer_invitation(
+    app: State<Shared>,
+    headers: HeaderMap,
+    Path((folder, uid)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    let Ok(uid) = uid.parse::<u64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(input) = serde_json::from_slice::<InvitationAction>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+    };
+    let result = blocking(move || {
+        let location = locate(&state, &session, &folder)?;
+        if location.shared {
+            return Ok(Err((
+                StatusCode::FORBIDDEN,
+                invitations::Refused::NotAllowed,
+            )));
+        }
+        let (_, messages) = imap_state::load_folder(
+            &state.mail_root,
+            &location.domain,
+            &location.localpart,
+            &location.folder,
+        )?;
+        let Some(message) = messages.into_iter().find(|message| message.uid == uid) else {
+            return Ok(Err((
+                StatusCode::NOT_FOUND,
+                invitations::Refused::NotAnInvitation,
+            )));
+        };
+        let bytes = std::fs::read(&message.path)?;
+        let user = crate::jmap::User {
+            address: session.address.clone(),
+            domain: session.domain.clone(),
+            localpart: session.localpart.clone(),
+        };
+        let state_for_card = state.clone();
+        Ok(
+            match invitations::act(state, user, &bytes, &input.action)? {
+                Ok(()) => Ok(invitation_card(&state_for_card, &session, &bytes, true)),
+                Err(refused) => Err((StatusCode::CONFLICT, refused)),
+            },
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(card)) => Json(serde_json::json!({ "invitation": card })).into_response(),
+        Ok(Err((status, refused))) => (
+            status,
+            Json(serde_json::json!({ "error": refused.message() })),
+        )
+            .into_response(),
+        Err(error) => internal_error(error),
     }
 }
 

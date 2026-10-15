@@ -41,7 +41,7 @@ use crate::jmap::{self, User};
 
 mod props;
 mod report;
-mod schedule;
+pub(crate) mod schedule;
 mod sharing;
 mod xml;
 

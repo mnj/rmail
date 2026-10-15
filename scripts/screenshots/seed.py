@@ -82,6 +82,36 @@ INBOX = [
 
 for frm, subject, body, html, ago in INBOX:
     deliver(message(frm, "alice@example.com", subject, body, html, ago))
+
+
+def invitation():
+    """An iMIP invitation from Priya for next Thursday, 14:00-15:00 UTC."""
+    now = time.gmtime()
+    days = (3 - now.tm_wday) % 7 or 7
+    day = time.gmtime(time.time() + days * 86400)
+    date = time.strftime("%Y%m%d", day)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", now)
+    lines = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Northwind//Calendar//EN", "METHOD:REQUEST",
+        "BEGIN:VEVENT", "UID:q4-infra-review@northwind.test", f"DTSTAMP:{stamp}", "SEQUENCE:0",
+        f"DTSTART:{date}T140000Z", f"DTEND:{date}T150000Z",
+        "SUMMARY:Q4 infrastructure review", "LOCATION:Video call (link in description)",
+        "DESCRIPTION:Mail migration status\\, ACME\\, deliverability and 2027 capacity.",
+        "ORGANIZER;CN=Priya Raman:mailto:priya@northwind.test",
+        "ATTENDEE;CN=Priya Raman;PARTSTAT=ACCEPTED:mailto:priya@northwind.test",
+        "ATTENDEE;CN=Alice Chen;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:alice@example.com",
+        "ATTENDEE;CN=Marcus Lee;PARTSTAT=TENTATIVE:mailto:marcus@contoso.test",
+        "ATTENDEE;CN=Bob Hansen;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:bob@example.com",
+        "END:VEVENT", "END:VCALENDAR", "",
+    ]
+    m = message('"Priya Raman" <priya@northwind.test>', "alice@example.com",
+                "Invitation: Q4 infrastructure review",
+                "Priya Raman invites you to \"Q4 infrastructure review\".", ago=60 * 10)
+    m.add_alternative("\r\n".join(lines), subtype="calendar", params={"method": "REQUEST"})
+    return m
+
+
+deliver(invitation())
 deliver(message('"Alice Chen" <alice@example.com>', "support@example.com",
                 "Customer escalation: delayed invoices", "Can someone look at ticket 4411?"))
 deliver(message('"Monitoring" <alerts@example.org>', "ops@example.org",

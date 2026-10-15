@@ -398,3 +398,25 @@ time { white-space: nowrap; }
   .suggestions { left: 14px; }
   .save-state { display: none; }
 }
+
+/* Calendar invitations in the reading pane */
+.invite-card { display: flex; gap: 12px; margin: 0 0 16px; padding: 14px 16px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 10px; background: var(--surface-2); }
+.invite-card.cancelled { border-left-color: var(--danger); }
+.invite-card.cancelled .invite-title { text-decoration: line-through; text-decoration-color: var(--muted); }
+.invite-icon { color: var(--accent-text); padding-top: 2px; }
+.invite-card.cancelled .invite-icon { color: var(--danger-text); }
+.invite-body { min-width: 0; flex: 1; display: grid; gap: 4px; }
+.invite-title { margin: 0; font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+.invite-line { display: flex; align-items: center; gap: 6px; color: var(--text-2); overflow-wrap: anywhere; }
+.invite-line svg { flex: none; color: var(--muted); }
+.invite-note { margin: 4px 0 0; }
+.invite-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.invite-actions .muted { margin-right: 4px; }
+.invite-guests > button { display: inline; padding: 0; text-align: left; text-decoration: none; color: var(--text-2); line-height: 1.5; }
+.invite-guests > button svg { vertical-align: -2px; margin-right: 6px; color: var(--muted); }
+.invite-guests > button .invite-count { text-decoration: underline; }
+.invite-guests ul { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 4px; max-height: 220px; overflow: auto; }
+.invite-guests li { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+.invite-status { color: var(--muted); white-space: nowrap; }
+.invite-status.accepted { color: var(--accent-text); }
+.invite-status.declined { color: var(--danger-text); }

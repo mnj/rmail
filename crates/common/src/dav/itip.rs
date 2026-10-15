@@ -867,7 +867,7 @@ fn readable_time(value: &str) -> String {
 }
 
 /// An iCalendar TEXT value as plain text (RFC 5545 3.3.11).
-fn unescape(value: &str) -> String {
+pub fn unescape(value: &str) -> String {
     let mut out = String::new();
     let mut chars = value.chars();
     while let Some(c) = chars.next() {

@@ -768,11 +768,16 @@ respected.
 - Invitation emails received from other servers (and from accounts in other domains here) are
   delivered as usual and their invitation, cancellation or reply is also put in the account's
   schedule inbox, where calendar clients offer it. Invitations and cancellations are never written
-  into calendars by the server, since anyone can send mail; the user accepts them in their client.
+  into calendars by the server, since anyone can send mail; the user accepts them in their client
+  or in webmail, where a message carrying an invitation shows the event with Accept, Maybe and
+  Decline. Answering there stores the event in the user's default calendar (or updates their
+  copy) and sends the reply through scheduling, as a CalDAV client's change would; an older
+  version of an invitation than the calendar holds can no longer be answered.
   A reply updates the organizer's event at once only when the replying attendee is invited and the
   message passed DMARC for the attendee's domain (or was submitted here by the attendee's own
   account); a domain without a DMARC record is not vouched for, so its replies stay in the inbox
-  for the client to apply. Quarantined mail and mail a Sieve script discards or only forwards are
+  for the client to apply, or for the organizer to apply with **Update my calendar** on the reply
+  in webmail. A cancellation is applied the same way, with **Mark cancelled in my calendar**. Quarantined mail and mail a Sieve script discards or only forwards are
   not looked at. The logs show each one as `imip_received` (with `applied` and the reason when
   not), `imip_skipped` or `imip_failed`; none of them affects delivery.
 - An alias that delivers to exactly one account counts as that account's calendar address:
