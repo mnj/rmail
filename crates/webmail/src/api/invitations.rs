@@ -257,6 +257,7 @@ pub(crate) fn invitation(
             }
         }
         Method::Cancel => match &copy {
+            Some(copy) if sequence(copy) > sequence(&calendar) => "outdated",
             Some(copy) if cancelled(copy) => "cancelled",
             Some(copy) if itip::organizer(copy) == itip::organizer(&calendar) => {
                 actions.push("cancel");
@@ -279,6 +280,9 @@ pub(crate) fn invitation(
                     .any(|address| itip::role(copy, address) == Role::Organizer)
             });
             match (&copy, &replier_card) {
+                (Some(copy), Some(_)) if organizes && sequence(copy) > sequence(&calendar) => {
+                    "outdated"
+                }
                 (Some(copy), Some(replier)) if organizes => {
                     let shown = main_component(copy).is_some_and(|event| {
                         event.properties_named("ATTENDEE").any(|attendee| {
@@ -446,7 +450,12 @@ pub(crate) fn act(
                 let copy = current
                     .and_then(|object| text::parse(&object.data).ok())
                     .filter(|copy| itip::organizer(copy) == itip::organizer(&calendar))
-                    .ok_or(PutError::PreconditionFailed)?;
+                    .ok_or(PutError::InvalidData(String::new()))?;
+                // An older cancellation than the copy (the event was
+                // reinstated since) no longer applies.
+                if sequence(&copy) > sequence(&calendar) {
+                    return Err(PutError::PreconditionFailed);
+                }
                 Ok(Prepared {
                     data: itip::apply_cancel(&copy, &calendar).to_text(),
                     schedule_tag: ScheduleTag::New,
@@ -454,7 +463,8 @@ pub(crate) fn act(
             })?;
             match stored {
                 Ok(_) => Ok(Ok(())),
-                Err(PutError::PreconditionFailed) => Ok(Err(Refused::NotAllowed)),
+                Err(PutError::PreconditionFailed) => Ok(Err(Refused::Outdated)),
+                Err(PutError::InvalidData(_)) => Ok(Err(Refused::NotAllowed)),
                 Err(error) => anyhow::bail!("storing the event: {error:?}"),
             }
         }
@@ -472,9 +482,13 @@ pub(crate) fn act(
                         own.iter()
                             .any(|address| itip::role(copy, address) == Role::Organizer)
                     })
-                    .ok_or(PutError::PreconditionFailed)?;
+                    .ok_or(PutError::InvalidData(String::new()))?;
+                // A reply to an older version must not undo a newer answer.
+                if sequence(&copy) > sequence(&calendar) {
+                    return Err(PutError::PreconditionFailed);
+                }
                 let merged = itip::apply_reply(&copy, &calendar, &attendee)
-                    .ok_or(PutError::PreconditionFailed)?;
+                    .ok_or(PutError::InvalidData(String::new()))?;
                 Ok(Prepared {
                     data: merged.to_text(),
                     schedule_tag: ScheduleTag::Keep,
@@ -482,7 +496,8 @@ pub(crate) fn act(
             })?;
             match stored {
                 Ok(_) => Ok(Ok(())),
-                Err(PutError::PreconditionFailed) => Ok(Err(Refused::NotAllowed)),
+                Err(PutError::PreconditionFailed) => Ok(Err(Refused::Outdated)),
+                Err(PutError::InvalidData(_)) => Ok(Err(Refused::NotAllowed)),
                 Err(error) => anyhow::bail!("storing the event: {error:?}"),
             }
         }
@@ -584,10 +599,7 @@ mod tests {
         assert_eq!(answered["invitation"]["your_status"], "accepted");
         assert_eq!(answered["invitation"]["attendees"][0]["status"], "accepted");
         let copy = stored(&root, "user", "inv-1");
-        assert!(
-            copy.contains("PARTSTAT=ACCEPTED") && !copy.contains("RSVP"),
-            "{copy}"
-        );
+        assert!(copy.contains("PARTSTAT=ACCEPTED") && !copy.contains("RSVP"));
         assert!(
             stored(&root, "other", "inv-1").contains("PARTSTAT=ACCEPTED"),
             "the reply reached the organizer"
@@ -610,6 +622,28 @@ mod tests {
         assert_eq!(detail["invitation"]["actions"], serde_json::json!([]));
         let (status, _) = call("POST", path, r#"{"action":"declined"}"#).await;
         assert_eq!(status, 409);
+
+        // A cancellation older than the calendar's copy is moot.
+        let stale_cancel = deliver(mail(
+            "CANCEL",
+            &event("inv-1", OTHER, USER, "NEEDS-ACTION", "STATUS:CANCELLED\r\n")
+                .replace("SEQUENCE:0", "SEQUENCE:1"),
+        ));
+        let (_, detail) = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{stale_cancel}"),
+            "",
+        )
+        .await;
+        assert_eq!(detail["invitation"]["state"], "outdated");
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{stale_cancel}/invitation"),
+            r#"{"action":"cancel"}"#,
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert!(!stored(&root, "user", "inv-1").contains("STATUS:CANCELLED"));
 
         // The organizer cancels.
         let cancel_uid = deliver(mail(
@@ -637,6 +671,7 @@ mod tests {
         let own_event = format!(
             "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n{}END:VCALENDAR\r\n",
             event("own-1", USER, "guest@remote.test", "NEEDS-ACTION", "")
+                .replace("SEQUENCE:0", "SEQUENCE:1")
         );
         {
             let conn = rmail_common::jmap::store::open(&root, "example.test", "user").unwrap();
@@ -645,9 +680,29 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+        // A reply to an older version is moot.
+        let stale_reply = deliver(mail(
+            "REPLY",
+            &event("own-1", USER, "guest@remote.test", "ACCEPTED", ""),
+        ));
+        let (_, detail) = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{stale_reply}"),
+            "",
+        )
+        .await;
+        assert_eq!(detail["invitation"]["state"], "outdated");
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{stale_reply}/invitation"),
+            r#"{"action":"apply"}"#,
+        )
+        .await;
+        assert_eq!(status, 409);
         let reply_uid = deliver(mail(
             "REPLY",
-            &event("own-1", USER, "guest@remote.test", "DECLINED", ""),
+            &event("own-1", USER, "guest@remote.test", "DECLINED", "")
+                .replace("SEQUENCE:0", "SEQUENCE:1"),
         ));
         let (_, detail) = call(
             "GET",
