@@ -125,17 +125,44 @@ fn scheduling_message(
         CalendarPart::TooLarge => return Ok(Err(Outcome::Skipped("calendar part too large"))),
         CalendarPart::Found(data) => data,
     };
-    let calendar = text::parse(&data)?;
+    let (method, calendar) = match scheduling_object(&data)? {
+        Ok(found) => found,
+        Err(why) => return Ok(Err(Outcome::Skipped(why))),
+    };
+    let Some(organizer) = itip::organizer(&calendar) else {
+        return Ok(Err(Outcome::Skipped("no organizer")));
+    };
+    let Some(account) = itip::own_address(&calendar, addresses) else {
+        return Ok(Err(Outcome::Skipped("not addressed to the account")));
+    };
+    let addressed = match method {
+        Method::Request | Method::Cancel => {
+            !same_address(&organizer, account) && itip::role(&calendar, account) == Role::Attendee
+        }
+        Method::Reply => itip::role(&calendar, account) == Role::Organizer,
+    };
+    if !addressed {
+        return Ok(Err(Outcome::Skipped("not addressed to the account")));
+    }
+    Ok(Ok((method, calendar, account.to_string())))
+}
+
+/// An iTIP message as a calendar: a `REQUEST`, `REPLY` or `CANCEL` about one
+/// event or to-do (one UID, as a calendar object holds; RFC 4791 4.1), or
+/// why not. Unreadable calendar data is an error.
+pub fn scheduling_object(
+    data: &str,
+) -> Result<std::result::Result<(Method, Component), &'static str>> {
+    let calendar = text::parse(data)?;
     if calendar.name != "VCALENDAR" {
-        return Ok(Err(Outcome::Skipped("not a calendar")));
+        return Ok(Err("not a calendar"));
     }
     let Some(method) = calendar
         .property("METHOD")
         .and_then(|method| Method::parse(&method.value))
     else {
-        return Ok(Err(Outcome::Skipped("not a REQUEST, REPLY or CANCEL")));
+        return Ok(Err("not a REQUEST, REPLY or CANCEL"));
     };
-    // One event or to-do, as a calendar object holds (RFC 4791 4.1).
     let parts = calendar
         .components
         .iter()
@@ -155,24 +182,9 @@ fn scheduling_message(
                 .all(|part| part.name == first.name && uid(part) == uid(first))
     });
     if !one_object {
-        return Ok(Err(Outcome::Skipped("not one event or to-do")));
+        return Ok(Err("not one event or to-do"));
     }
-    let Some(organizer) = itip::organizer(&calendar) else {
-        return Ok(Err(Outcome::Skipped("no organizer")));
-    };
-    let Some(account) = itip::own_address(&calendar, addresses) else {
-        return Ok(Err(Outcome::Skipped("not addressed to the account")));
-    };
-    let addressed = match method {
-        Method::Request | Method::Cancel => {
-            !same_address(&organizer, account) && itip::role(&calendar, account) == Role::Attendee
-        }
-        Method::Reply => itip::role(&calendar, account) == Role::Organizer,
-    };
-    if !addressed {
-        return Ok(Err(Outcome::Skipped("not addressed to the account")));
-    }
-    Ok(Ok((method, calendar, account.to_string())))
+    Ok(Ok((method, calendar)))
 }
 
 /// Put the message in the inbox and apply a vouched-for reply.

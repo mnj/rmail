@@ -24,6 +24,20 @@ export type MessageDetail = {
   in_reply_to: string; references: string;
   subject: string; date: string; text_body: string; html_body: string | null;
   has_remote_content: boolean; attachments: Attachment[]; labels: Label[];
+  invitation?: Invitation;
+};
+export type InvitationPerson = { address: string; name: string };
+export type InvitationAttendee = InvitationPerson & { status: string };
+export type InvitationAction = 'accepted' | 'tentative' | 'declined' | 'cancel' | 'apply';
+/** A calendar invitation, cancellation or reply carried by a message (iMIP). */
+export type Invitation = {
+  method: 'request' | 'cancel' | 'reply';
+  summary: string; location: string; description: string;
+  start: number | null; end: number | null; all_day: boolean; recurring: boolean;
+  organizer: InvitationPerson | null; attendees: InvitationAttendee[]; more_attendees: number;
+  you: string | null; your_status: string | null; replier: InvitationAttendee | null;
+  state: 'new' | 'in_calendar' | 'outdated' | 'cancelled' | 'not_invited' | 'applied' | 'not_applied';
+  actions: InvitationAction[];
 };
 export type OrganizeFolder = { name: string; learned: number; accepted: number; dismissed: number; excluded: boolean; autofile: boolean };
 export type OrganizeLabel = Label & { count: number; origin: 'user' | 'starter' | 'ai' };

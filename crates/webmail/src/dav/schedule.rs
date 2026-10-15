@@ -383,7 +383,7 @@ fn apply(
     })
 }
 
-fn random_name() -> String {
+pub(crate) fn random_name() -> String {
     (0..16)
         .map(|_| format!("{:02x}", rand::random::<u8>()))
         .collect()

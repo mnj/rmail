@@ -142,12 +142,19 @@ async function signIn(page) {
   await page.waitForSelector('.message-list .row');
   await page.waitForTimeout(500);
   await shot(page, 'webmail-inbox');
-  await page.click('text=Q4 infrastructure review');
+  await page.click('text=Q4 infrastructure review — agenda');
   await page.waitForTimeout(700);
   await shot(page, 'webmail-message');
   await page.click('text=This week: Rust 2024');
   await page.waitForTimeout(900);
   await shot(page, 'webmail-remote-blocked');
+  await page.click('.message-list >> text=Invitation: Q4 infrastructure review');
+  await page.waitForSelector('.invite-card');
+  await page.waitForTimeout(500);
+  await shot(page, 'webmail-invitation');
+  // Answering stores the event and sends the reply through scheduling.
+  await page.click('.invite-actions button:has-text("Accept")');
+  await page.waitForSelector('.invite-card >> text=You answered: Accepted');
   // A folder Bob shares with Alice, and sharing one of hers.
   await page.click('text=Team Projects');
   await page.waitForSelector('text=Migration runbook v3');
@@ -257,7 +264,7 @@ for (const theme of ['light', 'dark']) {
   await page.click('button.folder-name:has-text("Inbox")');
   await page.waitForSelector('.message-list .row');
   await page.waitForTimeout(400);
-  await page.click('text=Q4 infrastructure review');
+  await page.click('text=Q4 infrastructure review — agenda');
   await page.waitForTimeout(700);
   await shot(page, 'mobile-message');
   await page.click('button[aria-label=Back]');
@@ -265,6 +272,12 @@ for (const theme of ['light', 'dark']) {
   await page.click('text=This week: Rust 2024');
   await page.waitForTimeout(900);
   await shot(page, 'mobile-remote-blocked');
+  await page.click('button[aria-label=Back]');
+  await page.waitForTimeout(300);
+  await page.click('.message-list >> text=Invitation: Q4 infrastructure review');
+  await page.waitForSelector('.invite-card');
+  await page.waitForTimeout(500);
+  await shot(page, 'mobile-invitation');
   await page.click('button[aria-label=Back]');
   await page.waitForTimeout(300);
   await compose(page, 'mobile-compose', true);

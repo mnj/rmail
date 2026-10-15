@@ -44,7 +44,9 @@ screenshots of every page, and a quick start.
 - **Admin console** for mailboxes, quotas, aliases, catchalls, the outbound queue, database-stored
   settings, logs, Prometheus metrics and readiness checks.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
-  layout. Composing has a rich-text editor (formatting, lists, quotes, links, inline images,
+  layout. Calendar invitations show as a card with Accept, Maybe and Decline, which stores the
+  event and sends the reply as a calendar app would; cancellations and unverified replies can be
+  applied from the card too. Composing has a rich-text editor (formatting, lists, quotes, links, inline images,
   cleaned-up pastes from Word or Google Docs) that sends HTML with a generated plain-text
   alternative, a plain-text mode, signatures per identity, the browser's spellchecker in a chosen
   language, address suggestions from CardDAV contacts and recent recipients, autosaved drafts,

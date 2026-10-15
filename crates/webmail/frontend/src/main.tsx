@@ -8,6 +8,7 @@ import {
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
+import { InvitationCard } from './invitation';
 import {
   Api, ApiError, Attachment, CalendarListing, ComposePrefs, DavCollection, Folder, Grant, Identity, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize, SendResult,
   can, formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sharedFolderName, sortFolders, splitAddress,
@@ -884,6 +885,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
                 <time className="muted small" title={selected.date}>{formatFullDate(selected.internal_date)}</time>
               </div>
               {!shared && <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} />}
+              {selected.invitation && <InvitationCard api={api} folder={folder} uid={selected.uid} invitation={selected.invitation} />}
               {selected.html_body && selected.has_remote_content && <div className="remote-banner"><ImageIcon size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}
               {selected.html_body
                 ? <iframe className="html-message" title="Message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} />
