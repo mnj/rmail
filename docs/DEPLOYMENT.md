@@ -851,10 +851,10 @@ Users can also have new INBOX mail labeled automatically. This is a separate swi
 
 - Turning it on seeds common labels (Action needed, Receipts, Shipping, Travel, Finance, Events,
   Security, Newsletters, Promotions, Notifications, Social, Work, Personal). The fallback model
-  (local chat model, OpenRouter or Jev) then decides which labels apply to each new message. A label
+  (local chat model, OpenRouter, OpenAI, Anthropic or Jev) then decides which labels apply to each new message. A label
   is applied when its probability reaches `classifier.label_confidence` (70% by default), with at
   most three labels per message.
-- When no label fits, the local and OpenRouter chat models may create a new label: one to three
+- When no label fits, the chat models that write text (all but Jev) may create a new label: one to three
   words, with a short description, applied to that message and offered for later mail. Set
   `classifier.label_discovery` to `false` to turn this off. Jev only picks from existing labels; it
   gets one yes/no question per label in a single request.
@@ -884,13 +884,25 @@ Organization page (or the `classifier.*` settings):
 
 | Role | Setting | Options |
 | --- | --- | --- |
-| Embeddings (required) | `classifier.embed_provider` | `local`, `openrouter` |
-| Fallback for uncertain mail | `classifier.chat_provider` | `local`, `openrouter`, `jev` |
+| Embeddings (required) | `classifier.embed_provider` | `local`, `openrouter`, `openai` |
+| Fallback for uncertain mail | `classifier.chat_provider` | `local`, `openrouter`, `openai`, `anthropic`, `jev` |
 
 - **OpenRouter** (`classifier.openrouter_api_key`, `openrouter_embed_model`, `openrouter_chat_model`)
   uses the OpenAI-compatible `/embeddings` and `/chat/completions` APIs. `classifier.openrouter_base_url`
   can point at any compatible endpoint, such as a self-hosted vLLM or Ollama. Chat answers are
   constrained to the folder list with a JSON schema, and answers naming other folders are discarded.
+  Claude Haiku 5.5 is available there as `anthropic/claude-haiku-5-5`.
+- **OpenAI** (`classifier.openai_api_key`, `openai_embed_model`, `openai_chat_model`) calls
+  `api.openai.com` directly, so users consent to OpenAI rather than to OpenRouter. With
+  `classifier.background_tier` set to `flex`, the background worker's chat calls (labels and
+  fallback decisions for new mail) use OpenAI's flex tier: billed at batch rates, but queued, and
+  refused with 429 when OpenAI is short of capacity. Those are retried with growing pauses, then
+  sent at the standard tier; a model without the flex tier, or a flex request that gets no
+  answer within 15 minutes, goes to the standard tier at once. Other errors (a bad key) are not retried.
+  Calls a user waits for (summaries and labels asked for in webmail) always use the standard tier.
+- **Anthropic** (`classifier.anthropic_api_key`, `classifier.anthropic_chat_model`, default
+  `claude-haiku-5-5`) uses the Messages API with the same JSON schemas (`output_config.format`)
+  and a low effort. Anthropic has no embeddings; pair it with a local or OpenAI embedder.
 - **Jev** (`classifier.typesafe_api_key`, `classifier.jev_model`) is TypeSafe's decision model. It
   gets one choice question whose options are the user's folders (described by example subjects) plus
   "none", and returns the chosen option with a confidence instead of generated text.

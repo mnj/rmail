@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use rmail_common::config::{ChatProvider, ClassifierConfig, EmbedProvider};
+use rmail_common::config::{BackgroundTier, ChatProvider, ClassifierConfig, EmbedProvider};
 use serde::Serialize;
 
 pub trait Embedder: Send + Sync {
@@ -107,6 +107,15 @@ fn embed_spec(cfg: &ClassifierConfig) -> Option<Spec> {
                 secret(&cfg.openrouter_api_key),
             ]),
         }),
+        EmbedProvider::OpenAi => Some(Spec {
+            label: format!("openai:{}", cfg.openai_embed_model),
+            cloud: cfg.embed_provider.cloud(),
+            fingerprint: fingerprint(&[
+                "openai",
+                &cfg.openai_embed_model,
+                secret(&cfg.openai_api_key),
+            ]),
+        }),
     }
 }
 
@@ -128,6 +137,25 @@ fn chat_spec(cfg: &ClassifierConfig) -> Option<Spec> {
                 secret(&cfg.openrouter_api_key),
             ]),
         }),
+        ChatProvider::OpenAi => (!cfg.openai_chat_model.trim().is_empty()).then(|| Spec {
+            label: format!("openai:{}", cfg.openai_chat_model),
+            cloud: cfg.chat_provider.cloud(),
+            fingerprint: fingerprint(&[
+                "openai",
+                &cfg.openai_chat_model,
+                secret(&cfg.openai_api_key),
+                &format!("{:?}", cfg.background_tier),
+            ]),
+        }),
+        ChatProvider::Anthropic => (!cfg.anthropic_chat_model.trim().is_empty()).then(|| Spec {
+            label: format!("anthropic:{}", cfg.anthropic_chat_model),
+            cloud: cfg.chat_provider.cloud(),
+            fingerprint: fingerprint(&[
+                "anthropic",
+                &cfg.anthropic_chat_model,
+                secret(&cfg.anthropic_api_key),
+            ]),
+        }),
         ChatProvider::Jev => Some(Spec {
             label: format!("jev:{}", cfg.jev_model),
             cloud: cfg.chat_provider.cloud(),
@@ -141,6 +169,9 @@ fn chat_spec(cfg: &ClassifierConfig) -> Option<Spec> {
 pub struct Models {
     pub embedder: Option<Arc<dyn Embedder>>,
     pub chooser: Option<Arc<dyn Chooser>>,
+    /// The chat model for the background worker, when it runs at a cheaper
+    /// tier than calls users wait for (see `background_tier`).
+    pub background: Option<Arc<dyn Chooser>>,
     pub embed_info: Option<LoadedModel>,
     pub chat_info: Option<LoadedModel>,
     /// Load failures, shown on the admin console.
@@ -185,8 +216,19 @@ impl Models {
                         .push(format!("chat model {}: {error:#}", spec.label)),
                 },
             }
+            if models.chooser.is_some() {
+                models.background = match reuse(&previous.chat_info, &previous.background, &spec) {
+                    Some((_, background)) => Some(background),
+                    None => load_background(cfg),
+                };
+            }
         }
         models
+    }
+
+    /// The chat model the background worker uses.
+    pub fn worker_chooser(&self) -> Option<Arc<dyn Chooser>> {
+        self.background.clone().or_else(|| self.chooser.clone())
     }
 
     /// Third parties the loaded embedder and chooser send message text to.
@@ -238,7 +280,27 @@ fn load_embedder(cfg: &ClassifierConfig, models_dir: &Path) -> Result<Arc<dyn Em
             secret(&cfg.openrouter_api_key),
             &cfg.openrouter_embed_model,
         )?)),
+        EmbedProvider::OpenAi => Ok(Arc::new(crate::cloud::OpenAiEmbedder::load(
+            crate::cloud::OPENAI_API,
+            secret(&cfg.openai_api_key),
+            &cfg.openai_embed_model,
+        )?)),
     }
+}
+
+/// A flex-tier copy of the OpenAI chooser when the admin chose it for
+/// background work; other providers have no such tier.
+fn load_background(cfg: &ClassifierConfig) -> Option<Arc<dyn Chooser>> {
+    if cfg.background_tier != BackgroundTier::Flex || cfg.chat_provider != ChatProvider::OpenAi {
+        return None;
+    }
+    crate::cloud::OpenAiChooser::load(
+        crate::cloud::OPENAI_API,
+        secret(&cfg.openai_api_key),
+        &cfg.openai_chat_model,
+    )
+    .ok()
+    .map(|chooser| Arc::new(chooser.flex()) as Arc<dyn Chooser>)
 }
 
 fn load_chooser(cfg: &ClassifierConfig, models_dir: &Path) -> Result<Arc<dyn Chooser>> {
@@ -248,6 +310,16 @@ fn load_chooser(cfg: &ClassifierConfig, models_dir: &Path) -> Result<Arc<dyn Cho
             &cfg.openrouter_base_url,
             secret(&cfg.openrouter_api_key),
             &cfg.openrouter_chat_model,
+        )?)),
+        ChatProvider::OpenAi => Ok(Arc::new(crate::cloud::OpenAiChooser::load(
+            crate::cloud::OPENAI_API,
+            secret(&cfg.openai_api_key),
+            &cfg.openai_chat_model,
+        )?)),
+        ChatProvider::Anthropic => Ok(Arc::new(crate::cloud::AnthropicChooser::load(
+            crate::cloud::ANTHROPIC_API,
+            secret(&cfg.anthropic_api_key),
+            &cfg.anthropic_chat_model,
         )?)),
         ChatProvider::Jev => Ok(Arc::new(crate::cloud::JevChooser::load(
             crate::cloud::TYPESAFE_API,
@@ -401,5 +473,62 @@ pub mod fake {
             }
             Ok(answer)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmail_common::config::SecretString;
+
+    fn hosted(chat: ChatProvider, tier: BackgroundTier) -> ClassifierConfig {
+        ClassifierConfig {
+            chat_provider: chat,
+            background_tier: tier,
+            openai_api_key: Some(SecretString("sk-openai".into())),
+            anthropic_api_key: Some(SecretString("sk-ant".into())),
+            ..ClassifierConfig::default()
+        }
+    }
+
+    #[test]
+    fn only_openai_background_work_uses_the_flex_tier() {
+        let dir = Path::new("/nonexistent");
+        let flex = Models::load(
+            &hosted(ChatProvider::OpenAi, BackgroundTier::Flex),
+            dir,
+            &Models::default(),
+        );
+        assert!(flex.errors.is_empty(), "{:?}", flex.errors);
+        assert_eq!(flex.chat_cloud(), Some("openai"));
+        assert!(flex.background.is_some());
+        let again = Models::load(
+            &hosted(ChatProvider::OpenAi, BackgroundTier::Flex),
+            dir,
+            &flex,
+        );
+        assert!(Arc::ptr_eq(
+            again.background.as_ref().unwrap(),
+            flex.background.as_ref().unwrap()
+        ));
+
+        let standard = Models::load(
+            &hosted(ChatProvider::OpenAi, BackgroundTier::Standard),
+            dir,
+            &flex,
+        );
+        assert!(
+            standard.background.is_none(),
+            "the tier is part of the fingerprint"
+        );
+        assert!(standard.worker_chooser().is_some());
+
+        let anthropic = Models::load(
+            &hosted(ChatProvider::Anthropic, BackgroundTier::Flex),
+            dir,
+            &Models::default(),
+        );
+        assert_eq!(anthropic.chat_cloud(), Some("anthropic"));
+        assert!(anthropic.background.is_none(), "no flex tier there");
     }
 }

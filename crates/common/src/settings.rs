@@ -1020,9 +1020,9 @@ pub const SETTINGS: &[SettingSpec] = &[
         "classifier.embed_provider",
         "classifier",
         "Embedding provider",
-        "local runs a model on this server. openrouter sends the text of every message learned or classified to OpenRouter, only for users who agreed to it in webmail.",
+        "local runs a model on this server. openrouter (or any OpenAI-compatible endpoint) and openai send the text of every message learned or classified to that provider, only for users who agreed to it in webmail.",
         SettingKind::Choice {
-            options: &["local", "openrouter"],
+            options: &["local", "openrouter", "openai"],
         },
         CLASSIFIER,
     ),
@@ -1038,9 +1038,9 @@ pub const SETTINGS: &[SettingSpec] = &[
         "classifier.chat_provider",
         "classifier",
         "Fallback provider",
-        "Where uncertain messages are decided. jev is TypeSafe's decision model, which picks one folder with a confidence instead of generating text. Cloud providers only see mail of users who agreed to them in webmail.",
+        "Where uncertain messages are decided and labels applied. openrouter takes any OpenAI-compatible endpoint (Claude Haiku 5.5 there is anthropic/claude-haiku-5-5); openai and anthropic call those providers' own APIs. jev is TypeSafe's decision model, which picks one folder with a confidence instead of generating text. Cloud providers only see mail of users who agreed to them in webmail.",
         SettingKind::Choice {
-            options: &["local", "openrouter", "jev"],
+            options: &["local", "openrouter", "openai", "anthropic", "jev"],
         },
         CLASSIFIER,
     ),
@@ -1098,6 +1098,56 @@ pub const SETTINGS: &[SettingSpec] = &[
         "Jev model",
         "jev-latest follows TypeSafe's current release.",
         SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openai_api_key",
+        "classifier",
+        "OpenAI API key",
+        "From platform.openai.com/api-keys, for the openai providers.",
+        SettingKind::Secret,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openai_embed_model",
+        "classifier",
+        "OpenAI embedding model",
+        "Model id, e.g. text-embedding-3-small. Changing it relearns every opted-in mailbox.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.openai_chat_model",
+        "classifier",
+        "OpenAI chat model",
+        "Model id for the fallback and labels, e.g. gpt-6-luna. Empty disables it.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.anthropic_api_key",
+        "classifier",
+        "Anthropic API key",
+        "From platform.claude.com, for the anthropic provider.",
+        SettingKind::Secret,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.anthropic_chat_model",
+        "classifier",
+        "Anthropic chat model",
+        "Model id for the fallback and labels, e.g. claude-haiku-5-5. Empty disables it.",
+        SettingKind::Text,
+        CLASSIFIER,
+    ),
+    spec(
+        "classifier.background_tier",
+        "classifier",
+        "Background tier",
+        "flex sends the background worker's OpenAI calls at the flex tier: about half price but slower, and retried (then sent at the standard tier) when OpenAI has no capacity. Calls users wait for in webmail always use the standard tier. Other providers ignore it.",
+        SettingKind::Choice {
+            options: &["standard", "flex"],
+        },
         CLASSIFIER,
     ),
     spec(
@@ -1376,9 +1426,22 @@ pub fn classifier_models(conn: &Connection) -> Result<ClassifierModels> {
         serde_json::from_value(value("classifier.embed_provider")?).unwrap_or_default();
     let chat: ChatProvider =
         serde_json::from_value(value("classifier.chat_provider")?).unwrap_or_default();
+    // Unset model settings take the defaults ClassifierConfig gives them.
+    let defaults = crate::config::ClassifierConfig::default();
+    let model = |key: &str, default: &str| -> Result<bool> {
+        Ok(match value(key)? {
+            Value::Null => !default.trim().is_empty(),
+            set => !set.as_str().unwrap_or_default().trim().is_empty(),
+        })
+    };
     let chat_configured = match chat {
         ChatProvider::Local => !text("classifier.chat_model")?.is_empty(),
         ChatProvider::OpenRouter => !text("classifier.openrouter_chat_model")?.is_empty(),
+        ChatProvider::OpenAi => model("classifier.openai_chat_model", &defaults.openai_chat_model)?,
+        ChatProvider::Anthropic => model(
+            "classifier.anthropic_chat_model",
+            &defaults.anthropic_chat_model,
+        )?,
         ChatProvider::Jev => true,
     };
     Ok(ClassifierModels {
@@ -2331,6 +2394,8 @@ mod tests {
                         | "acme.dns.tsig_secret"
                         | "classifier.openrouter_api_key"
                         | "classifier.typesafe_api_key"
+                        | "classifier.openai_api_key"
+                        | "classifier.anthropic_api_key"
                         | "compose_ai.api_key"
                 )
                 || spec.key.starts_with("global.listeners.")

@@ -130,7 +130,7 @@ impl Account<'_> {
     /// from its own watermark; a failed model call leaves the message for
     /// the next cycle.
     fn label_inbox(&mut self) -> Result<()> {
-        let chooser = self.models.chooser.clone().context("no fallback model")?;
+        let chooser = self.models.worker_chooser().context("no fallback model")?;
         let conn = store::open_existing(self.mail_root, self.domain, self.localpart)?
             .context("store disappeared")?;
         store::seed_starter_labels(&conn)?;
@@ -413,7 +413,10 @@ impl Account<'_> {
                     dismissed: &dismissed,
                 },
                 self.cfg,
-                self.models.chooser.as_deref().filter(|_| self.use_chooser),
+                self.models
+                    .worker_chooser()
+                    .filter(|_| self.use_chooser)
+                    .as_deref(),
             )?;
             self.report.classified += 1;
             if let Some(decision) = decision {

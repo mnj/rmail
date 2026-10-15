@@ -85,6 +85,8 @@ export const methodLabel: Record<Suggestion['method'], string> = {
 const providerNames: Record<string, string> = {
   openrouter: 'OpenRouter (openrouter.ai)',
   typesafe: 'TypeSafe (typesafe.ai)',
+  openai: 'OpenAI (openai.com)',
+  anthropic: 'Anthropic (anthropic.com)',
 };
 
 export function providerName(id: string): string {
