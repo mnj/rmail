@@ -3522,6 +3522,7 @@ dependencies = [
  "hmac",
  "rand 0.8.8",
  "rmail_common",
+ "rmail_sieve",
  "roxmltree",
  "rusqlite",
  "serde",

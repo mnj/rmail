@@ -736,7 +736,15 @@ enabling.
 - A client's vacation response (out of office) is kept in the database and answered at delivery,
   alongside the account's own Sieve script rather than replacing it. It follows Sieve vacation's
   rules: one reply per sender per week, and none to lists, automated mail or the user's own
-  address.
+  address. Webmail edits the same reply under **Out of office** (with optional start and end
+  dates) and shows a banner while it is on.
+- **Filters** in webmail edit the account's Sieve script, so the rules run at delivery whatever app
+  the mail is read in. Rules match From, To/Cc, Subject, any header or the size, and move, mark
+  read, star, label, forward (keeping a copy or not) or delete. Webmail keeps them in a script
+  named `webmail` with the rules recorded in a comment at its top. An active script from
+  elsewhere (ManageSieve, or `webmail` edited by hand) is never overwritten unasked: webmail shows
+  it as text and checks edits with the delivery parser, and replacing it with rules keeps it,
+  switched off.
 - Uploads are limited to webmail's 16 MiB request size and are removed after a day unless used.
 
 ### Calendars and contacts

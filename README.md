@@ -44,13 +44,15 @@ screenshots of every page, and a quick start.
 - **Admin console** for mailboxes, quotas, aliases, catchalls, the outbound queue, database-stored
   settings, logs, Prometheus metrics and readiness checks.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
-  layout. Calendar invitations show as a card with Accept, Maybe and Decline, which stores the
-  event and sends the reply as a calendar app would; cancellations and unverified replies can be
-  applied from the card too. Composing has a rich-text editor (formatting, lists, quotes, links, inline images,
-  cleaned-up pastes from Word or Google Docs) that sends HTML with a generated plain-text
-  alternative, a plain-text mode, signatures per identity, the browser's spellchecker in a chosen
-  language, address suggestions from CardDAV contacts and recent recipients, autosaved drafts,
-  drag-and-drop attachments, undo send and send later. Opt-in AI writing suggestions (grey
+  layout. Calendar invitations show as a card with Accept, Maybe and Decline, which stores the event
+  and sends the reply as a calendar app would; cancellations and unverified replies can be applied
+  from the card too. Out-of-office replies and mail filters are edited in webmail and applied on the
+  server at delivery, so they work in every mail app; filters are kept as Sieve, and a hand-written
+  script is shown and edited as text. Composing has a rich-text editor (formatting, lists, quotes,
+  links, inline images, cleaned-up pastes from Word or Google Docs) that sends HTML with a generated
+  plain-text alternative, a plain-text mode, signatures per identity, the browser's spellchecker in
+  a chosen language, address suggestions from CardDAV contacts and recent recipients, autosaved
+  drafts, drag-and-drop attachments, undo send and send later. Opt-in AI writing suggestions (grey
   ghost-text continuations, accepted with Tab, and rewrites of a selection) come from any
   OpenAI-compatible endpoint the admin configures, through the server so the key stays there.
 - **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,

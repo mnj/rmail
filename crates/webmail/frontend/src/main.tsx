@@ -9,6 +9,7 @@ import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
 import { InvitationCard } from './invitation';
+import { FilterIcon, FiltersDialog, Vacation, VacationDialog, VacationIcon, vacationNote } from './rules';
 import {
   Api, ApiError, Attachment, CalendarListing, ComposePrefs, DavCollection, Folder, Grant, Identity, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize, SendResult,
   can, formatFullDate, formatListDate, formatSize, hasFlag, isUserFolder, methodLabel, providerName, sharedFolderName, sortFolders, splitAddress,
@@ -446,6 +447,9 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [prefs, setPrefs] = useState<ComposePrefs>({ format: 'html', language: '', undo_seconds: 0, ai_suggestions: false });
   const [identities, setIdentities] = useState<Identity[]>([]);
   const [composeSettings, setComposeSettings] = useState(false);
+  const [vacation, setVacation] = useState<Vacation | null>(null);
+  const [vacationOpen, setVacationOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [remoteLoaded, setRemoteLoaded] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -461,6 +465,8 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
     api<Identity[]>('/api/identities').then(setIdentities).catch(() => undefined);
   }, [api, canSend]);
   useEffect(() => { loadComposeSettings(); }, [loadComposeSettings]);
+  useEffect(() => { api<Vacation>('/api/vacation').then(setVacation).catch(() => undefined); }, [api]);
+  const awayNote = vacationNote(vacation);
 
   /** Open the compose window once its seed (which may fetch the original's HTML) is ready. */
   const startCompose = (seed: ComposeSeed | Promise<ComposeSeed>) => {
@@ -764,12 +770,14 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           {canSend && <button className="sidebar-link" onClick={() => setComposeSettings(true)}><PenLine size={15} />Compose settings</button>}
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
+          <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>
+          <button className="sidebar-link" onClick={() => setFiltersOpen(true)}><FilterIcon size={15} />Filters</button>
           <ThemeSwitch />
           <button className="sidebar-link" onClick={onLogout}><LogOut size={15} />Sign out</button>
         </div>
       </aside>
 
-      <section className="mailbox">
+      <section className={`mailbox ${awayNote ? 'away' : ''}`}>
         <header className="topbar">
           <IconButton label="Folders" className="mobile-only" onClick={() => setView('folders')}><Menu size={18} /></IconButton>
           <form className="search" onSubmit={search} role="search">
@@ -779,6 +787,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           </form>
           <IconButton label="Refresh" onClick={() => refresh().catch((err) => flash((err as Error).message))}><RefreshCw size={16} className={loading ? 'spin' : ''} /></IconButton>
         </header>
+        {awayNote && <div className="away-banner"><VacationIcon size={15} /><span>{awayNote}</span><button className="link" onClick={() => setVacationOpen(true)}>Change</button></div>}
         <div className="toolbar">
           <input type="checkbox" aria-label="Select all" checked={allChecked} ref={(el) => { if (el) el.indeterminate = checked.length > 0 && !allChecked; }} onChange={(e) => setChecked(e.target.checked ? messages.map((m) => m.uid) : [])} />
           {checked.length > 0 ? (
@@ -916,6 +925,8 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {prompt && <PromptDialog {...prompt} />}
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
       {calendars && <CalendarsDialog api={api} onClose={() => setCalendars(false)} />}
+      {vacationOpen && vacation && <VacationDialog api={api} initial={vacation} onClose={() => setVacationOpen(false)} onSaved={setVacation} />}
+      {filtersOpen && <FiltersDialog api={api} folders={folders} labels={organize?.labels ?? []} onClose={() => setFiltersOpen(false)} />}
       {rawFor !== null && <RawDialog api={api} folder={folder} uid={rawFor} onClose={() => setRawFor(null)} />}
     </main>
   );
