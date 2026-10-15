@@ -681,11 +681,15 @@ service's host so they know where their draft goes.
 
 Choosing a model: ghost text is only useful if it appears within a second or so of a pause, so
 small, fast, non-reasoning models suit it best (a "mini" or "nano" class model from a hosted
-provider, or a 1–8B instruction-tuned model on a local GPU). Reasoning models spend their small
-token budget thinking and add seconds. OpenRouter model ids look like `provider/model` (for example
-`openai/gpt-4.1-nano` or `meta-llama/llama-3.1-8b-instruct`); OpenAI's own API takes the bare name.
-Check that the model accepts the `max_tokens` parameter. Any model choice is yours; rMail does not
-pick one.
+provider, or a 1–8B instruction-tuned model on a local GPU). Good starting points are
+`gpt-4.1-nano` on OpenAI, `openai/gpt-4.1-nano` on OpenRouter, or `qwen2.5:7b-instruct` on Ollama.
+OpenRouter model ids look like `provider/model`; OpenAI's own API takes the bare name.
+
+Reasoning models (OpenAI's o-series and GPT-5) work but add seconds of hidden thinking, so raise
+the timeout if you use one. They refuse `max_tokens` and `temperature`; when a model answers the
+first request that way, webmail retries with `max_completion_tokens` (plus room for the
+reasoning) and low reasoning effort, and keeps using that form for the model until it restarts.
+Any model choice is yours; rMail does not pick one.
 
 How requests are made:
 

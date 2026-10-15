@@ -1184,7 +1184,7 @@ pub const SETTINGS: &[SettingSpec] = &[
         "compose_ai.model",
         "compose_ai",
         "Model",
-        "Model id at the provider. Small, fast models suit suggestions as you type; OpenRouter ids look like provider/model. Empty keeps suggestions off.",
+        "Model id at the provider. Small, fast models suit suggestions as you type, e.g. gpt-4.1-nano on OpenAI, openai/gpt-4.1-nano on OpenRouter, or a 3-8B instruct model such as qwen2.5:7b-instruct on Ollama. Reasoning models (o-series, GPT-5) work but are slower. Empty keeps suggestions off.",
         SettingKind::Text,
         LIVE,
     ),
