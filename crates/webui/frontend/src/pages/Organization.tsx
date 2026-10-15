@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { CheckCircle2, Cloud, Download, FlaskConical, Plus, RefreshCw, Save, Trash2 } from 'lucide-react';
-import { api, CatalogModel, ChatProvider, EmbedProvider, ModelKind, Organization } from '../api';
+import { api, BackgroundTier, CatalogModel, ChatProvider, EmbedProvider, ModelKind, Organization } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, formatRelative, IconButton, Modal, Panel, Toggle, useFeedback, useResource } from '../ui';
 
 const kindLabel: Record<ModelKind, string> = { embedding: 'Embedding', chat: 'Chat' };
@@ -50,7 +50,7 @@ function CustomModelModal({ onClose, onStarted }: { onClose: () => void; onStart
   );
 }
 
-const providerNames: Record<string, string> = { openrouter: 'OpenRouter', typesafe: 'TypeSafe' };
+const providerNames: Record<string, string> = { openrouter: 'OpenRouter', typesafe: 'TypeSafe', openai: 'OpenAI', anthropic: 'Anthropic' };
 
 type ProviderForm = {
   embed_provider: EmbedProvider;
@@ -59,9 +59,15 @@ type ProviderForm = {
   openrouter_embed_model: string;
   openrouter_chat_model: string;
   jev_model: string;
+  openai_embed_model: string;
+  openai_chat_model: string;
+  anthropic_chat_model: string;
+  background_tier: BackgroundTier;
   /** Typed replacements; empty keeps the stored key. */
   openrouter_api_key: string;
   typesafe_api_key: string;
+  openai_api_key: string;
+  anthropic_api_key: string;
 };
 
 function providerForm(org: Organization): ProviderForm {
@@ -73,8 +79,14 @@ function providerForm(org: Organization): ProviderForm {
     openrouter_embed_model: text('openrouter_embed_model', 'openai/text-embedding-3-small'),
     openrouter_chat_model: text('openrouter_chat_model'),
     jev_model: text('jev_model', 'jev-latest'),
+    openai_embed_model: text('openai_embed_model', 'text-embedding-3-small'),
+    openai_chat_model: text('openai_chat_model', 'gpt-6-luna'),
+    anthropic_chat_model: text('anthropic_chat_model', 'claude-haiku-5-5'),
+    background_tier: (text('background_tier', 'standard') as BackgroundTier),
     openrouter_api_key: '',
     typesafe_api_key: '',
+    openai_api_key: '',
+    anthropic_api_key: '',
   };
 }
 
@@ -89,6 +101,8 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
   const status = org.daemon.running ? org.daemon.status : null;
   const usesOpenRouter = form.embed_provider === 'openrouter' || form.chat_provider === 'openrouter';
   const usesJev = form.chat_provider === 'jev';
+  const usesOpenAi = form.embed_provider === 'openai' || form.chat_provider === 'openai';
+  const usesAnthropic = form.chat_provider === 'anthropic';
   const changes = Object.fromEntries(Object.entries(form).filter(([key, value]) =>
     key.endsWith('_api_key') ? value !== '' : value !== stored[key as keyof ProviderForm]));
   const dirty = Object.keys(changes).length > 0;
@@ -104,7 +118,7 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
     }, 'Providers saved');
     setSaving(false);
     if (ok) {
-      setForm({ ...form, openrouter_api_key: '', typesafe_api_key: '' });
+      setForm({ ...form, openrouter_api_key: '', typesafe_api_key: '', openai_api_key: '', anthropic_api_key: '' });
       onSaved();
     }
   }
@@ -120,16 +134,19 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
       )}
       <div className="formStack padded">
         <div className="grid even">
-          <Field label="Embeddings" hint={form.embed_provider === 'openrouter' ? 'Every message learned or classified is sent. Changing the model relearns every mailbox.' : 'Pick the model in the table below.'}>
+          <Field label="Embeddings" hint={form.embed_provider !== 'local' ? 'Every message learned or classified is sent. Changing the model relearns every mailbox.' : 'Pick the model in the table below.'}>
             <select value={form.embed_provider} onChange={(event) => set({ embed_provider: event.target.value as EmbedProvider })}>
               <option value="local">On this server</option>
-              <option value="openrouter">OpenRouter</option>
+              <option value="openrouter">OpenRouter or another OpenAI-compatible API</option>
+              <option value="openai">OpenAI</option>
             </select>
           </Field>
           <Field label="Fallback and labels" hint={<>{form.chat_provider === 'jev' ? 'Jev answers with calibrated probabilities instead of generated text.' : form.chat_provider === 'local' ? 'Pick the chat model in the table below.' : 'Messages the vote is unsure about are sent.'} It also applies users' labels{form.chat_provider === 'local' ? '.' : ', so every new message of users with labels on is sent.'}</>}>
             <select value={form.chat_provider} onChange={(event) => set({ chat_provider: event.target.value as ChatProvider })}>
               <option value="local">On this server</option>
-              <option value="openrouter">OpenRouter</option>
+              <option value="openrouter">OpenRouter or another OpenAI-compatible API</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic (Claude)</option>
               <option value="jev">TypeSafe Jev</option>
             </select>
           </Field>
@@ -140,10 +157,35 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
           </Field>
           <div className="grid even">
             {form.embed_provider === 'openrouter' && <Field label="Embedding model"><input value={form.openrouter_embed_model} onChange={(event) => set({ openrouter_embed_model: event.target.value })} placeholder="openai/text-embedding-3-small" /></Field>}
-            {form.chat_provider === 'openrouter' && <Field label="Chat model" hint="Empty turns the fallback off."><input value={form.openrouter_chat_model} onChange={(event) => set({ openrouter_chat_model: event.target.value })} placeholder="openai/gpt-4.1-mini" /></Field>}
+            {form.chat_provider === 'openrouter' && <Field label="Chat model" hint="Empty turns the fallback off. Claude Haiku 5.5 is anthropic/claude-haiku-5-5."><input value={form.openrouter_chat_model} onChange={(event) => set({ openrouter_chat_model: event.target.value })} placeholder="openai/gpt-6-luna" /></Field>}
           </div>
           <Field label="API base" hint="Any OpenAI-compatible endpoint, such as a self-hosted vLLM or Ollama."><input value={form.openrouter_base_url} onChange={(event) => set({ openrouter_base_url: event.target.value })} /></Field>
         </>}
+        {usesOpenAi && <>
+          <Field label="OpenAI API key" hint={<>From platform.openai.com/api-keys.{keySet('openai_api_key') ? ' A key is stored; type to replace it.' : ''}</>}>
+            <input type="password" autoComplete="new-password" value={form.openai_api_key} placeholder={keySet('openai_api_key') ? '•••••••• (set)' : 'sk-…'} onChange={(event) => set({ openai_api_key: event.target.value })} />
+          </Field>
+          <div className="grid even">
+            {form.embed_provider === 'openai' && <Field label="Embedding model"><input value={form.openai_embed_model} onChange={(event) => set({ openai_embed_model: event.target.value })} placeholder="text-embedding-3-small" /></Field>}
+            {form.chat_provider === 'openai' && <Field label="Chat model" hint="Empty turns the fallback off."><input value={form.openai_chat_model} onChange={(event) => set({ openai_chat_model: event.target.value })} placeholder="gpt-6-luna" /></Field>}
+          </div>
+          {form.chat_provider === 'openai' && (
+            <Field label="Background work" hint={form.background_tier === 'flex' ? 'About half price but slower; when OpenAI has no capacity the call is retried, then sent at the standard tier. Calls users wait for in webmail always use the standard tier.' : 'Labels and fallback decisions made in the background are billed at the standard rate.'}>
+              <select value={form.background_tier} onChange={(event) => set({ background_tier: event.target.value as BackgroundTier })}>
+                <option value="standard">Standard tier</option>
+                <option value="flex">Flex tier (cheaper, slower)</option>
+              </select>
+            </Field>
+          )}
+        </>}
+        {usesAnthropic && (
+          <div className="grid even">
+            <Field label="Anthropic API key" hint={<>From platform.claude.com.{keySet('anthropic_api_key') ? ' A key is stored; type to replace it.' : ''}</>}>
+              <input type="password" autoComplete="new-password" value={form.anthropic_api_key} placeholder={keySet('anthropic_api_key') ? '•••••••• (set)' : 'sk-ant-…'} onChange={(event) => set({ anthropic_api_key: event.target.value })} />
+            </Field>
+            <Field label="Chat model" hint="Empty turns the fallback off."><input value={form.anthropic_chat_model} onChange={(event) => set({ anthropic_chat_model: event.target.value })} placeholder="claude-haiku-5-5" /></Field>
+          </div>
+        )}
         {usesJev && (
           <div className="grid even">
             <Field label="TypeSafe API key" hint={keySet('typesafe_api_key') ? 'A key is stored; type to replace it.' : undefined}>

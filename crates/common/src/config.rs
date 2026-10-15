@@ -877,6 +877,34 @@ pub struct ClassifierConfig {
     pub typesafe_api_key: Option<SecretString>,
     #[serde(default = "default_jev_model")]
     pub jev_model: String,
+    /// OpenAI's own API (api.openai.com), for embeddings and chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_api_key: Option<SecretString>,
+    #[serde(default = "default_openai_embed_model")]
+    pub openai_embed_model: String,
+    #[serde(default = "default_openai_chat_model")]
+    pub openai_chat_model: String,
+    /// Anthropic's Messages API, for chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_api_key: Option<SecretString>,
+    #[serde(default = "default_anthropic_chat_model")]
+    pub anthropic_chat_model: String,
+    /// How the background worker's chat calls are billed. Calls a user
+    /// waits for in webmail always use the standard tier.
+    #[serde(default)]
+    pub background_tier: BackgroundTier,
+}
+
+/// Processing tier for chat calls nobody is waiting for.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundTier {
+    #[default]
+    Standard,
+    /// OpenAI flex processing: about half price, slower, and sometimes
+    /// refused for lack of capacity (retried, then sent at the standard
+    /// tier). Other providers ignore it.
+    Flex,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -885,7 +913,11 @@ pub enum EmbedProvider {
     /// A GGUF model run in-process (`embed_model`).
     #[default]
     Local,
+    /// Any OpenAI-compatible endpoint (`openrouter_base_url`), OpenRouter by
+    /// default.
     OpenRouter,
+    #[serde(rename = "openai")]
+    OpenAi,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -895,6 +927,9 @@ pub enum ChatProvider {
     #[default]
     Local,
     OpenRouter,
+    #[serde(rename = "openai")]
+    OpenAi,
+    Anthropic,
     /// TypeSafe's Jev decision model: picks one folder from the list with a
     /// calibrated confidence instead of generating text.
     Jev,
@@ -904,12 +939,15 @@ pub enum ChatProvider {
 /// they consent in webmail.
 pub const CLOUD_OPENROUTER: &str = "openrouter";
 pub const CLOUD_TYPESAFE: &str = "typesafe";
+pub const CLOUD_OPENAI: &str = "openai";
+pub const CLOUD_ANTHROPIC: &str = "anthropic";
 
 impl EmbedProvider {
     pub fn cloud(self) -> Option<&'static str> {
         match self {
             EmbedProvider::Local => None,
             EmbedProvider::OpenRouter => Some(CLOUD_OPENROUTER),
+            EmbedProvider::OpenAi => Some(CLOUD_OPENAI),
         }
     }
 }
@@ -919,6 +957,8 @@ impl ChatProvider {
         match self {
             ChatProvider::Local => None,
             ChatProvider::OpenRouter => Some(CLOUD_OPENROUTER),
+            ChatProvider::OpenAi => Some(CLOUD_OPENAI),
+            ChatProvider::Anthropic => Some(CLOUD_ANTHROPIC),
             ChatProvider::Jev => Some(CLOUD_TYPESAFE),
         }
     }
@@ -930,22 +970,31 @@ impl ClassifierConfig {
         cloud_providers(
             self.embed_provider,
             self.chat_provider,
-            &self.openrouter_chat_model,
+            !self.chat_model_id().is_empty(),
         )
+    }
+
+    /// The chat model the chosen provider runs; empty turns the fallback off
+    /// (Jev always has one).
+    pub fn chat_model_id(&self) -> &str {
+        match self.chat_provider {
+            ChatProvider::Local => self.chat_model.trim(),
+            ChatProvider::OpenRouter => self.openrouter_chat_model.trim(),
+            ChatProvider::OpenAi => self.openai_chat_model.trim(),
+            ChatProvider::Anthropic => self.anthropic_chat_model.trim(),
+            ChatProvider::Jev => "jev",
+        }
     }
 }
 
-/// Third parties that receive message text under these settings. An
-/// OpenRouter fallback without a model id is off and sends nothing.
+/// Third parties that receive message text under these settings. A chat
+/// fallback without a model id is off and sends nothing.
 pub fn cloud_providers(
     embed: EmbedProvider,
     chat: ChatProvider,
-    openrouter_chat_model: &str,
+    chat_configured: bool,
 ) -> Vec<&'static str> {
-    let chat = match chat {
-        ChatProvider::OpenRouter if openrouter_chat_model.trim().is_empty() => None,
-        chat => chat.cloud(),
-    };
+    let chat = chat.cloud().filter(|_| chat_configured);
     let mut providers: Vec<&'static str> = [embed.cloud(), chat].into_iter().flatten().collect();
     providers.sort_unstable();
     providers.dedup();
@@ -975,6 +1024,12 @@ impl Default for ClassifierConfig {
             openrouter_chat_model: String::new(),
             typesafe_api_key: None,
             jev_model: default_jev_model(),
+            openai_api_key: None,
+            openai_embed_model: default_openai_embed_model(),
+            openai_chat_model: default_openai_chat_model(),
+            anthropic_api_key: None,
+            anthropic_chat_model: default_anthropic_chat_model(),
+            background_tier: BackgroundTier::Standard,
         }
     }
 }
@@ -990,6 +1045,15 @@ fn default_openrouter_embed_model() -> String {
 }
 fn default_jev_model() -> String {
     "jev-latest".to_string()
+}
+fn default_openai_embed_model() -> String {
+    "text-embedding-3-small".to_string()
+}
+fn default_openai_chat_model() -> String {
+    "gpt-6-luna".to_string()
+}
+fn default_anthropic_chat_model() -> String {
+    "claude-haiku-5-5".to_string()
 }
 fn default_classifier_poll_interval_seconds() -> u64 {
     15

@@ -232,8 +232,9 @@ export type CatalogModel = { id: string; name: string; kind: ModelKind; file: st
 export type InstalledModel = { file: string; size: number; meta: { kind: ModelKind; url: string; sha256: string; size: number; downloaded_at: number } | null };
 export type ModelDownload = { file: string; received: number; total: number; status: { state: 'running' } | { state: 'done'; sha256: string } | { state: 'failed'; error: string } };
 export type LoadedModel = { file: string; load_ms: number; cloud: string | null };
-export type EmbedProvider = 'local' | 'openrouter';
-export type ChatProvider = 'local' | 'openrouter' | 'jev';
+export type EmbedProvider = 'local' | 'openrouter' | 'openai';
+export type ChatProvider = 'local' | 'openrouter' | 'openai' | 'anthropic' | 'jev';
+export type BackgroundTier = 'standard' | 'flex';
 export type ClassifierStatus = {
   enabled: boolean;
   local_models: boolean;
