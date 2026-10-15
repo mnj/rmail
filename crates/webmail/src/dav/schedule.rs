@@ -21,6 +21,9 @@
 //!   invite and answer in the owner's name for that calendar's events, as
 //!   a delegate. Recipients still apply a message only when it comes from
 //!   their copy's organizer.
+//! - An account is also the calendar user of its aliases that deliver only
+//!   to it (`db::calendar_addresses`): an event naming the alias is
+//!   scheduled under the alias, and email for it is sent from the alias.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -64,8 +67,33 @@ impl Route {
 pub(crate) struct Outgoing {
     /// The calendar user it is from: the owner of the calendar changed.
     sender: User,
+    /// The address it is from: the sender's own or one of its aliases.
+    from: String,
     message: Message,
     routes: Vec<(String, Route)>,
+}
+
+/// The calendar addresses of `user`, its own first.
+pub(super) fn addresses(dav: &Dav, user: &User) -> Vec<String> {
+    db::calendar_addresses(&dav.app.db_path, &user.address)
+        .unwrap_or_else(|_| vec![user.address.clone()])
+}
+
+/// The address of `addresses` an event involves the user under, now or
+/// before the change.
+fn acting_address<'a>(
+    addresses: &'a [String],
+    calendar: &text::Component,
+    previous: Option<&text::Component>,
+) -> &'a str {
+    let involved = |calendar: &text::Component| {
+        itip::own_address(calendar, addresses)
+            .filter(|address| itip::role(calendar, address) != Role::None)
+    };
+    involved(calendar)
+        .or_else(|| previous.and_then(involved))
+        .or(addresses.first().map(String::as_str))
+        .unwrap_or_default()
 }
 
 fn same_domain(user: &User, domain: &str) -> bool {
@@ -110,7 +138,13 @@ fn route(dav: &Dav, sender: &User, address: &str) -> Route {
     }
 }
 
-fn plan(dav: &Dav, sender: &User, messages: Vec<Message>) -> Vec<Outgoing> {
+fn plan(
+    dav: &Dav,
+    sender: &User,
+    from: &str,
+    own: &[String],
+    messages: Vec<Message>,
+) -> Vec<Outgoing> {
     let mut budget = MAX_RECIPIENTS;
     messages
         .into_iter()
@@ -118,7 +152,7 @@ fn plan(dav: &Dav, sender: &User, messages: Vec<Message>) -> Vec<Outgoing> {
             let routes = message
                 .recipients
                 .iter()
-                .filter(|recipient| !recipient.eq_ignore_ascii_case(&sender.address))
+                .filter(|recipient| !own.iter().any(|own| own.eq_ignore_ascii_case(recipient)))
                 .map(|recipient| {
                     let route = if budget == 0 {
                         Route::Refused("5.1")
@@ -131,6 +165,7 @@ fn plan(dav: &Dav, sender: &User, messages: Vec<Message>) -> Vec<Outgoing> {
                 .collect();
             Outgoing {
                 sender: sender.clone(),
+                from: from.to_string(),
                 message,
                 routes,
             }
@@ -155,8 +190,9 @@ pub(crate) fn prepare_put(
     let Ok(mut calendar) = text::parse(data) else {
         return (unchanged(ScheduleTag::None), Vec::new());
     };
-    let user = owner.address.as_str();
     let previous = current.and_then(|object| text::parse(&object.data).ok());
+    let own = addresses(dav, owner);
+    let user = acting_address(&own, &calendar, previous.as_ref());
     let role_now = itip::role(&calendar, user);
     let role_before = previous
         .as_ref()
@@ -178,7 +214,7 @@ pub(crate) fn prepare_put(
             "ORGANIZER",
         )
     };
-    let outgoing = plan(dav, owner, messages);
+    let outgoing = plan(dav, owner, user, &own, messages);
     let statuses = outgoing
         .iter()
         .flat_map(|outgoing| &outgoing.routes)
@@ -210,7 +246,8 @@ pub(crate) fn prepare_delete(dav: &Dav, owner: &User, previous: &Object) -> Vec<
     let Ok(previous) = text::parse(&previous.data) else {
         return Vec::new();
     };
-    let user = owner.address.as_str();
+    let own = addresses(dav, owner);
+    let user = acting_address(&own, &previous, None);
     let messages = match itip::role(&previous, user) {
         Role::Organizer => itip::organizer_messages(Some(&previous), None, user),
         Role::Attendee => itip::attendee_reply(Some(&previous), None, user)
@@ -218,7 +255,7 @@ pub(crate) fn prepare_delete(dav: &Dav, owner: &User, previous: &Object) -> Vec<
             .collect(),
         Role::None => Vec::new(),
     };
-    plan(dav, owner, messages)
+    plan(dav, owner, user, &own, messages)
 }
 
 /// Send what a stored change implies. Failures are logged: the change is
@@ -226,6 +263,7 @@ pub(crate) fn prepare_delete(dav: &Dav, owner: &User, previous: &Object) -> Vec<
 pub(crate) fn deliver(dav: &Dav, outgoing: Vec<Outgoing>) {
     for Outgoing {
         sender,
+        from,
         message,
         routes,
     } in outgoing
@@ -234,7 +272,7 @@ pub(crate) fn deliver(dav: &Dav, outgoing: Vec<Outgoing>) {
         for (recipient, route) in routes {
             match route {
                 Route::Local(account) => {
-                    if let Err(error) = deliver_local(dav, &sender, &account, &message) {
+                    if let Err(error) = deliver_local(dav, &from, &account, &message) {
                         webmail_log!("warn", "scheduling_delivery_failed", {
                             "recipient": account.address,
                             "error": format!("{error:#}")
@@ -246,7 +284,7 @@ pub(crate) fn deliver(dav: &Dav, outgoing: Vec<Outgoing>) {
             }
         }
         if !by_email.is_empty()
-            && let Err(error) = send_email(dav, &sender, &message, &by_email)
+            && let Err(error) = send_email(dav, &sender, &from, &message, &by_email)
         {
             webmail_log!("warn", "scheduling_mail_failed", {
                 "sender": sender.address,
@@ -269,7 +307,7 @@ fn uid_of(calendar: &text::Component) -> Option<String> {
 /// event (RFC 6638 4.1).
 pub(super) fn deliver_local(
     dav: &Dav,
-    sender: &User,
+    sender: &str,
     account: &User,
     message: &Message,
 ) -> anyhow::Result<()> {
@@ -279,7 +317,7 @@ pub(super) fn deliver_local(
     let Some(uid) = uid_of(&message.calendar) else {
         return Ok(());
     };
-    let sender = sender.address.as_str();
+    let recipient = addresses(dav, account);
     // The lookup only picks where the copy is; the message is applied to
     // the version the write transaction holds, so concurrent replies or
     // the recipient's own edits are not lost.
@@ -293,8 +331,7 @@ pub(super) fn deliver_local(
     };
     let stored = store::put_with(&conn, &collection, &name, &mut |current| {
         let copy = current.and_then(|object| text::parse(&object.data).ok());
-        apply(message, copy.as_ref(), sender, &account.address)
-            .ok_or(store::PutError::PreconditionFailed)
+        apply(message, copy.as_ref(), sender, &recipient).ok_or(store::PutError::PreconditionFailed)
     })?;
     match stored {
         // Nothing for this account to change.
@@ -310,7 +347,7 @@ fn apply(
     message: &Message,
     copy: Option<&text::Component>,
     sender: &str,
-    recipient: &str,
+    recipient: &[String],
 ) -> Option<Prepared> {
     let organized_by_sender = |copy: &text::Component| {
         itip::organizer(copy).is_some_and(|organizer| organizer.eq_ignore_ascii_case(sender))
@@ -328,10 +365,16 @@ fn apply(
             itip::apply_cancel(copy, &message.calendar),
             ScheduleTag::New,
         ),
-        (Method::Reply, Some(copy)) if itip::role(copy, recipient) == Role::Organizer => (
-            itip::apply_reply(copy, &message.calendar, sender)?,
-            ScheduleTag::Keep,
-        ),
+        (Method::Reply, Some(copy))
+            if recipient
+                .iter()
+                .any(|address| itip::role(copy, address) == Role::Organizer) =>
+        {
+            (
+                itip::apply_reply(copy, &message.calendar, sender)?,
+                ScheduleTag::Keep,
+            )
+        }
         _ => return None,
     };
     Some(Prepared {
@@ -349,7 +392,8 @@ fn random_name() -> String {
 /// An iMIP email (RFC 6047) with the message as a `text/calendar` part.
 fn send_email(
     dav: &Dav,
-    sender: &User,
+    account: &User,
+    sender: &str,
     message: &Message,
     recipients: &[String],
 ) -> anyhow::Result<()> {
@@ -357,7 +401,6 @@ fn send_email(
         anyhow::bail!("sending is off");
     };
     let (summary, details) = itip::summary_text(&message.calendar);
-    let sender = sender.address.as_str();
     let (subject, intro) = match message.method {
         Method::Request => (
             format!("Invitation: {summary}"),
@@ -408,7 +451,7 @@ fn send_email(
     tokio::runtime::Handle::current().block_on(crate::submit::submit_as(
         submission,
         &dav.app.mail_root,
-        sender,
+        &account.address,
         sender,
         recipients,
         &built.bytes,
@@ -468,9 +511,10 @@ pub(crate) fn post(
         ));
     };
     let organizer = query.property("ORGANIZER");
+    let own = addresses(dav, &dav.user);
     if organizer
         .and_then(|organizer| itip::address(&organizer.value))
-        .is_none_or(|address| !address.eq_ignore_ascii_case(&dav.user.address))
+        .is_none_or(|address| !own.iter().any(|own| own.eq_ignore_ascii_case(&address)))
     {
         return Ok(xml_response(
             StatusCode::FORBIDDEN,
@@ -526,6 +570,7 @@ fn busy(dav: &Dav, account: &User, start: i64, end: i64) -> anyhow::Result<Vec<(
         )?)
     };
     let conn = conn.as_deref().unwrap_or(&dav.conn);
+    let own = addresses(dav, account);
     let mut periods = Vec::new();
     for collection in store::collections(conn, store::Kind::Calendar)? {
         for object in store::objects(conn, &collection)? {
@@ -548,7 +593,9 @@ fn busy(dav: &Dav, account: &User, start: i64, end: i64) -> anyhow::Result<Vec<(
                 let declined = event
                     .properties_named("ATTENDEE")
                     .filter(|attendee| {
-                        itip::address(&attendee.value).as_deref() == Some(&account.address)
+                        itip::address(&attendee.value).is_some_and(|address| {
+                            own.iter().any(|own| own.eq_ignore_ascii_case(&address))
+                        })
                     })
                     .any(|attendee| {
                         attendee

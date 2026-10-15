@@ -51,8 +51,15 @@ impl Session {
             data.clone(),
             verified.clone(),
         );
+        let db_path = self.db_path.clone();
         let received = tokio::task::spawn_blocking(move || {
-            imip::receive(&mail_root, &domain, &local, &account, &data, &verified)
+            // Invitations to an alias that delivers only here are the
+            // account's too.
+            let addresses = match &db_path {
+                Some(db_path) => rmail_common::db::calendar_addresses(db_path, &account)?,
+                None => vec![account],
+            };
+            imip::receive(&mail_root, &domain, &local, &addresses, &data, &verified)
         })
         .await;
         match received {

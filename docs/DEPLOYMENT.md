@@ -775,6 +775,10 @@ respected.
   for the client to apply. Quarantined mail and mail a Sieve script discards or only forwards are
   not looked at. The logs show each one as `imip_received` (with `applied` and the reason when
   not), `imip_skipped` or `imip_failed`; none of them affects delivery.
+- An alias that delivers to exactly one account counts as that account's calendar address:
+  invitations to it reach the account (by email and from accounts here), clients see it in the
+  account's `calendar-user-address-set`, and answers and events organized under it are sent from
+  the alias. Aliases with several targets are groups and are not calendar addresses.
 - Users can share a calendar or address book with other accounts on the server, read-only or
   with changes allowed. In webmail, **Calendar sharing** in the sidebar lists the user's
   calendars and address books with a share button on each, since Thunderbird and DAVx⁵ cannot

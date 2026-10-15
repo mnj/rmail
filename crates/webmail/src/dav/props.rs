@@ -177,7 +177,14 @@ pub(crate) fn value(dav: &Dav, resource: &Resource<'_>, name: &Name) -> Option<S
                 Some(xml::href(&home_href(&dav.user, Kind::AddressBook)))
             }
             (CALDAV, "calendar-user-address-set") => {
-                Some(hrefs(&[format!("mailto:{}", dav.user.address), principal]))
+                // Clients recognize the user in invitations to an alias by
+                // these, and answer as that address.
+                let mut set = super::schedule::addresses(dav, &dav.user)
+                    .into_iter()
+                    .map(|address| format!("mailto:{address}"))
+                    .collect::<Vec<_>>();
+                set.push(principal);
+                Some(hrefs(&set))
             }
             (CALDAV, "calendar-user-type") => Some("INDIVIDUAL".to_string()),
             (CALDAV, "schedule-inbox-URL") => Some(xml::href(&format!(
