@@ -33,6 +33,7 @@ const SENT_SEARCH: usize = 500;
 pub(crate) fn routes() -> Router<Shared> {
     Router::new()
         .route("/api/send", post(send))
+        .route("/api/compose/entity", post(entity))
         .route("/api/drafts", post(save_draft))
         .route("/api/scheduled", get(scheduled))
         .route("/api/scheduled/{id}/cancel", post(cancel_scheduled))
@@ -114,6 +115,10 @@ struct ComposeRequest {
     /// Send at this time (Unix seconds) instead of now.
     #[serde(default)]
     send_at: Option<i64>,
+    /// The body, signed or encrypted in the browser from what
+    /// `/api/compose/entity` made of this request; sent as it is.
+    #[serde(default)]
+    entity: Option<String>,
 }
 
 /// The account's folder with special-use `attribute`, else one named
@@ -245,6 +250,13 @@ fn outgoing(
     };
     if let Some(html) = input.html.filter(|html| !html.trim().is_empty()) {
         message.set_html(&html);
+    }
+    if let Some(entity) = input.entity {
+        anyhow::ensure!(
+            compose::valid_entity(&entity),
+            "the signed or encrypted body is not one that can be sent as it is"
+        );
+        message.entity = Some(entity);
     }
     Ok((message, mail_from, input.source, input.draft_uid))
 }
@@ -450,6 +462,39 @@ async fn send(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     .into_response()
 }
 
+/// The body the browser signs or encrypts for this request, with who it
+/// goes to and who it is from (whose keys are needed).
+async fn entity(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    let Ok(mut input) = serde_json::from_slice::<ComposeRequest>(&body) else {
+        return rejected(StatusCode::BAD_REQUEST, "invalid json");
+    };
+    input.entity = None;
+    let result = blocking(move || {
+        let (message, mail_from, _, _) = outgoing(&state, &session, input)?;
+        let recipients = message.envelope_recipients()?;
+        let entity = compose::body_entity(&message);
+        anyhow::ensure!(
+            entity.len() <= MAX_MESSAGE_BYTES,
+            "the message is larger than 10 MB"
+        );
+        Ok(serde_json::json!({
+            "entity": entity,
+            "from": mail_from,
+            "recipients": recipients,
+        }))
+    })
+    .await;
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => rejected(StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")),
+    }
+}
+
 async fn save_draft(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let state = app.0;
     let session = match Session::signed_in(&state, &headers).await {
@@ -460,7 +505,9 @@ async fn save_draft(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Resp
         return rejected(StatusCode::BAD_REQUEST, "invalid json");
     };
     let result = blocking(move || {
-        let (message, _, _, previous) = outgoing(&state, &session, input)?;
+        // Drafts are kept as written; signing and encrypting is for sending.
+        let (mut message, _, _, previous) = outgoing(&state, &session, input)?;
+        message.entity = None;
         let built = compose::build(&message, true, None)?;
         if built.bytes.len() > MAX_MESSAGE_BYTES {
             anyhow::bail!("the draft is larger than 10 MB");

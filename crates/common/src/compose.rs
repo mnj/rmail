@@ -31,6 +31,33 @@ pub struct Outgoing {
     /// A calendar invitation, reply or cancellation (iMIP, RFC 6047), sent
     /// as a `text/calendar` alternative to the text.
     pub calendar: Option<CalendarPart>,
+    /// A body made elsewhere (its headers and content, see
+    /// [`valid_entity`]), sent instead of one built from the fields above:
+    /// webmail's browser signs or encrypts [`body_entity`] and sends the
+    /// result.
+    pub entity: Option<String>,
+}
+
+/// The longest body entity accepted from a client.
+pub const MAX_ENTITY_BYTES: usize = 40 * 1024 * 1024;
+
+/// Whether `entity` can be sent as a message body as it is: MIME headers
+/// starting with `Content-Type`, then a body, in 7-bit lines of at most
+/// 998 characters ending in CRLF, so nothing on the way re-encodes it (and
+/// breaks a signature).
+pub fn valid_entity(entity: &str) -> bool {
+    entity.len() <= MAX_ENTITY_BYTES
+        && entity
+            .get(..13)
+            .is_some_and(|start| start.eq_ignore_ascii_case("content-type:"))
+        && entity.contains("\r\n\r\n")
+        && entity.ends_with("\r\n")
+        && entity.split("\r\n").all(|line| {
+            line.len() <= 998
+                && line
+                    .bytes()
+                    .all(|b| b == b'\t' || (0x20..0x7f).contains(&b))
+        })
 }
 
 pub struct CalendarPart {
@@ -150,7 +177,21 @@ pub fn build(message: &Outgoing, include_bcc: bool, message_id: Option<&str>) ->
     }
     header(&mut out, "MIME-Version", "1.0");
     header(&mut out, "User-Agent", "rMail Webmail");
+    match &message.entity {
+        Some(entity) if valid_entity(entity) => out.push_str(entity),
+        Some(_) => bail!("the message body is not one that can be sent as it is"),
+        None => out.push_str(&body_entity(message)),
+    }
+    Ok(Built {
+        bytes: out.into_bytes(),
+        message_id,
+    })
+}
 
+/// The body of `message`: its MIME headers (`Content-Type` and so on) and
+/// content, without the message headers.
+pub fn body_entity(message: &Outgoing) -> String {
+    let mut out = String::new();
     let text_part = format!(
         "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n{}",
         quoted_printable(&message.text)
@@ -229,10 +270,7 @@ pub fn build(message: &Outgoing, include_bcc: bool, message_id: Option<&str>) ->
         }
         out.push_str(&format!("--{boundary}--\r\n"));
     }
-    Ok(Built {
-        bytes: out.into_bytes(),
-        message_id,
-    })
+    out
 }
 
 /// A `multipart/<subtype>` entity (headers and body) of `parts`, each
@@ -599,5 +637,32 @@ mod tests {
             !raw.contains("\r\nBcc: injected"),
             "header injection is neutralised"
         );
+    }
+
+    #[test]
+    fn a_prepared_body_is_sent_unchanged_when_it_is_safe() {
+        let mut message = Outgoing {
+            from: "a@x.test".to_string(),
+            to: vec!["b@x.test".to_string()],
+            subject: "S".to_string(),
+            text: "hi".to_string(),
+            ..Default::default()
+        };
+        let inner = body_entity(&message);
+        assert!(inner.starts_with("Content-Type: text/plain"));
+        assert!(valid_entity(&inner));
+        message.entity = Some(inner.clone());
+        let built = String::from_utf8(build(&message, false, None).unwrap().bytes).unwrap();
+        assert!(built.ends_with(&inner) && built.contains("Subject: S\r\n"));
+        for bad in [
+            "Content-Type: text/plain\r\n\r\nlone\nLF\r\n",
+            "X-Other: 1\r\n\r\nbody\r\n",
+            "Content-Type: text/plain\r\n\r\n8bit \u{e9}\r\n",
+            "Content-Type: text/plain\r\nno body",
+        ] {
+            assert!(!valid_entity(bad), "{bad:?}");
+            message.entity = Some(bad.to_string());
+            assert!(build(&message, false, None).is_err());
+        }
     }
 }

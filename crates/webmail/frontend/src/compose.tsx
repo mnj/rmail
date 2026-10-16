@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { CalendarClock, ChevronDown, Paperclip, Send, Sparkles, Trash2, Type, X } from 'lucide-react';
+import { CalendarClock, ChevronDown, Lock, Paperclip, Send, Sparkles, Trash2, Type, X } from 'lucide-react';
+import { Crypto } from './crypto/hook';
+import { Security, Technology, protect, technologies } from './crypto/compose';
 import { REWRITE_STYLES, RewriteStyle, assist, attachTextareaGhost, ghostTextPlugin, insertIntoTextarea } from './assist';
 import { EditorHandle, EditorPlugin, RichEditor, escapeHtml, textToHtml } from './editor';
 import {
@@ -201,10 +203,16 @@ function laterChoices(): [string, Date][] {
   return [[`Tomorrow, ${fmt(tomorrow)}`, tomorrow], [`Monday, ${fmt(monday)}`, monday]];
 }
 
-export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onSent }: {
+export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onSent, crypto }: {
   api: Api; from: string; seed: ComposeSeed; prefs: ComposePrefs; identities: Identity[];
   onClose: (note?: string) => void; onSent: (result?: SendResult) => void;
+  /** The user's keys, for signing and encrypting. */
+  crypto?: Crypto;
 }) {
+  const kinds = crypto ? technologies(crypto) : [];
+  const [security, setSecurity] = useState<Security>('none');
+  const [technology, setTechnology] = useState<Technology | null>(null);
+  const tech: Technology | undefined = technology && kinds.includes(technology) ? technology : kinds[0];
   const defaultIdentity = identities.find((i) => i.email.toLowerCase() === from.toLowerCase()) || identities[0];
   const [identityId, setIdentityId] = useState(defaultIdentity?.id || '');
   const identity = identities.find((i) => i.id === identityId);
@@ -356,12 +364,13 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
     setLaterOpen(false);
     try {
       const timing = sendAt ? { send_at: Math.floor(sendAt.getTime() / 1000) } : prefs.undo_seconds > 0 ? { delay: prefs.undo_seconds } : {};
-      const result = await api<SendResult>('/api/send', { method: 'POST', body: JSON.stringify({ ...payload(), ...timing }) });
+      const entity = security !== 'none' && crypto && tech ? await protect(crypto, payload(), security, tech) : undefined;
+      const result = await api<SendResult>('/api/send', { method: 'POST', body: JSON.stringify({ ...payload(), ...timing, ...(entity ? { entity } : {}) }) });
       dirty.current = false;
       onSent(result);
       onClose(result.scheduled ? undefined : 'Message sent');
     } catch (err) {
-      setError((err as Error).message);
+      if ((err as Error).message !== 'cancelled') setError((err as Error).message);
     } finally {
       setBusy(null);
     }
@@ -569,6 +578,23 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
           </span>
         )}
         <button className={`icon ${format === 'html' ? 'active' : ''}`} aria-pressed={format === 'html'} aria-label={format === 'html' ? 'Switch to plain text' : 'Switch to formatted text'} title={format === 'html' ? 'Formatted text (click for plain text)' : 'Plain text (click for formatted text)'} onClick={() => switchFormat(format === 'html' ? 'text' : 'html')}><Type size={16} /></button>
+        {kinds.length > 0 && (
+          <span className={`compose-security ${security !== 'none' ? 'on' : ''}`}>
+            <Lock size={14} aria-hidden="true" />
+            <select aria-label="Sign or encrypt" value={security} onChange={(e) => setSecurity(e.target.value as Security)}>
+              <option value="none">Not signed</option>
+              <option value="sign">Sign</option>
+              <option value="encrypt">Encrypt</option>
+              <option value="sign-encrypt">Sign and encrypt</option>
+            </select>
+            {kinds.length > 1 && security !== 'none' && (
+              <select aria-label="With" value={tech} onChange={(e) => setTechnology(e.target.value as Technology)}>
+                <option value="pgp">OpenPGP</option>
+                <option value="smime">S/MIME</option>
+              </select>
+            )}
+          </span>
+        )}
         <span className="spacer" />
         <span className="save-state muted small">{busy === 'draft' ? 'Saving…' : savedAt ? `Saved ${savedAt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}` : ''}</span>
         <button className="secondary" disabled={busy !== null} onClick={() => saveDraft(false)} title={`Save draft (${mod}S)`}>Save draft</button>

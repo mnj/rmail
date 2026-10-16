@@ -3,8 +3,11 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck,
+  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck, Lock,
 } from 'lucide-react';
+import { useCrypto } from './crypto/hook';
+const EncryptionDialog = React.lazy(() => import('./crypto/settings').then((m) => ({ default: m.EncryptionDialog })));
+import { ENCRYPTED, ProtectedMessage } from './crypto/reader';
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
@@ -465,6 +468,8 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [contacts, setContacts] = useState<ContactSeed | null | false>(false);
   const [calendarMode, setCalendarMode] = useState(false);
   const [securityOpen, setSecurityOpen] = useState(false);
+  const [encryptionOpen, setEncryptionOpen] = useState(false);
+  const [crypto, cryptoPrompt] = useCrypto(api, address);
   const [vacation, setVacation] = useState<Vacation | null>(null);
   const [vacationOpen, setVacationOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -794,6 +799,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>
           <button className="sidebar-link" onClick={() => setFiltersOpen(true)}><FilterIcon size={15} />Filters</button>
           <button className="sidebar-link" onClick={() => setSecurityOpen(true)}><ShieldCheck size={15} />Security</button>
+          <button className="sidebar-link" onClick={() => setEncryptionOpen(true)}><Lock size={15} />Encryption</button>
           <ThemeSwitch />
           <button className="sidebar-link" onClick={onLogout}><LogOut size={15} />Sign out</button>
         </div>
@@ -918,11 +924,14 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
               </div>
               {!shared && <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} />}
               {selected.invitation && <InvitationCard api={api} folder={folder} uid={selected.uid} invitation={selected.invitation} />}
+              {selected.protection && <ProtectedMessage crypto={crypto} folder={folder} uid={selected.uid} protection={selected.protection} from={selected.from} textBody={selected.text_body} />}
+              {selected.protection && ENCRYPTED.has(selected.protection) ? null : <>
               {selected.html_body && selected.has_remote_content && <div className="remote-banner"><ImageIcon size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}
               {selected.html_body
                 ? <iframe className="html-message" title="Message" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc={selected.html_body} />
                 : <pre className="text-message">{selected.text_body}</pre>}
               <Attachments folder={folder} uid={selected.uid} attachments={selected.attachments} />
+              </>}
             </div>
           </>
         ) : (
@@ -940,6 +949,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           identities={identities}
           onClose={(note) => { setCompose(null); if (note) flash(note); }}
           onSent={sent}
+          crypto={crypto}
         />
       )}
       {notice && <div className="toast" role="status">{notice.text}{notice.action && <button className="toast-action" onClick={notice.action.run}>{notice.action.label}</button>}</div>}
@@ -949,6 +959,8 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
       {calendars && <CalendarsDialog api={api} onClose={() => setCalendars(false)} />}
       {securityOpen && <SecurityDialog api={api} address={address} onClose={() => setSecurityOpen(false)} />}
+      {encryptionOpen && <React.Suspense fallback={null}><EncryptionDialog crypto={crypto} onClose={() => setEncryptionOpen(false)} /></React.Suspense>}
+      {cryptoPrompt}
       {contacts !== false && <ContactsDialog api={api} seed={contacts} onClose={() => setContacts(false)} onWrite={(to, name) => { setContacts(false); if (canSend) startCompose({ to: name ? `${name} <${to}>` : to }); }} />}
       {vacationOpen && vacation && <VacationDialog api={api} initial={vacation} onClose={() => setVacationOpen(false)} onSaved={setVacation} />}
       {filtersOpen && <FiltersDialog api={api} folders={folders} labels={organize?.labels ?? []} onClose={() => setFiltersOpen(false)} />}

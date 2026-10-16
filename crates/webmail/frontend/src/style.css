@@ -619,3 +619,35 @@ time { white-space: nowrap; }
 .calendar-filter label { display: inline-flex; align-items: center; gap: 6px; }
 .icon.tiny { width: 22px; height: 22px; padding: 0; }
 .feed-error { color: var(--danger-text); display: inline-flex; }
+
+/* Encryption (OpenPGP and S/MIME) */
+.crypto-choice { display: grid; gap: 8px; }
+.crypto-choice label { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+.crypto-choice label.selected { border-color: var(--accent); background: var(--surface-2); }
+.crypto-choice span { display: grid; gap: 2px; }
+.crypto-keys { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.crypto-keys li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.crypto-key-text { flex: 1; min-width: 0; display: grid; }
+.crypto-key-text strong, .crypto-key-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crypto-kind { font-size: 11px; font-weight: 650; padding: 2px 6px; border-radius: 6px; background: var(--hover); color: var(--text-2); white-space: nowrap; }
+.crypto-panel { display: grid; gap: 8px; margin: 0 0 12px; }
+.crypto-badge { display: flex; align-items: flex-start; gap: 8px; padding: 8px 12px; border-radius: 10px; font-size: 13px; border: 1px solid var(--border); background: var(--surface-2); }
+.crypto-badge svg { flex: none; margin-top: 1px; }
+.crypto-badge.valid { color: var(--accent-text); }
+.crypto-badge.invalid { color: var(--danger-text); border-color: var(--danger); }
+.crypto-badge.unknown_key { color: var(--warn-text); background: var(--warn-bg); }
+.crypto-badge span { color: var(--text); }
+.crypto-locked { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 10px; background: var(--surface-2); }
+.crypto-locked > div { flex: 1; min-width: 0; }
+.crypto-locked p { margin: 2px 0 0; }
+.crypto-attachments { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; }
+.crypto-attachments a { display: inline-flex; align-items: center; gap: 6px; }
+.compose-security { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.compose-security.on { color: var(--accent-text); }
+.compose-security select { border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 6px; background: var(--surface); color: var(--text); }
+@media (max-width: 520px) { .crypto-locked { flex-wrap: wrap; } }
+.crypto-dialog h2, form[aria-label="Unlock key"] h2 { display: flex; align-items: center; gap: 8px; }
+@media (max-width: 860px) {
+  .compose footer:has(.compose-security) { flex-wrap: wrap; row-gap: 6px; }
+  .compose-security { order: 10; flex-basis: 100%; }
+}

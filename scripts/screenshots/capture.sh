@@ -5,7 +5,7 @@
 # loopback ports in a temporary directory, fills it with sample data (seed.py)
 # and captures the admin console and webmail with Playwright (capture.mjs).
 #
-# Requires: cargo, bun, python3, openssl. Chromium is downloaded by Playwright
+# Requires: cargo, bun, python3, openssl, gpg (the OpenPGP check). Chromium is downloaded by Playwright
 # unless CHROMIUM_PATH points at an existing binary.
 set -euo pipefail
 
@@ -88,5 +88,12 @@ for _ in $(seq 1 50); do
 done
 
 python3 "${here}/seed.py"
-(cd "${here}" && node capture.mjs "${out}")
+# An S/MIME certificate for Alice to import, and somewhere for the capture
+# to leave signed and encrypted mail for crypto_check.py.
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=Alice Chen/emailAddress=alice@example.com" \
+  -addext "subjectAltName=email:alice@example.com" -keyout alice-smime.key -out alice-smime.pem 2>/dev/null
+openssl pkcs12 -export -inkey alice-smime.key -in alice-smime.pem -out alice.p12 -passout pass:Demo-pass-123
+mkdir -p crypto
+(cd "${here}" && DEMO_DIR="${demo}" node capture.mjs "${out}")
+python3 "${here}/crypto_check.py" "${demo}"
 echo "Screenshots written to ${out}"

@@ -25,6 +25,8 @@ export type MessageDetail = {
   subject: string; date: string; text_body: string; html_body: string | null;
   has_remote_content: boolean; attachments: Attachment[]; labels: Label[];
   invitation?: Invitation;
+  /** How the message is signed or encrypted; the browser checks and decrypts it. */
+  protection?: string;
 };
 export type InvitationPerson = { address: string; name: string };
 export type InvitationAttendee = InvitationPerson & { status: string };
