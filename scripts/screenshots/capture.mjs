@@ -226,6 +226,25 @@ async function signIn(page) {
   await page.waitForSelector('.month');
   await page.waitForTimeout(400);
   await shot(page, 'webmail-calendar-month');
+  // Security: an app password for a phone, then the start of 2FA setup.
+  await page.click('.sidebar-link:has-text("Security")');
+  await page.waitForSelector('.security-dialog >> text=New app password');
+  await page.click('.security-dialog button:has-text("New app password")');
+  await page.fill('.security-dialog input[placeholder="e.g. iPhone mail"]', 'iPhone mail');
+  await page.fill('.security-dialog input[type=password]', password);
+  await page.click('.security-dialog button:has-text("Create")');
+  await page.waitForSelector('.app-password code');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-app-password');
+  await page.click('.security-dialog button:has-text("Done")');
+  await page.click('.security-dialog button:has-text("Turn on")');
+  await page.fill('.security-dialog input[type=password]', password);
+  await page.click('.security-dialog button:has-text("Continue")');
+  await page.waitForSelector('.totp-qr svg');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-two-factor');
+  await page.click('.security-dialog button:has-text("Cancel")');
+  await page.click('.security-dialog button[aria-label=Close]');
   await ctx.close();
 }
 

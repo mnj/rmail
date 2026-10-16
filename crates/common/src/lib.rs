@@ -55,6 +55,7 @@ pub mod tls;
 pub mod tlsrpt;
 pub mod tracking;
 pub mod transport;
+pub mod two_factor;
 pub mod urlauth;
 pub mod websession;
 

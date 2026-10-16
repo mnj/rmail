@@ -28,6 +28,7 @@ tower-http = { version = "0.6", features = ["limit", "timeout"] }
 pbkdf2 = "0.11"
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
 base64 = "0.21"
 flate2 = "1"
 roxmltree = "0.20"
