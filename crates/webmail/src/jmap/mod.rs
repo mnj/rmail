@@ -1,4 +1,4 @@
-//! JMAP (RFC 8620 core, RFC 8621 mail and submission) over the accounts'
+//! JMAP (RFC 8620 core, RFC 8621 mail and submission, RFC 9610 contacts) over the accounts'
 //! Maildir storage, served by webmail next to its own API.
 //!
 //! - Clients authenticate every request with HTTP Basic (address and
@@ -36,6 +36,7 @@ use serde_json::{Map, Value, json};
 use crate::api::AppState;
 
 mod blob;
+mod contacts;
 mod email;
 pub(crate) mod identity;
 mod mailbox;
@@ -53,6 +54,7 @@ pub(crate) const CORE: &str = "urn:ietf:params:jmap:core";
 pub(crate) const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub(crate) const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 pub(crate) const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
+pub(crate) use contacts::CONTACTS;
 
 const MAX_CALLS_IN_REQUEST: usize = 64;
 pub(crate) const MAX_OBJECTS_IN_GET: usize = 1000;
@@ -376,7 +378,7 @@ impl Account {
     }
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -474,6 +476,7 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
         capabilities.insert(MAIL.to_string(), mail_account_capabilities(account));
         if account.is_personal() {
             capabilities.insert(VACATION.to_string(), json!({}));
+            capabilities.insert(CONTACTS.to_string(), contacts::account_capability());
         }
         if account.is_personal() && can_send {
             capabilities.insert(
@@ -522,6 +525,8 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
     capabilities.insert(MAIL.to_string(), json!({}));
     capabilities.insert(VACATION.to_string(), json!({}));
     primary.insert(VACATION.to_string(), json!(own));
+    capabilities.insert(CONTACTS.to_string(), json!({}));
+    primary.insert(CONTACTS.to_string(), json!(own));
     if can_send {
         capabilities.insert(SUBMISSION.to_string(), json!({}));
         primary.insert(SUBMISSION.to_string(), json!(own));
@@ -760,6 +765,7 @@ fn method_capability(name: &str) -> &'static str {
         "Core" => CORE,
         "Identity" | "EmailSubmission" => SUBMISSION,
         "VacationResponse" => VACATION,
+        "AddressBook" | "ContactCard" => CONTACTS,
         _ => MAIL,
     }
 }
@@ -796,6 +802,14 @@ fn call_method(ctx: &mut Ctx, name: &str, args: Map<String, Value>) -> MethodRes
         "EmailSubmission/set" => submission::set(ctx, args),
         "VacationResponse/get" => vacation::get(ctx, args),
         "VacationResponse/set" => vacation::set(ctx, args),
+        "AddressBook/get" => contacts::book_get(ctx, args),
+        "AddressBook/changes" => contacts::book_changes(ctx, args),
+        "AddressBook/set" => contacts::book_set(ctx, args),
+        "ContactCard/get" => contacts::card_get(ctx, args),
+        "ContactCard/changes" => contacts::card_changes(ctx, args),
+        "ContactCard/query" => contacts::card_query(ctx, args),
+        "ContactCard/queryChanges" => query::cannot_calculate(ctx, args),
+        "ContactCard/set" => contacts::card_set(ctx, args),
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
@@ -897,7 +911,7 @@ pub(crate) fn process(ctx: &mut Ctx, request: &Value) -> Result<Value, (&'static
         let capability = capability
             .as_str()
             .ok_or((NOT_REQUEST, "using holds a non-string".to_string()))?;
-        let known = [CORE, MAIL, VACATION].contains(&capability)
+        let known = [CORE, MAIL, VACATION, CONTACTS].contains(&capability)
             || (capability == SUBMISSION && ctx.app.submission.is_some());
         if !known {
             return Err((

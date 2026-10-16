@@ -61,8 +61,9 @@ screenshots of every page, and a quick start.
   send later. Opt-in AI writing suggestions (grey ghost-text continuations, accepted with Tab, and
   rewrites of a selection) come from any OpenAI-compatible endpoint the admin configures, through
   the server so the key stays there.
-- **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
-  search, sending, vacation response and push.
+- **JMAP** (RFC 8620, RFC 8621, RFC 9610) for mail clients, served by webmail: mailboxes, email,
+  threads, search, sending, vacation response, push, and contacts (the same address books
+  CardDAV syncs).
 - **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so
   Thunderbird, Apple devices and DAVx⁵ keep calendars and address books in sync, and server-side
   scheduling (RFC 6638): invitations, replies and free-busy between accounts, by email for
@@ -306,6 +307,7 @@ records include `_jmap._tcp` for discovery.
 | --- | --- | ---: | --- |
 | RFC 8620 | JMAP core | 90% | Session resource, `Core/echo`, result references (with `*`), creation ids across calls, request and method errors, blob upload and download, and push over an event source (with `ping` and `closeafter`). State strings come from a per-account change log, so `/changes` sees every change, whatever made it (IMAP, delivery, webmail, Sieve). `/queryChanges` always answers `cannotCalculateChanges` and clients query again. Push subscriptions (`PushSubscription`, web push) and `Blob/copy` are not implemented. Destroyed objects are remembered for 60 days; older states must resynchronize. |
 | RFC 8621 | JMAP mail and submission | 90% | `Mailbox`, `Email`, `Thread`, `SearchSnippet`, `Identity` and `EmailSubmission` with their `get`, `changes`, `query` and `set` methods, plus `Email/import`, `Email/copy` and `Email/parse`. Emails with one EMAILID in several folders are one Email, keywords are the IMAP flags, threads follow Message-ID, In-Reply-To and References. Mail goes through the submission service; with `HOLDUNTIL`/`HOLDFOR` in the envelope (up to `maxDelayedSend`, 30 days) it is held and stays `pending`, cancellable by setting `undoStatus` to `canceled`, until it is released. Delivery status is what that service reports, not later DSNs. `VacationResponse` (RFC 8621 section 8) is answered at delivery next to the account's own Sieve script, with Sieve vacation's rules (one reply per sender per week, none to lists or automated mail). Mailbox `sortOrder` follows the role and is not stored. Shared mailboxes (RFC 4314 grants) appear as one more account per owner, limited to the user's rights. |
+| RFC 9610 | JMAP for Contacts | 70% | `AddressBook` (`get`, `changes`, `set`) and `ContactCard` (`get`, `changes`, `query`, `set`) over the user's CardDAV address books, as JSContact cards (RFC 9553): name, emails, phones, organization, title, birthday, note and addresses. Edits keep every other vCard line; JSContact properties outside those are refused with `invalidProperties`. A card lives in one address book and cannot be moved; the directory is read-only; `/changes` is exact per book. No `ContactCard/copy`, `queryChanges` or sharing (`shareWith`), and push does not report these types. |
 
 ## CalDAV and CardDAV standards support
 

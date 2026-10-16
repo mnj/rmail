@@ -78,6 +78,16 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     if !has_schedule_tag {
         conn.execute_batch("ALTER TABLE dav_objects ADD COLUMN schedule_tag TEXT")?;
     }
+    // Databases from before JMAP contacts lack the sequence an object was
+    // created at; theirs count as created before any state a client holds.
+    let has_created_seq = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dav_objects') WHERE name = 'created_seq'")?
+        .exists([])?;
+    if !has_created_seq {
+        conn.execute_batch(
+            "ALTER TABLE dav_objects ADD COLUMN created_seq INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     // Databases from before server-filled collections lack the marker;
     // the subscriptions they hold were made by the server.
     let has_managed = conn
@@ -730,9 +740,12 @@ pub fn put_with(
     let tag = etag(&prepared.data);
     tx.execute(
         "INSERT INTO dav_objects(collection_id, name, uid, etag, data, component, start_at, end_at,
-             modseq, modified, deleted, schedule_tag)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now'), 0, ?10)
-         ON CONFLICT(collection_id, name) DO UPDATE SET uid = excluded.uid, etag = excluded.etag,
+             modseq, modified, deleted, schedule_tag, created_seq)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now'), 0, ?10, ?9)
+         ON CONFLICT(collection_id, name) DO UPDATE SET
+             created_seq = CASE WHEN dav_objects.deleted = 1 THEN excluded.created_seq
+                 ELSE dav_objects.created_seq END,
+             uid = excluded.uid, etag = excluded.etag,
              data = excluded.data, component = excluded.component, start_at = excluded.start_at,
              end_at = excluded.end_at, modseq = excluded.modseq, modified = excluded.modified,
              deleted = 0, schedule_tag = excluded.schedule_tag",
@@ -850,6 +863,43 @@ pub fn changes_since(
             })
             .collect(),
     ))
+}
+
+/// One object's change since a sequence, for JMAP `/changes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectChange {
+    pub name: String,
+    pub modseq: i64,
+    /// The sequence the object was (last) created at.
+    pub created_seq: i64,
+    pub deleted: bool,
+}
+
+/// The objects changed after `since`, oldest change first, or `None`
+/// when changes that long ago are no longer known.
+pub fn object_changes(
+    conn: &Connection,
+    collection: &Collection,
+    since: i64,
+) -> Result<Option<Vec<ObjectChange>>> {
+    if since < collection.min_seq || since > collection.sync_seq {
+        return Ok(None);
+    }
+    let mut statement = conn.prepare(
+        "SELECT name, modseq, created_seq, deleted FROM dav_objects
+         WHERE collection_id = ?1 AND modseq > ?2 ORDER BY modseq",
+    )?;
+    let rows = statement
+        .query_map(params![collection.id, since], |row| {
+            Ok(ObjectChange {
+                name: row.get(0)?,
+                modseq: row.get(1)?,
+                created_seq: row.get(2)?,
+                deleted: row.get::<_, i64>(3)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(rows))
 }
 
 #[cfg(test)]

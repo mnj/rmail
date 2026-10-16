@@ -25,7 +25,7 @@ use rmail_common::mime::{
 pub(crate) mod assist;
 mod calendars;
 mod compose;
-mod contacts;
+pub(crate) mod contacts;
 mod events;
 mod invitations;
 mod mail_rules;

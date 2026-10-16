@@ -92,7 +92,9 @@ pub fn freebusy_shared_domains(db: &Path) -> Result<Vec<String>> {
 
 /// Whether other domains may see `domain`'s free-busy times.
 pub fn freebusy_shared(db: &Path, domain: &str) -> Result<bool> {
-    let domain = domain.to_ascii_lowercase();
+    let Ok(domain) = crate::domain::canonicalize_domain(domain.trim()) else {
+        return Ok(false);
+    };
     let conn = open(db)?;
     Ok(conn
         .query_row(
