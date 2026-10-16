@@ -689,7 +689,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
-      if (target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (calendarMode || target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
       const move = (delta: number) => {
         const index = selectedIndex < 0 ? (delta > 0 ? 0 : messages.length - 1) : selectedIndex + delta;
         const message = messages[index];
@@ -774,7 +774,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         <div className="sidebar-foot">
           {canSend && <button className="sidebar-link" onClick={() => setComposeSettings(true)}><PenLine size={15} />Compose settings</button>}
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
-          <button className={`sidebar-link ${calendarMode ? 'active' : ''}`} aria-current={calendarMode ? 'page' : undefined} onClick={() => { setCalendarMode(true); setView('list'); }}><CalendarDays size={15} />Calendar</button>
+          <button className={`sidebar-link ${calendarMode ? 'active' : ''}`} aria-current={calendarMode ? 'page' : undefined} onClick={() => { setCalendarMode(true); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><CalendarDays size={15} />Calendar</button>
           <button className="sidebar-link" onClick={() => setContacts(null)}><BookUser size={15} />Contacts</button>
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>

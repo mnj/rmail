@@ -419,7 +419,12 @@ fn check(fields: &EventFields) -> Result<(), &'static str> {
     if fields.summary.contains(['\r', '\n']) || fields.location.contains(['\r', '\n']) {
         return Err("The title and place are one line each.");
     }
-    if fields.end < fields.start || fields.end - fields.start > MAX_RANGE {
+    if fields.end < fields.start
+        || fields
+            .end
+            .checked_sub(fields.start)
+            .is_none_or(|span| span > MAX_RANGE)
+    {
         return Err("The event must end after it starts, within a year.");
     }
     if fields.all_day
@@ -609,7 +614,12 @@ async fn list(app: State<Shared>, headers: HeaderMap, Query(range): Query<Range>
         Ok(session) => session,
         Err(status) => return status.into_response(),
     };
-    if range.to <= range.from || range.to - range.from > MAX_RANGE {
+    if range.to <= range.from
+        || range
+            .to
+            .checked_sub(range.from)
+            .is_none_or(|span| span > MAX_RANGE)
+    {
         return refused(StatusCode::BAD_REQUEST, "invalid range");
     }
     let result = blocking(move || {
@@ -698,6 +708,9 @@ fn save(
         )));
     }
     let dav = dav_for(state, session)?;
+    let owner_addresses =
+        rmail_common::db::calendar_addresses(&state.db_path, &place.owner.address)
+            .unwrap_or_else(|_| vec![place.owner.address.clone()]);
     let uid = uuid();
     let name = name.map_or_else(|| format!("{uid}.ics"), str::to_string);
     let etag = input.etag.clone();
@@ -710,11 +723,13 @@ fn save(
             _ => return Err(PutError::PreconditionFailed),
         }
         let existing = current.and_then(|object| text::parse(&object.data).ok());
-        // An invitation is answered, not edited.
-        if existing
-            .as_ref()
-            .is_some_and(|calendar| itip::role(calendar, &place.owner.address) == Role::Attendee)
-        {
+        // An invitation is answered, not edited, whichever of the owner's
+        // addresses it was sent to.
+        if existing.as_ref().is_some_and(|calendar| {
+            owner_addresses
+                .iter()
+                .any(|address| itip::role(calendar, address) == Role::Attendee)
+        }) {
             return Err(PutError::InvalidData("attendee".into()));
         }
         let data = calendar_text(existing.as_ref(), &fields, &uid, &place.owner.address);
@@ -1025,6 +1040,51 @@ mod tests {
         .await;
         assert_eq!(status, 403);
 
+        // Invited at an alias: still answered, not edited.
+        db::add_alias(
+            &state.db_path,
+            "sales@example.test",
+            &["other@example.test"],
+        )
+        .unwrap();
+        let mut aliased = serde_json::to_value(EventFields {
+            repeat: "none".into(),
+            ..fields()
+        })
+        .unwrap();
+        aliased["attendees"] = json!(["sales@example.test"]);
+        aliased["summary"] = json!("Pricing");
+        let (status, _) = call(ME, "POST", "/api/events/own:default".into(), aliased).await;
+        assert_eq!(status, 204);
+        let (_, theirs) = call(
+            "other@example.test",
+            "GET",
+            range(NINE - 3_600, NINE + 3_600),
+            Value::Null,
+        )
+        .await;
+        let pricing = theirs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["details"]["summary"] == "Pricing")
+            .unwrap()
+            .clone();
+        assert_eq!(pricing["editable"], false);
+        let mut change = pricing["details"].clone();
+        change["etag"] = pricing["etag"].clone();
+        let (status, _) = call(
+            "other@example.test",
+            "PUT",
+            format!(
+                "/api/events/own:default/{}",
+                pricing["name"].as_str().unwrap()
+            ),
+            change,
+        )
+        .await;
+        assert_eq!(status, 403, "invited at an alias");
+
         // The organizer moves it: the guest's copy follows.
         let mine = &events[0];
         let path = format!("/api/events/own:default/{}", mine["name"].as_str().unwrap());
@@ -1043,15 +1103,29 @@ mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(theirs["events"][0]["start"], NINE + 3_600);
+        let review = theirs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["details"]["summary"] == "Review; Q4, budget")
+            .unwrap();
+        assert_eq!(review["start"], NINE + 3_600);
 
         // Deleting it cancels it for the guest.
+        let review_of = |listing: &Value| {
+            listing["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["details"]["summary"] == "Review; Q4, budget")
+                .cloned()
+        };
         let (_, listing) = call(ME, "GET", range(NINE, NINE + 7_200), Value::Null).await;
-        let etag = listing["events"][0]["etag"].clone();
+        let etag = review_of(&listing).unwrap()["etag"].clone();
         let (status, _) = call(ME, "DELETE", path, json!({ "etag": etag })).await;
         assert_eq!(status, 204);
         let (_, listing) = call(ME, "GET", range(NINE, NINE + 7_200), Value::Null).await;
-        assert_eq!(listing["events"], json!([]));
+        assert!(review_of(&listing).is_none());
         let (_, theirs) = call(
             "other@example.test",
             "GET",
@@ -1059,9 +1133,17 @@ mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(theirs["events"][0]["cancelled"], true);
+        let review = theirs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["details"]["summary"] == "Review; Q4, budget")
+            .unwrap();
+        assert_eq!(review["cancelled"], true);
 
         let (status, _) = call(ME, "GET", range(0, 500 * 86_400), Value::Null).await;
         assert_eq!(status, 400, "range too long");
+        let (status, _) = call(ME, "GET", range(i64::MIN, i64::MAX), Value::Null).await;
+        assert_eq!(status, 400, "no overflow");
     }
 }

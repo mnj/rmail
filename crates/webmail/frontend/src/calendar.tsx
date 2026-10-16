@@ -182,8 +182,8 @@ function EventEditor({ api, draft, calendars, onClose, onSaved }: { api: Api; dr
 
 const statusWords: Record<string, string> = { accepted: 'Going', declined: 'Not going', tentative: 'Maybe', 'needs-action': 'No answer yet' };
 
-function EventPopup({ event, calendar, onClose, onEdit, onDelete }: {
-  event: CalEvent; calendar: Calendar | undefined; onClose: () => void; onEdit: () => void; onDelete: () => void;
+function EventPopup({ event, calendar, color, onClose, onEdit, onDelete }: {
+  event: CalEvent; calendar: Calendar | undefined; color: string; onClose: () => void; onEdit: () => void; onDelete: () => void;
 }) {
   const d = event.details;
   const { first, last } = eventDays(event);
@@ -205,7 +205,7 @@ function EventPopup({ event, calendar, onClose, onEdit, onDelete }: {
           <div><Clock size={14} />{when}{event.cancelled && <strong className="danger-text"> · Cancelled</strong>}</div>
           {d.repeat !== 'none' && <div><Repeat size={14} />{{ daily: 'Every day', weekly: 'Every week', monthly: 'Every month', yearly: 'Every year', custom: 'Repeats', none: '' }[d.repeat]}</div>}
           {d.location && <div><MapPin size={14} />{d.location}</div>}
-          {calendar && <div><span className="calendar-dot" style={{ background: colorOf([calendar], calendar.id) }} />{calendar.displayname}{calendar.owner ? `, shared by ${calendar.owner}` : ''}</div>}
+          {calendar && <div><span className="calendar-dot" style={{ background: color }} />{calendar.displayname}{calendar.owner ? `, shared by ${calendar.owner}` : ''}</div>}
           {guests.length > 0 && (
             <div className="event-guests"><Users size={14} />
               <ul>{guests.map((g) => <li key={g.address}><span>{g.name || g.address}</span><small className="muted">{statusWords[g.status] ?? g.status}</small></li>)}</ul>
@@ -446,7 +446,7 @@ export function CalendarView({ api, onShowFolders, flash }: { api: Api; onShowFo
           : mode === 'month' ? <MonthView month={anchor} events={events} calendars={calendars} onOpen={setOpen} onCreate={create} />
           : <AgendaView from={anchor} events={events} calendars={calendars} onOpen={setOpen} />}
       </div>
-      {open && <EventPopup event={open} calendar={calendars.find((c) => c.id === open.calendar)} onClose={() => setOpen(null)} onDelete={() => remove(open)}
+      {open && <EventPopup event={open} calendar={calendars.find((c) => c.id === open.calendar)} color={colorOf(calendars, open.calendar)} onClose={() => setOpen(null)} onDelete={() => remove(open)}
         onEdit={() => { setDraft({ calendar: open.calendar, name: open.name, etag: open.etag, details: open.details }); setOpen(null); }} />}
       {draft && <EventEditor api={api} draft={draft} calendars={calendars} onClose={() => setDraft(null)} onSaved={(message) => { setDraft(null); flash(message); load(); }} />}
     </section>
