@@ -28,6 +28,10 @@ pub enum Method {
     Request,
     Cancel,
     Reply,
+    /// An attendee proposes other times (RFC 5546 3.2.7).
+    Counter,
+    /// The organizer turns a proposal down (RFC 5546 3.2.8).
+    DeclineCounter,
 }
 
 impl Method {
@@ -36,6 +40,8 @@ impl Method {
             Method::Request => "REQUEST",
             Method::Cancel => "CANCEL",
             Method::Reply => "REPLY",
+            Method::Counter => "COUNTER",
+            Method::DeclineCounter => "DECLINECOUNTER",
         }
     }
 
@@ -44,6 +50,8 @@ impl Method {
             "REQUEST" => Some(Method::Request),
             "CANCEL" => Some(Method::Cancel),
             "REPLY" => Some(Method::Reply),
+            "COUNTER" => Some(Method::Counter),
+            "DECLINECOUNTER" => Some(Method::DeclineCounter),
             _ => None,
         }
     }
@@ -815,6 +823,143 @@ pub fn apply_reply(existing: &Component, message: &Component, attendee: &str) ->
     changed.then_some(copy)
 }
 
+/// The master event (no RECURRENCE-ID), or the first one.
+fn master_of(calendar: &Component) -> Option<&Component> {
+    scheduled(calendar)
+        .find(|c| c.property("RECURRENCE-ID").is_none())
+        .or_else(|| scheduled(calendar).next())
+}
+
+/// A proposal from attendee `user` to hold the event at `start`..`end`
+/// instead (RFC 5546 3.2.7): the master event with the new times, the
+/// organizer and the user's own attendee line, and an optional comment.
+/// `None` when the user is not an attendee.
+pub fn counter(
+    calendar: &Component,
+    user: &str,
+    start: Property,
+    end: Property,
+    comment: Option<&str>,
+) -> Option<Message> {
+    if role(calendar, user) != Role::Attendee {
+        return None;
+    }
+    let organizer = organizer(calendar)?;
+    let mut proposal = outgoing(calendar, Method::Counter);
+    let master_index = proposal
+        .components
+        .iter()
+        .position(|c| c.name != "VTIMEZONE" && c.property("RECURRENCE-ID").is_none())?;
+    let mut index = 0;
+    proposal.components.retain(|component| {
+        let kept = component.name == "VTIMEZONE" || index == master_index;
+        index += 1;
+        kept
+    });
+    let event = proposal
+        .components
+        .iter_mut()
+        .find(|c| c.name != "VTIMEZONE")?;
+    event.properties.retain(|property| {
+        !matches!(
+            property.name.as_str(),
+            "DTSTART" | "DTEND" | "DURATION" | "COMMENT"
+        ) && (property.name != "ATTENDEE" || is_user(property, user))
+    });
+    event.properties.push(start);
+    event.properties.push(end);
+    if let Some(comment) = comment.map(str::trim).filter(|c| !c.is_empty()) {
+        event.properties.push(Property::new(
+            "COMMENT",
+            &comment
+                .replace('\\', "\\\\")
+                .replace(';', "\\;")
+                .replace(',', "\\,")
+                .replace(['\r', '\n'], " "),
+        ));
+    }
+    Some(Message {
+        method: Method::Counter,
+        recipients: vec![organizer],
+        calendar: proposal,
+    })
+}
+
+/// The organizer's "no" to a proposal (RFC 5546 3.2.8), to `attendee`,
+/// who proposed it (a proposal may list every guest).
+pub fn decline_counter(proposal: &Component, attendee: &str) -> Option<Message> {
+    let event = master_of(proposal)?;
+    let attendee = attendee.trim().to_ascii_lowercase();
+    let line = event
+        .properties_named("ATTENDEE")
+        .find(|a| address(&a.value).as_deref() == Some(attendee.as_str()))?
+        .clone();
+    let mut decline = Component::new("VCALENDAR");
+    decline.set_property("VERSION", "2.0");
+    decline.set_property("PRODID", "-//rMail//EN");
+    decline
+        .properties
+        .insert(0, Property::new("METHOD", Method::DeclineCounter.as_str()));
+    let mut component = Component::new("VEVENT");
+    for name in ["UID", "SEQUENCE", "ORGANIZER", "RECURRENCE-ID"] {
+        for property in event.properties_named(name) {
+            component.properties.push(property.clone());
+        }
+    }
+    component.properties.push(line);
+    component.set_property(
+        "DTSTAMP",
+        &super::recur::utc_text(chrono::Utc::now().timestamp()),
+    );
+    decline.components.push(component);
+    Some(Message {
+        method: Method::DeclineCounter,
+        recipients: vec![attendee],
+        calendar: decline,
+    })
+}
+
+/// The organizer's copy with a proposal's times taken: the master event
+/// moves to them (a change every attendee then hears of).
+pub fn apply_counter(existing: &Component, proposal: &Component) -> Option<Component> {
+    let proposed = master_of(proposal)?;
+    let start = proposed.property("DTSTART")?.clone();
+    // RFC 5546 lets the end be a duration.
+    let end = proposed
+        .property("DTEND")
+        .or_else(|| proposed.property("DURATION"))
+        .cloned();
+    let mut copy = existing.clone();
+    let event = copy
+        .components
+        .iter_mut()
+        .find(|c| c.name != "VTIMEZONE" && c.property("RECURRENCE-ID").is_none())?;
+    event
+        .properties
+        .retain(|p| !matches!(p.name.as_str(), "DTSTART" | "DTEND" | "DURATION"));
+    event.properties.push(start);
+    if let Some(end) = end {
+        event.properties.push(end);
+    }
+    let sequence = event
+        .property("SEQUENCE")
+        .and_then(|s| s.value.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    event.set_property("SEQUENCE", &(sequence + 1).to_string());
+    // The time zones a proposal's times use come along.
+    for zone in proposal.components.iter().filter(|c| c.name == "VTIMEZONE") {
+        let tzid = zone.property("TZID").map(|t| t.value.clone());
+        if !copy
+            .components
+            .iter()
+            .any(|c| c.name == "VTIMEZONE" && c.property("TZID").map(|t| t.value.clone()) == tzid)
+        {
+            copy.components.insert(0, zone.clone());
+        }
+    }
+    Some(copy)
+}
+
 /// A short text for an invitation email: what, when, who.
 pub fn summary_text(calendar: &Component) -> (String, String) {
     let first = scheduled(calendar).next();
@@ -905,6 +1050,82 @@ mod tests {
              END:VEVENT\r\nEND:VCALENDAR\r\n"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn proposals_of_other_times() {
+        let calendar = event(
+            &[
+                ("bob@example.test", "ACCEPTED"),
+                ("carol@example.test", "NEEDS-ACTION"),
+            ],
+            "Plan",
+            "",
+        );
+        let start = Property::new("DTSTART", "20261013T100000Z");
+        let end = Property::new("DTEND", "20261013T110000Z");
+        assert!(
+            counter(&calendar, ORGANIZER, start.clone(), end.clone(), None).is_none(),
+            "not an attendee"
+        );
+        let proposal = counter(
+            &calendar,
+            "bob@example.test",
+            start,
+            end,
+            Some("Tuesday, please"),
+        )
+        .unwrap();
+        assert_eq!(proposal.method, Method::Counter);
+        assert_eq!(proposal.recipients, [ORGANIZER]);
+        let text = proposal.calendar.to_text();
+        assert!(text.contains("METHOD:COUNTER") && text.contains("DTSTART:20261013T100000Z"));
+        assert!(
+            text.contains("bob@example.test") && !text.contains("carol@example.test"),
+            "{text}"
+        );
+        assert!(text.contains("COMMENT:Tuesday\\, please"));
+
+        let decline = decline_counter(&proposal.calendar, "bob@example.test").unwrap();
+        assert_eq!(decline.method, Method::DeclineCounter);
+        assert_eq!(decline.recipients, ["bob@example.test"]);
+        assert!(decline.calendar.to_text().contains("METHOD:DECLINECOUNTER"));
+        // A proposal listing every guest is declined to its proposer only.
+        let decline = decline_counter(&calendar, "carol@example.test").unwrap();
+        assert_eq!(decline.recipients, ["carol@example.test"]);
+        let text = decline.calendar.to_text();
+        assert!(!text.contains("bob@example.test"), "{text}");
+        assert!(decline_counter(&calendar, "dave@example.test").is_none());
+
+        let moved = apply_counter(&calendar, &proposal.calendar).unwrap();
+        let master = master_of(&moved).unwrap();
+        assert_eq!(
+            master.property("DTSTART").unwrap().value,
+            "20261013T100000Z"
+        );
+        assert_eq!(master.property("SEQUENCE").unwrap().value, "1");
+        assert!(
+            moved.to_text().contains("carol@example.test"),
+            "everyone stays invited"
+        );
+
+        // A proposal may give its end as a duration.
+        let by_duration = text::parse(
+            &proposal
+                .calendar
+                .to_text()
+                .replace("DTEND:20261013T110000Z", "DURATION:PT2H"),
+        )
+        .unwrap();
+        let moved = apply_counter(&calendar, &by_duration).unwrap();
+        assert_eq!(
+            master_of(&moved)
+                .unwrap()
+                .property("DURATION")
+                .unwrap()
+                .value,
+            "PT2H"
+        );
     }
 
     #[test]

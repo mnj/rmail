@@ -164,6 +164,19 @@ async function signIn(page) {
   // Answering stores the event and sends the reply through scheduling.
   await page.click('.invite-actions button:has-text("Accept")');
   await page.waitForSelector('.invite-card >> text=You answered: Accepted');
+  await page.click('.invite-actions button:has-text("Propose a new time")');
+  await page.waitForSelector('.invite-propose');
+  await page.fill('.invite-propose textarea', 'Could we start an hour later?');
+  await shot(page, 'webmail-invitation-propose');
+  await page.click('.invite-propose button:has-text("Cancel")');
+  // A guest's proposal for a meeting Alice organizes.
+  await page.click('.message-list >> text=New time proposed: Fabrikam onboarding sync');
+  await page.waitForSelector('.invite-card >> text=Accept new time');
+  await page.waitForTimeout(400);
+  await shot(page, 'webmail-invitation-counter');
+  // Taking it moves the event and updates the guests.
+  await page.click('.invite-actions button:has-text("Accept new time")');
+  await page.waitForSelector('.invite-card >> text=Your calendar has this time now');
   // A folder Bob shares with Alice, and sharing one of hers.
   await page.click('text=Team Projects');
   await page.waitForSelector('text=Migration runbook v3');

@@ -177,6 +177,36 @@ for uid, name, email in [
     )
     urllib.request.urlopen(request, context=TLS).read()
 
+# A meeting Alice organizes, and Sofia proposing another time for it.
+def counter_day(days, hour):
+    day = time.gmtime(time.time() + days * 86400)
+    return time.strftime(f"%Y%m%dT{hour:02d}0000Z", day)
+
+
+sync_event = [
+    "BEGIN:VEVENT", "UID:fabrikam-sync@example.com", f"DTSTAMP:{counter_day(0, 8)}", "SEQUENCE:0",
+    f"DTSTART:{counter_day(2, 10)}", f"DTEND:{counter_day(2, 11)}", "SUMMARY:Fabrikam onboarding sync",
+    "ORGANIZER;CN=Alice Chen:mailto:alice@example.com",
+    "ATTENDEE;CN=Alice Chen;PARTSTAT=ACCEPTED:mailto:alice@example.com",
+    "ATTENDEE;CN=Sofia Lind;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:sofia@fabrikam.test",
+    "END:VEVENT",
+]
+calendar = "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//rMail demo//EN", *sync_event, "END:VCALENDAR", ""])
+urllib.request.urlopen(urllib.request.Request(
+    "https://127.0.0.1:18081/dav/calendars/alice%40example.com/default/fabrikam-sync.ics",
+    method="PUT", data=calendar.encode(),
+    headers={"Authorization": auth, "Content-Type": "text/calendar; charset=utf-8"},
+), context=TLS).read()
+proposed = [line.replace(counter_day(2, 10), counter_day(3, 13)).replace(counter_day(2, 11), counter_day(3, 14))
+            .replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED") for line in sync_event]
+proposed.insert(-1, "COMMENT:Could we push it a day? Afternoons work better for our team.")
+counter = message('"Sofia Lind" <sofia@fabrikam.test>', "alice@example.com",
+                  "New time proposed: Fabrikam onboarding sync",
+                  "Sofia Lind proposes a new time for \"Fabrikam onboarding sync\".", ago=60 * 5)
+counter.add_alternative("\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Fabrikam//EN", "METHOD:COUNTER",
+                                     *proposed, "END:VCALENDAR", ""]), subtype="calendar", params={"method": "COUNTER"})
+deliver(counter)
+
 # Alice opts in to writing suggestions (the demo points them at fake_ai.py).
 webmail = urllib.request.build_opener(
     urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),

@@ -51,7 +51,8 @@ pub(crate) struct Attendee {
 /// What the reading pane shows for a message with a calendar part.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Invitation {
-    /// `request`, `cancel` or `reply`.
+    /// `request`, `cancel`, `reply`, `counter` (other times proposed) or
+    /// `declinecounter` (a proposal turned down).
     pub method: &'static str,
     pub summary: String,
     pub location: String,
@@ -68,8 +69,14 @@ pub(crate) struct Invitation {
     pub you: Option<String>,
     /// The user's answer: from their calendar copy when there is one.
     pub your_status: Option<String>,
-    /// For a reply: who answered and how.
+    /// For a reply: who answered and how; for a proposal (COUNTER), who
+    /// proposes it.
     pub replier: Option<Attendee>,
+    /// For a proposal: the event's times now, in the user's calendar.
+    pub current_start: Option<i64>,
+    pub current_end: Option<i64>,
+    /// For a proposal: the note that came with it.
+    pub comment: String,
     /// - `new`: an invitation not in the user's calendar yet;
     /// - `in_calendar`: in the user's calendar;
     /// - `outdated`: the calendar holds a newer version;
@@ -78,10 +85,13 @@ pub(crate) struct Invitation {
     ///   (a forwarded invitation, say), or a reply about an event they do
     ///   not organize here;
     /// - `applied` / `not_applied`: a reply the organizer's copy shows or
-    ///   does not show yet.
+    ///   does not show yet;
+    /// - `proposal`: other times proposed to the organizer;
+    /// - `proposal_declined`: the organizer turned the user's proposal down.
     pub state: &'static str,
     /// What the user can do: `accepted`, `tentative`, `declined` (answer),
-    /// `cancel` (mark the copy cancelled), `apply` (apply a reply).
+    /// `counter` (propose other times), `cancel` (mark the copy cancelled),
+    /// `apply` (apply a reply), `accept_counter` / `decline_counter`.
     pub actions: Vec<&'static str>,
 }
 
@@ -177,6 +187,71 @@ fn replier(calendar: &Component) -> Option<&Property> {
     found
 }
 
+/// Who proposes other times (COUNTER). Clients send the whole guest list,
+/// so: the guest who sent the message, else the only one who is not the
+/// organizer.
+fn proposer<'a>(calendar: &'a Component, message: &[u8]) -> Option<&'a Property> {
+    if let Some(found) = replier(calendar) {
+        return Some(found);
+    }
+    let attendees: Vec<&Property> = calendar
+        .components
+        .iter()
+        .filter(|component| component.name != "VTIMEZONE")
+        .flat_map(|component| component.properties_named("ATTENDEE"))
+        .collect();
+    let sender = rmail_common::mime_section::header_value(message, "From").map(|from| {
+        let from = from.trim();
+        from.rsplit_once('<')
+            .map_or(from, |(_, rest)| rest.trim_end_matches('>').trim())
+            .to_ascii_lowercase()
+    });
+    if let Some(sender) = sender
+        && let Some(found) = attendees
+            .iter()
+            .find(|attendee| itip::address(&attendee.value).as_deref() == Some(sender.as_str()))
+    {
+        return Some(found);
+    }
+    let organizer = main_component(calendar)
+        .and_then(|event| event.property("ORGANIZER"))
+        .and_then(|organizer| itip::address(&organizer.value));
+    let mut guests = attendees
+        .into_iter()
+        .filter(|attendee| itip::address(&attendee.value) != organizer);
+    match (guests.next(), guests.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+/// An event's start and end, the end from `DTEND` or `DURATION`.
+fn exact_times(event: &Component) -> (Option<i64>, Option<i64>) {
+    let start = event.property("DTSTART").and_then(recur::instant);
+    let end = event
+        .property("DTEND")
+        .and_then(recur::instant)
+        .or_else(|| {
+            let duration = event
+                .property("DURATION")
+                .and_then(|duration| text::parse_duration(&duration.value))?;
+            Some(start? + duration.max(0))
+        });
+    (start, end)
+}
+
+/// Whether a proposal is about the organizer's own `copy`: the same
+/// organizer, one of the user's addresses, and a proposer the copy invites.
+fn proposal_fits(copy: &Component, proposal: &Component, proposer: &str, own: &[String]) -> bool {
+    let organizer = itip::organizer(copy);
+    organizer.is_some()
+        && organizer == itip::organizer(proposal)
+        && own
+            .iter()
+            .any(|address| itip::role(copy, address) == Role::Organizer)
+        && itip::role(copy, proposer) == Role::Attendee
+}
+
 /// The calendar a message carries, if it is an iTIP message.
 fn message_calendar(message: &[u8]) -> Option<(Method, Component)> {
     match mime::calendar_part(message, imip::MAX_CALENDAR_BYTES) {
@@ -202,17 +277,9 @@ pub(crate) fn invitation(
             .is_some_and(|v| v.eq_ignore_ascii_case("DATE"))
     });
     // Exact times for the card; `time_bounds` widens floating times.
-    let start = event.property("DTSTART").and_then(recur::instant).or(start);
-    let end = event
-        .property("DTEND")
-        .and_then(recur::instant)
-        .or_else(|| {
-            let duration = event
-                .property("DURATION")
-                .and_then(|duration| text::parse_duration(&duration.value))?;
-            Some(start? + duration.max(0))
-        })
-        .or(end);
+    let (exact_start, exact_end) = exact_times(event);
+    let start = exact_start.or(start);
+    let end = exact_end.or(end);
     let attendees = event
         .properties_named("ATTENDEE")
         .filter_map(|attendee| {
@@ -233,6 +300,7 @@ pub(crate) fn invitation(
     let mut actions = Vec::new();
     let mut your_status = None;
     let mut replier_card = None;
+    let mut current = (None, None);
     let state = match method {
         Method::Request => {
             your_status = copy
@@ -247,11 +315,11 @@ pub(crate) fn invitation(
                 Some(copy) if sequence(copy) > sequence(&calendar) => "outdated",
                 Some(copy) if cancelled(copy) => "cancelled",
                 Some(_) => {
-                    actions.extend(["accepted", "tentative", "declined"]);
+                    actions.extend(["accepted", "tentative", "declined", "counter"]);
                     "in_calendar"
                 }
                 None => {
-                    actions.extend(["accepted", "tentative", "declined"]);
+                    actions.extend(["accepted", "tentative", "declined", "counter"]);
                     "new"
                 }
             }
@@ -301,6 +369,34 @@ pub(crate) fn invitation(
                 _ => "not_invited",
             }
         }
+        Method::Counter => {
+            replier_card = proposer(&calendar, message).and_then(|attendee| {
+                let person = person(attendee)?;
+                Some(Attendee {
+                    address: person.address,
+                    name: person.name,
+                    status: status_of(attendee),
+                })
+            });
+            let organizes = copy.as_ref().is_some_and(|copy| {
+                own.iter()
+                    .any(|address| itip::role(copy, address) == Role::Organizer)
+            });
+            if let Some(event) = copy.as_ref().and_then(main_component) {
+                current = exact_times(event);
+            }
+            let taken = current.0 == start && (end.is_none() || current.1 == end);
+            match &copy {
+                Some(_) if organizes && taken => "applied",
+                Some(copy) if organizes && sequence(copy) > sequence(&calendar) => "outdated",
+                Some(_) if organizes => {
+                    actions.extend(["accept_counter", "decline_counter"]);
+                    "proposal"
+                }
+                _ => "not_invited",
+            }
+        }
+        Method::DeclineCounter => "proposal_declined",
     };
     if !can_act {
         actions.clear();
@@ -322,7 +418,12 @@ pub(crate) fn invitation(
             Method::Request => "request",
             Method::Cancel => "cancel",
             Method::Reply => "reply",
+            Method::Counter => "counter",
+            Method::DeclineCounter => "declinecounter",
         },
+        current_start: current.0,
+        current_end: current.1,
+        comment: text_value(event, "COMMENT"),
         summary: text_value(event, "SUMMARY"),
         location: text_value(event, "LOCATION"),
         description: description.chars().take(MAX_DESCRIPTION_CHARS).collect(),
@@ -383,11 +484,23 @@ fn set_answer(calendar: &mut Component, me: &str, partstat: &str) {
 }
 
 /// Take `action` on the invitation in `message` for `user`.
+/// Other times an attendee proposes (`counter`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct Proposal {
+    /// Unix seconds; for an all-day event, midnight UTC of the first day
+    /// and of the day after the last.
+    pub start: i64,
+    pub end: i64,
+    #[serde(default)]
+    pub comment: String,
+}
+
 pub(crate) fn act(
     app: Arc<AppState>,
     user: User,
     message: &[u8],
     action: &str,
+    proposal: Option<Proposal>,
 ) -> anyhow::Result<Result<(), Refused>> {
     let Some((method, calendar)) = message_calendar(message) else {
         return Ok(Err(Refused::NotAnInvitation));
@@ -501,6 +614,107 @@ pub(crate) fn act(
                 Err(error) => anyhow::bail!("storing the event: {error:?}"),
             }
         }
+        (Method::Request, "counter") => {
+            let Some(proposal) = proposal.filter(|p| {
+                p.end > p.start
+                    && p.end - p.start <= 366 * 86_400
+                    && p.comment.chars().count() <= 500
+            }) else {
+                return Ok(Err(Refused::NotAllowed));
+            };
+            // The user's copy (it may have changed since), else the message.
+            let base = found
+                .as_ref()
+                .and_then(|(_, object)| text::parse(&object.data).ok())
+                .unwrap_or_else(|| calendar.clone());
+            let Some(me) = itip::own_address(&base, &own)
+                .filter(|me| itip::role(&base, me) == Role::Attendee)
+                .map(str::to_string)
+            else {
+                return Ok(Err(Refused::NotAllowed));
+            };
+            let all_day = main_component(&base)
+                .and_then(|event| event.property("DTSTART"))
+                .is_some_and(|start| {
+                    start
+                        .param("VALUE")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("DATE"))
+                });
+            let time = |name: &str, seconds: i64| {
+                if all_day {
+                    let mut property = Property::new(name, &recur::utc_text(seconds)[..8]);
+                    property.set_param("VALUE", Some("DATE"));
+                    property
+                } else {
+                    Property::new(name, &recur::utc_text(seconds))
+                }
+            };
+            let Some(counter) = itip::counter(
+                &base,
+                &me,
+                time("DTSTART", proposal.start),
+                time("DTEND", proposal.end),
+                Some(&proposal.comment),
+            ) else {
+                return Ok(Err(Refused::NotAllowed));
+            };
+            schedule::send(&dav, &dav.user.clone(), &me, vec![counter]);
+            Ok(Ok(()))
+        }
+        (Method::Counter, "accept_counter") => {
+            let (Some((collection, object)), Some(proposer)) = (
+                found,
+                proposer(&calendar, message).and_then(|p| itip::address(&p.value)),
+            ) else {
+                return Ok(Err(Refused::NotAllowed));
+            };
+            let mut outgoing = Vec::new();
+            let stored = store::put_with(&dav.conn, &collection, &object.name, &mut |current| {
+                let copy = current
+                    .and_then(|object| text::parse(&object.data).ok())
+                    .filter(|copy| proposal_fits(copy, &calendar, &proposer, &own))
+                    .ok_or(PutError::InvalidData(String::new()))?;
+                if sequence(&copy) > sequence(&calendar) {
+                    return Err(PutError::PreconditionFailed);
+                }
+                let moved = itip::apply_counter(&copy, &calendar)
+                    .ok_or(PutError::InvalidData(String::new()))?;
+                // Every attendee hears of the new time, as from a client.
+                let (prepared, messages) =
+                    schedule::prepare_put(&dav, &dav.user, current, &moved.to_text());
+                outgoing = messages;
+                Ok(prepared)
+            })?;
+            match stored {
+                Ok(_) => {
+                    schedule::deliver(&dav, outgoing);
+                    Ok(Ok(()))
+                }
+                Err(PutError::PreconditionFailed) => Ok(Err(Refused::Outdated)),
+                Err(PutError::InvalidData(_)) => Ok(Err(Refused::NotAllowed)),
+                Err(error) => anyhow::bail!("storing the event: {error:?}"),
+            }
+        }
+        (Method::Counter, "decline_counter") => {
+            let copy = found
+                .as_ref()
+                .and_then(|(_, object)| text::parse(&object.data).ok());
+            let proposer = proposer(&calendar, message).and_then(|p| itip::address(&p.value));
+            let (Some(copy), Some(proposer)) = (copy, proposer) else {
+                return Ok(Err(Refused::NotAllowed));
+            };
+            if !proposal_fits(&copy, &calendar, &proposer, &own) {
+                return Ok(Err(Refused::NotAllowed));
+            }
+            let (Some(decline), Some(from)) = (
+                itip::decline_counter(&calendar, &proposer),
+                itip::organizer(&copy),
+            ) else {
+                return Ok(Err(Refused::NotAllowed));
+            };
+            schedule::send(&dav, &dav.user.clone(), &from, vec![decline]);
+            Ok(Ok(()))
+        }
         _ => Ok(Err(Refused::NotAllowed)),
     }
 }
@@ -511,7 +725,7 @@ mod tests {
     use super::super::{SESSION_COOKIE, sign_session};
     use rmail_common::dav::store;
     use rmail_common::{db, imap_state};
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     const USER: &str = "user@example.test";
     const OTHER: &str = "other@example.test";
@@ -589,7 +803,7 @@ mod tests {
         assert_eq!(card["end"], 1_792_490_400);
         assert_eq!(
             card["actions"],
-            serde_json::json!(["accepted", "tentative", "declined"])
+            serde_json::json!(["accepted", "tentative", "declined", "counter"])
         );
 
         let path = format!("/api/folders/INBOX/messages/{uid}/invitation");
@@ -728,5 +942,171 @@ mod tests {
         let plain = deliver(b"From: a@b.test\r\nSubject: hi\r\n\r\nhello".to_vec());
         let (_, detail) = call("GET", format!("/api/folders/INBOX/messages/{plain}"), "").await;
         assert!(detail.get("invitation").is_none());
+    }
+
+    #[test]
+    fn the_proposer_is_the_sending_guest() {
+        let calendar = |extra: &str| {
+            let data = format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:COUNTER\r\n{}END:VCALENDAR\r\n",
+                event("p-1", USER, "ann@remote.test", "ACCEPTED", extra)
+            );
+            rmail_common::dav::text::parse(&data).unwrap()
+        };
+        let both = calendar("ATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@remote.test\r\n");
+        let from = |sender: &str| format!("From: Bob <{sender}>\r\n\r\n").into_bytes();
+        let found = |c, m: &[u8]| {
+            super::proposer(c, m).and_then(|p| rmail_common::dav::itip::address(&p.value))
+        };
+        assert_eq!(
+            found(&both, &from("BOB@remote.test")).as_deref(),
+            Some("bob@remote.test")
+        );
+        assert_eq!(found(&both, &from("x@remote.test")), None);
+        let with_organizer = calendar(&format!("ATTENDEE;PARTSTAT=ACCEPTED:mailto:{USER}\r\n"));
+        assert_eq!(
+            found(&with_organizer, &from("x@remote.test")).as_deref(),
+            Some("ann@remote.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposals_are_made_accepted_and_declined() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let root = state.mail_root.clone();
+        let cookie = Some(format!("{SESSION_COOKIE}={}", sign_session(&state, USER)));
+        let call = |method: &'static str, path: String, body: String| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move {
+                let response = route(req(method, &path, body.as_bytes(), cookie), &state).await;
+                let json: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+                (response.status, json)
+            }
+        };
+        let deliver = |data: Vec<u8>| {
+            imap_state::deliver_message(&root, "example.test", "user", &data)
+                .unwrap()
+                .1
+        };
+
+        // As a guest: an invitation offers to propose another time.
+        let invited = deliver(mail(
+            "REQUEST",
+            &event("inv-9", "boss@remote.test", USER, "NEEDS-ACTION", ""),
+        ));
+        let (_, detail) = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{invited}"),
+            String::new(),
+        )
+        .await;
+        assert!(
+            detail["invitation"]["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("counter"))
+        );
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{invited}/invitation"),
+            json!({"action": "counter", "proposal": {"start": 1_792_490_400, "end": 1_792_494_000, "comment": "Later?"}}).to_string(),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "sent (by email; this test has no submission service)"
+        );
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{invited}/invitation"),
+            json!({"action": "counter", "proposal": {"start": 10, "end": 5}}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 409, "an end before the start");
+
+        // As the organizer: a proposal shows the times now and can be taken.
+        let own = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n{}END:VCALENDAR\r\n",
+            event("own-9", USER, "guest@remote.test", "ACCEPTED", "")
+        );
+        {
+            let conn = rmail_common::jmap::store::open(&root, "example.test", "user").unwrap();
+            let calendar = store::default_calendar(&conn).unwrap();
+            store::put(&conn, &calendar, "own9.ics", &own, &|_| true)
+                .unwrap()
+                .unwrap();
+        }
+        let proposal = |start: &str| {
+            event(
+                "own-9",
+                USER,
+                "guest@remote.test",
+                "ACCEPTED",
+                "COMMENT:Could we move it?\r\n",
+            )
+            .replace("DTSTART:20261020T090000Z", &format!("DTSTART:{start}"))
+            .replace(
+                "DTEND:20261020T100000Z",
+                &format!("DTEND:{}", start.replace("T09", "T10")),
+            )
+        };
+        let stranger = deliver(mail(
+            "COUNTER",
+            &proposal("20261023T090000Z").replace("guest@remote.test", "stranger@remote.test"),
+        ));
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{stranger}/invitation"),
+            json!({"action": "accept_counter"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 409, "only an invited guest's proposal can be taken");
+        let counter_uid = deliver(mail("COUNTER", &proposal("20261021T090000Z")));
+        let (_, detail) = call(
+            "GET",
+            format!("/api/folders/INBOX/messages/{counter_uid}"),
+            String::new(),
+        )
+        .await;
+        let card = &detail["invitation"];
+        assert_eq!(card["method"], "counter");
+        assert_eq!(card["state"], "proposal");
+        assert_eq!(card["comment"], "Could we move it?");
+        assert_eq!(card["current_start"], 1_792_486_800);
+        assert_eq!(card["start"], 1_792_573_200);
+        assert_eq!(
+            card["actions"],
+            json!(["accept_counter", "decline_counter"])
+        );
+        let (status, body) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{counter_uid}/invitation"),
+            json!({"action": "accept_counter"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let moved = stored(&root, "user", "own-9");
+        assert!(
+            moved.contains("DTSTART:20261021T090000Z") && moved.contains("SEQUENCE:1"),
+            "{moved}"
+        );
+        assert_eq!(body["invitation"]["state"], "applied", "{body}");
+
+        let second = deliver(mail(
+            "COUNTER",
+            &proposal("20261022T090000Z").replace("SEQUENCE:0", "SEQUENCE:1"),
+        ));
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{second}/invitation"),
+            json!({"action": "decline_counter"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            stored(&root, "user", "own-9").contains("DTSTART:20261021T090000Z"),
+            "unchanged"
+        );
     }
 }

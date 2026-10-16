@@ -12,6 +12,8 @@
 //!   and the delivery vouches for the attendee's domain (DMARC passed for
 //!   the `From` domain) or address (sent by that account here). Otherwise
 //!   it only goes to the inbox.
+//! - A `COUNTER` (an attendee proposing other times) and a `DECLINECOUNTER`
+//!   are only kept for the organizer and the attendee to act on.
 //! - Only messages addressed to the account are kept: it must be an
 //!   attendee of a `REQUEST` or `CANCEL` and the organizer of a `REPLY`,
 //!   under its own address or an alias that delivers only to it
@@ -136,10 +138,11 @@ fn scheduling_message(
         return Ok(Err(Outcome::Skipped("not addressed to the account")));
     };
     let addressed = match method {
-        Method::Request | Method::Cancel => {
+        Method::Request | Method::Cancel | Method::DeclineCounter => {
             !same_address(&organizer, account) && itip::role(&calendar, account) == Role::Attendee
         }
-        Method::Reply => itip::role(&calendar, account) == Role::Organizer,
+        // A proposal of other times is for the organizer, who decides.
+        Method::Reply | Method::Counter => itip::role(&calendar, account) == Role::Organizer,
     };
     if !addressed {
         return Ok(Err(Outcome::Skipped("not addressed to the account")));
