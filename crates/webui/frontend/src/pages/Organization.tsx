@@ -90,6 +90,14 @@ function providerForm(org: Organization): ProviderForm {
   };
 }
 
+function tierHint(tier: BackgroundTier, provider: ChatProvider): string {
+  const waiting = ' Calls users wait for in webmail always use the standard tier.';
+  if (tier === 'flex' && provider === 'openai') return 'About half price but slower; when OpenAI has no capacity the call is retried, then sent at the standard tier.' + waiting;
+  if (tier === 'batch') return 'New mail is labeled through the batch API at half price: questions are sent together every 15 minutes (or per 100) and labels appear when the batch is done, usually within an hour. Folder decisions stay immediate.' + waiting;
+  if (tier === 'flex') return 'Anthropic has no flex tier, so background work uses the standard tier.' + waiting;
+  return 'Labels and fallback decisions made in the background are billed at the standard rate.';
+}
+
 /** Local or hosted models per role. Hosted ones only see mail of users who agree in webmail. */
 function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => void }) {
   const { run } = useFeedback();
@@ -169,14 +177,6 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
             {form.embed_provider === 'openai' && <Field label="Embedding model"><input value={form.openai_embed_model} onChange={(event) => set({ openai_embed_model: event.target.value })} placeholder="text-embedding-3-small" /></Field>}
             {form.chat_provider === 'openai' && <Field label="Chat model" hint="Empty turns the fallback off."><input value={form.openai_chat_model} onChange={(event) => set({ openai_chat_model: event.target.value })} placeholder="gpt-6-luna" /></Field>}
           </div>
-          {form.chat_provider === 'openai' && (
-            <Field label="Background work" hint={form.background_tier === 'flex' ? 'About half price but slower; when OpenAI has no capacity the call is retried, then sent at the standard tier. Calls users wait for in webmail always use the standard tier.' : 'Labels and fallback decisions made in the background are billed at the standard rate.'}>
-              <select value={form.background_tier} onChange={(event) => set({ background_tier: event.target.value as BackgroundTier })}>
-                <option value="standard">Standard tier</option>
-                <option value="flex">Flex tier (cheaper, slower)</option>
-              </select>
-            </Field>
-          )}
         </>}
         {usesAnthropic && (
           <div className="grid even">
@@ -185,6 +185,15 @@ function ProvidersPanel({ org, onSaved }: { org: Organization; onSaved: () => vo
             </Field>
             <Field label="Chat model" hint="Empty turns the fallback off."><input value={form.anthropic_chat_model} onChange={(event) => set({ anthropic_chat_model: event.target.value })} placeholder="claude-haiku-5-5" /></Field>
           </div>
+        )}
+        {(form.chat_provider === 'openai' || form.chat_provider === 'anthropic') && (
+          <Field label="Background work" hint={tierHint(form.background_tier, form.chat_provider)}>
+            <select value={form.background_tier} onChange={(event) => set({ background_tier: event.target.value as BackgroundTier })}>
+              <option value="standard">Standard tier</option>
+              {form.chat_provider === 'openai' && <option value="flex">Flex tier (cheaper, slower)</option>}
+              <option value="batch">Batch API for labels (half price, delayed)</option>
+            </select>
+          </Field>
         )}
         {usesJev && (
           <div className="grid even">

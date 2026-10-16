@@ -87,16 +87,10 @@ impl Api {
 
     fn send(&self, path: &str, body: &Value, timeout: Duration) -> Sent {
         let url = format!("{}{path}", self.base);
-        let request = self.client.post(&url).timeout(timeout).json(body);
-        let request = match self.auth {
-            Auth::Bearer => request
-                .bearer_auth(&self.key)
-                // OpenRouter shows these on its activity page; others ignore them.
-                .header("X-Title", "rMail"),
-            Auth::Anthropic => request
-                .header("x-api-key", &self.key)
-                .header("anthropic-version", "2023-06-01"),
-        };
+        let request = self
+            .authorized(self.client.post(&url).timeout(timeout).json(body))
+            // OpenRouter shows this on its activity page; others ignore it.
+            .header("X-Title", "rMail");
         let response = match request.send() {
             Ok(response) => response,
             Err(error) => return Sent::Transport(anyhow!("{url}: {error}")),
@@ -156,6 +150,68 @@ impl Api {
             Sent::Done(value) => Ok(value),
             Sent::Retry(error, _) | Sent::Transport(error) | Sent::Failed(error, _) => Err(error),
         }
+    }
+
+    fn authorized(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        match self.auth {
+            Auth::Bearer => request.bearer_auth(&self.key),
+            Auth::Anthropic => request
+                .header("x-api-key", &self.key)
+                .header("anthropic-version", "2023-06-01"),
+        }
+    }
+
+    /// GET `path` (or a full URL the provider gave) as text.
+    fn get_text(&self, path_or_url: &str) -> Result<String> {
+        let url = if path_or_url.starts_with("https://") || path_or_url.starts_with("http://") {
+            // Only follow URLs on the provider's own host, with the key.
+            let host = |url: &str| url.split('/').nth(2).map(str::to_ascii_lowercase);
+            if host(path_or_url) != host(&self.base) {
+                bail!("refusing to send the API key to {path_or_url}");
+            }
+            path_or_url.to_string()
+        } else {
+            format!("{}{path_or_url}", self.base)
+        };
+        let response = self
+            .authorized(self.client.get(&url).timeout(FLEX_TIMEOUT))
+            .send()
+            .with_context(|| url.clone())?;
+        let status = response.status();
+        let text = response.text().with_context(|| format!("{url}: reading"))?;
+        if !status.is_success() {
+            bail!("{url}: HTTP {status}: {}", error_message(&text));
+        }
+        Ok(text)
+    }
+
+    fn get(&self, path: &str) -> Result<Value> {
+        serde_json::from_str(&self.get_text(path)?).with_context(|| format!("{path}: not JSON"))
+    }
+
+    /// Upload a batch input file (OpenAI's Files API).
+    fn upload(&self, filename: &str, content: Vec<u8>) -> Result<Value> {
+        let url = format!("{}/files", self.base);
+        let part = reqwest::blocking::multipart::Part::bytes(content)
+            .file_name(filename.to_string())
+            .mime_str("application/jsonl")?;
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("purpose", "batch")
+            .part("file", part);
+        let response = self
+            .authorized(self.client.post(&url).timeout(FLEX_TIMEOUT))
+            .multipart(form)
+            .send()
+            .with_context(|| url.clone())?;
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        if !status.is_success() {
+            bail!("{url}: HTTP {status}: {}", error_message(&text));
+        }
+        serde_json::from_str(&text).with_context(|| format!("{url}: not JSON"))
     }
 
     /// OpenAI flex processing: billed at batch rates, but queued and refused
@@ -335,24 +391,7 @@ impl Chooser for OpenAiChooser {
         if labels.is_empty() && !may_propose {
             return Ok(Labeling::default());
         }
-        let schema = labels_schema(labels, may_propose);
-        let body = json!({
-            "model": self.model,
-            "temperature": 0,
-            "max_tokens": 400,
-            "messages": [
-                { "role": "system", "content": label_prompt(labels, may_propose) },
-                { "role": "user", "content": message },
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "labels",
-                    "strict": true,
-                    "schema": schema,
-                },
-            },
-        });
+        let body = openai_label_body(&self.model, message, labels, may_propose);
         Ok(parse_labels(&self.complete(body)?, labels, may_propose))
     }
 
@@ -382,6 +421,27 @@ impl OpenAiChooser {
             .context("chat response has no message content")?
             .to_string())
     }
+}
+
+/// A Chat Completions request for one labeling question.
+fn openai_label_body(model: &str, message: &str, labels: &[LabelHint], may_propose: bool) -> Value {
+    json!({
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 400,
+        "messages": [
+            { "role": "system", "content": label_prompt(labels, may_propose) },
+            { "role": "user", "content": message },
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "labels",
+                "strict": true,
+                "schema": labels_schema(labels, may_propose),
+            },
+        },
+    })
 }
 
 /// The JSON schema of a labeling answer: known label names with a
@@ -478,21 +538,25 @@ impl AnthropicChooser {
     }
 
     fn complete(&self, body: Value) -> Result<String> {
-        let response = self.api.post("/messages", &body)?;
-        match response["stop_reason"].as_str() {
-            Some("refusal") => bail!("the model declined to answer"),
-            Some("max_tokens") => bail!("the answer was cut off at the token limit"),
-            _ => {}
-        }
-        let text: String = response["content"]
-            .as_array()
-            .context("message has no content")?
-            .iter()
-            .filter(|block| block["type"] == "text")
-            .filter_map(|block| block["text"].as_str())
-            .collect();
-        Ok(text)
+        anthropic_text(&self.api.post("/messages", &body)?)
     }
+}
+
+/// The text of a Messages API answer; a refusal or a cut-off answer is an
+/// error.
+fn anthropic_text(message: &Value) -> Result<String> {
+    match message["stop_reason"].as_str() {
+        Some("refusal") => bail!("the model declined to answer"),
+        Some("max_tokens") => bail!("the answer was cut off at the token limit"),
+        _ => {}
+    }
+    Ok(message["content"]
+        .as_array()
+        .context("message has no content")?
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect())
 }
 
 impl Chooser for AnthropicChooser {
@@ -534,6 +598,196 @@ impl Chooser for AnthropicChooser {
     fn summarize(&self, message: &str) -> Result<String> {
         let body = self.request(SUMMARY_PROMPT, message, 220, None);
         Ok(tidy_summary(&self.complete(body)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batches
+
+/// One answer from a batch: the request's id and its text, or why it has
+/// none.
+pub type BatchAnswer = (String, std::result::Result<String, String>);
+
+/// Where a submitted batch stands.
+#[derive(Debug, PartialEq)]
+pub enum BatchPoll {
+    Running,
+    /// Finished (or expired, cancelled or failed): every answer there is.
+    /// Requests without one get none and may be sent again.
+    Ended(Vec<BatchAnswer>),
+}
+
+/// A provider's batch API (half price, answers within 24 hours) for
+/// labeling questions nobody waits for.
+pub trait Batcher: Send + Sync {
+    /// The request one labeling question becomes.
+    fn label_request(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Value;
+    /// Submit `(custom_id, request)` pairs; the batch id.
+    fn submit(&self, requests: &[(String, Value)]) -> Result<String>;
+    fn poll(&self, batch: &str) -> Result<BatchPoll>;
+}
+
+/// Each JSONL line parsed; a line that is not JSON is skipped.
+fn jsonl(text: &str) -> impl Iterator<Item = Value> + '_ {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+}
+
+/// OpenAI's Batch API: requests go up as a JSONL file, answers come back as
+/// one.
+pub struct OpenAiBatcher {
+    api: Api,
+    model: String,
+}
+
+impl OpenAiBatcher {
+    pub fn load(base: &str, key: &str, model: &str) -> Result<Self> {
+        if model.trim().is_empty() {
+            bail!("no chat model id is set");
+        }
+        Ok(Self {
+            api: Api::new(base, key)?,
+            model: model.trim().to_string(),
+        })
+    }
+
+    fn answers(&self, file: &str, out: &mut Vec<BatchAnswer>) -> Result<()> {
+        for line in jsonl(&self.api.get_text(&format!("/files/{file}/content"))?) {
+            let Some(id) = line["custom_id"].as_str() else {
+                continue;
+            };
+            let response = &line["response"];
+            let answer = match (
+                response["status_code"].as_u64(),
+                response["body"]["choices"][0]["message"]["content"].as_str(),
+            ) {
+                (Some(200), Some(text)) => Ok(text.to_string()),
+                _ => Err(line["error"]["message"]
+                    .as_str()
+                    .or_else(|| response["body"]["error"]["message"].as_str())
+                    .unwrap_or("no answer")
+                    .to_string()),
+            };
+            out.push((id.to_string(), answer));
+        }
+        Ok(())
+    }
+}
+
+impl Batcher for OpenAiBatcher {
+    fn label_request(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Value {
+        openai_label_body(&self.model, message, labels, may_propose)
+    }
+
+    fn submit(&self, requests: &[(String, Value)]) -> Result<String> {
+        let mut file = Vec::new();
+        for (id, body) in requests {
+            serde_json::to_writer(
+                &mut file,
+                &json!({
+                    "custom_id": id,
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": body,
+                }),
+            )?;
+            file.push(b'\n');
+        }
+        let uploaded = self.api.upload("rmail-labels.jsonl", file)?;
+        let input = uploaded["id"].as_str().context("upload has no file id")?;
+        let batch = self.api.post(
+            "/batches",
+            &json!({
+                "input_file_id": input,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+            }),
+        )?;
+        Ok(batch["id"].as_str().context("batch has no id")?.to_string())
+    }
+
+    fn poll(&self, batch: &str) -> Result<BatchPoll> {
+        let state = self.api.get(&format!("/batches/{batch}"))?;
+        match state["status"].as_str().unwrap_or_default() {
+            "completed" | "expired" | "failed" | "cancelled" => {
+                let mut answers = Vec::new();
+                for key in ["output_file_id", "error_file_id"] {
+                    if let Some(file) = state[key].as_str() {
+                        self.answers(file, &mut answers)?;
+                    }
+                }
+                Ok(BatchPoll::Ended(answers))
+            }
+            _ => Ok(BatchPoll::Running),
+        }
+    }
+}
+
+/// Anthropic's Message Batches API.
+pub struct AnthropicBatcher {
+    chooser: AnthropicChooser,
+}
+
+impl AnthropicBatcher {
+    pub fn load(base: &str, key: &str, model: &str) -> Result<Self> {
+        Ok(Self {
+            chooser: AnthropicChooser::load(base, key, model)?,
+        })
+    }
+}
+
+impl Batcher for AnthropicBatcher {
+    fn label_request(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Value {
+        self.chooser.request(
+            &label_prompt(labels, may_propose),
+            message,
+            400,
+            Some(labels_schema(labels, may_propose)),
+        )
+    }
+
+    fn submit(&self, requests: &[(String, Value)]) -> Result<String> {
+        let requests: Vec<Value> = requests
+            .iter()
+            .map(|(id, params)| json!({ "custom_id": id, "params": params }))
+            .collect();
+        let batch = self
+            .chooser
+            .api
+            .post("/messages/batches", &json!({ "requests": requests }))?;
+        Ok(batch["id"].as_str().context("batch has no id")?.to_string())
+    }
+
+    fn poll(&self, batch: &str) -> Result<BatchPoll> {
+        let state = self
+            .chooser
+            .api
+            .get(&format!("/messages/batches/{batch}"))?;
+        if state["processing_status"] != "ended" {
+            return Ok(BatchPoll::Running);
+        }
+        let Some(results) = state["results_url"].as_str() else {
+            return Ok(BatchPoll::Ended(Vec::new()));
+        };
+        let mut answers = Vec::new();
+        for line in jsonl(&self.chooser.api.get_text(results)?) {
+            let Some(id) = line["custom_id"].as_str() else {
+                continue;
+            };
+            let result = &line["result"];
+            let answer = if result["type"] == "succeeded" {
+                anthropic_text(&result["message"]).map_err(|error| error.to_string())
+            } else {
+                Err(result["error"]["error"]["message"]
+                    .as_str()
+                    .or_else(|| result["type"].as_str())
+                    .unwrap_or("no answer")
+                    .to_string())
+            };
+            answers.push((id.to_string(), answer));
+        }
+        Ok(BatchPoll::Ended(answers))
     }
 }
 
@@ -679,14 +933,40 @@ mod tests {
     /// Serve canned responses on loopback, one per connection, and pass each
     /// request's authorization header and JSON body back to the test.
     fn serve(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<(String, Value)>) {
+        let (base, full) = serve_paths(responses);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (_, auth, body) in full {
+                if tx.send((auth, body)).is_err() {
+                    break;
+                }
+            }
+        });
+        (base, rx)
+    }
+
+    /// As [`serve`], also passing each request's method and path; a body
+    /// that is not JSON comes back as a string.
+    fn serve_paths(
+        responses: Vec<(u16, String)>,
+    ) -> (String, mpsc::Receiver<(String, String, Value)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
+        let host = base.clone();
         std::thread::spawn(move || {
             for (status, body) in responses {
+                let body = body.replace("{BASE}", &host);
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let (mut length, mut auth) = (0usize, String::new());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let target = request_line
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
@@ -706,11 +986,9 @@ mod tests {
                 }
                 let mut request = vec![0; length];
                 reader.read_exact(&mut request).unwrap();
-                tx.send((
-                    auth,
-                    serde_json::from_slice(&request).unwrap_or(Value::Null),
-                ))
-                .unwrap();
+                let received = serde_json::from_slice(&request)
+                    .unwrap_or_else(|_| Value::from(String::from_utf8_lossy(&request).to_string()));
+                let _ = tx.send((target, auth, received));
                 let mut stream = stream;
                 write!(
                     stream,
@@ -1009,6 +1287,125 @@ mod tests {
         let chooser = OpenAiChooser::load(&base, "sk", "gpt").unwrap();
         chooser.summarize("x").unwrap();
         assert!(requests.recv().unwrap().1.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn openai_batches_upload_a_file_and_read_the_output_file() {
+        let output = [
+            json!({"custom_id": "q1", "response": {"status_code": 200, "body": {"choices": [{"message": {"content": "{\"labels\": []}"}}]}}, "error": null}),
+            json!({"custom_id": "q2", "response": {"status_code": 400, "body": {"error": {"message": "bad request"}}}, "error": null}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let (base, requests) = serve_paths(vec![
+            (200, json!({"id": "file-in"}).to_string()),
+            (
+                200,
+                json!({"id": "batch_1", "status": "validating"}).to_string(),
+            ),
+            (
+                200,
+                json!({"id": "batch_1", "status": "in_progress"}).to_string(),
+            ),
+            (
+                200,
+                json!({"id": "batch_1", "status": "completed", "output_file_id": "file-out"})
+                    .to_string(),
+            ),
+            (200, output),
+        ]);
+        let batcher = OpenAiBatcher::load(&base, "sk", "gpt-6-luna").unwrap();
+        let body = batcher.label_request("Hello", &[], true);
+        assert_eq!(body["model"], "gpt-6-luna");
+        let batch = batcher
+            .submit(&[("q1".into(), body.clone()), ("q2".into(), body)])
+            .unwrap();
+        assert_eq!(batch, "batch_1");
+        let (target, auth, upload) = requests.recv().unwrap();
+        assert_eq!(
+            (target.as_str(), auth.as_str()),
+            ("POST /files", "Bearer sk")
+        );
+        let upload = upload.as_str().unwrap();
+        assert!(upload.contains("name=\"purpose\"") && upload.contains("batch"));
+        assert!(
+            upload.contains(r#""custom_id":"q1""#)
+                && upload.contains(r#""url":"/v1/chat/completions""#)
+        );
+        let (target, _, create) = requests.recv().unwrap();
+        assert_eq!(target, "POST /batches");
+        assert_eq!(create["input_file_id"], "file-in");
+        assert_eq!(create["completion_window"], "24h");
+
+        assert_eq!(batcher.poll(&batch).unwrap(), BatchPoll::Running);
+        assert_eq!(requests.recv().unwrap().0, "GET /batches/batch_1");
+        let BatchPoll::Ended(answers) = batcher.poll(&batch).unwrap() else {
+            panic!("ended")
+        };
+        assert_eq!(answers[0], ("q1".into(), Ok("{\"labels\": []}".into())));
+        assert_eq!(answers[1], ("q2".into(), Err("bad request".into())));
+        requests.recv().unwrap();
+        assert_eq!(requests.recv().unwrap().0, "GET /files/file-out/content");
+    }
+
+    #[test]
+    fn anthropic_batches_use_message_batches_and_results_on_the_same_host() {
+        let results = [
+            json!({"custom_id": "q1", "result": {"type": "succeeded", "message": {"content": [{"type": "text", "text": "{}"}], "stop_reason": "end_turn"}}}),
+            json!({"custom_id": "q2", "result": {"type": "expired"}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let (base, requests) = serve_paths(vec![
+            (200, json!({"id": "msgbatch_1", "processing_status": "in_progress"}).to_string()),
+            (200, json!({"processing_status": "in_progress"}).to_string()),
+            (200, json!({"processing_status": "ended", "results_url": "{BASE}/messages/batches/msgbatch_1/results"}).to_string()),
+            (200, results),
+        ]);
+        let batcher = AnthropicBatcher::load(&base, "sk-ant", "claude-haiku-5-5").unwrap();
+        let params = batcher.label_request("Hello", &[], true);
+        assert!(params["output_config"]["format"]["schema"].is_object());
+        assert_eq!(
+            batcher.submit(&[("q1".into(), params)]).unwrap(),
+            "msgbatch_1"
+        );
+        let (target, auth, create) = requests.recv().unwrap();
+        assert_eq!(
+            (target.as_str(), auth.as_str()),
+            ("POST /messages/batches", "x-api-key sk-ant")
+        );
+        assert_eq!(create["requests"][0]["custom_id"], "q1");
+        assert_eq!(create["requests"][0]["params"]["model"], "claude-haiku-5-5");
+        assert_eq!(batcher.poll("msgbatch_1").unwrap(), BatchPoll::Running);
+        assert_eq!(
+            requests.recv().unwrap().0,
+            "GET /messages/batches/msgbatch_1"
+        );
+        let BatchPoll::Ended(answers) = batcher.poll("msgbatch_1").unwrap() else {
+            panic!("ended")
+        };
+        assert_eq!(answers[0], ("q1".into(), Ok("{}".into())));
+        assert_eq!(answers[1], ("q2".into(), Err("expired".into())));
+        requests.recv().unwrap();
+        let (target, auth, _) = requests.recv().unwrap();
+        assert_eq!(target, "GET /messages/batches/msgbatch_1/results");
+        assert_eq!(auth, "x-api-key sk-ant");
+
+        // A results URL on another host does not get the key.
+        let (base, requests) = serve_paths(vec![(
+            200,
+            json!({"processing_status": "ended", "results_url": "https://elsewhere.test/results"})
+                .to_string(),
+        )]);
+        let batcher = AnthropicBatcher::load(&base, "sk-ant", "m").unwrap();
+        let error = batcher.poll("msgbatch_2").unwrap_err().to_string();
+        assert!(error.contains("refusing"), "{error}");
+        requests.recv().unwrap();
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
     #[test]

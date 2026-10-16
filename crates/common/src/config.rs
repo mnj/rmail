@@ -905,6 +905,10 @@ pub enum BackgroundTier {
     /// refused for lack of capacity (retried, then sent at the standard
     /// tier). Other providers ignore it.
     Flex,
+    /// The provider's batch API (OpenAI or Anthropic): half price, answers
+    /// within 24 hours (usually minutes). Only labels go this way; folder
+    /// decisions use the standard tier, since a late suggestion is no use.
+    Batch,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]

@@ -29,6 +29,9 @@ const LABEL_BUDGET: usize = 32;
 const INITIAL_INBOX_LABELS: usize = 50;
 /// Most labels put on one message.
 const MAX_LABELS_PER_MESSAGE: usize = 3;
+/// Messages queued for the batch API per account per cycle; each is a
+/// request in a batch, not a call.
+const BATCH_QUEUE_BUDGET: usize = 500;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct CycleReport {
@@ -39,6 +42,11 @@ pub struct CycleReport {
     pub moved: usize,
     /// Messages that got at least one label.
     pub labeled: usize,
+    /// Labeling questions queued for the batch API, submitted in a batch,
+    /// and answered from one.
+    pub queued: usize,
+    pub submitted: usize,
+    pub answered: usize,
     /// Opted-in accounts skipped (in whole or in part) because a model is a
     /// cloud provider their user has not agreed to.
     pub awaiting_consent: usize,
@@ -111,6 +119,7 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
                 .push(format!("{localpart}@{domain}: {error:#}"));
         }
     }
+    crate::batch::step(mail_root, cfg, models, &mut report);
     report
 }
 
@@ -165,44 +174,51 @@ impl Account<'_> {
         let mut hints: Vec<crate::engine::LabelHint> = labels.iter().map(hint).collect();
         let threshold = self.cfg.label_confidence as f64 / 100.0;
         let mut done = mark.filter(|_| !first).map_or(0, |m| m.last_uid);
-        let caught_up = pending.len() <= LABEL_BUDGET;
-        for message in pending.into_iter().take(LABEL_BUDGET) {
+        let batch = self.models.batcher.clone();
+        let budget = if batch.is_some() {
+            BATCH_QUEUE_BUDGET
+        } else {
+            LABEL_BUDGET
+        };
+        let caught_up = pending.len() <= budget;
+        for message in pending.into_iter().take(budget) {
             if let Some(doc) = read_document(&message.path, self.cfg) {
-                let answer = chooser.label(&doc.text, &hints, discover)?;
-                let mut applied: Vec<(String, f64)> = answer
-                    .labels
-                    .into_iter()
-                    .filter(|(_, probability)| *probability >= threshold)
-                    .collect();
-                applied.sort_by(|a, b| b.1.total_cmp(&a.1));
-                applied.truncate(MAX_LABELS_PER_MESSAGE);
-                // The model found no fitting label and named one; it applies
-                // to this message and is offered for later mail.
-                if let Some((name, description)) = answer.proposed
-                    && applied.len() < MAX_LABELS_PER_MESSAGE
-                    && let Some(label) = store::add_ai_label(&conn, &name, &description)?
-                {
-                    classifier_log!("info", "label_created", { "account": self.name(), "label": label.name });
-                    hints.push(hint(&label));
-                    applied.push((label.name.clone(), 1.0));
-                    labels.push(label);
-                }
-                for (name, _) in &applied {
-                    if let Some(label) = labels.iter().find(|label| &label.name == name) {
-                        store::set_keyword(
-                            self.mail_root,
-                            self.domain,
-                            self.localpart,
-                            "INBOX",
-                            message.uid,
-                            &label.keyword,
-                            true,
-                        )?;
+                if let Some((provider, batcher)) = &batch {
+                    // Asked through the batch API; the answer is applied
+                    // when it comes back (`crate::batch`).
+                    let body = batcher.label_request(&doc.text, &hints, discover);
+                    store::queue_label_request(
+                        &conn,
+                        &store::LabelRequest {
+                            custom_id: crate::batch::new_id(),
+                            uidvalidity: inbox.uidvalidity,
+                            uid: message.uid,
+                            hints: crate::batch::hints_json(&hints),
+                            may_propose: discover,
+                            provider: provider.clone(),
+                            body: body.to_string(),
+                            batch_id: None,
+                            attempts: 0,
+                            created_at: chrono_now(),
+                        },
+                    )?;
+                    self.report.queued += 1;
+                } else {
+                    let answer = chooser.label(&doc.text, &hints, discover)?;
+                    if apply_labeling(
+                        self.mail_root,
+                        self.domain,
+                        self.localpart,
+                        &conn,
+                        inbox.uidvalidity,
+                        message.uid,
+                        answer,
+                        &mut labels,
+                        &mut hints,
+                        threshold,
+                    )? {
+                        self.report.labeled += 1;
                     }
-                }
-                if !applied.is_empty() {
-                    store::record_labels(&conn, inbox.uidvalidity, message.uid, &applied)?;
-                    self.report.labeled += 1;
                 }
             }
             done = done.max(message.uid);
@@ -519,6 +535,68 @@ mod rusqlite_conn {
 }
 
 /// User folders the account has not excluded.
+/// Put the labels a model chose (and one it proposed, if any) on an INBOX
+/// message; whether it got any. A message no longer in INBOX is skipped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_labeling(
+    mail_root: &Path,
+    domain: &str,
+    localpart: &str,
+    conn: &rusqlite::Connection,
+    uidvalidity: u64,
+    uid: u64,
+    answer: crate::engine::Labeling,
+    labels: &mut Vec<store::Label>,
+    hints: &mut Vec<crate::engine::LabelHint>,
+    threshold: f64,
+) -> Result<bool> {
+    let mut applied: Vec<(String, f64)> = answer
+        .labels
+        .into_iter()
+        .filter(|(_, probability)| *probability >= threshold)
+        .collect();
+    applied.sort_by(|a, b| b.1.total_cmp(&a.1));
+    applied.truncate(MAX_LABELS_PER_MESSAGE);
+    // The model found no fitting label and named one; it applies to this
+    // message and is offered for later mail.
+    if let Some((name, description)) = answer.proposed
+        && applied.len() < MAX_LABELS_PER_MESSAGE
+        && let Some(label) = store::add_ai_label(conn, &name, &description)?
+    {
+        classifier_log!("info", "label_created", { "account": format!("{localpart}@{domain}"), "label": label.name });
+        hints.push(crate::engine::LabelHint {
+            name: label.name.clone(),
+            description: label.description.clone(),
+        });
+        applied.push((label.name.clone(), 1.0));
+        labels.push(label);
+    }
+    for (name, _) in &applied {
+        if let Some(label) = labels.iter().find(|label| &label.name == name) {
+            store::set_keyword(
+                mail_root,
+                domain,
+                localpart,
+                "INBOX",
+                uid,
+                &label.keyword,
+                true,
+            )?;
+        }
+    }
+    if applied.is_empty() {
+        return Ok(false);
+    }
+    store::record_labels(conn, uidvalidity, uid, &applied)?;
+    Ok(true)
+}
+
+fn chrono_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 pub fn is_eligible(folder: &Folder, excluded: &[String]) -> bool {
     store::is_user_folder(folder) && !excluded.iter().any(|name| name == &folder.name)
 }
@@ -792,6 +870,137 @@ mod tests {
             !store::prefs(&conn).unwrap().enabled,
             "folder suggestions stay off"
         );
+    }
+
+    /// A batch API that answers every question with `answer` once `ready`.
+    struct FakeBatcher {
+        submitted: std::sync::Mutex<Vec<Vec<String>>>,
+        answer: String,
+        ready: std::sync::atomic::AtomicBool,
+        /// Answer only the first question of a batch.
+        partial: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::cloud::Batcher for FakeBatcher {
+        fn label_request(
+            &self,
+            message: &str,
+            labels: &[crate::engine::LabelHint],
+            _may_propose: bool,
+        ) -> serde_json::Value {
+            serde_json::json!({ "message": message, "labels": labels.len() })
+        }
+
+        fn submit(&self, requests: &[(String, serde_json::Value)]) -> Result<String> {
+            let mut submitted = self.submitted.lock().unwrap();
+            submitted.push(requests.iter().map(|(id, _)| id.clone()).collect());
+            Ok(format!("batch-{}", submitted.len()))
+        }
+
+        fn poll(&self, batch: &str) -> Result<crate::cloud::BatchPoll> {
+            use std::sync::atomic::Ordering;
+            if !self.ready.load(Ordering::SeqCst) {
+                return Ok(crate::cloud::BatchPoll::Running);
+            }
+            let index: usize = batch.trim_start_matches("batch-").parse().unwrap();
+            let ids = self.submitted.lock().unwrap()[index - 1].clone();
+            let take = if self.partial.load(Ordering::SeqCst) {
+                1
+            } else {
+                ids.len()
+            };
+            Ok(crate::cloud::BatchPoll::Ended(
+                ids.into_iter()
+                    .take(take)
+                    .map(|id| (id, Ok(self.answer.clone())))
+                    .collect(),
+            ))
+        }
+    }
+
+    #[test]
+    fn batch_labels_are_queued_sent_together_and_applied_when_answered() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        let (_, first) =
+            imap_state::deliver_message(root, D, L, &mail("a@b.test", "One", "x")).unwrap();
+        let (_, second) =
+            imap_state::deliver_message(root, D, L, &mail("c@d.test", "Two", "y")).unwrap();
+        enable_labels(root, &[("To do", "Needs action")]);
+        let chooser = Arc::new(fake::Fixed::labelling(&[("To do", 0.9)]));
+        let batcher = Arc::new(FakeBatcher {
+            submitted: Default::default(),
+            answer: r#"{"labels": [{"name": "To do", "confidence": 0.95}], "new_label": null}"#
+                .into(),
+            ready: false.into(),
+            partial: false.into(),
+        });
+        let batched = Models {
+            chooser: Some(chooser.clone()),
+            batcher: Some(("fake:model".into(), batcher.clone())),
+            ..Models::default()
+        };
+
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!(
+            (report.queued, report.submitted, report.labeled),
+            (2, 2, 0),
+            "{report:?}"
+        );
+        assert_eq!(*chooser.label_calls.lock().unwrap(), 0, "no direct calls");
+        assert_eq!(
+            batcher.submitted.lock().unwrap().len(),
+            1,
+            "one batch for both"
+        );
+        // Still running: nothing is sent again.
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!((report.queued, report.submitted), (0, 0), "{report:?}");
+
+        batcher.ready.store(true, Ordering::SeqCst);
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!((report.answered, report.labeled), (2, 2), "{report:?}");
+        for uid in [first, second] {
+            assert!(inbox_flags(root, uid).unwrap().iter().any(|f| f == "To_do"));
+        }
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        assert!(store::label_requests(&conn).unwrap().is_empty());
+
+        // A question a batch ended without answering is sent again.
+        batcher.partial.store(true, Ordering::SeqCst);
+        imap_state::deliver_message(root, D, L, &mail("e@f.test", "Three", "z")).unwrap();
+        imap_state::deliver_message(root, D, L, &mail("g@h.test", "Four", "w")).unwrap();
+        batcher.ready.store(false, Ordering::SeqCst);
+        run_cycle(root, &cfg(), &batched);
+        batcher.ready.store(true, Ordering::SeqCst);
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!(report.answered, 1, "{report:?}");
+        let left = store::label_requests(&conn).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!((left[0].batch_id.as_deref(), left[0].attempts), (None, 1));
+
+        // Another provider or model: what was queued for this one is dropped.
+        let other = Models {
+            batcher: Some(("fake:other".into(), batcher.clone())),
+            ..batched.clone()
+        };
+        batcher.ready.store(false, Ordering::SeqCst);
+        run_cycle(root, &cfg(), &other);
+        assert!(
+            store::label_requests(&conn)
+                .unwrap()
+                .iter()
+                .all(|request| request.provider == "fake:other")
+        );
+
+        // Labels turned off: the queue is emptied.
+        let mut prefs = store::prefs(&conn).unwrap();
+        prefs.labels_enabled = false;
+        store::set_prefs(&conn, &prefs).unwrap();
+        run_cycle(root, &cfg(), &other);
+        assert!(store::label_requests(&conn).unwrap().is_empty());
     }
 
     #[test]

@@ -234,7 +234,7 @@ export type ModelDownload = { file: string; received: number; total: number; sta
 export type LoadedModel = { file: string; load_ms: number; cloud: string | null };
 export type EmbedProvider = 'local' | 'openrouter' | 'openai';
 export type ChatProvider = 'local' | 'openrouter' | 'openai' | 'anthropic' | 'jev';
-export type BackgroundTier = 'standard' | 'flex';
+export type BackgroundTier = 'standard' | 'flex' | 'batch';
 export type ClassifierStatus = {
   enabled: boolean;
   local_models: boolean;
