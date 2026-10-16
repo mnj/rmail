@@ -304,6 +304,44 @@ async function signIn(page) {
   await ctx.close();
 }
 
+// A file too large to attach goes as a download link, which works for the
+// recipient (here Alice herself) without signing in.
+{
+  const ctx = await browser.newContext(desktop);
+  const page = await ctx.newPage();
+  await signIn(page);
+  await page.click('.compose-button');
+  await page.waitForSelector('.compose .editor-root');
+  await page.fill('.compose input[aria-label=To]', 'alice@example.com');
+  await page.fill('.compose label:has-text("Subject") input', 'Site photos');
+  await page.click('.compose .editor-root');
+  await page.keyboard.type('Here are the photos from the data-centre visit.');
+  const big = Buffer.alloc(12 * 1024 * 1024, 7);
+  const chooser = page.waitForEvent('filechooser');
+  await page.click('.compose button[aria-label="Attach files"]');
+  await (await chooser).setFiles({ name: 'site-photos.zip', mimeType: 'application/zip', buffer: big });
+  await page.click('.link-offer button:has-text("Send as link")');
+  await page.waitForSelector('.file-chip.link:has-text("site-photos.zip")', { timeout: 60000 });
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-file-link');
+  await page.click('.compose button:has-text("Send")');
+  await page.waitForSelector('.compose', { state: 'detached', timeout: 20000 });
+  await page.click('button.folder-name:has-text("Inbox")');
+  for (let i = 0; i < 30 && !(await page.isVisible('.message-list .row:has-text("Site photos")')); i++) {
+    await page.waitForTimeout(1000);
+    await page.click('button.folder-name:has-text("Sent")');
+    await page.click('button.folder-name:has-text("Inbox")');
+  }
+  await openMessage(page, 'Site photos');
+  const link = await page.frameLocator('iframe.html-message').locator('a:has-text("site-photos.zip")').getAttribute('href', { timeout: 10000 });
+  const anonymous = await browser.newContext({ ignoreHTTPSErrors: true });
+  const response = await anonymous.request.get(link);
+  if (response.status() !== 200 || (await response.body()).length !== big.length) throw new Error(`the link gave ${response.status()}`);
+  if (!String(response.headers()['content-disposition']).startsWith('attachment')) throw new Error('the link is not a download');
+  await anonymous.close();
+  await ctx.close();
+}
+
 // Encryption: an OpenPGP key made in the browser and an S/MIME certificate
 // imported, mail signed and encrypted with each, then read back. The raw
 // messages are left for crypto_check.py to check with GnuPG and OpenSSL.

@@ -10,7 +10,7 @@ const EncryptionDialog = React.lazy(() => import('./crypto/settings').then((m) =
 import { ENCRYPTED, ProtectedMessage } from './crypto/reader';
 const OrganizeDialog = React.lazy(() => import('./organize').then((m) => ({ default: m.OrganizeDialog })));
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
-import { ComposeSettingsDialog } from './settings';
+const ComposeSettingsDialog = React.lazy(() => import('./settings').then((m) => ({ default: m.ComposeSettingsDialog })));
 import { ContactSeed, ContactsDialog } from './contacts';
 import { CalendarView } from './calendar';
 import { SecurityDialog } from './security';
@@ -1033,7 +1033,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         />
       )}
       {notice && <div className="toast" role="status">{notice.text}{notice.action && <button className="toast-action" onClick={notice.action.run}>{notice.action.label}</button>}</div>}
-      {composeSettings && <ComposeSettingsDialog api={api} prefs={prefs} identities={identities} onClose={() => setComposeSettings(false)} onSaved={loadComposeSettings} onOpenDraft={(f, uid) => { setComposeSettings(false); openDraft(f, uid); }} />}
+      {composeSettings && <React.Suspense fallback={null}><ComposeSettingsDialog api={api} prefs={prefs} identities={identities} onClose={() => setComposeSettings(false)} onSaved={loadComposeSettings} onOpenDraft={(f, uid) => { setComposeSettings(false); openDraft(f, uid); }} /></React.Suspense>}
       {organizing && <React.Suspense fallback={null}><OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} /></React.Suspense>}
       {prompt && <PromptDialog {...prompt} />}
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}

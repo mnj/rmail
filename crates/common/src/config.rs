@@ -242,6 +242,9 @@ pub struct Config {
     /// AI writing suggestions in webmail's compose window.
     #[serde(default)]
     pub compose_ai: ComposeAiConfig,
+    /// Files too large to attach, sent from webmail as download links.
+    #[serde(default)]
+    pub file_links: FileLinksConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -1103,6 +1106,45 @@ pub struct ComposeAiConfig {
     /// Suggestions and rewrites one user may request per minute.
     #[serde(default = "default_compose_ai_requests_per_minute")]
     pub requests_per_minute: u32,
+}
+
+/// Large files shared from webmail as download links (`/f/<token>`). Off
+/// until the admin turns it on, since the server then hosts files anyone
+/// with a link can fetch.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct FileLinksConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Largest file, in MB.
+    #[serde(default = "default_file_links_max_file_mb")]
+    pub max_file_mb: u64,
+    /// Files one user may share at a time, in MB.
+    #[serde(default = "default_file_links_per_user_mb")]
+    pub per_user_mb: u64,
+    /// Days a link works; the file is then deleted.
+    #[serde(default = "default_file_links_days")]
+    pub days: u64,
+}
+
+fn default_file_links_max_file_mb() -> u64 {
+    512
+}
+fn default_file_links_per_user_mb() -> u64 {
+    2048
+}
+fn default_file_links_days() -> u64 {
+    30
+}
+
+impl Default for FileLinksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_file_mb: default_file_links_max_file_mb(),
+            per_user_mb: default_file_links_per_user_mb(),
+            days: default_file_links_days(),
+        }
+    }
 }
 
 impl Default for ComposeAiConfig {

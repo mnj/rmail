@@ -638,6 +638,18 @@ The search box then offers **By meaning**, which lists the open folder's message
 query, best first. Turning it off deletes the index. With a hosted embedding model, indexing and
 searches only happen for users who agreed to that provider.
 
+### Large files as links
+
+With **Large files** turned on in the console's settings (`file_links.enabled`, off by default),
+webmail offers files too large to attach (10 MB in all) as download links instead. The file is
+uploaded in 8 MB pieces and kept in the account's directory (outside its mail folders); the
+message gets a link (`https://<webmail host>/f/<token>`) that anyone who has it can use until it
+expires, after which the file is deleted. Downloads are always offered as a file to save, never
+shown in the browser. Limits: `file_links.max_file_mb` per file (512), `file_links.per_user_mb`
+shared at a time per user (2048), `file_links.days` a link works (30). Users see and delete their
+shared files, with download counts, in **Compose settings**. A reverse proxy must pass `/f/`
+through and allow request bodies of at least 16 MB.
+
 ### OpenPGP and S/MIME
 
 Users sign and encrypt mail with OpenPGP (RFC 9580, PGP/MIME as in RFC 3156) or S/MIME (RFC 8551)

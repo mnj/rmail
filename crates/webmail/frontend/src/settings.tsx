@@ -1,11 +1,12 @@
 // Compose settings: default format, spellchecking language, undo send, AI
 // writing suggestions (when the server offers them), names and signatures
-// per identity, and messages waiting to be sent.
+// per identity, messages waiting to be sent, and large files shared as links.
 
 import { useEffect, useRef, useState } from 'react';
-import { CalendarClock, Sparkles, X } from 'lucide-react';
+import { CalendarClock, Copy, Link2, Sparkles, Trash2, X } from 'lucide-react';
+import { FileListing, SharedFile } from './filelinks';
 import { EditorHandle, RichEditor } from './editor';
-import { Api, ComposePrefs, Identity, Scheduled, formatFullDate } from './types';
+import { Api, ComposePrefs, Identity, Scheduled, formatFullDate, formatSize } from './types';
 
 /** Languages offered for spellchecking; the browser needs a dictionary for the one chosen. */
 const LANGUAGES = ['en', 'en-US', 'en-GB', 'da', 'de', 'nl', 'fr', 'es', 'it', 'pt', 'pt-BR', 'sv', 'nb', 'nn', 'fi', 'is', 'pl', 'cs', 'uk', 'ru', 'el', 'tr', 'ja', 'zh'];
@@ -41,9 +42,21 @@ export function ComposeSettingsDialog({ api, prefs, identities, onClose, onSaved
   const [busy, setBusy] = useState(false);
   const editors = useRef<Record<string, EditorHandle | null>>({});
 
+  const [files, setFiles] = useState<FileListing | null>(null);
   useEffect(() => {
     api<Scheduled[]>('/api/scheduled').then(setScheduled).catch(() => setScheduled([]));
+    api<FileListing>('/api/files').then(setFiles).catch(() => setFiles(null));
   }, [api]);
+
+  async function removeFile(file: SharedFile) {
+    if (!window.confirm(`Delete ${file.name}? Its link stops working.`)) return;
+    try {
+      await api(`/api/files/${file.id}`, { method: 'DELETE' });
+      setFiles((current) => current && { ...current, files: current.files.filter((f) => f.id !== file.id), used: current.used - file.size });
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
@@ -130,6 +143,21 @@ export function ComposeSettingsDialog({ api, prefs, identities, onClose, onSaved
             ))}
           </ul>
         )}
+        {files?.enabled && <>
+          <h3 className="dialog-section"><Link2 size={15} />Large files shared as links</h3>
+          <p className="dialog-hint">Files too large to attach are sent as download links. Anyone with a link can download the file until it expires. {formatSize(files.used)} of {formatSize(files.per_user_bytes)} used.</p>
+          {files.files.length === 0 ? <p className="muted">No shared files.</p> : (
+            <ul className="scheduled-list">
+              {files.files.map((file) => (
+                <li key={file.id}>
+                  <span><strong>{file.name}</strong><small>{formatSize(file.size)} · until {formatFullDate(file.expires)} · {file.downloads} download{file.downloads === 1 ? '' : 's'}</small></span>
+                  <button type="button" className="icon" aria-label={`Copy the link to ${file.name}`} title="Copy link" onClick={() => navigator.clipboard?.writeText(`${window.location.origin}${file.url}`)}><Copy size={14} /></button>
+                  <button type="button" className="icon" aria-label={`Delete ${file.name}`} title="Delete" onClick={() => removeFile(file)}><Trash2 size={14} /></button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>}
         {error && <p className="error">{error}</p>}
         <footer><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button></footer>
       </form>

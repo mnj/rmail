@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { CalendarClock, ChevronDown, Lock, Paperclip, Send, Sparkles, Trash2, Type, X } from 'lucide-react';
+import { CalendarClock, ChevronDown, Link2, Lock, Paperclip, Send, Sparkles, Trash2, Type, X } from 'lucide-react';
+import { FileListing, Linked, uploadAsLink } from './filelinks';
 import { Crypto } from './crypto/hook';
 import { Security, Technology, protect, technologies } from './crypto/compose';
 import { REWRITE_STYLES, RewriteStyle, assist, attachTextareaGhost, ghostTextPlugin, insertIntoTextarea } from './assist';
@@ -230,6 +231,12 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
   });
   const initialHtml = useRef(isDraft ? seed.html || textToHtml(seed.text || '') : `<div><br></div>${signatureHtml(defaultIdentity)}${seed.html || ''}`);
   const [uploads, setUploads] = useState<Upload[]>([]);
+  // Files too large to attach, sent as download links instead.
+  const [linkSettings, setLinkSettings] = useState<FileListing | null>(null);
+  const [links, setLinks] = useState<Linked[]>([]);
+  const [offer, setOffer] = useState<File[] | null>(null);
+  const [linking, setLinking] = useState<{ name: string; sent: number; size: number } | null>(null);
+  useEffect(() => { api<FileListing>('/api/files').then(setLinkSettings).catch(() => setLinkSettings(null)); }, [api]);
   const [stored, setStored] = useState<Stored[]>(seed.stored || []);
   const [draftUid, setDraftUid] = useState<number | undefined>(seed.draft_uid);
   const [draftFolder, setDraftFolder] = useState<string | null>(null);
@@ -329,8 +336,16 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
     setRewrite(null);
   }
 
-  const body = () => (format === 'html' ? { html: editorRef.current?.getHTML() || '', text: '' } : { text });
-  const hasContent = () => Boolean(to.trim() || subject.trim() || (format === 'html' ? editorRef.current?.getText().trim() : text.trim()) || uploads.length);
+  /** The links to large files, after the message's own text. */
+  const until = () => new Date(Math.min(...links.map((l) => l.expires)) * 1000).toLocaleDateString();
+  const linksText = () => links.length
+    ? `\n\nFiles (download until ${until()}):\n${links.map((l) => `${l.name} (${formatSize(l.size)}): ${l.url}`).join('\n')}`
+    : '';
+  const linksHtml = () => links.length
+    ? `<p>Files (download until ${escapeHtml(until())}):<br>${links.map((l) => `<a href="${escapeHtml(l.url)}">${escapeHtml(l.name)}</a> (${formatSize(l.size)})`).join('<br>')}</p>`
+    : '';
+  const body = () => (format === 'html' ? { html: (editorRef.current?.getHTML() || '') + linksHtml(), text: '' } : { text: text + linksText() });
+  const hasContent = () => Boolean(to.trim() || subject.trim() || (format === 'html' ? editorRef.current?.getText().trim() : text.trim()) || uploads.length || links.length);
 
   const payload = () => ({
     to: addressList(to), cc: addressList(cc), bcc: addressList(bcc), subject, ...body(),
@@ -343,13 +358,41 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
 
   async function addFiles(files: File[]) {
     if (!files.length) return;
-    const added = await Promise.all(files.map(readFile));
-    if (total + added.reduce((sum, u) => sum + u.size, 0) > MAX_BYTES) {
-      setError('Attachments can be at most 10 MB in total.');
+    if (total + files.reduce((sum, f) => sum + f.size, 0) > MAX_BYTES) {
+      if (linkSettings?.enabled) setOffer(files);
+      else setError('Attachments can be at most 10 MB in total.');
       return;
     }
+    const added = await Promise.all(files.map(readFile));
     touch();
     setUploads((list) => [...list, ...added]);
+  }
+
+  async function sendAsLinks(files: File[]) {
+    setOffer(null);
+    setError('');
+    const chunk = linkSettings?.chunk_bytes ?? 8 * 1024 * 1024;
+    for (const file of files) {
+      if (linkSettings && file.size > linkSettings.max_file_bytes) {
+        setError(`${file.name} is larger than ${formatSize(linkSettings.max_file_bytes)}, the most this server shares.`);
+        continue;
+      }
+      setLinking({ name: file.name, sent: 0, size: file.size });
+      try {
+        const linked = await uploadAsLink(api, file, chunk, (sent) => setLinking({ name: file.name, sent, size: file.size }));
+        touch();
+        setLinks((list) => [...list, linked]);
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    }
+    setLinking(null);
+  }
+
+  async function removeLink(link: Linked) {
+    touch();
+    setLinks((list) => list.filter((l) => l.id !== link.id));
+    await api(`/api/files/${link.id}`, { method: 'DELETE' }).catch(() => undefined);
   }
 
   async function send(sendAt?: Date) {
@@ -518,8 +561,20 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
       ) : (
         <textarea ref={bodyRef} className="compose-body" value={text} lang={prefs.language || undefined} spellCheck onChange={(e) => { setText(e.target.value); touch(); }} aria-label="Message" />
       )}
-      {(uploads.length > 0 || stored.length > 0) && (
+      {offer && (
+        <div className="link-offer" role="alert">
+          <Link2 size={15} />
+          <span>{offer.length === 1 ? `${offer[0].name} is` : 'These files are'} too large to attach (10 MB in all). Send {offer.length === 1 ? 'it' : 'them'} as a download link instead? Links work for {linkSettings?.days ?? 30} days.</span>
+          <button type="button" className="primary small-button" onClick={() => sendAsLinks(offer)}>Send as link</button>
+          <button type="button" className="secondary small-button" onClick={() => setOffer(null)}>Cancel</button>
+        </div>
+      )}
+      {linking && <div className="link-offer" role="status"><Link2 size={15} /><span>Uploading {linking.name}… {Math.round((linking.sent / Math.max(1, linking.size)) * 100)}%</span><progress max={linking.size} value={linking.sent} /></div>}
+      {(uploads.length > 0 || stored.length > 0 || links.length > 0) && (
         <div className="compose-attachments">
+          {links.map((l) => (
+            <span className="file-chip link" key={l.id} title={`Sent as a link: ${l.url}`}><Link2 size={12} />{l.name}<small>{formatSize(l.size)} · link</small><button aria-label={`Remove ${l.name}`} onClick={() => removeLink(l)}><X size={12} /></button></span>
+          ))}
           {stored.map((s, i) => (
             <span className="file-chip" key={`s${i}`}><Paperclip size={12} />{s.filename}<small>{formatSize(s.size)}</small><button aria-label={`Remove ${s.filename}`} onClick={() => { touch(); setStored((list) => list.filter((_, j) => j !== i)); }}><X size={12} /></button></span>
           ))}
