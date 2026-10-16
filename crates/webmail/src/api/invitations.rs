@@ -225,6 +225,33 @@ fn proposer<'a>(calendar: &'a Component, message: &[u8]) -> Option<&'a Property>
     }
 }
 
+/// An event's start and end, the end from `DTEND` or `DURATION`.
+fn exact_times(event: &Component) -> (Option<i64>, Option<i64>) {
+    let start = event.property("DTSTART").and_then(recur::instant);
+    let end = event
+        .property("DTEND")
+        .and_then(recur::instant)
+        .or_else(|| {
+            let duration = event
+                .property("DURATION")
+                .and_then(|duration| text::parse_duration(&duration.value))?;
+            Some(start? + duration.max(0))
+        });
+    (start, end)
+}
+
+/// Whether a proposal is about the organizer's own `copy`: the same
+/// organizer, one of the user's addresses, and a proposer the copy invites.
+fn proposal_fits(copy: &Component, proposal: &Component, proposer: &str, own: &[String]) -> bool {
+    let organizer = itip::organizer(copy);
+    organizer.is_some()
+        && organizer == itip::organizer(proposal)
+        && own
+            .iter()
+            .any(|address| itip::role(copy, address) == Role::Organizer)
+        && itip::role(copy, proposer) == Role::Attendee
+}
+
 /// The calendar a message carries, if it is an iTIP message.
 fn message_calendar(message: &[u8]) -> Option<(Method, Component)> {
     match mime::calendar_part(message, imip::MAX_CALENDAR_BYTES) {
@@ -250,17 +277,9 @@ pub(crate) fn invitation(
             .is_some_and(|v| v.eq_ignore_ascii_case("DATE"))
     });
     // Exact times for the card; `time_bounds` widens floating times.
-    let start = event.property("DTSTART").and_then(recur::instant).or(start);
-    let end = event
-        .property("DTEND")
-        .and_then(recur::instant)
-        .or_else(|| {
-            let duration = event
-                .property("DURATION")
-                .and_then(|duration| text::parse_duration(&duration.value))?;
-            Some(start? + duration.max(0))
-        })
-        .or(end);
+    let (exact_start, exact_end) = exact_times(event);
+    let start = exact_start.or(start);
+    let end = exact_end.or(end);
     let attendees = event
         .properties_named("ATTENDEE")
         .filter_map(|attendee| {
@@ -364,10 +383,7 @@ pub(crate) fn invitation(
                     .any(|address| itip::role(copy, address) == Role::Organizer)
             });
             if let Some(event) = copy.as_ref().and_then(main_component) {
-                current = (
-                    event.property("DTSTART").and_then(recur::instant),
-                    event.property("DTEND").and_then(recur::instant),
-                );
+                current = exact_times(event);
             }
             let taken = current.0 == start && (end.is_none() || current.1 == end);
             match &copy {
@@ -646,17 +662,17 @@ pub(crate) fn act(
             Ok(Ok(()))
         }
         (Method::Counter, "accept_counter") => {
-            let Some((collection, object)) = found else {
+            let (Some((collection, object)), Some(proposer)) = (
+                found,
+                proposer(&calendar, message).and_then(|p| itip::address(&p.value)),
+            ) else {
                 return Ok(Err(Refused::NotAllowed));
             };
             let mut outgoing = Vec::new();
             let stored = store::put_with(&dav.conn, &collection, &object.name, &mut |current| {
                 let copy = current
                     .and_then(|object| text::parse(&object.data).ok())
-                    .filter(|copy| {
-                        own.iter()
-                            .any(|address| itip::role(copy, address) == Role::Organizer)
-                    })
+                    .filter(|copy| proposal_fits(copy, &calendar, &proposer, &own))
                     .ok_or(PutError::InvalidData(String::new()))?;
                 if sequence(&copy) > sequence(&calendar) {
                     return Err(PutError::PreconditionFailed);
@@ -680,17 +696,22 @@ pub(crate) fn act(
             }
         }
         (Method::Counter, "decline_counter") => {
-            let organizes = found
+            let copy = found
                 .as_ref()
-                .and_then(|(_, object)| text::parse(&object.data).ok())
-                .is_some_and(|copy| {
-                    own.iter()
-                        .any(|address| itip::role(&copy, address) == Role::Organizer)
-                });
-            let Some(decline) = itip::decline_counter(&calendar).filter(|_| organizes) else {
+                .and_then(|(_, object)| text::parse(&object.data).ok());
+            let proposer = proposer(&calendar, message).and_then(|p| itip::address(&p.value));
+            let (Some(copy), Some(proposer)) = (copy, proposer) else {
                 return Ok(Err(Refused::NotAllowed));
             };
-            let from = itip::organizer(&calendar).unwrap_or_else(|| dav.user.address.clone());
+            if !proposal_fits(&copy, &calendar, &proposer, &own) {
+                return Ok(Err(Refused::NotAllowed));
+            }
+            let (Some(decline), Some(from)) = (
+                itip::decline_counter(&calendar, &proposer),
+                itip::organizer(&copy),
+            ) else {
+                return Ok(Err(Refused::NotAllowed));
+            };
             schedule::send(&dav, &dav.user.clone(), &from, vec![decline]);
             Ok(Ok(()))
         }
@@ -1030,6 +1051,17 @@ mod tests {
                 &format!("DTEND:{}", start.replace("T09", "T10")),
             )
         };
+        let stranger = deliver(mail(
+            "COUNTER",
+            &proposal("20261023T090000Z").replace("guest@remote.test", "stranger@remote.test"),
+        ));
+        let (status, _) = call(
+            "POST",
+            format!("/api/folders/INBOX/messages/{stranger}/invitation"),
+            json!({"action": "accept_counter"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 409, "only an invited guest's proposal can be taken");
         let counter_uid = deliver(mail("COUNTER", &proposal("20261021T090000Z")));
         let (_, detail) = call(
             "GET",

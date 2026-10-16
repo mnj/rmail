@@ -885,12 +885,15 @@ pub fn counter(
     })
 }
 
-/// The organizer's "no" to a proposal (RFC 5546 3.2.8), to its sender.
-pub fn decline_counter(proposal: &Component) -> Option<Message> {
+/// The organizer's "no" to a proposal (RFC 5546 3.2.8), to `attendee`,
+/// who proposed it (a proposal may list every guest).
+pub fn decline_counter(proposal: &Component, attendee: &str) -> Option<Message> {
     let event = master_of(proposal)?;
-    let attendee = event
+    let attendee = attendee.trim().to_ascii_lowercase();
+    let line = event
         .properties_named("ATTENDEE")
-        .find_map(|a| address(&a.value))?;
+        .find(|a| address(&a.value).as_deref() == Some(attendee.as_str()))?
+        .clone();
     let mut decline = Component::new("VCALENDAR");
     decline.set_property("VERSION", "2.0");
     decline.set_property("PRODID", "-//rMail//EN");
@@ -898,11 +901,12 @@ pub fn decline_counter(proposal: &Component) -> Option<Message> {
         .properties
         .insert(0, Property::new("METHOD", Method::DeclineCounter.as_str()));
     let mut component = Component::new("VEVENT");
-    for name in ["UID", "SEQUENCE", "ORGANIZER", "ATTENDEE", "RECURRENCE-ID"] {
+    for name in ["UID", "SEQUENCE", "ORGANIZER", "RECURRENCE-ID"] {
         for property in event.properties_named(name) {
             component.properties.push(property.clone());
         }
     }
+    component.properties.push(line);
     component.set_property(
         "DTSTAMP",
         &super::recur::utc_text(chrono::Utc::now().timestamp()),
@@ -920,7 +924,11 @@ pub fn decline_counter(proposal: &Component) -> Option<Message> {
 pub fn apply_counter(existing: &Component, proposal: &Component) -> Option<Component> {
     let proposed = master_of(proposal)?;
     let start = proposed.property("DTSTART")?.clone();
-    let end = proposed.property("DTEND").cloned();
+    // RFC 5546 lets the end be a duration.
+    let end = proposed
+        .property("DTEND")
+        .or_else(|| proposed.property("DURATION"))
+        .cloned();
     let mut copy = existing.clone();
     let event = copy
         .components
@@ -1078,10 +1086,16 @@ mod tests {
         );
         assert!(text.contains("COMMENT:Tuesday\\, please"));
 
-        let decline = decline_counter(&proposal.calendar).unwrap();
+        let decline = decline_counter(&proposal.calendar, "bob@example.test").unwrap();
         assert_eq!(decline.method, Method::DeclineCounter);
         assert_eq!(decline.recipients, ["bob@example.test"]);
         assert!(decline.calendar.to_text().contains("METHOD:DECLINECOUNTER"));
+        // A proposal listing every guest is declined to its proposer only.
+        let decline = decline_counter(&calendar, "carol@example.test").unwrap();
+        assert_eq!(decline.recipients, ["carol@example.test"]);
+        let text = decline.calendar.to_text();
+        assert!(!text.contains("bob@example.test"), "{text}");
+        assert!(decline_counter(&calendar, "dave@example.test").is_none());
 
         let moved = apply_counter(&calendar, &proposal.calendar).unwrap();
         let master = master_of(&moved).unwrap();
@@ -1093,6 +1107,24 @@ mod tests {
         assert!(
             moved.to_text().contains("carol@example.test"),
             "everyone stays invited"
+        );
+
+        // A proposal may give its end as a duration.
+        let by_duration = text::parse(
+            &proposal
+                .calendar
+                .to_text()
+                .replace("DTEND:20261013T110000Z", "DURATION:PT2H"),
+        )
+        .unwrap();
+        let moved = apply_counter(&calendar, &by_duration).unwrap();
+        assert_eq!(
+            master_of(&moved)
+                .unwrap()
+                .property("DURATION")
+                .unwrap()
+                .value,
+            "PT2H"
         );
     }
 
