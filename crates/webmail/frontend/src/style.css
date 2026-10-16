@@ -657,3 +657,7 @@ time { white-space: nowrap; }
 .ai-found-item > svg { flex: none; color: var(--muted); }
 .ai-found-item > span:not(.muted) { flex: 1; min-width: 0; display: grid; }
 .ai-found-item strong, .ai-found-item small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Search by meaning */
+.search .meaning { display: inline-flex; align-items: center; gap: 4px; flex: none; border: 1px solid var(--border); border-radius: 999px; background: none; color: var(--muted); font-size: 12px; padding: 2px 8px; margin-right: 4px; white-space: nowrap; }
+.search .meaning.on { border-color: var(--accent); color: var(--accent-text); background: var(--surface-2); }

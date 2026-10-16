@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FolderPlus, Plus, Tag, X } from 'lucide-react';
+import { FolderPlus, Plus, Search, Tag, X } from 'lucide-react';
 import type { Api, Organize, OrganizeFolder, OrganizeLabel } from './types';
 import { listNames } from './types';
 
@@ -9,6 +9,7 @@ function cloudUses(data: Organize): string[] {
   if (data.enabled && data.cloud_required) uses.push('Every message you file or receive is sent to learn your folders, including recent mail already in them.');
   else if (data.enabled && data.labels_cloud) uses.push('Messages rMail is unsure where to file are sent.');
   if (data.labels_enabled && data.labels_cloud) uses.push('Every new message in your inbox is sent to label it.');
+  if (data.search_enabled && data.cloud_required) uses.push('Every message in your folders (not Trash or Junk) is sent to index it for search by meaning, and so are your searches.');
   if ((data.ai_labels || data.ai_summary) && data.labels_cloud) uses.push('Messages you choose to summarize or label are sent when you ask.');
   return uses;
 }
@@ -59,6 +60,7 @@ export function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: (
         body: JSON.stringify({
           enabled: data.enabled,
           labels_enabled: data.labels_enabled,
+          search_enabled: data.search_enabled,
           labels: data.labels.filter((l) => l.name.trim()).map((l) => ({ name: l.name, description: l.description })),
           labels_seen: seen,
           ...(data.cloud_providers.length ? { cloud_consent: data.cloud_consent } : {}),
@@ -144,7 +146,14 @@ export function OrganizeDialog({ api, onClose, onSaved }: { api: Api; onClose: (
             )}
           </>}
 
-          {(data.enabled || data.labels_enabled || data.ai_labels || data.ai_summary) && data.cloud_providers.length > 0 && <>
+          {data.search_available && <>
+            <h3 className="dialog-section"><Search size={16} />Search by meaning</h3>
+            <p className="dialog-hint">Find mail by what it is about, not only the words in it: “boat trip” finds the sailing club's message. rMail indexes your folders (not Trash or Junk) in the background, newest first; then the search box offers <strong>By meaning</strong>.</p>
+            <label className="switch-row"><input type="checkbox" checked={data.search_enabled} onChange={(e) => setData({ ...data, search_enabled: e.target.checked })} /><span>Index my mail for search by meaning</span></label>
+            {data.search_enabled && data.search_indexed > 0 && <p className="dialog-hint">{data.search_indexed} messages indexed so far.</p>}
+          </>}
+
+          {(data.enabled || data.labels_enabled || data.search_enabled || data.ai_labels || data.ai_summary) && data.cloud_providers.length > 0 && <>
             <h3 className="dialog-section">Privacy</h3>
             <label className="switch-row"><input type="checkbox" checked={data.cloud_consent} onChange={(e) => setData({ ...data, cloud_consent: e.target.checked })} /><span>Send my mail to {listNames(data.cloud_providers)}</span></label>
             <p className="dialog-hint">

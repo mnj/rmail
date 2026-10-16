@@ -140,6 +140,14 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS label_requests_batch ON label_requests(batch_id);
+        CREATE TABLE IF NOT EXISTS search_vectors(
+            folder TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            PRIMARY KEY (folder, uid)
+        );
         ",
     )?;
     // Added after the first release: stores opted in before them start with
@@ -152,6 +160,12 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column(conn, "prefs", "labels_seeded", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column(
+        conn,
+        "prefs",
+        "search_enabled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -193,12 +207,15 @@ pub struct Prefs {
     /// suggestions (`enabled`).
     #[serde(default)]
     pub labels_enabled: bool,
+    /// Index the user's mail for search by meaning (embeddings).
+    #[serde(default)]
+    pub search_enabled: bool,
 }
 
 impl Prefs {
     /// Whether the daemon has anything to do for this account.
     pub fn any_enabled(&self) -> bool {
-        self.enabled || self.labels_enabled
+        self.enabled || self.labels_enabled || self.search_enabled
     }
 
     /// Whether the user agreed to every provider in `providers`.
@@ -210,8 +227,9 @@ impl Prefs {
 }
 
 pub fn prefs(conn: &Connection) -> Result<Prefs> {
-    let (enabled, excluded, autofile, consent, labels_enabled) = conn.query_row(
-        "SELECT enabled, excluded_folders, autofile_folders, cloud_consent, labels_enabled
+    let (enabled, excluded, autofile, consent, labels_enabled, search_enabled) = conn.query_row(
+        "SELECT enabled, excluded_folders, autofile_folders, cloud_consent, labels_enabled,
+             search_enabled
          FROM prefs WHERE id = 1",
         [],
         |row| {
@@ -221,6 +239,7 @@ pub fn prefs(conn: &Connection) -> Result<Prefs> {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, bool>(4)?,
+                row.get::<_, bool>(5)?,
             ))
         },
     )?;
@@ -230,20 +249,23 @@ pub fn prefs(conn: &Connection) -> Result<Prefs> {
         autofile_folders: serde_json::from_str(&autofile).unwrap_or_default(),
         cloud_consent: serde_json::from_str(&consent).unwrap_or_default(),
         labels_enabled,
+        search_enabled,
     })
 }
 
 pub fn set_prefs(conn: &Connection, prefs: &Prefs) -> Result<()> {
     conn.execute(
         "UPDATE prefs SET enabled = ?1, excluded_folders = ?2, autofile_folders = ?3,
-             cloud_consent = ?4, labels_enabled = ?5, updated_at = ?6 WHERE id = 1",
+             cloud_consent = ?4, labels_enabled = ?5, updated_at = ?6, search_enabled = ?7
+         WHERE id = 1",
         params![
             prefs.enabled,
             serde_json::to_string(&prefs.excluded_folders)?,
             serde_json::to_string(&prefs.autofile_folders)?,
             serde_json::to_string(&prefs.cloud_consent)?,
             prefs.labels_enabled,
-            now()
+            now(),
+            prefs.search_enabled
         ],
     )?;
     Ok(())
@@ -854,6 +876,132 @@ pub fn example_counts(conn: &Connection) -> Result<BTreeMap<String, u64>> {
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// Search by meaning
+
+/// UIDs of `folder` (at `uidvalidity`) indexed with `model_id`.
+pub fn search_indexed(
+    conn: &Connection,
+    folder: &str,
+    uidvalidity: u64,
+    model_id: &str,
+) -> Result<std::collections::HashSet<u64>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid FROM search_vectors WHERE folder = ?1 AND uidvalidity = ?2 AND model_id = ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![folder, uidvalidity as i64, model_id], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().map(|uid| uid as u64).collect())
+}
+
+pub fn put_search_vector(
+    conn: &Connection,
+    folder: &str,
+    uidvalidity: u64,
+    uid: u64,
+    model_id: &str,
+    embedding: &[f32],
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO search_vectors(folder, uidvalidity, uid, model_id, embedding)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            folder,
+            uidvalidity as i64,
+            uid as i64,
+            model_id,
+            encode_embedding(embedding)
+        ],
+    )?;
+    Ok(())
+}
+
+/// Forget what `folder` no longer holds: other UID validities, other
+/// models, and messages not in `present`.
+pub fn prune_search(
+    conn: &Connection,
+    folder: &str,
+    uidvalidity: u64,
+    model_id: &str,
+    present: &std::collections::HashSet<u64>,
+) -> Result<usize> {
+    let indexed = {
+        let mut stmt = conn
+            .prepare("SELECT uid, uidvalidity, model_id FROM search_vectors WHERE folder = ?1")?;
+        stmt.query_map(params![folder], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut removed = 0;
+    for (uid, validity, model) in indexed {
+        if validity != uidvalidity || model != model_id || !present.contains(&uid) {
+            removed += conn.execute(
+                "DELETE FROM search_vectors WHERE folder = ?1 AND uid = ?2",
+                params![folder, uid as i64],
+            )?;
+        }
+    }
+    Ok(removed)
+}
+
+/// Forget folders that are gone (or no longer searched).
+pub fn keep_search_folders(conn: &Connection, folders: &[String]) -> Result<()> {
+    let known = {
+        let mut stmt = conn.prepare("SELECT DISTINCT folder FROM search_vectors")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for folder in known.into_iter().filter(|f| !folders.contains(f)) {
+        conn.execute(
+            "DELETE FROM search_vectors WHERE folder = ?1",
+            params![folder],
+        )?;
+    }
+    Ok(())
+}
+
+/// The indexed vectors of `folder` for `model_id`: (uidvalidity, uid, vector).
+pub fn search_vectors(
+    conn: &Connection,
+    folder: &str,
+    model_id: &str,
+) -> Result<Vec<(u64, u64, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT uidvalidity, uid, embedding FROM search_vectors WHERE folder = ?1 AND model_id = ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![folder, model_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+                decode_embedding(&row.get::<_, Vec<u8>>(2)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn search_count(conn: &Connection) -> Result<u64> {
+    Ok(
+        conn.query_row("SELECT COUNT(*) FROM search_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })? as u64,
+    )
+}
+
+pub fn clear_search(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM search_vectors", [])?;
+    Ok(())
+}
+
 fn encode_embedding(values: &[f32]) -> Vec<u8> {
     values
         .iter()
@@ -1289,6 +1437,7 @@ mod tests {
             autofile_folders: vec!["Receipts".into()],
             cloud_consent: vec!["openrouter".into()],
             labels_enabled: true,
+            search_enabled: true,
         };
         set_prefs(&conn, &wanted).unwrap();
         assert_eq!(prefs(&conn).unwrap(), wanted);

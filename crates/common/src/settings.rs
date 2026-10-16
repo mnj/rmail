@@ -1401,6 +1401,9 @@ pub struct ClassifierModels {
     /// Whether that model writes text (local or OpenRouter chat), which
     /// summaries need; Jev only picks from options.
     pub chat_writes_text: bool,
+    /// Whether an embedding model is configured (folder suggestions and
+    /// search by meaning need one).
+    pub embed_configured: bool,
 }
 
 impl ClassifierModels {
@@ -1444,7 +1447,19 @@ pub fn classifier_models(conn: &Connection) -> Result<ClassifierModels> {
         )?,
         ChatProvider::Jev => true,
     };
+    let embed_configured = match embed {
+        crate::config::EmbedProvider::Local => !text("classifier.embed_model")?.is_empty(),
+        crate::config::EmbedProvider::OpenRouter => model(
+            "classifier.openrouter_embed_model",
+            &defaults.openrouter_embed_model,
+        )?,
+        crate::config::EmbedProvider::OpenAi => model(
+            "classifier.openai_embed_model",
+            &defaults.openai_embed_model,
+        )?,
+    };
     Ok(ClassifierModels {
+        embed_configured,
         embed_cloud: embed.cloud(),
         chat_cloud: chat.cloud().filter(|_| chat_configured),
         chat_configured,

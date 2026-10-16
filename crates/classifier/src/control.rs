@@ -156,6 +156,48 @@ async fn execute(shared: &Arc<Shared>, request: Request) -> Result<serde_json::V
                 "ms": started.elapsed().as_millis() as u64,
             }))
         }
+        Request::Search {
+            domain,
+            localpart,
+            folder,
+            query,
+            limit,
+        } => {
+            let runtime = shared.runtime().await;
+            let embedder = runtime
+                .models
+                .embedder
+                .clone()
+                .context("no embedding model is loaded")?;
+            let mail_root = std::path::PathBuf::from(&runtime.config.global.mail_root);
+            let started = Instant::now();
+            let results = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
+                let wanted = embedder.embed(&[query])?.remove(0);
+                let Some(conn) = rmail_common::classifier_store::open_existing(&mail_root, &domain, &localpart)? else {
+                    return Ok(Vec::new());
+                };
+                let mut scored: Vec<(f32, u64, u64)> =
+                    rmail_common::classifier_store::search_vectors(&conn, &folder, embedder.model_id())?
+                        .into_iter()
+                        .map(|(validity, uid, vector)| {
+                            let score = vector.iter().zip(&wanted).map(|(a, b)| a * b).sum::<f32>();
+                            (score, validity, uid)
+                        })
+                        .collect();
+                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                Ok(scored
+                    .into_iter()
+                    .take(limit.clamp(1, 200))
+                    .map(|(score, uidvalidity, uid)| json!({ "uidvalidity": uidvalidity, "uid": uid, "score": score }))
+                    .collect())
+            })
+            .await??;
+            Ok(json!({
+                "model": runtime.models.embed_info.as_ref().map(|m| m.file.clone()),
+                "results": results,
+                "ms": started.elapsed().as_millis() as u64,
+            }))
+        }
         Request::Summarize { text } => {
             let runtime = shared.runtime().await;
             let chooser = runtime

@@ -130,6 +130,11 @@ struct Overview {
     ai_labels: bool,
     ai_summary: bool,
     labels_enabled: bool,
+    /// Search by meaning: whether the server has an embedding model for it,
+    /// whether the user turned it on, and how many messages are indexed.
+    search_available: bool,
+    search_enabled: bool,
+    search_indexed: u64,
     labels: Vec<LabelView>,
     folder_ideas: Vec<FolderIdea>,
     pending: usize,
@@ -218,6 +223,12 @@ async fn overview(app: State<Shared>, headers: HeaderMap) -> Response {
             ai_summary: server_enabled && models.chat_writes_text,
             cloud_providers,
             labels_enabled: prefs.labels_enabled,
+            search_available: server_enabled && models.embed_configured,
+            search_enabled: prefs.search_enabled,
+            search_indexed: match &conn {
+                Some(conn) => store::search_count(conn)?,
+                None => 0,
+            },
             labels: labels
                 .into_iter()
                 .map(|label| LabelView {
@@ -261,6 +272,9 @@ struct SaveRequest {
     /// Absent keeps the current setting, as for `labels`.
     #[serde(default)]
     labels_enabled: Option<bool>,
+    /// Absent keeps the current setting.
+    #[serde(default)]
+    search_enabled: Option<bool>,
     #[serde(default)]
     labels: Option<Vec<LabelInput>>,
     /// Label names the editor showed, so labels the model added meanwhile
@@ -295,12 +309,14 @@ async fn save(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
             None => Prefs::default(),
         };
         let labels_on = input.labels_enabled.unwrap_or(current.labels_enabled);
+        let search_on = input.search_enabled.unwrap_or(current.search_enabled);
         // Opting out of an account that never opted in leaves no file behind.
         let conn = match existing {
             Some(conn) => conn,
             // Consent alone is worth keeping: on-demand AI actions need it.
             None if input.enabled
                 || labels_on
+                || search_on
                 || input.labels.is_some()
                 || input.cloud_consent == Some(true) =>
             {
@@ -349,6 +365,7 @@ async fn save(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
             autofile_folders: keep(input.autofile_folders),
             cloud_consent,
             labels_enabled: labels_on,
+            search_enabled: search_on,
         };
         store::set_prefs(&conn, &prefs)?;
         if prefs.labels_enabled {
@@ -357,6 +374,9 @@ async fn save(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
         }
         if !prefs.enabled {
             clear_pending(root, domain, local, &conn)?;
+        }
+        if !prefs.search_enabled {
+            store::clear_search(&conn)?;
         }
         Ok(Ok(()))
     })

@@ -112,6 +112,9 @@ def invitation():
 
 
 deliver(invitation())
+deliver(message('"Harbour Sailing Club" <club@harbour-sailing.test>', "alice@example.com",
+                "Regatta on Saturday", "The club boats leave the marina at nine. Bring a life jacket "
+                "and something warm; we sail back around four.", ago=60 * 60 * 30))
 deliver(message('"Alice Chen" <alice@example.com>', "support@example.com",
                 "Customer escalation: delayed invoices", "Can someone look at ticket 4411?"))
 deliver(message('"Monitoring" <alerts@example.org>', "ops@example.org",
@@ -216,7 +219,7 @@ for path, method, body in [
     ("/api/login", "POST", {"address": "alice@example.com", "password": PASSWORD}),
     ("/api/compose/settings", "PUT", {"format": "html", "language": "", "undo_seconds": 0, "ai_suggestions": True}),
     # She agrees to the (fake) hosted model reading mail she asks about.
-    ("/api/organize", "PUT", {"enabled": False, "cloud_consent": True}),
+    ("/api/organize", "PUT", {"enabled": False, "cloud_consent": True, "search_enabled": True}),
 ]:
     webmail.open(urllib.request.Request(
         "https://127.0.0.1:18081" + path, method=method, data=json.dumps(body).encode(),

@@ -575,6 +575,100 @@ struct ListQuery {
     offset: usize,
     #[serde(default)]
     q: String,
+    /// `1`: rank the folder's messages by closeness in meaning to `q`
+    /// (the user's search index) instead of matching words.
+    #[serde(default)]
+    semantic: Option<String>,
+}
+
+/// Most messages a search by meaning lists.
+const MAX_SEMANTIC_RESULTS: usize = 50;
+
+/// The folder's messages closest in meaning to `query`, best first, as
+/// (uidvalidity, uid, score): from the classifier daemon and the user's
+/// search index. Only the user's own folders have one.
+async fn semantic_ranking(
+    state: &Shared,
+    session: &Session,
+    folder: &str,
+    query: &str,
+) -> Result<Vec<(u64, u64, f64)>, (StatusCode, String)> {
+    let checked = {
+        let (state, session, folder) = (state.clone(), session.clone(), folder.to_string());
+        blocking(move || {
+            let location = locate(&state, &session, &folder)?;
+            let conn = rmail_common::classifier_store::open_existing(
+                &state.mail_root,
+                &session.domain,
+                &session.localpart,
+            )?;
+            let prefs = match &conn {
+                Some(conn) => rmail_common::classifier_store::prefs(conn)?,
+                None => Default::default(),
+            };
+            let settings = rmail_common::settings::open(&state.db_path).ok();
+            let models = settings
+                .as_ref()
+                .and_then(|conn| rmail_common::settings::classifier_models(conn).ok())
+                .unwrap_or_default();
+            let running = settings
+                .as_ref()
+                .and_then(|conn| {
+                    rmail_common::settings::get(conn, "classifier.enabled")
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            Ok((location, prefs, models, running))
+        })
+        .await
+    };
+    let (location, prefs, models, running) =
+        checked.map_err(|error| (StatusCode::NOT_FOUND, format!("{error:#}")))?;
+    if location.is_shared() {
+        return Err((
+            StatusCode::CONFLICT,
+            "search by meaning works in your own folders".into(),
+        ));
+    }
+    if !running || !prefs.search_enabled || !models.embed_configured {
+        return Err((
+            StatusCode::CONFLICT,
+            "search by meaning is not turned on".into(),
+        ));
+    }
+    if let Some(provider) = models.embed_cloud
+        && !prefs.allows_cloud(&[provider])
+    {
+        return Err((StatusCode::FORBIDDEN, format!("consent:{provider}")));
+    }
+    let socket = rmail_common::classifier_control::socket_path(&state.mail_root);
+    let request = rmail_common::classifier_control::Request::Search {
+        domain: session.domain.clone(),
+        localpart: session.localpart.clone(),
+        folder: location.folder.clone(),
+        query: query.chars().take(500).collect(),
+        limit: MAX_SEMANTIC_RESULTS,
+    };
+    let reply = rmail_common::classifier_control::call(
+        &socket,
+        &request,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_GATEWAY, format!("{error:#}")))?;
+    let results = reply["results"].as_array().cloned().unwrap_or_default();
+    Ok(results
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r["uidvalidity"].as_u64()?,
+                r["uid"].as_u64()?,
+                r["score"].as_f64().unwrap_or(0.0),
+            ))
+        })
+        .collect())
 }
 
 fn default_limit() -> usize {
@@ -861,6 +955,14 @@ async fn message_list(
     };
     let needle = query.q.trim().to_lowercase();
     let limit = query.limit.clamp(1, 200);
+    let ranking = if query.semantic.as_deref() == Some("1") && !needle.is_empty() {
+        match semantic_ranking(&state, &session, &folder, query.q.trim()).await {
+            Ok(ranking) => Some(ranking),
+            Err((status, message)) => return (status, message).into_response(),
+        }
+    } else {
+        None
+    };
     let result = blocking(move || {
         let location = locate(&state, &session, &folder)?;
         let folder = location.folder.clone();
@@ -891,7 +993,32 @@ async fn message_list(
         let (total, page): (
             usize,
             Vec<(imap_state::Message, rmail_common::mime::ParsedMessage)>,
-        ) = if needle.is_empty() {
+        ) = if let Some(ranking) = ranking {
+            // Closest first, as the index ranked them.
+            let mut by_uid: std::collections::HashMap<u64, imap_state::Message> =
+                messages.into_iter().map(|m| (m.uid, m)).collect();
+            let current: Vec<_> = ranking
+                .into_iter()
+                .filter(|(validity, _, _)| *validity == info.uidvalidity)
+                .filter_map(|(_, uid, score)| by_uid.remove(&uid).map(|m| (m, score)))
+                .collect();
+            // What is reasonably close to the best match still here (the
+            // index may hold messages deleted since its last cycle).
+            let best = current.first().map(|(_, score)| *score).unwrap_or(0.0);
+            let ranked: Vec<_> = current
+                .into_iter()
+                .filter(|(_, score)| best <= 0.0 || *score >= best * 0.5)
+                .map(|(message, _)| message)
+                .collect();
+            let total = ranked.len();
+            let page = ranked
+                .into_iter()
+                .skip(query.offset)
+                .take(limit)
+                .filter_map(|message| read(&message).map(|parsed| (message, parsed)))
+                .collect();
+            (total, page)
+        } else if needle.is_empty() {
             let total = messages.len();
             let page = messages
                 .into_iter()
@@ -2465,6 +2592,105 @@ mod tests {
         send["entity"] = serde_json::json!("Content-Type: text/plain\r\n\r\nbare\nnewline\r\n");
         let refused = call("POST", "/api/send", send.to_string().into_bytes()).await;
         assert_eq!(refused.status, 422);
+    }
+
+    #[tokio::test]
+    async fn search_by_meaning_ranks_the_folder_from_the_index() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (state.mail_root.clone(), "example.test", "user");
+        imap_state::init_account(&root, d, l).unwrap();
+        let mut uids = Vec::new();
+        for subject in ["Sailing club", "Invoice 7", "Harbour fees"] {
+            let message = format!("From: a@b.test\r\nSubject: {subject}\r\n\r\nbody");
+            uids.push(
+                imap_state::deliver_message(&root, d, l, message.as_bytes())
+                    .unwrap()
+                    .1,
+            );
+        }
+        let validity = imap_state::load_folder(&root, d, l, "INBOX")
+            .unwrap()
+            .0
+            .uidvalidity;
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let path = "/api/folders/INBOX/messages?q=boats&semantic=1";
+        let off = route(req("GET", path, b"", cookie.clone()), &state).await;
+        assert_eq!(off.status, 409, "not turned on");
+
+        let mut settings = rmail_common::settings::open(&state.db_path).unwrap();
+        rmail_common::settings::write_raw(
+            &mut settings,
+            &[
+                (
+                    "classifier.embed_model".to_string(),
+                    Some(serde_json::json!("e.gguf")),
+                ),
+                (
+                    "classifier.enabled".to_string(),
+                    Some(serde_json::json!(true)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let store = rmail_common::classifier_store::open_or_create(&root, d, l).unwrap();
+        let mut prefs = rmail_common::classifier_store::prefs(&store).unwrap();
+        prefs.search_enabled = true;
+        rmail_common::classifier_store::set_prefs(&store, &prefs).unwrap();
+
+        let socket = rmail_common::classifier_control::socket_path(&root);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (first, third) = (uids[0], uids[2]);
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let reply = serde_json::json!({"ok": true, "data": {"results": [
+                {"uidvalidity": validity, "uid": 998, "score": 2.0},
+                {"uidvalidity": validity, "uid": third, "score": 0.8},
+                {"uidvalidity": validity, "uid": first, "score": 0.7},
+                {"uidvalidity": validity, "uid": 999, "score": 0.6},
+                {"uidvalidity": validity + 1, "uid": first, "score": 0.5},
+            ]}});
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        });
+        let found = route(req("GET", path, b"", cookie), &state).await;
+        assert_eq!(
+            found.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&found.body)
+        );
+        let found: serde_json::Value = serde_json::from_slice(&found.body).unwrap();
+        let subjects: Vec<&str> = found["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["subject"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            subjects,
+            ["Harbour fees", "Sailing club"],
+            "closest first; gone and stale entries dropped"
+        );
+        let request = daemon.await.unwrap();
+        assert_eq!(
+            (request["command"].as_str(), request["folder"].as_str()),
+            (Some("search"), Some("INBOX"))
+        );
+        assert_eq!(request["query"], "boats");
     }
 
     #[tokio::test]

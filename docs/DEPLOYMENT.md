@@ -631,6 +631,13 @@ with **Add to calendar**, and the sender's signature with **Save contact** (a kn
 opens with the new phone, company or title added). Nothing is added without the user's click.
 Hosted models only receive a message when the user has agreed to that provider.
 
+**Search by meaning** (with an embedding model configured): users turn it on under **Organize my
+mail**; the classifier then indexes their folders (not Trash or Junk) in the background, newest
+first, up to 256 messages per account per cycle, and forgets messages that are deleted or moved.
+The search box then offers **By meaning**, which lists the open folder's messages closest to the
+query, best first. Turning it off deletes the index. With a hosted embedding model, indexing and
+searches only happen for users who agreed to that provider.
+
 ### OpenPGP and S/MIME
 
 Users sign and encrypt mail with OpenPGP (RFC 9580, PGP/MIME as in RFC 3156) or S/MIME (RFC 8551)
