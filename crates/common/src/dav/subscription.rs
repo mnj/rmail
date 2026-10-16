@@ -144,8 +144,16 @@ async fn public_address(url: &reqwest::Url) -> Result<SocketAddr> {
     Ok(addresses[0])
 }
 
-/// Fetch a feed: public addresses only, redirects checked one by one.
+/// Fetch a feed: public addresses only, redirects checked one by one, all
+/// of it (lookups, redirects and the body) within [`TIMEOUT`].
 pub async fn fetch(url: &reqwest::Url) -> Result<String> {
+    match tokio::time::timeout(TIMEOUT, fetch_unbounded(url)).await {
+        Ok(result) => result,
+        Err(_) => bail!("the calendar's server took too long"),
+    }
+}
+
+async fn fetch_unbounded(url: &reqwest::Url) -> Result<String> {
     let mut url = url.clone();
     for _ in 0..=MAX_REDIRECTS {
         let address = public_address(&url).await?;
