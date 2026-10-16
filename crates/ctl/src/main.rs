@@ -103,6 +103,14 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Rooms and equipment: mailboxes that answer invitations themselves
+    Resource {
+        #[command(subcommand)]
+        action: ResourceAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// DKIM signing keys and the ARC sealing key, stored in the database
     Dkim {
         #[command(subcommand)]
@@ -236,6 +244,18 @@ enum TwoFactorAction {
     Allow { domain: String },
     /// Domains that require it
     Domains,
+}
+
+#[derive(Subcommand)]
+enum ResourceAction {
+    /// Mark ADDRESS as a room or equipment, or as a person again
+    Set {
+        address: String,
+        /// room, equipment or person
+        kind: String,
+    },
+    /// List the resources
+    List,
 }
 
 #[derive(Subcommand)]
@@ -749,6 +769,35 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&cfg.global.db_path),
                 &mut std::io::stdout(),
             )?;
+        }
+        Commands::Resource { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db = std::path::Path::new(&cfg.global.db_path);
+            match action {
+                ResourceAction::Set { address, kind } => {
+                    let parsed = match kind.as_str() {
+                        "person" | "none" => None,
+                        other => Some(
+                            rmail_common::resources::ResourceKind::parse(other).ok_or_else(
+                                || anyhow::anyhow!("kind must be room, equipment or person"),
+                            )?,
+                        ),
+                    };
+                    rmail_common::resources::set(db, &address, parsed)?;
+                    println!(
+                        "{address} is now a {}",
+                        parsed.map_or("person", |k| k.as_str())
+                    );
+                }
+                ResourceAction::List => {
+                    for (address, kind) in rmail_common::resources::list(db, None)? {
+                        println!("{address}\t{}", kind.as_str());
+                    }
+                }
+            }
         }
         Commands::Feedback { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {

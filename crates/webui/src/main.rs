@@ -54,6 +54,8 @@ struct AccountSummary {
     quota_bytes: Option<u64>,
     two_factor: bool,
     app_passwords: usize,
+    /// `room` or `equipment` for a resource account.
+    resource: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -531,6 +533,12 @@ fn account_summaries_sync(
     let app_password_counts = db_path
         .and_then(|db| rmail_common::two_factor::app_password_counts(Path::new(db)).ok())
         .unwrap_or_default();
+    let resources: std::collections::HashMap<String, &'static str> = db_path
+        .and_then(|db| rmail_common::resources::list(Path::new(db), None).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(address, kind)| (address, kind.as_str()))
+        .collect();
     if let Some(db_path) = db_path {
         for mailbox in rmail_common::db::list_mailboxes(db_path)? {
             let mut folders = 0usize;
@@ -552,6 +560,9 @@ fn account_summaries_sync(
                 .unwrap_or(0);
             accounts.push(AccountSummary {
                 two_factor: mailbox.two_factor.is_some(),
+                resource: resources
+                    .get(&mailbox.address.to_ascii_lowercase())
+                    .copied(),
                 app_passwords,
                 address: mailbox.address,
                 auth: if mailbox.scram.is_some() {

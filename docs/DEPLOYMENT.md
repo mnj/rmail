@@ -841,6 +841,14 @@ respected.
   the address it checked, and each redirect (at most three) is checked again. Feeds are capped
   at 5 MB, 20 seconds and 5,000 events, with 20 subscriptions per account. A failed refresh keeps
   the last events and shows a warning next to the calendar.
+- **Rooms and equipment** are mailboxes marked as resources (Type in the console's mailbox editor,
+  or `rmail_ctl resource set <address> room|equipment|person`). People in the same domain book
+  one by inviting it, for example with **Book a room or equipment** in webmail's event editor,
+  which marks it `CUTYPE=ROOM` or `RESOURCE`. The server answers for it at once: accepted when
+  its calendar is free for every occurrence in the next 400 days, declined when one overlaps
+  another booking (declined, cancelled and free-time events do not count). The reply reaches the
+  organizer like any guest's, and a moved meeting is checked again. Invitations from other
+  domains arrive by email and wait in the resource's inbox for a person.
 - **Contacts** in webmail's sidebar lists the user's address books and those shared with them,
   with search, and adds, edits and deletes contacts in the same store CardDAV clients sync, so
   changes reach phones and the other way round. Webmail edits the name, email addresses, phone
