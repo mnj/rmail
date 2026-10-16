@@ -19,16 +19,27 @@ export function technologies(crypto: Crypto): Technology[] {
 
 async function ownKey(crypto: Crypto, kind: Technology, from: string): Promise<keys.OwnKey> {
   const mine = crypto.state?.keys.filter((k) => k.kind === kind) ?? [];
-  for (const key of mine) {
-    const emails = kind === 'pgp' ? (await pgp.describe(key.data)).emails : [];
-    if (emails.includes(from.toLowerCase())) return key;
-  }
   if (!mine.length) throw new Error(`You have no ${kind === 'pgp' ? 'OpenPGP key' : 'S/MIME certificate'}. Add one under Encryption.`);
-  return mine[0];
+  const address = from.toLowerCase();
+  if (kind === 'pgp') {
+    for (const key of mine) if ((await pgp.describe(key.data)).emails.includes(address)) return key;
+    // An OpenPGP key often serves several addresses; the first one does.
+    return mine[0];
+  }
+  // A certificate names its address, and receivers check it against From:
+  // only a matching one will do. Reading it needs the certificate unlocked.
+  for (const key of mine) {
+    if (!(await keys.ensureUnlocked(key, crypto.ask))) throw new Error('cancelled');
+    if ((await smime.ownCertificate(keys.openedSmime(key.id)!)).emails.includes(address)) return key;
+  }
+  throw new Error(`None of your S/MIME certificates is for ${from}.`);
 }
 
 /** The body to send for `payload`, signed and/or encrypted. */
-export async function protect(crypto: Crypto, payload: object, security: Security, kind: Technology): Promise<string> {
+export async function protect(crypto: Crypto, payload: { bcc?: string[] }, security: Security, kind: Technology): Promise<string> {
+  const encryptingAtAll = security === 'encrypt' || security === 'sign-encrypt';
+  // Every recipient's key is named in an encrypted message, so Bcc would not stay hidden.
+  if (encryptingAtAll && payload.bcc?.length) throw new Error('Encrypted mail cannot have Bcc recipients: the others could see whose keys it is encrypted to. Send them a separate copy.');
   const made = await crypto.api<{ entity: string; from: string; recipients: string[] }>('/api/compose/entity', { method: 'POST', body: JSON.stringify(payload) });
   const own = await ownKey(crypto, kind, made.from);
   const signing = security === 'sign' || security === 'sign-encrypt';

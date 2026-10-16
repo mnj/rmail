@@ -70,7 +70,13 @@ export async function moveKeys(api: Api, owner: string, state: CryptoState, to: 
   if (to === state.storage) return;
   if (to === 'server') {
     await api('/api/crypto', { method: 'PUT', body: JSON.stringify({ storage: 'server' }) });
-    for (const key of state.keys) await saveKey(api, owner, 'server', key);
+    try {
+      for (const key of state.keys) await saveKey(api, owner, 'server', key);
+    } catch (err) {
+      // Back to the browser, where the keys still are (the server drops what it got).
+      await api('/api/crypto', { method: 'PUT', body: JSON.stringify({ storage: 'browser' }) }).catch(() => undefined);
+      throw err;
+    }
     for (const key of state.keys) await tx('readwrite', (store) => store.delete(`${owner}\u0000${key.id}`));
   } else {
     for (const key of state.keys) await saveKey(api, owner, 'browser', key);

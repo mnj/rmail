@@ -1,7 +1,7 @@
 // The reading pane's part for signed and encrypted mail: checks signatures
 // and decrypts in the browser, then shows what was inside.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import DOMPurify from 'dompurify';
 import { Download, Lock, ShieldAlert, ShieldCheck, ShieldQuestion, Unlock } from 'lucide-react';
 import { Crypto } from './hook';
@@ -10,11 +10,19 @@ import { Shown, binaryToBytes, bytesToBinary, crlf, decodedBody, encryptedPayloa
 import * as pgp from './pgp';
 import * as smime from './smime';
 
-type Verdict = { kind: 'pgp' | 'smime'; status: 'valid' | 'invalid' | 'unknown_key'; signer: string | null; note?: string };
+type Verdict = {
+  kind: 'pgp' | 'smime'; status: 'valid' | 'invalid' | 'unknown_key'; signer: string | null; note?: string;
+  /** A sender's S/MIME certificate the user may keep for encrypting to them. */
+  certificate?: { pem: string; address: string };
+};
 type Opened = { shown: Shown | null; verdicts: Verdict[] };
 
 export const ENCRYPTED = new Set(['pgp-encrypted', 'smime-encrypted', 'smime-opaque', 'pgp-inline']);
 
+// No decrypted content may load anything (EFAIL-style exfiltration, read
+// receipts): a strict policy in the document, and the attributes and
+// elements that would load removed besides.
+const DOCUMENT_CSP = "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:; media-src 'none'; form-action 'none'";
 const purifier = DOMPurify(window);
 purifier.addHook('uponSanitizeAttribute', (_node, data) => {
   // Nothing decrypted loads from elsewhere (no tracking, nothing leaks).
@@ -31,9 +39,10 @@ function htmlDocument(html: string, shown: Shown): string {
   }
   const clean = purifier.sanitize(body, {
     WHOLE_DOCUMENT: false,
-    FORBID_TAGS: ['form', 'input', 'button', 'textarea', 'select', 'iframe', 'object', 'embed', 'meta', 'link', 'base', 'script'],
+    FORBID_TAGS: ['form', 'input', 'button', 'textarea', 'select', 'iframe', 'object', 'embed', 'meta', 'link', 'base', 'script', 'style', 'video', 'audio', 'source', 'picture'],
+    FORBID_ATTR: ['srcset', 'poster', 'background', 'ping', 'formaction'],
   });
-  return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>body{font-family:system-ui,sans-serif;margin:0;padding:0 2px;overflow-wrap:anywhere}img{max-width:100%;height:auto}</style></head><body>${clean}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${DOCUMENT_CSP}"><base target="_blank"><style>body{font-family:system-ui,sans-serif;margin:0;padding:0 2px;overflow-wrap:anywhere}img{max-width:100%;height:auto}</style></head><body>${clean}</body></html>`;
 }
 
 async function fetchRaw(folder: string, uid: number): Promise<string> {
@@ -75,15 +84,20 @@ async function open(entity: string, crypto: Crypto, from: string, depth = 0): Pr
     let note = result.reason;
     if (result.status === 'valid') {
       if (sender && result.emails.length && !result.emails.includes(sender)) note = `The certificate is for ${result.emails.join(', ')}, not the sender.`;
-      else if (result.certificate && !state.publicKeys.some((k) => k.data.trim() === result.certificate!.trim())) {
-        // Remember the sender's certificate, to encrypt to them later.
-        const info = await smime.describeCertificate(result.certificate);
-        await keys.savePublicKey(crypto.api, { id: info.id, kind: 'smime', address: info.emails[0] ?? sender, label: info.label, data: info.pem }).then(() => crypto.reload()).catch(() => undefined);
-      }
       if (result.issuer) note = [note, `Certificate issued by ${result.issuer}; not checked against trusted authorities.`].filter(Boolean).join(' ');
     }
+    // Offer to keep the certificate for encrypting to the sender, only on the
+    // user's word, and say so when it differs from the one they have.
+    let certificate: Verdict['certificate'];
+    if (result.status === 'valid' && result.certificate && sender && result.emails.includes(sender)) {
+      const stored = state.publicKeys.filter((k) => k.kind === 'smime' && k.address === sender);
+      if (!stored.some((k) => k.data.trim() === result.certificate!.trim())) {
+        certificate = { pem: result.certificate, address: sender };
+        if (stored.length) note = [note, `This certificate differs from the one you have for ${sender}.`].filter(Boolean).join(' ');
+      }
+    }
     const inner = await open(result.content, crypto, from, depth + 1);
-    return { shown: inner.shown, verdicts: [{ kind: 'smime', status: result.status, signer: result.signer, note }, ...inner.verdicts] };
+    return { shown: inner.shown, verdicts: [{ kind: 'smime', status: result.status, signer: result.signer, note, certificate }, ...inner.verdicts] };
   }
   if (kind === 'pgp-encrypted') {
     const armored = encryptedPayload(entity);
@@ -130,7 +144,14 @@ async function openInline(text: string, crypto: Crypto): Promise<Opened> {
   return { shown: { text: decoded, html: null, attachments: [] }, verdicts: result.verdict ? [{ kind: 'pgp', ...result.verdict }] : [] };
 }
 
-function Badge({ verdict }: { verdict: Verdict }) {
+function Badge({ verdict, crypto }: { verdict: Verdict; crypto: Crypto }) {
+  const [kept, setKept] = useState(false);
+  async function keep() {
+    const info = await smime.describeCertificate(verdict.certificate!.pem);
+    await keys.savePublicKey(crypto.api, { id: info.id, kind: 'smime', address: verdict.certificate!.address, label: info.label, data: info.pem });
+    setKept(true);
+    await crypto.reload();
+  }
   const tech = verdict.kind === 'pgp' ? 'OpenPGP' : 'S/MIME';
   const Icon = verdict.status === 'valid' ? ShieldCheck : verdict.status === 'unknown_key' ? ShieldQuestion : ShieldAlert;
   const text = verdict.status === 'valid'
@@ -141,6 +162,7 @@ function Badge({ verdict }: { verdict: Verdict }) {
   return (
     <div className={`crypto-badge ${verdict.status}`} role="status">
       <Icon size={16} /><span>{text}{verdict.note && <small className="muted"> {verdict.note}</small>}</span>
+      {verdict.certificate && !kept && <button type="button" className="secondary small-button" onClick={() => keep().catch(() => undefined)}>Use to encrypt to {verdict.certificate.address}</button>}
     </div>
   );
 }
@@ -164,27 +186,33 @@ export function ProtectedMessage({ crypto, folder, uid, protection, from, textBo
   const [opened, setOpened] = useState<Opened | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  // Results for a message no longer shown are dropped.
+  const current = useRef(0);
 
   async function run() {
     if (!crypto.state) return;
+    const token = ++current.current;
     setBusy(true);
     setError('');
     try {
-      setOpened(protection === 'pgp-inline' || protection === 'pgp-inline-signed'
+      const result = protection === 'pgp-inline' || protection === 'pgp-inline-signed'
         ? await openInline(textBody, crypto)
-        : await open(await fetchRaw(folder, uid), crypto, from));
+        : await open(await fetchRaw(folder, uid), crypto, from);
+      if (token === current.current) setOpened(result);
     } catch (err) {
       const message = (err as Error).message;
-      if (message !== 'cancelled') setError(message || 'The message could not be opened.');
+      if (token === current.current && message !== 'cancelled') setError(message || 'The message could not be opened.');
     } finally {
-      setBusy(false);
+      if (token === current.current) setBusy(false);
     }
   }
 
   // Signatures are checked at once; decrypting waits for the user.
   useEffect(() => {
+    current.current++;
     setOpened(null);
     setError('');
+    setBusy(false);
     if (!encrypted && crypto.state) run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folder, uid, protection, crypto.state === null]);
@@ -200,7 +228,7 @@ export function ProtectedMessage({ crypto, folder, uid, protection, from, textBo
         </div>
       )}
       {!encrypted && busy && <p className="muted small">Checking the signature…</p>}
-      {opened?.verdicts.map((verdict, index) => <Badge key={index} verdict={verdict} />)}
+      {opened?.verdicts.map((verdict, index) => <Badge key={index} verdict={verdict} crypto={crypto} />)}
       {error && <div className="crypto-badge invalid" role="alert"><ShieldAlert size={16} /><span>{error}</span></div>}
       {encrypted && shown && (
         <>

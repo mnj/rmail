@@ -168,7 +168,7 @@ export function EncryptionDialog({ crypto, onClose }: { crypto: Crypto; onClose:
         )}
 
         <h3 className="dialog-section">Other people's keys</h3>
-        <p className="dialog-hint">Needed to encrypt to someone. Certificates from S/MIME-signed mail you read are added by themselves.</p>
+        <p className="dialog-hint">Needed to encrypt to someone. A certificate from S/MIME-signed mail can be added from the message.</p>
         {state.publicKeys.length > 0 && (
           <ul className="crypto-keys">
             {state.publicKeys.map((key) => (

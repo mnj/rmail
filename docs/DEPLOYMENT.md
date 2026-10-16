@@ -643,10 +643,14 @@ under **Encryption** in webmail. Nothing needs enabling.
   cannot be recovered.
 - OpenPGP keys are made in webmail (Curve25519) or imported; S/MIME certificates are imported as
   `.p12`/`.pfx` (RSA). Other people's public keys and certificates are kept on the server for every
-  device; certificates from S/MIME-signed mail the user reads are added automatically.
+  device; a certificate from S/MIME-signed mail can be kept for encrypting to its sender with one
+  click on the message (never on its own, and a certificate that differs from the stored one is
+  pointed out). Signing with S/MIME uses the certificate for the From address.
 - Signatures are checked when a signed message is opened; encrypted mail is decrypted on request,
   after the passphrase (keys stay unlocked until the tab is closed). Mail encrypted to someone is
-  also encrypted to the sender, so the Sent copy can be read. Drafts are saved unencrypted.
+  also encrypted to the sender, so the Sent copy can be read. Drafts are saved unencrypted, and
+  encrypted mail cannot have Bcc recipients (whose keys would show). Decrypted HTML is shown
+  under a policy that loads nothing from the network.
 - Limits: S/MIME certificates are not checked against trusted certificate authorities (the reader
   names the issuer); S/MIME uses RSA keys and AES-CBC content encryption (no `authEnveloped-data`);
   encrypted mail cannot be searched on the server; keys are not looked up automatically (no WKD or
