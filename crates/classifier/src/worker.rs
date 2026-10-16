@@ -29,6 +29,8 @@ const LABEL_BUDGET: usize = 32;
 const INITIAL_INBOX_LABELS: usize = 50;
 /// Most labels put on one message.
 const MAX_LABELS_PER_MESSAGE: usize = 3;
+/// Messages added to an account's search index per cycle.
+const SEARCH_BUDGET: usize = 256;
 /// Messages queued for the batch API per account per cycle; each is a
 /// request in a batch, not a call.
 const BATCH_QUEUE_BUDGET: usize = 500;
@@ -42,6 +44,8 @@ pub struct CycleReport {
     pub moved: usize,
     /// Messages that got at least one label.
     pub labeled: usize,
+    /// Messages added to search indexes.
+    pub indexed: usize,
     /// Labeling questions queued for the batch API, submitted in a batch,
     /// and answered from one.
     pub queued: usize,
@@ -88,10 +92,13 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
         let folders = prefs.enabled && models.embedder.is_some() && embed_allowed;
         // Labels have no local stand-in for a cloud model the user refused.
         let labels = prefs.labels_enabled && models.chooser.is_some() && chat_allowed;
-        if (prefs.enabled && !embed_allowed) || (prefs.labels_enabled && !chat_allowed) {
+        let search = prefs.search_enabled && models.embedder.is_some() && embed_allowed;
+        if ((prefs.enabled || prefs.search_enabled) && !embed_allowed)
+            || (prefs.labels_enabled && !chat_allowed)
+        {
             report.awaiting_consent += 1;
         }
-        if !folders && !labels {
+        if !folders && !labels && !search {
             continue;
         }
         report.accounts += 1;
@@ -111,6 +118,9 @@ pub fn run_cycle(mail_root: &Path, cfg: &ClassifierConfig, models: &Models) -> C
         }
         if folders && result.is_ok() {
             result = account.run();
+        }
+        if search && result.is_ok() {
+            result = account.index_search();
         }
         if let Err(error) = result {
             classifier_log!("warn", "account_cycle_failed", { "account": format!("{localpart}@{domain}"), "error": format!("{error:#}") });
@@ -135,6 +145,70 @@ struct Account<'a> {
 }
 
 impl Account<'_> {
+    /// Add the account's newest unindexed messages to its search index
+    /// (every folder but Trash and Junk), and forget what is gone.
+    fn index_search(&mut self) -> Result<()> {
+        let embedder = self.models.embedder.clone().context("no embedding model")?;
+        let conn = store::open_or_create(self.mail_root, self.domain, self.localpart)?;
+        let searched: Vec<Folder> =
+            imap_state::list_folders(self.mail_root, self.domain, self.localpart)?
+                .into_iter()
+                .filter(|f| !matches!(f.special_use.as_deref(), Some("\\Trash" | "\\Junk")))
+                .collect();
+        store::keep_search_folders(
+            &conn,
+            &searched.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+        )?;
+        let mut budget = SEARCH_BUDGET;
+        for folder in &searched {
+            let (info, messages) =
+                imap_state::load_folder(self.mail_root, self.domain, self.localpart, &folder.name)?;
+            let present = messages.iter().map(|m| m.uid).collect();
+            store::prune_search(
+                &conn,
+                &folder.name,
+                info.uidvalidity,
+                embedder.model_id(),
+                &present,
+            )?;
+            if budget == 0 {
+                continue;
+            }
+            let indexed =
+                store::search_indexed(&conn, &folder.name, info.uidvalidity, embedder.model_id())?;
+            let mut todo: Vec<&Message> = messages
+                .iter()
+                .filter(|m| !indexed.contains(&m.uid))
+                .collect();
+            todo.sort_by_key(|m| std::cmp::Reverse(m.uid));
+            todo.truncate(budget);
+            for chunk in todo.chunks(EMBED_BATCH) {
+                budget = budget.saturating_sub(chunk.len());
+                let docs: Vec<(u64, String)> = chunk
+                    .iter()
+                    .filter_map(|m| read_document(&m.path, self.cfg).map(|doc| (m.uid, doc.text)))
+                    .collect();
+                if docs.is_empty() {
+                    continue;
+                }
+                let texts: Vec<String> = docs.iter().map(|(_, text)| text.clone()).collect();
+                let vectors = embedder.embed(&texts)?;
+                for ((uid, _), vector) in docs.iter().zip(vectors) {
+                    store::put_search_vector(
+                        &conn,
+                        &folder.name,
+                        info.uidvalidity,
+                        *uid,
+                        embedder.model_id(),
+                        &vector,
+                    )?;
+                }
+                self.report.indexed += docs.len();
+            }
+        }
+        Ok(())
+    }
+
     /// Apply the user's labels to new INBOX mail as IMAP keywords. Resumes
     /// from its own watermark; a failed model call leaves the message for
     /// the next cycle.
@@ -737,6 +811,7 @@ mod tests {
                 autofile_folders: autofile.iter().map(|s| s.to_string()).collect(),
                 cloud_consent: vec![],
                 labels_enabled: false,
+                search_enabled: false,
             },
         )
         .unwrap();
@@ -1147,6 +1222,58 @@ mod tests {
     }
 
     #[test]
+    fn search_indexes_every_folder_but_trash_and_forgets_what_goes() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        seed(root);
+        let conn = store::open_or_create(root, D, L).unwrap();
+        let mut prefs = store::prefs(&conn).unwrap();
+        prefs.search_enabled = true;
+        store::set_prefs(&conn, &prefs).unwrap();
+        imap_state::append_message(
+            root,
+            D,
+            L,
+            "Trash",
+            &mail("x@y.test", "Thrown away", "gone"),
+            vec![],
+        )
+        .unwrap();
+        let report = run_cycle(root, &cfg(), &models());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let total: usize = imap_state::list_folders(root, D, L)
+            .unwrap()
+            .iter()
+            .filter(|f| f.name != "Trash")
+            .map(|f| {
+                imap_state::load_folder(root, D, L, &f.name)
+                    .unwrap()
+                    .1
+                    .len()
+            })
+            .sum();
+        assert_eq!(report.indexed, total);
+        assert!(
+            store::search_vectors(&conn, "Trash", "bow")
+                .unwrap()
+                .is_empty()
+        );
+        let receipts = store::search_vectors(&conn, "Receipts", "bow").unwrap();
+        assert!(!receipts.is_empty());
+        // A second cycle has nothing new; a deleted message leaves the index.
+        assert_eq!(run_cycle(root, &cfg(), &models()).indexed, 0);
+        let gone = receipts[0].1;
+        imap_state::delete_message_by_uid(root, D, L, "Receipts", gone).unwrap();
+        run_cycle(root, &cfg(), &models());
+        assert!(
+            !store::search_vectors(&conn, "Receipts", "bow")
+                .unwrap()
+                .iter()
+                .any(|(_, uid, _)| *uid == gone)
+        );
+    }
+
+    #[test]
     fn accounts_without_a_store_are_skipped() {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path());
@@ -1317,6 +1444,7 @@ mod tests {
                 autofile_folders: vec![],
                 cloud_consent: vec![],
                 labels_enabled: false,
+                search_enabled: false,
             },
         )
         .unwrap();

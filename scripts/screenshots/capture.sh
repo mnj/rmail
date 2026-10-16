@@ -69,6 +69,10 @@ demo_setting classifier.chat_provider openrouter
 demo_setting classifier.openrouter_base_url http://127.0.0.1:18090/v1
 demo_setting classifier.openrouter_chat_model demo-model
 demo_setting classifier.openrouter_api_key demo-key
+# Embeddings for search by meaning, from fake_ai.py as well.
+demo_setting classifier.embed_provider openrouter
+demo_setting classifier.openrouter_embed_model demo-embed
+demo_setting classifier.poll_interval_seconds 5
 for mailbox in alice@example.com bob@example.com support@example.com ops@example.org; do
   "${ctl}" add-mailbox "${mailbox}" --password Demo-pass-123 --config config.toml >/dev/null
 done

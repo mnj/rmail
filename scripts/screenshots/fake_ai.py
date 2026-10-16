@@ -32,10 +32,37 @@ def extraction(system):
     })
 
 
+# Embeddings: words that mean much the same land on one dimension, the rest
+# are hashed, so "boat trip" is close to the sailing club's mail.
+CONCEPTS = [
+    {"boat", "boats", "sailing", "sail", "regatta", "harbour", "harbor", "marina", "yacht", "club"},
+    {"invoice", "invoices", "payment", "bill", "billing", "paid", "amount", "receipt"},
+    {"trip", "travel", "flight", "hotel", "booking", "journey"},
+    {"meeting", "agenda", "review", "call", "invite", "invitation"},
+]
+DIMENSIONS = 64
+
+
+def embed(text):
+    vector = [0.0] * DIMENSIONS
+    for word in re.findall(r"[a-z]+", text.lower()):
+        concept = next((i for i, words in enumerate(CONCEPTS) if word in words), None)
+        if concept is not None:
+            vector[concept] += 1.0
+        else:
+            vector[len(CONCEPTS) + sum(map(ord, word)) % (DIMENSIONS - len(CONCEPTS))] += 0.2
+    norm = sum(v * v for v in vector) ** 0.5 or 1.0
+    return [v / norm for v in vector]
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
+        if self.path.endswith("/embeddings"):
+            texts = request.get("input", [])
+            texts = [texts] if isinstance(texts, str) else texts
+            return self.reply({"data": [{"index": i, "embedding": embed(t)} for i, t in enumerate(texts)]})
         system = request.get("messages", [{}])[0].get("content", "")
         if "find (1) events" in system:
             text = extraction(system)
@@ -43,7 +70,10 @@ class Handler(BaseHTTPRequestHandler):
             text = SUMMARY
         else:
             text = REWRITE if "rewrite" in system else CONTINUATION
-        body = json.dumps({"choices": [{"message": {"role": "assistant", "content": text}}]}).encode()
+        self.reply({"choices": [{"message": {"role": "assistant", "content": text}}]})
+
+    def reply(self, value):
+        body = json.dumps(value).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

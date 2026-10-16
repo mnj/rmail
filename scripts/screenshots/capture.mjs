@@ -283,6 +283,27 @@ async function signIn(page) {
   await ctx.close();
 }
 
+// Search by meaning: once the classifier has indexed the inbox, "boat trip"
+// finds the sailing club's mail, which never says either word.
+{
+  const ctx = await browser.newContext(desktop);
+  const page = await ctx.newPage();
+  await signIn(page);
+  for (let i = 0; i < 60; i++) {
+    const indexed = await page.evaluate(async () => (await (await fetch('/api/organize', { headers: { 'X-Rmail-Webmail': '1' } })).json()).search_indexed);
+    if (indexed > 5) break;
+    await page.waitForTimeout(1000);
+  }
+  await page.fill('input[aria-label="Search mail"]', 'boat trip');
+  await page.click('.search button.meaning');
+  await page.press('input[aria-label="Search mail"]', 'Enter');
+  await page.waitForSelector('.folder-title:has-text("Closest to")');
+  await page.waitForSelector('.message-list .row:first-child:has-text("Regatta on Saturday")');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-search-meaning');
+  await ctx.close();
+}
+
 // Encryption: an OpenPGP key made in the browser and an S/MIME certificate
 // imported, mail signed and encrypted with each, then read back. The raw
 // messages are left for crypto_check.py to check with GnuPG and OpenSSL.

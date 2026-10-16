@@ -8,7 +8,7 @@ import {
 import { useCrypto } from './crypto/hook';
 const EncryptionDialog = React.lazy(() => import('./crypto/settings').then((m) => ({ default: m.EncryptionDialog })));
 import { ENCRYPTED, ProtectedMessage } from './crypto/reader';
-import { OrganizeDialog } from './organize';
+const OrganizeDialog = React.lazy(() => import('./organize').then((m) => ({ default: m.OrganizeDialog })));
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
 import { ContactSeed, ContactsDialog } from './contacts';
@@ -522,6 +522,10 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [checked, setChecked] = useState<number[]>([]);
   const [query, setQuery] = useState('');
   const [activeQuery, setActiveQuery] = useState('');
+  /** Search by meaning (the user's index) rather than by words. */
+  const [byMeaning, setByMeaning] = useState(false);
+  /** Whether the search shown (`activeQuery`) is by meaning. */
+  const [activeMeaning, setActiveMeaning] = useState(false);
   const [view, setView] = useState<'folders' | 'list' | 'message'>('list');
   const [organize, setOrganize] = useState<Organize | null>(null);
   const [organizing, setOrganizing] = useState(false);
@@ -575,13 +579,13 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       flash((err as Error).message);
     }
     loadFolders().catch(() => undefined);
-    if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery).catch(() => undefined);
+    if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery, 0, activeMeaning).catch(() => undefined);
   }
 
   /** After sending: offer to undo a message that waits (undo send, or send later). */
   function sent(result?: SendResult) {
     loadFolders().catch(() => undefined);
-    if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery).catch(() => undefined);
+    if (current?.special_use === '\\Drafts' || current?.special_use === '\\Sent') loadMessages(folder, activeQuery, 0, activeMeaning).catch(() => undefined);
     const scheduled = result?.scheduled;
     if (!scheduled) return;
     const undo = async () => {
@@ -601,11 +605,12 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const loadFolders = useCallback(async () => setFolders(sortFolders(await api<Folder[]>('/api/folders'))), [api]);
   const loadOrganize = useCallback(() => api<Organize>('/api/organize').then(setOrganize).catch(() => setOrganize(null)), [api]);
 
-  const loadMessages = useCallback(async (name: string, q: string, offset = 0) => {
+  const loadMessages = useCallback(async (name: string, q: string, offset = 0, meaning = false) => {
     setLoading(true);
     try {
       const params = new URLSearchParams({ limit: String(PAGE), offset: String(offset) });
       if (q) params.set('q', q);
+      if (q && meaning) params.set('semantic', '1');
       const page = await api<MessagePage>(`/api/folders/${encodeURIComponent(name)}/messages?${params}`);
       setTotal(page.total);
       setMessages((current) => (offset ? [...current, ...page.messages] : page.messages));
@@ -615,9 +620,9 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   }, [api]);
 
   const refresh = useCallback(async () => {
-    await Promise.all([loadFolders(), loadMessages(folder, activeQuery)]);
+    await Promise.all([loadFolders(), loadMessages(folder, activeQuery, 0, activeMeaning)]);
     setChecked([]);
-  }, [loadFolders, loadMessages, folder, activeQuery]);
+  }, [loadFolders, loadMessages, folder, activeQuery, activeMeaning]);
 
   useEffect(() => {
     loadOrganize();
@@ -649,15 +654,18 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
     setChecked([]);
     setQuery('');
     setActiveQuery('');
+    setActiveMeaning(false);
     setView('list');
     await loadMessages(name, '').catch((err) => flash((err as Error).message));
   }
 
   async function search(event?: React.FormEvent) {
     event?.preventDefault();
+    const meaning = byMeaning && Boolean(organize?.search_enabled) && Boolean(query.trim());
     setActiveQuery(query.trim());
+    setActiveMeaning(meaning);
     setSelected(null);
-    await loadMessages(folder, query.trim());
+    await loadMessages(folder, query.trim(), 0, meaning).catch((err) => flash((err as Error).message));
   }
 
   async function openMessage(message: Message) {
@@ -882,7 +890,8 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           <form className="search" onSubmit={search} role="search">
             <Search size={16} />
             <input ref={searchRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder={`Search ${current ? folderLabel(current) : 'mail'}`} aria-label="Search mail" />
-            {activeQuery && <button type="button" className="clear" aria-label="Clear search" onClick={() => { setQuery(''); setActiveQuery(''); loadMessages(folder, ''); }}><X size={14} /></button>}
+            {activeQuery && <button type="button" className="clear" aria-label="Clear search" onClick={() => { setQuery(''); setActiveQuery(''); setActiveMeaning(false); loadMessages(folder, ''); }}><X size={14} /></button>}
+            {organize?.search_enabled && !current?.owner && <button type="button" className={`meaning ${byMeaning ? 'on' : ''}`} aria-pressed={byMeaning} title={byMeaning ? 'Searching by meaning (click for words)' : 'Search by words (click to search by meaning)'} onClick={() => setByMeaning(!byMeaning)}><Sparkles size={13} />By meaning</button>}
           </form>
           <IconButton label="Refresh" onClick={() => refresh().catch((err) => flash((err as Error).message))}><RefreshCw size={16} className={loading ? 'spin' : ''} /></IconButton>
         </header>
@@ -908,7 +917,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
               {allowed(current, 'flag') && <IconButton label="Star" onClick={() => act('flag', checked)}><Star size={16} /></IconButton>}
             </div>
           ) : (
-            <strong className="folder-title">{activeQuery ? `Results for “${activeQuery}”` : current ? folderLabel(current) : folder}</strong>
+            <strong className="folder-title">{activeQuery ? `${activeMeaning ? 'Closest to' : 'Results for'} “${activeQuery}”` : current ? folderLabel(current) : folder}</strong>
           )}
           {folder === 'INBOX' && suggested > 0 && !checked.length && <button className="accept-all" onClick={acceptAll} title="Move every suggested message to its suggested folder"><FolderInput size={14} />Move {suggested} suggested</button>}
           <span className="total">{total ? `${messages.length < total ? `${messages.length} of ` : ''}${total}` : ''}</span>
@@ -938,7 +947,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
             );
           })}
           {!loading && messages.length === 0 && <div className="empty-list">{activeQuery ? 'No messages match your search.' : 'No messages here.'}</div>}
-          {messages.length < total && <button className="load-more" disabled={loading} onClick={() => loadMessages(folder, activeQuery, messages.length)}>{loading ? 'Loading…' : `Load ${Math.min(PAGE, total - messages.length)} more`}</button>}
+          {messages.length < total && <button className="load-more" disabled={loading} onClick={() => loadMessages(folder, activeQuery, messages.length, activeMeaning)}>{loading ? 'Loading…' : `Load ${Math.min(PAGE, total - messages.length)} more`}</button>}
         </div>
       </section>
 
@@ -1025,7 +1034,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       )}
       {notice && <div className="toast" role="status">{notice.text}{notice.action && <button className="toast-action" onClick={notice.action.run}>{notice.action.label}</button>}</div>}
       {composeSettings && <ComposeSettingsDialog api={api} prefs={prefs} identities={identities} onClose={() => setComposeSettings(false)} onSaved={loadComposeSettings} onOpenDraft={(f, uid) => { setComposeSettings(false); openDraft(f, uid); }} />}
-      {organizing && <OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} />}
+      {organizing && <React.Suspense fallback={null}><OrganizeDialog api={api} onClose={() => setOrganizing(false)} onSaved={() => { refresh(); loadOrganize(); }} /></React.Suspense>}
       {prompt && <PromptDialog {...prompt} />}
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
       {calendars && <CalendarsDialog api={api} onClose={() => setCalendars(false)} />}

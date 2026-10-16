@@ -53,6 +53,8 @@ export type Organize = {
   labels_enabled: boolean; labels_available: boolean; labels_cloud: boolean; labels: OrganizeLabel[];
   folder_ideas: { label: string; count: number }[];
   ai_labels: boolean; ai_summary: boolean;
+  /** Search by meaning: offered by the server, turned on, and messages indexed so far. */
+  search_available: boolean; search_enabled: boolean; search_indexed: number;
 };
 export type LabelGuess = { name: string; keyword: string | null; probability: number; applied: boolean };
 export type LabelPreview = { labels: LabelGuess[]; threshold: number; proposed: { name: string; description: string } | null; model: string | null };

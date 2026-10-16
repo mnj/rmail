@@ -44,6 +44,15 @@ pub enum Request {
     /// `text`, from the fallback model (one that writes text). `today` is
     /// the message's date (`Thursday 2026-10-15`), for relative dates.
     Extract { text: String, today: String },
+    /// The messages of one of an account's folders closest in meaning to
+    /// `query`, from its search index (embedding model).
+    Search {
+        domain: String,
+        localpart: String,
+        folder: String,
+        query: String,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
