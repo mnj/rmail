@@ -28,15 +28,19 @@ export type MessageDetail = {
 };
 export type InvitationPerson = { address: string; name: string };
 export type InvitationAttendee = InvitationPerson & { status: string };
-export type InvitationAction = 'accepted' | 'tentative' | 'declined' | 'cancel' | 'apply';
+export type InvitationAction = 'accepted' | 'tentative' | 'declined' | 'cancel' | 'apply' | 'counter' | 'accept_counter' | 'decline_counter';
+/** Other times for an event, proposed to its organizer (Unix seconds; the end is exclusive). */
+export type Proposal = { start: number; end: number; comment: string };
 /** A calendar invitation, cancellation or reply carried by a message (iMIP). */
 export type Invitation = {
-  method: 'request' | 'cancel' | 'reply';
+  method: 'request' | 'cancel' | 'reply' | 'counter' | 'declinecounter';
   summary: string; location: string; description: string;
   start: number | null; end: number | null; all_day: boolean; recurring: boolean;
   organizer: InvitationPerson | null; attendees: InvitationAttendee[]; more_attendees: number;
   you: string | null; your_status: string | null; replier: InvitationAttendee | null;
-  state: 'new' | 'in_calendar' | 'outdated' | 'cancelled' | 'not_invited' | 'applied' | 'not_applied';
+  /** For a proposal: the event's times now, and the note that came with it. */
+  current_start: number | null; current_end: number | null; comment: string;
+  state: 'new' | 'in_calendar' | 'outdated' | 'cancelled' | 'not_invited' | 'applied' | 'not_applied' | 'proposal' | 'proposal_declined';
   actions: InvitationAction[];
 };
 export type OrganizeFolder = { name: string; learned: number; accepted: number; dismissed: number; excluded: boolean; autofile: boolean };

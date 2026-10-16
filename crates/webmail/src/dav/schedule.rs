@@ -159,6 +159,13 @@ fn route(dav: &Dav, sender: &User, address: &str) -> Route {
     }
 }
 
+/// Send scheduling messages (a proposal, a declined proposal) as `owner`,
+/// from whichever of its addresses the event names.
+pub(crate) fn send(dav: &Dav, owner: &User, from: &str, messages: Vec<Message>) {
+    let own = addresses(dav, owner);
+    deliver(dav, plan(dav, owner, from, &own, messages));
+}
+
 fn plan(
     dav: &Dav,
     sender: &User,
@@ -177,6 +184,17 @@ fn plan(
                 .map(|recipient| {
                     let route = if budget == 0 {
                         Route::Refused("5.1")
+                    } else if matches!(message.method, Method::Counter | Method::DeclineCounter) {
+                        // Proposals go by email even inside the domain: the
+                        // person deciding sees them in their mail (webmail
+                        // shows them as a card), and delivery also files
+                        // them in the schedule inbox for calendar apps.
+                        budget -= 1;
+                        if dav.app.submission.is_some() {
+                            Route::Email
+                        } else {
+                            Route::Refused("5.1")
+                        }
                     } else {
                         budget -= 1;
                         route(dav, sender, recipient)
@@ -545,6 +563,14 @@ fn send_email(
         Method::Cancel => (
             format!("Cancelled: {summary}"),
             format!("{sender} cancelled \"{summary}\"."),
+        ),
+        Method::Counter => (
+            format!("New time proposed: {summary}"),
+            format!("{sender} proposes another time for \"{summary}\"."),
+        ),
+        Method::DeclineCounter => (
+            format!("Proposal declined: {summary}"),
+            format!("{sender} keeps the time of \"{summary}\"."),
         ),
         Method::Reply => {
             let answer = message

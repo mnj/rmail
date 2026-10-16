@@ -816,7 +816,12 @@ respected.
   message passed DMARC for the attendee's domain (or was submitted here by the attendee's own
   account); a domain without a DMARC record is not vouched for, so its replies stay in the inbox
   for the client to apply, or for the organizer to apply with **Update my calendar** on the reply
-  in webmail. A cancellation is applied the same way, with **Mark cancelled in my calendar**. Quarantined mail and mail a Sieve script discards or only forwards are
+  in webmail. A cancellation is applied the same way, with **Mark cancelled in my calendar**.
+  A guest can also **Propose a new time** from the invitation card, with a note; the proposal
+  (iTIP `COUNTER`, RFC 5546) goes to the organizer by email, whose webmail shows the event's
+  current and proposed times with **Accept new time** (the event moves, its sequence goes up and
+  every guest is sent the update) or **Decline** (the guest gets a `DECLINECOUNTER`). Proposals
+  are never applied automatically. Quarantined mail and mail a Sieve script discards or only forwards are
   not looked at. The logs show each one as `imip_received` (with `applied` and the reason when
   not), `imip_skipped` or `imip_failed`; none of them affects delivery.
 - An alias that delivers to exactly one account counts as that account's calendar address:

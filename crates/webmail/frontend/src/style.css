@@ -420,6 +420,12 @@ time { white-space: nowrap; }
 .invite-status { color: var(--muted); white-space: nowrap; }
 .invite-status.accepted { color: var(--accent-text); }
 .invite-status.declined { color: var(--danger-text); }
+.invite-was { text-decoration: line-through; text-decoration-color: var(--muted); }
+.invite-comment { margin: 4px 0 0; padding: 4px 0 4px 10px; border-left: 2px solid var(--border-strong); color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.invite-propose { display: grid; gap: 8px; margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
+.invite-propose-times { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.invite-propose input { border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 9px; background: var(--surface); color: var(--text); min-width: 0; }
+@media (max-width: 520px) { .invite-propose-times { grid-template-columns: minmax(0, 1fr); } }
 /* Out of office and filters */
 .mailbox.away { grid-template-rows: auto auto auto minmax(0, 1fr); }
 .away-banner { display: flex; align-items: center; gap: 8px; padding: 8px 14px; background: var(--warn-bg); color: var(--warn-text); font-size: 13px; border-bottom: 1px solid var(--border); }

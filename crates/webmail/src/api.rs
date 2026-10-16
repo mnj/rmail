@@ -1177,8 +1177,12 @@ fn invitation_card(
 
 #[derive(Deserialize)]
 struct InvitationAction {
-    /// `accepted`, `tentative`, `declined`, `cancel` or `apply`.
+    /// `accepted`, `tentative`, `declined`, `counter`, `cancel`, `apply`,
+    /// `accept_counter` or `decline_counter`.
     action: String,
+    /// The times proposed with `counter`.
+    #[serde(default)]
+    proposal: Option<invitations::Proposal>,
 }
 
 /// Answer the invitation in a message, mark a cancellation or apply a
@@ -1228,7 +1232,7 @@ async fn answer_invitation(
         };
         let state_for_card = state.clone();
         Ok(
-            match invitations::act(state, user, &bytes, &input.action)? {
+            match invitations::act(state, user, &bytes, &input.action, input.proposal)? {
                 Ok(()) => Ok(invitation_card(&state_for_card, &session, &bytes, true)),
                 Err(refused) => Err((StatusCode::CONFLICT, refused)),
             },
