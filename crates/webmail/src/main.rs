@@ -22,6 +22,7 @@ mod api;
 mod assets;
 mod dav;
 mod jmap;
+mod webdav;
 use rmail_common::local_submit as submit;
 
 #[tokio::main]

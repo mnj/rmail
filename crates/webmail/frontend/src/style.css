@@ -666,3 +666,22 @@ time { white-space: nowrap; }
 .link-offer > span { flex: 1; min-width: 12em; }
 .link-offer progress { flex: 1; min-width: 8em; }
 .file-chip.link svg { color: var(--accent-text); }
+
+/* Files */
+.files-dialog { grid-template-rows: auto auto 1fr auto; }
+.files-dialog h2 { display: flex; align-items: center; gap: 8px; }
+.files-path { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-size: 14px; }
+.files-path span { display: inline-flex; align-items: center; color: var(--muted); }
+.files-list { min-height: 0; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+.files-list ul { list-style: none; margin: 0; padding: 4px; }
+.files-list li { display: grid; grid-template-columns: minmax(0, 1fr) 80px 170px auto; align-items: center; gap: 10px; padding: 4px 8px; border-radius: 8px; }
+.files-list li:hover { background: var(--hover); }
+.files-list p { padding: 12px; }
+.files-name { display: flex; align-items: center; gap: 8px; min-width: 0; border: 0; background: none; padding: 6px 0; color: var(--text); text-decoration: none; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-name svg { flex: none; color: var(--muted); }
+.files-actions { display: flex; gap: 2px; }
+.files-progress { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 13px; }
+.files-progress progress { flex: 1; }
+.files-footer { justify-content: flex-start; }
+.files-footer code { font-size: 12px; }
+@media (max-width: 640px) { .files-list li { grid-template-columns: minmax(0, 1fr) auto; } .files-list li small { display: none; } }

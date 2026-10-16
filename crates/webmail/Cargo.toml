@@ -18,6 +18,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 chrono-tz = "0.10"
 futures-util = { version = "0.3", default-features = false }
 tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["timeout"] }
 hmac = "0.12"
 roxmltree = "0.20"
 rusqlite = "0.29"

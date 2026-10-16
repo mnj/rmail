@@ -638,6 +638,24 @@ The search box then offers **By meaning**, which lists the open folder's message
 query, best first. Turning it off deletes the index. With a hosted embedding model, indexing and
 searches only happen for users who agreed to that provider.
 
+### File storage (WebDAV)
+
+With **File storage** turned on in the console's settings (`files.enabled`, off by default), every
+user gets their own files: in webmail's **Files** view (folders, upload by button or drag and
+drop, rename, delete, download) and over WebDAV at `https://<webmail host>/webdav/` for file
+managers and sync apps (Windows "Map network drive", macOS Finder "Connect to Server", GNOME
+Files, rclone, DAVx5 and the like). Clients sign in with the address and its password, or an app
+password when two-factor sign-in is on.
+
+- Files live in the account's directory under `rmail-drive/`, outside the mail folders, within
+  `files.quota_mb` per user (1024) and `files.max_file_mb` per file (1024). Uploads stream to disk
+  and stop when they would go over either.
+- WebDAV class 1, plus locks that are granted but not enforced (Finder and Windows ask for them
+  before writing). Properties clients set are accepted and not kept. Quota is reported (RFC 4331).
+- Downloads are always offered as files to save, never shown in the browser.
+- A reverse proxy must pass `/webdav/` through with request bodies up to the largest file and a
+  long enough timeout; webmail itself allows four hours per request there.
+
 ### Large files as links
 
 With **Large files** turned on in the console's settings (`file_links.enabled`, off by default),

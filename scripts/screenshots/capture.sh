@@ -65,6 +65,7 @@ demo_setting compose_ai.model demo-model
 # The mail classifier's fallback model (summaries, dates and contacts) is
 # fake_ai.py too, as an OpenAI-compatible "OpenRouter" endpoint.
 demo_setting file_links.enabled true
+demo_setting files.enabled true
 demo_setting classifier.enabled true
 demo_setting classifier.chat_provider openrouter
 demo_setting classifier.openrouter_base_url http://127.0.0.1:18090/v1
@@ -108,4 +109,15 @@ openssl pkcs12 -export -inkey alice-smime.key -in alice-smime.pem -out alice.p12
 mkdir -p crypto
 (cd "${here}" && DEMO_DIR="${demo}" node capture.mjs "${out}")
 python3 "${here}/crypto_check.py" "${demo}"
+# WebDAV as a file manager uses it: create, upload, list, fetch, move, delete.
+dav() { curl -sk -u "alice@example.com:Demo-pass-123" -o /dev/null -w '%{http_code}' "$@"; }
+base=https://127.0.0.1:18081/webdav
+printf 'quarterly numbers\n' > "${demo}/numbers.txt"
+[[ "$(dav -X MKCOL "${base}/Client%20check")" == 201 ]]
+[[ "$(dav -T "${demo}/numbers.txt" "${base}/Client%20check/numbers.txt")" == 201 ]]
+[[ "$(dav -X PROPFIND -H 'Depth: 1' "${base}/Client%20check/")" == 207 ]]
+[[ "$(curl -sk -u "alice@example.com:Demo-pass-123" "${base}/Client%20check/numbers.txt")" == "quarterly numbers" ]]
+[[ "$(dav -X MOVE -H "Destination: ${base}/Client%20check/renamed.txt" "${base}/Client%20check/numbers.txt")" == 201 ]]
+[[ "$(dav -X DELETE "${base}/Client%20check")" == 204 ]]
+echo "WebDAV client check: good"
 echo "Screenshots written to ${out}"

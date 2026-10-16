@@ -161,8 +161,9 @@ pub(crate) fn router(state: Shared) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(log_request))
-        .with_state(state);
-    rmail_common::http::harden(app, MAX_BODY_BYTES)
+        .with_state(state.clone());
+    // WebDAV file storage streams large uploads: its own limits, not these.
+    rmail_common::http::harden(app, MAX_BODY_BYTES).merge(crate::webdav::routes(state))
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +379,16 @@ struct SessionResponse {
     can_send: bool,
     /// The user's domain requires two-factor sign-in and it is not on yet.
     two_factor_setup: bool,
+    /// Whether file storage (the Files view and WebDAV) is on.
+    files: bool,
+}
+
+/// Whether the administrator turned file storage on.
+fn files_enabled(state: &AppState) -> bool {
+    rmail_common::settings::open(&state.db_path)
+        .ok()
+        .and_then(|conn| rmail_common::settings::files(&conn).ok())
+        .is_some_and(|files| files.enabled)
 }
 
 async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes) -> Response {
@@ -464,6 +475,7 @@ async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes
             two_factor_setup,
             address,
             can_send: state.submission.is_some(),
+            files: files_enabled(&state),
         }),
         websession::set_cookie(
             SESSION_COOKIE,
@@ -503,6 +515,7 @@ async fn session_info(app: State<Shared>, headers: HeaderMap) -> Response {
         address: session.address,
         can_send: state.submission.is_some(),
         two_factor_setup,
+        files: files_enabled(&state),
     })
     .into_response()
 }
@@ -1853,7 +1866,7 @@ fn set_flag(flags: &mut Vec<String>, flag: &str, enabled: bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use rmail_common::maildir;
