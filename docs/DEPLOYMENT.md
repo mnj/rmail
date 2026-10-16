@@ -627,6 +627,35 @@ with its headers (**View source**, or download as `.eml`), light and dark themes
 When mail organization is enabled with a fallback model, messages also offer **Summarize** and
 **Suggest labels**.
 
+### OpenPGP and S/MIME
+
+Users sign and encrypt mail with OpenPGP (RFC 9580, PGP/MIME as in RFC 3156) or S/MIME (RFC 8551)
+under **Encryption** in webmail. Nothing needs enabling.
+
+- All cryptography runs in the browser (OpenPGP.js and node-forge, loaded only when used). The
+  server builds the message body (`/api/compose/entity`), the browser signs or encrypts it, and the
+  server sends what it is given byte for byte; it never holds a usable private key or a decrypted
+  message.
+- Each user chooses where their own keys live: **in this browser only** (IndexedDB; other devices
+  need the key imported too) or **on the server, locked** (stored in the account's store, still
+  locked with the user's passphrase, so any device they sign in on can use them). Switching moves
+  the keys; the server deletes its copies when keys go to the browser. A forgotten passphrase
+  cannot be recovered.
+- OpenPGP keys are made in webmail (Curve25519) or imported; S/MIME certificates are imported as
+  `.p12`/`.pfx` (RSA). Other people's public keys and certificates are kept on the server for every
+  device; a certificate from S/MIME-signed mail can be kept for encrypting to its sender with one
+  click on the message (never on its own, and a certificate that differs from the stored one is
+  pointed out). Signing with S/MIME uses the certificate for the From address.
+- Signatures are checked when a signed message is opened; encrypted mail is decrypted on request,
+  after the passphrase (keys stay unlocked until the tab is closed). Mail encrypted to someone is
+  also encrypted to the sender, so the Sent copy can be read. Drafts are saved unencrypted, and
+  encrypted mail cannot have Bcc recipients (whose keys would show). Decrypted HTML is shown
+  under a policy that loads nothing from the network.
+- Limits: S/MIME certificates are not checked against trusted certificate authorities (the reader
+  names the issuer); S/MIME uses RSA keys and AES-CBC content encryption (no `authEnveloped-data`);
+  encrypted mail cannot be searched on the server; keys are not looked up automatically (no WKD or
+  Autocrypt yet).
+
 ### Two-factor sign-in and app passwords
 
 Users manage both under **Security** in webmail.

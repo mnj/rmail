@@ -100,6 +100,62 @@ impl Leaf<'_> {
     }
 }
 
+/// How a message is signed or encrypted, judged from its top-level
+/// `Content-Type` (or an armored OpenPGP block in a plain-text body):
+/// `pgp-encrypted`, `pgp-signed`, `pgp-inline`, `smime-encrypted`,
+/// `smime-signed` (detached) or `smime-opaque` (signed-data inside). The
+/// webmail reader decrypts and verifies these in the browser.
+pub fn protection(bytes: &[u8]) -> Option<&'static str> {
+    let (head, body) = split_head(bytes);
+    let headers = parse_headers(head);
+    let content_type = headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+    let kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let params = header_params(content_type);
+    let param = |name: &str| {
+        params
+            .get(name)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    match kind.as_str() {
+        "multipart/encrypted" if param("protocol") == "application/pgp-encrypted" => {
+            Some("pgp-encrypted")
+        }
+        "multipart/signed" => match param("protocol").as_str() {
+            "application/pgp-signature" => Some("pgp-signed"),
+            "application/pkcs7-signature" | "application/x-pkcs7-signature" => Some("smime-signed"),
+            _ => None,
+        },
+        "application/pkcs7-mime" | "application/x-pkcs7-mime" => {
+            match param("smime-type").as_str() {
+                "signed-data" => Some("smime-opaque"),
+                "enveloped-data" | "authenveloped-data" | "" => Some("smime-encrypted"),
+                _ => None,
+            }
+        }
+        "" | "text/plain" => {
+            let start = &body[..body.len().min(64 * 1024)];
+            let text = String::from_utf8_lossy(start);
+            if text.contains("-----BEGIN PGP MESSAGE-----") {
+                Some("pgp-inline")
+            } else if text.contains("-----BEGIN PGP SIGNED MESSAGE-----") {
+                Some("pgp-inline-signed")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn parse_message(bytes: &[u8]) -> ParsedMessage {
     let (head, body) = split_head(bytes);
     let headers = parse_headers(head);
@@ -956,6 +1012,50 @@ Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n\
         assert!(
             allowed.contains("img-src data: cid: https: http:"),
             "{allowed}"
+        );
+    }
+
+    #[test]
+    fn protection_is_read_from_the_top_level_type() {
+        let message = |content_type: &str, body: &str| {
+            format!("From: a@x.test\r\nContent-Type: {content_type}\r\n\r\n{body}").into_bytes()
+        };
+        assert_eq!(
+            protection(&message(
+                "multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=b",
+                ""
+            )),
+            Some("pgp-encrypted")
+        );
+        assert_eq!(
+            protection(&message(
+                "multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=b",
+                ""
+            )),
+            Some("pgp-signed")
+        );
+        assert_eq!(
+            protection(&message(
+                "multipart/signed; protocol=\"application/x-pkcs7-signature\"; boundary=b",
+                ""
+            )),
+            Some("smime-signed")
+        );
+        assert_eq!(
+            protection(&message(
+                "application/pkcs7-mime; smime-type=enveloped-data; name=smime.p7m",
+                ""
+            )),
+            Some("smime-encrypted")
+        );
+        assert_eq!(
+            protection(&message("text/plain", "-----BEGIN PGP MESSAGE-----\r\n...")),
+            Some("pgp-inline")
+        );
+        assert_eq!(protection(&message("text/plain", "hello")), None);
+        assert_eq!(
+            protection(&message("multipart/mixed; boundary=b", "")),
+            None
         );
     }
 }

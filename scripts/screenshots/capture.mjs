@@ -1,5 +1,7 @@
 // Capture the admin console and webmail from a running demo instance (see capture.sh)
 // and write them as WebP files to the directory given as the first argument.
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { chromium } from 'playwright';
 
 const out = process.argv[2];
@@ -267,6 +269,128 @@ async function signIn(page) {
   await shot(page, 'webmail-two-factor');
   await page.click('.security-dialog button:has-text("Cancel")');
   await page.click('.security-dialog button[aria-label=Close]');
+  await ctx.close();
+}
+
+// Encryption: an OpenPGP key made in the browser and an S/MIME certificate
+// imported, mail signed and encrypted with each, then read back. The raw
+// messages are left for crypto_check.py to check with GnuPG and OpenSSL.
+async function sendProtected(page, to, subject, text, security, technology, passphrase) {
+  await page.click('.compose-button');
+  await page.waitForSelector('.compose .editor-root');
+  await page.fill('.compose input[aria-label=To]', to);
+  await page.fill('.compose label:has-text("Subject") input', subject);
+  await page.click('.compose .editor-root');
+  await page.keyboard.type(text);
+  await page.selectOption('.compose select[aria-label="Sign or encrypt"]', security);
+  if (technology) await page.selectOption('.compose select[aria-label=With]', technology);
+  await page.click('.compose button:has-text("Send")');
+  const unlock = page.locator('form[aria-label="Unlock key"]');
+  const asked = await Promise.race([
+    unlock.waitFor({ timeout: 20000 }).then(() => true),
+    page.waitForSelector('.compose', { state: 'detached', timeout: 20000 }).then(() => false),
+  ]).catch(() => false);
+  if (asked) {
+    await unlock.locator('input[type=password]').fill(passphrase);
+    await unlock.locator('button:has-text("Unlock")').click();
+  }
+  await page.waitForSelector('.compose', { state: 'detached', timeout: 20000 }).catch(async (err) => {
+    const problem = await page.locator('.compose-error').textContent().catch(() => null);
+    throw new Error(`sending "${subject}" failed: ${problem ?? err.message}`);
+  });
+}
+
+async function openMessage(page, subject) {
+  for (let i = 0; i < 5; i++) {
+    await page.click(`.message-list .row:has-text("${subject}")`);
+    if (await page.waitForSelector(`.subject-line:has-text("${subject}")`, { timeout: 3000 }).then(() => true, () => false)) return;
+  }
+  throw new Error(`could not open "${subject}"`);
+}
+
+async function saveRaw(page, folder, subject, file) {
+  const raw = await page.evaluate(async ([folder, subject]) => {
+    const headers = { 'X-Rmail-Webmail': '1' };
+    const list = await (await fetch(`/api/folders/${encodeURIComponent(folder)}/messages?limit=50`, { headers })).json();
+    const message = list.messages.find((m) => m.subject === subject);
+    return (await fetch(`/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}/raw`, { headers })).text();
+  }, [folder, subject]);
+  writeFileSync(join(process.env.DEMO_DIR, 'crypto', file), raw);
+}
+
+if (process.env.DEMO_DIR) {
+  const ctx = await browser.newContext({ ...desktop, acceptDownloads: true });
+  const page = await ctx.newPage();
+  await signIn(page);
+  const phrase = 'correct horse battery';
+  await page.click('.sidebar-link:has-text("Encryption")');
+  await page.waitForSelector('.crypto-dialog');
+  await page.click('.crypto-dialog button:has-text("New OpenPGP key")');
+  await page.fill('.crypto-dialog label:has-text("Your name") input', 'Alice Chen');
+  await page.fill('.crypto-dialog label:has-text("Passphrase to lock it") input', phrase);
+  await page.fill('.crypto-dialog label:has-text("Again") input', phrase);
+  await page.click('.crypto-dialog button:has-text("Create key")');
+  await page.waitForSelector('.crypto-keys li:has-text("Alice Chen <alice@example.com>")', { timeout: 30000 });
+  await page.click('.crypto-dialog button:has-text("Import S/MIME certificate")');
+  await page.setInputFiles('.crypto-dialog input[type=file]', join(process.env.DEMO_DIR, 'alice.p12'));
+  await page.fill('.crypto-dialog label:has-text("The file\'s password") input', password);
+  await page.fill('.crypto-dialog label:has-text("Passphrase to lock it here") input', phrase);
+  await page.click('.crypto-dialog button:has-text("Import")');
+  await page.waitForSelector('.crypto-keys li:has-text("S/MIME")', { timeout: 30000 });
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-encryption');
+  const download = page.waitForEvent('download');
+  await page.click('.crypto-dialog button[aria-label="Download public key"]');
+  await (await download).saveAs(join(process.env.DEMO_DIR, 'crypto', 'alice.asc'));
+  await page.click('.crypto-dialog button[aria-label=Close]');
+
+  await sendProtected(page, 'alice@example.com', 'OpenPGP hello', 'Only you can read this.', 'sign-encrypt', 'pgp', phrase);
+  await sendProtected(page, 'alice@example.com', 'S/MIME hello', 'Sealed with S/MIME.', 'sign-encrypt', 'smime', phrase);
+  await sendProtected(page, 'bob@example.com', 'OpenPGP signed', 'Signed, not sealed.', 'sign', 'pgp', phrase);
+  await sendProtected(page, 'bob@example.com', 'S/MIME signed', 'Signed with a certificate.', 'sign', 'smime', phrase);
+
+  await page.click('button.folder-name:has-text("Inbox")');
+  // Delivery to the inbox takes a moment.
+  for (let i = 0; i < 30 && !(await page.isVisible('.message-list >> text=S/MIME hello')); i++) {
+    await page.waitForTimeout(1000);
+    await page.click('button.folder-name:has-text("Sent")');
+    await page.click('button.folder-name:has-text("Inbox")');
+  }
+  await openMessage(page, 'OpenPGP hello');
+  await page.click('.crypto-locked button:has-text("Decrypt")');
+  await page.waitForSelector('.crypto-badge.valid', { timeout: 20000 });
+  await page.frameLocator('.crypto-panel iframe').locator('text=Only you can read this.').waitFor();
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-decrypted');
+  await openMessage(page, 'S/MIME hello');
+  await page.click('.crypto-locked button:has-text("Decrypt")');
+  await page.waitForSelector('.crypto-badge.valid', { timeout: 20000 });
+  await page.frameLocator('.crypto-panel iframe').locator('text=Sealed with S/MIME.').waitFor();
+  await page.click('button.folder-name:has-text("Sent")');
+  await openMessage(page, 'OpenPGP signed');
+  await page.waitForSelector('.crypto-badge.valid', { timeout: 20000 });
+  await openMessage(page, 'S/MIME signed');
+  await page.waitForSelector('.crypto-badge.valid', { timeout: 20000 });
+  // Keys moved to the server work in a fresh tab, after the passphrase.
+  await page.click('.sidebar-link:has-text("Encryption")');
+  await page.click('.crypto-choice label:has-text("On the server")');
+  await page.waitForSelector('.crypto-choice label.selected:has-text("On the server")');
+  await page.waitForSelector('.crypto-keys li:has-text("S/MIME")');
+  await page.click('.crypto-dialog button[aria-label=Close]');
+  await page.reload();
+  await page.waitForSelector('.message-list .row');
+  await page.click('button.folder-name:has-text("Inbox")');
+  await openMessage(page, 'S/MIME hello');
+  await page.click('.crypto-locked button:has-text("Decrypt")');
+  const unlock = page.locator('form[aria-label="Unlock key"]');
+  await unlock.locator('input[type=password]').fill(phrase);
+  await unlock.locator('button:has-text("Unlock")').click();
+  await page.waitForSelector('.crypto-badge.valid', { timeout: 20000 });
+  await page.frameLocator('.crypto-panel iframe').locator('text=Sealed with S/MIME.').waitFor();
+  for (const [folder, subject, file] of [
+    ['Sent', 'OpenPGP signed', 'pgp-signed.eml'], ['Sent', 'S/MIME signed', 'smime-signed.eml'],
+    ['INBOX', 'OpenPGP hello', 'pgp-encrypted.eml'], ['INBOX', 'S/MIME hello', 'smime-encrypted.eml'],
+  ]) await saveRaw(page, folder, subject, file);
   await ctx.close();
 }
 

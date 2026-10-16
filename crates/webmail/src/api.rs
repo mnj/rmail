@@ -26,6 +26,7 @@ pub(crate) mod assist;
 mod calendars;
 mod compose;
 pub(crate) mod contacts;
+mod crypto;
 mod events;
 mod invitations;
 mod mail_rules;
@@ -129,6 +130,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(assist::routes())
         .merge(calendars::routes())
         .merge(contacts::routes())
+        .merge(crypto::routes())
         .merge(security::routes())
         .merge(events::routes())
         .merge(subscriptions::routes())
@@ -559,6 +561,10 @@ struct MessageDetail {
     /// The calendar invitation, cancellation or reply the message carries.
     #[serde(skip_serializing_if = "Option::is_none")]
     invitation: Option<invitations::Invitation>,
+    /// How the message is signed or encrypted (`rmail_common::mime::
+    /// protection`); the browser verifies or decrypts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protection: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -1116,6 +1122,7 @@ async fn message_detail(
             .ok_or_else(|| anyhow::anyhow!("no such message"))?;
         let bytes = std::fs::read(&message.path)?;
         let invitation = invitation_card(&state, &session, &bytes, !location.shared);
+        let protection = rmail_common::mime::protection(&bytes);
         let parsed = parse_message(&bytes);
         let labels = labels_for(
             &organize::labels(&state.mail_root, &session.domain, &session.localpart),
@@ -1140,6 +1147,7 @@ async fn message_detail(
             labels,
             text_body: parsed.text_body,
             invitation,
+            protection,
             has_remote_content: parsed.html_body.as_deref().is_some_and(has_remote_content),
             html_body: parsed
                 .html_body
@@ -2384,6 +2392,79 @@ mod tests {
             }
         });
         (address, rx)
+    }
+
+    #[tokio::test]
+    async fn a_body_signed_in_the_browser_is_sent_as_it_is() {
+        let td = tempfile::tempdir().unwrap();
+        let base = state(&td);
+        let (root, d, l) = (base.mail_root.clone(), "example.test", "user");
+        imap_state::init_account(&root, d, l).unwrap();
+        let (address, mut received) = fake_submission(root.clone()).await;
+        let state = Arc::new(AppState {
+            mail_root: base.mail_root.clone(),
+            db_path: base.db_path.clone(),
+            static_dir: base.static_dir.clone(),
+            session_secret: base.session_secret.clone(),
+            secure_cookies: false,
+            throttle: AuthThrottle::default(),
+            revoked: websession::RevocationList::default(),
+            submission: Some(address),
+            oauth: None,
+            jmap_logins: Default::default(),
+            shutdown: None,
+            assist_limiter: Default::default(),
+        });
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call = |method: &'static str, path: &'static str, body: Vec<u8>| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move { route(req(method, path, &body, cookie), &state).await }
+        };
+        let request = serde_json::json!({"to": ["a@b.test"], "cc": ["c@d.test"], "subject": "Signed", "text": "hello"});
+        let made = call(
+            "POST",
+            "/api/compose/entity",
+            request.to_string().into_bytes(),
+        )
+        .await;
+        assert_eq!(made.status, 200);
+        let made: serde_json::Value = serde_json::from_slice(&made.body).unwrap();
+        let inner = made["entity"].as_str().unwrap();
+        assert!(inner.starts_with("Content-Type: text/plain"), "{inner}");
+        assert_eq!(
+            made["recipients"],
+            serde_json::json!(["a@b.test", "c@d.test"])
+        );
+        assert_eq!(made["from"], "user@example.test");
+
+        // What the browser would make of it: a detached signature around it.
+        let outer = format!(
+            "Content-Type: multipart/signed; micalg=pgp-sha256;\r\n protocol=\"application/pgp-signature\"; boundary=\"s1\"\r\n\r\n\
+             --s1\r\n{inner}\r\n--s1\r\nContent-Type: application/pgp-signature\r\n\r\n\
+             -----BEGIN PGP SIGNATURE-----\r\nabc\r\n-----END PGP SIGNATURE-----\r\n--s1--\r\n"
+        );
+        let mut send = request.clone();
+        send["entity"] = serde_json::json!(outer);
+        let sent = call("POST", "/api/send", send.to_string().into_bytes()).await;
+        assert_eq!(sent.status, 200, "{}", String::from_utf8_lossy(&sent.body));
+        let (_, data) = received.recv().await.unwrap();
+        assert!(data.contains("Subject: Signed"));
+        // The fake submission server hands back lines joined with LF.
+        assert!(
+            data.contains(&outer.replace("\r\n", "\n")),
+            "the body is sent as it is"
+        );
+        let copy = &imap_state::load_folder(&root, d, l, "Sent").unwrap().1[0];
+        let copy = std::fs::read(&copy.path).unwrap();
+        assert_eq!(rmail_common::mime::protection(&copy), Some("pgp-signed"));
+
+        // A body that a server on the way would re-encode is refused.
+        send["entity"] = serde_json::json!("Content-Type: text/plain\r\n\r\nbare\nnewline\r\n");
+        let refused = call("POST", "/api/send", send.to_string().into_bytes()).await;
+        assert_eq!(refused.status, 422);
     }
 
     #[tokio::test]
