@@ -117,6 +117,10 @@ function EventEditor({ api, draft, calendars, onClose, onSaved }: { api: Api; dr
   const [location, setLocation] = useState(d.location);
   const [guests, setGuests] = useState(d.attendees.join(', '));
   const [description, setDescription] = useState(d.description);
+  const [rooms, setRooms] = useState<{ address: string; kind: 'room' | 'equipment' }[]>([]);
+  useEffect(() => { api<{ address: string; kind: 'room' | 'equipment' }[]>('/api/resources').then(setRooms).catch(() => setRooms([])); }, [api]);
+  const guestList = guests.split(/[,;\s]+/).map((g) => g.trim().toLowerCase()).filter(Boolean);
+  const addGuest = (address: string) => { if (!guestList.includes(address)) setGuests([...guestList, address].join(', ')); };
   const [calendar, setCalendar] = useState(draft.calendar);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -172,6 +176,14 @@ function EventEditor({ api, draft, calendars, onClose, onSaved }: { api: Api; dr
         </div>
         <label className="field"><span>Place</span><input value={location} maxLength={500} onChange={(e) => setLocation(e.target.value)} /></label>
         <label className="field"><span>Guests</span><input value={guests} placeholder="name@example.com, …" onChange={(e) => setGuests(e.target.value)} /></label>
+        {rooms.length > 0 && (
+          <label className="field"><span>Book a room or equipment</span>
+            <select value="" onChange={(e) => e.target.value && addGuest(e.target.value)}>
+              <option value="">Choose…</option>
+              {rooms.filter((r) => !guestList.includes(r.address)).map((r) => <option key={r.address} value={r.address}>{r.address.split('@')[0]} ({r.kind === 'room' ? 'room' : 'equipment'})</option>)}
+            </select>
+          </label>
+        )}
         {guests.trim() && <p className="dialog-hint">Guests get an invitation by email (or straight in their calendar on this server), and an update or cancellation when you change or delete the event.</p>}
         <label className="field"><span>Notes</span><textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} /></label>
         {error && <p className="error" role="alert">{error}</p>}

@@ -19,6 +19,7 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [quota, setQuota] = useState(existing?.quota_bytes ? String(Math.round(existing.quota_bytes / 1024 / 1024)) : '');
+  const [kind, setKind] = useState<string>(existing?.resource || 'person');
   const [saving, setSaving] = useState(false);
 
   async function submit(event: React.FormEvent) {
@@ -29,7 +30,12 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
     // Zero removes the quota; an untouched empty field on edit keeps it.
     if (quota !== '') body.quota_mib = Number(quota);
     else if (existing?.quota_bytes) body.quota_mib = 0;
-    const ok = await run(() => api('/api/accounts', existing ? 'PATCH' : 'POST', body), existing ? `Updated ${address}` : `Created ${address}`);
+    const ok = await run(async () => {
+      await api('/api/accounts', existing ? 'PATCH' : 'POST', body);
+      if (kind !== (existing?.resource || 'person')) {
+        await api('/api/accounts/resource', 'POST', { address: address.trim(), kind: kind === 'person' ? null : kind });
+      }
+    }, existing ? `Updated ${address}` : `Created ${address}`);
     setSaving(false);
     if (ok) {
       onSaved();
@@ -54,6 +60,13 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
         </Field>
         <Field label="Storage quota (MiB)" hint="Empty or 0 means unlimited.">
           <input type="number" min={0} value={quota} onChange={(event) => setQuota(event.target.value)} placeholder="Unlimited" />
+        </Field>
+        <Field label="Type" hint={kind === 'person' ? 'A person\'s mailbox.' : 'People in its domain book it by inviting it to a meeting: it accepts when its calendar is free and declines a clash. Invitations from elsewhere wait in its inbox.'}>
+          <select value={kind} onChange={(event) => setKind(event.target.value)}>
+            <option value="person">Person</option>
+            <option value="room">Room</option>
+            <option value="equipment">Equipment</option>
+          </select>
         </Field>
       </form>
     </Modal>
@@ -248,6 +261,7 @@ export function AccountsPage() {
                   <td><strong>{account.address}</strong><small>{account.unseen ? `${account.unseen} unread` : 'No unread mail'}</small></td>
                   <td>
                     <span className={`pill ${account.auth === 'Unset' ? 'warn' : ''}`}>{account.auth === 'Unset' ? 'No password' : account.auth}</span>
+                    {account.resource && <span className="pill">{account.resource === 'room' ? 'Room' : 'Equipment'}</span>}
                     {account.two_factor && <span className="pill ok" title="Two-factor sign-in is on; mail apps use app passwords">2FA</span>}
                     {account.app_passwords > 0 && <small>{account.app_passwords} app password{account.app_passwords === 1 ? '' : 's'}</small>}
                   </td>

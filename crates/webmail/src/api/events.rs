@@ -46,6 +46,7 @@ pub(crate) fn routes() -> Router<Shared> {
         .route("/api/events", get(list))
         .route("/api/events/{calendar}", post(create))
         .route("/api/events/{calendar}/{name}", put(update).delete(remove))
+        .route("/api/resources", get(resources))
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -314,6 +315,7 @@ fn calendar_text(
     fields: &EventFields,
     uid: &str,
     organizer: &str,
+    resources: &std::collections::HashMap<String, &'static str>,
 ) -> String {
     let mut calendar = existing.cloned().unwrap_or_else(|| {
         let mut calendar = Component::new("VCALENDAR");
@@ -382,6 +384,10 @@ fn calendar_text(
             .any(|p| itip::address(&p.value).as_deref() == Some(address.as_str()));
         if !present {
             let mut attendee = Property::new("ATTENDEE", &mailto(address));
+            // Rooms and equipment say what they are (they answer themselves).
+            if let Some(cutype) = resources.get(address) {
+                attendee.set_param("CUTYPE", Some(cutype));
+            }
             attendee.set_param("PARTSTAT", Some("NEEDS-ACTION"));
             attendee.set_param("RSVP", Some("TRUE"));
             event.properties.push(attendee);
@@ -618,6 +624,26 @@ fn refused(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// The rooms and equipment in the user's domain, to invite to an event.
+async fn resources(app: State<Shared>, headers: HeaderMap) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    match blocking(move || rmail_common::resources::list(&state.db_path, Some(&session.domain)))
+        .await
+    {
+        Ok(list) => Json(
+            list.into_iter()
+                .map(|(address, kind)| serde_json::json!({ "address": address, "kind": kind }))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 #[derive(Deserialize)]
 struct Range {
     from: i64,
@@ -729,6 +755,11 @@ fn save(
         rmail_common::db::calendar_addresses(&state.db_path, &place.owner.address)
             .unwrap_or_else(|_| vec![place.owner.address.clone()]);
     let uid = uuid();
+    let resource_types: std::collections::HashMap<String, &'static str> =
+        rmail_common::resources::list(&state.db_path, None)?
+            .into_iter()
+            .map(|(address, kind)| (address, kind.cutype()))
+            .collect();
     let name = name.map_or_else(|| format!("{uid}.ics"), str::to_string);
     let etag = input.etag.clone();
     let fields = input.fields;
@@ -749,7 +780,13 @@ fn save(
         }) {
             return Err(PutError::InvalidData("attendee".into()));
         }
-        let data = calendar_text(existing.as_ref(), &fields, &uid, &place.owner.address);
+        let data = calendar_text(
+            existing.as_ref(),
+            &fields,
+            &uid,
+            &place.owner.address,
+            &resource_types,
+        );
         let (prepared, messages) = schedule::prepare_put(&dav, &place.owner, current, &data);
         outgoing = messages;
         Ok(prepared)
@@ -904,7 +941,7 @@ mod tests {
 
     #[test]
     fn new_events_are_written_in_the_users_zone() {
-        let data = calendar_text(None, &fields(), "u-1", ME);
+        let data = calendar_text(None, &fields(), "u-1", ME, &Default::default());
         let calendar = text::parse(&data).unwrap();
         let event = master(&calendar).unwrap();
         let start = event.property("DTSTART").unwrap();
@@ -923,7 +960,7 @@ mod tests {
             repeat: "none".into(),
             ..fields()
         };
-        let data = calendar_text(None, &all_day, "u-2", ME);
+        let data = calendar_text(None, &all_day, "u-2", ME, &Default::default());
         assert!(data.contains("DTSTART;VALUE=DATE:20261020"));
         assert!(data.contains("DTEND;VALUE=DATE:20261021"));
         assert!(check(&all_day).is_ok());
@@ -953,7 +990,7 @@ mod tests {
         assert_eq!(edited.attendees, ["bob@example.test", "eve@example.test"]);
         edited.summary = "Standup (new room)".into();
         edited.attendees = vec!["bob@example.test".into(), "ann@example.test".into()];
-        let data = calendar_text(Some(&calendar), &edited, "ignored", ME);
+        let data = calendar_text(Some(&calendar), &edited, "ignored", ME, &Default::default());
         for kept in [
             "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
             "BEGIN:VALARM",
@@ -970,7 +1007,7 @@ mod tests {
 
         edited.attendees.clear();
         edited.repeat = "none".into();
-        let data = calendar_text(Some(&calendar), &edited, "ignored", ME);
+        let data = calendar_text(Some(&calendar), &edited, "ignored", ME, &Default::default());
         assert!(
             !data.contains("ORGANIZER") && !data.contains("ATTENDEE") && !data.contains("RRULE")
         );
@@ -1162,5 +1199,97 @@ mod tests {
         assert_eq!(status, 400, "range too long");
         let (status, _) = call(ME, "GET", range(i64::MIN, i64::MAX), Value::Null).await;
         assert_eq!(status, 400, "no overflow");
+    }
+
+    #[tokio::test]
+    async fn rooms_accept_free_times_and_decline_clashes() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        db::add_mailbox(
+            &state.db_path,
+            "room1@example.test",
+            Some("plain:x"),
+            None,
+            None,
+        )
+        .unwrap();
+        rmail_common::resources::set(
+            &state.db_path,
+            "room1@example.test",
+            Some(rmail_common::resources::ResourceKind::Room),
+        )
+        .unwrap();
+        let cookie = Some(format!("{SESSION_COOKIE}={}", sign_session(&state, ME)));
+        let call = |method: &'static str, path: String, body: Value| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move {
+                let body = if body.is_null() {
+                    Vec::new()
+                } else {
+                    body.to_string().into_bytes()
+                };
+                let response = route(req(method, &path, &body, cookie), &state).await;
+                (
+                    response.status,
+                    serde_json::from_slice::<Value>(&response.body).unwrap_or_default(),
+                )
+            }
+        };
+        let (_, rooms) = call("GET", "/api/resources".into(), Value::Null).await;
+        assert_eq!(
+            rooms,
+            json!([{"address": "room1@example.test", "kind": "room"}])
+        );
+        let book = |summary: &'static str, start: i64| {
+            let mut event = serde_json::to_value(EventFields {
+                summary: summary.into(),
+                start,
+                end: start + 3_600,
+                repeat: "none".into(),
+                ..fields()
+            })
+            .unwrap();
+            event["attendees"] = json!(["room1@example.test"]);
+            call("POST", "/api/events/own:default".into(), event)
+        };
+        let room_status = |listing: &Value, summary: &str| {
+            listing["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["details"]["summary"] == summary)
+                .and_then(|e| {
+                    e["attendee_details"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|a| a["address"] == "room1@example.test")
+                        .map(|a| a["status"].clone())
+                })
+        };
+        assert_eq!(book("First", NINE).await.0, 204);
+        assert_eq!(book("Clash", NINE + 1_800).await.0, 204);
+        assert_eq!(book("Later", NINE + 7_200).await.0, 204);
+        let (_, listing) = call(
+            "GET",
+            format!("/api/events?from={}&to={}", NINE - 3_600, NINE + 86_400),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(room_status(&listing, "First"), Some(json!("accepted")));
+        assert_eq!(room_status(&listing, "Clash"), Some(json!("declined")));
+        assert_eq!(room_status(&listing, "Later"), Some(json!("accepted")));
+        let organizer_copy = listing["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["details"]["summary"] == "First")
+            .unwrap()
+            .clone();
+        assert!(
+            organizer_copy["attendee_details"]
+                .to_string()
+                .contains("room1")
+        );
     }
 }

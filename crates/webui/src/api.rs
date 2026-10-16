@@ -110,6 +110,7 @@ pub(crate) fn router(state: Shared) -> Router {
                 .delete(delete_account),
         )
         .route("/api/accounts/two-factor-reset", post(reset_two_factor))
+        .route("/api/accounts/resource", post(set_resource))
         .route(
             "/api/two-factor-policy",
             get(two_factor_policy).put(set_two_factor_policy),
@@ -879,6 +880,43 @@ async fn reset_two_factor(State(state): State<Shared>, body: Bytes) -> Response 
         blocking(move || {
             let removed = rmail_common::two_factor::disable(Path::new(&db), &input.address)?;
             Ok(json!({ "result": if removed { "reset" } else { "not_enabled" } }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct ResourceChange {
+    address: String,
+    /// `room`, `equipment`, or null for a person.
+    kind: Option<String>,
+}
+
+/// Mark a mailbox as a room or equipment (it then answers invitations from
+/// its domain itself), or as a person again.
+async fn set_resource(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: ResourceChange = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    let kind = match input.kind.as_deref() {
+        None | Some("") | Some("person") => None,
+        Some(text) => match rmail_common::resources::ResourceKind::parse(text) {
+            Some(kind) => Some(kind),
+            None => {
+                return (StatusCode::BAD_REQUEST, "kind must be room or equipment").into_response();
+            }
+        },
+    };
+    outcome(
+        blocking(move || {
+            rmail_common::resources::set(Path::new(&db), &input.address, kind)
+                .map(|_| json!({ "result": "ok" }))
         })
         .await,
         StatusCode::BAD_REQUEST,

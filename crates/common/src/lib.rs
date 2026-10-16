@@ -41,6 +41,7 @@ pub mod net;
 pub mod oauth;
 pub mod outbound;
 pub mod proxy;
+pub mod resources;
 pub mod restart;
 pub mod runtime;
 pub mod scanner;

@@ -70,7 +70,7 @@ export type PasswordPolicy = {
 };
 export type Session = { authenticated: boolean; user: string | null; setup_required: boolean; password_policy?: PasswordPolicy };
 export type Stats = { mailboxes: number; total_messages: number; delivered_count: number; outbound_pending: number };
-export type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null; two_factor: boolean; app_passwords: number };
+export type Account = { address: string; auth: string; folders: number; messages: number; unseen: number; used_bytes: number; quota_bytes: number | null; two_factor: boolean; app_passwords: number; resource: 'room' | 'equipment' | null };
 export type TwoFactorPolicy = { domains: { domain: string; required: boolean }[] };
 /** A folder one account shares with another (IMAP ACL); rights are RFC 4314 letters. */
 export type FolderShare = { owner: string; folder: string; mailbox_id: string; grantee: string; rights: string };

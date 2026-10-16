@@ -334,10 +334,98 @@ pub(super) fn deliver_local(
         apply(message, copy.as_ref(), sender, &recipient).ok_or(store::PutError::PreconditionFailed)
     })?;
     match stored {
+        Ok(_) => {
+            // A room or piece of equipment answers for itself.
+            if message.method == Method::Request
+                && rmail_common::resources::kind_of(&dav.app.db_path, &account.address)?.is_some()
+            {
+                answer_as_resource(dav, account, &collection, &name)?;
+            }
+            Ok(())
+        }
         // Nothing for this account to change.
-        Ok(_) | Err(store::PutError::PreconditionFailed) => Ok(()),
+        Err(store::PutError::PreconditionFailed) => Ok(()),
         Err(error) => anyhow::bail!("storing the event: {error:?}"),
     }
+}
+
+/// How far ahead a resource looks for clashes with a repeating booking.
+const RESOURCE_HORIZON: i64 = 400 * 86_400;
+
+/// A resource's answer to an invitation now in its calendar: accepted when
+/// every occurrence (within [`RESOURCE_HORIZON`]) is free, declined when one
+/// overlaps another booking. The reply goes out like anyone's.
+fn answer_as_resource(
+    dav: &Dav,
+    resource: &User,
+    collection: &store::Collection,
+    name: &str,
+) -> anyhow::Result<()> {
+    let resource_dav = Dav {
+        user: resource.clone(),
+        conn: rmail_common::jmap::store::open(
+            &dav.app.mail_root,
+            &resource.domain,
+            &resource.localpart,
+        )?,
+        app: dav.app.clone(),
+    };
+    let Some(object) = store::object(&resource_dav.conn, collection, name)? else {
+        return Ok(());
+    };
+    let calendar = text::parse(&object.data)?;
+    let own = addresses(&resource_dav, resource);
+    let Some(me) = own
+        .iter()
+        .find(|address| itip::role(&calendar, address) == Role::Attendee)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let now = chrono::Utc::now().timestamp();
+    let (from, until) = (now - 86_400, now + RESOURCE_HORIZON);
+    let wanted = recur::occurrences(&calendar, from, until);
+    let taken = busy_except(
+        &resource_dav,
+        resource,
+        from,
+        until,
+        uid_of(&calendar).as_deref(),
+    )?;
+    let clash = wanted.iter().any(|occurrence| {
+        taken
+            .iter()
+            .any(|(begin, finish, _)| occurrence.start < *finish && *begin < occurrence.end)
+    });
+    let partstat = if clash { "DECLINED" } else { "ACCEPTED" };
+    let mut outgoing = Vec::new();
+    let stored = store::put_with(&resource_dav.conn, collection, name, &mut |current| {
+        let Some(mut copy) = current.and_then(|object| text::parse(&object.data).ok()) else {
+            return Err(store::PutError::PreconditionFailed);
+        };
+        for component in copy.components.iter_mut().filter(|c| c.name != "VTIMEZONE") {
+            for attendee in component
+                .properties
+                .iter_mut()
+                .filter(|property| property.name == "ATTENDEE")
+            {
+                if itip::address(&attendee.value)
+                    .is_some_and(|found| found.eq_ignore_ascii_case(&me))
+                {
+                    attendee.set_param("PARTSTAT", Some(partstat));
+                    attendee.set_param("RSVP", None);
+                }
+            }
+        }
+        let (prepared, messages) = prepare_put(&resource_dav, resource, current, &copy.to_text());
+        outgoing = messages;
+        Ok(prepared)
+    })?;
+    if stored.is_ok() {
+        webmail_log!("info", "resource_answered", { "resource": resource.address, "answer": partstat });
+        deliver(&resource_dav, outgoing);
+    }
+    Ok(())
 }
 
 /// The recipient's copy after a message from `sender`, or `None` when the
@@ -560,6 +648,17 @@ pub(crate) fn post(
 /// Busy periods of `account` between `start` and `end`: opaque, not
 /// cancelled, not declined events; tentative ones apart.
 fn busy(dav: &Dav, account: &User, start: i64, end: i64) -> anyhow::Result<Vec<(i64, i64, bool)>> {
+    busy_except(dav, account, start, end, None)
+}
+
+/// [`busy`], leaving out the event with UID `skip` (the one being answered).
+fn busy_except(
+    dav: &Dav,
+    account: &User,
+    start: i64,
+    end: i64,
+    skip: Option<&str>,
+) -> anyhow::Result<Vec<(i64, i64, bool)>> {
     let conn = if account.address == dav.user.address {
         None
     } else {
@@ -578,6 +677,9 @@ fn busy(dav: &Dav, account: &User, start: i64, end: i64) -> anyhow::Result<Vec<(
                 || object.start.is_some_and(|begin| begin >= end)
                 || object.end.is_some_and(|finish| finish <= start)
             {
+                continue;
+            }
+            if skip.is_some() && object.uid.as_deref() == skip {
                 continue;
             }
             let Ok(calendar) = text::parse(&object.data) else {
