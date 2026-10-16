@@ -64,6 +64,7 @@ demo_setting compose_ai.base_url http://127.0.0.1:18090/v1
 demo_setting compose_ai.model demo-model
 # The mail classifier's fallback model (summaries, dates and contacts) is
 # fake_ai.py too, as an OpenAI-compatible "OpenRouter" endpoint.
+demo_setting file_links.enabled true
 demo_setting classifier.enabled true
 demo_setting classifier.chat_provider openrouter
 demo_setting classifier.openrouter_base_url http://127.0.0.1:18090/v1

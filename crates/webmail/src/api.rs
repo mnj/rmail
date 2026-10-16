@@ -28,6 +28,7 @@ mod compose;
 pub(crate) mod contacts;
 mod crypto;
 mod events;
+mod files;
 mod invitations;
 mod mail_rules;
 mod organize;
@@ -72,6 +73,17 @@ type Shared = Arc<AppState>;
 /// Start the background refresh of calendar subscriptions.
 pub(crate) fn spawn_background(state: Shared) {
     subscriptions::spawn_refresher(state.clone());
+    // Expired download links and abandoned uploads, hourly.
+    let swept = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let state = swept.clone();
+            if let Err(error) = blocking(move || files::sweep(&state)).await {
+                webmail_log!("warn", "file_sweep_failed", { "error": format!("{error:#}") });
+            }
+        }
+    });
     // The global address list: soon after start, then every 30 minutes.
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -130,6 +142,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(assist::routes())
         .merge(calendars::routes())
         .merge(contacts::routes())
+        .merge(files::routes())
         .merge(crypto::routes())
         .merge(security::routes())
         .merge(events::routes())
@@ -143,6 +156,9 @@ pub(crate) fn router(state: Shared) -> Router {
             require_two_factor_setup,
         ))
         .layer(middleware::from_fn(reject_cross_site))
+        // axum's own 2 MB default would cut uploads (attachments, file
+        // chunks) well short of the limit `harden` sets.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(log_request))
         .with_state(state);
