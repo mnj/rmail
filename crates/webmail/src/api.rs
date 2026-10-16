@@ -585,14 +585,14 @@ struct ListQuery {
 const MAX_SEMANTIC_RESULTS: usize = 50;
 
 /// The folder's messages closest in meaning to `query`, best first, as
-/// (uidvalidity, uid): from the classifier daemon and the user's search
-/// index. Only the user's own folders have one.
+/// (uidvalidity, uid, score): from the classifier daemon and the user's
+/// search index. Only the user's own folders have one.
 async fn semantic_ranking(
     state: &Shared,
     session: &Session,
     folder: &str,
     query: &str,
-) -> Result<Vec<(u64, u64)>, (StatusCode, String)> {
+) -> Result<Vec<(u64, u64, f64)>, (StatusCode, String)> {
     let checked = {
         let (state, session, folder) = (state.clone(), session.clone(), folder.to_string());
         blocking(move || {
@@ -606,15 +606,25 @@ async fn semantic_ranking(
                 Some(conn) => rmail_common::classifier_store::prefs(conn)?,
                 None => Default::default(),
             };
-            let models = rmail_common::settings::open(&state.db_path)
-                .ok()
-                .and_then(|conn| rmail_common::settings::classifier_models(&conn).ok())
+            let settings = rmail_common::settings::open(&state.db_path).ok();
+            let models = settings
+                .as_ref()
+                .and_then(|conn| rmail_common::settings::classifier_models(conn).ok())
                 .unwrap_or_default();
-            Ok((location, prefs, models))
+            let running = settings
+                .as_ref()
+                .and_then(|conn| {
+                    rmail_common::settings::get(conn, "classifier.enabled")
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            Ok((location, prefs, models, running))
         })
         .await
     };
-    let (location, prefs, models) =
+    let (location, prefs, models, running) =
         checked.map_err(|error| (StatusCode::NOT_FOUND, format!("{error:#}")))?;
     if location.is_shared() {
         return Err((
@@ -622,7 +632,7 @@ async fn semantic_ranking(
             "search by meaning works in your own folders".into(),
         ));
     }
-    if !prefs.search_enabled || !models.embed_configured {
+    if !running || !prefs.search_enabled || !models.embed_configured {
         return Err((
             StatusCode::CONFLICT,
             "search by meaning is not turned on".into(),
@@ -649,15 +659,15 @@ async fn semantic_ranking(
     .await
     .map_err(|error| (StatusCode::BAD_GATEWAY, format!("{error:#}")))?;
     let results = reply["results"].as_array().cloned().unwrap_or_default();
-    // Keep what is reasonably close to the best match.
-    let best = results
-        .first()
-        .and_then(|r| r["score"].as_f64())
-        .unwrap_or(0.0);
     Ok(results
         .iter()
-        .filter(|r| best <= 0.0 || r["score"].as_f64().unwrap_or(0.0) >= best * 0.5)
-        .filter_map(|r| Some((r["uidvalidity"].as_u64()?, r["uid"].as_u64()?)))
+        .filter_map(|r| {
+            Some((
+                r["uidvalidity"].as_u64()?,
+                r["uid"].as_u64()?,
+                r["score"].as_f64().unwrap_or(0.0),
+            ))
+        })
         .collect())
 }
 
@@ -987,10 +997,18 @@ async fn message_list(
             // Closest first, as the index ranked them.
             let mut by_uid: std::collections::HashMap<u64, imap_state::Message> =
                 messages.into_iter().map(|m| (m.uid, m)).collect();
-            let ranked: Vec<_> = ranking
+            let current: Vec<_> = ranking
                 .into_iter()
-                .filter(|(validity, _)| *validity == info.uidvalidity)
-                .filter_map(|(_, uid)| by_uid.remove(&uid))
+                .filter(|(validity, _, _)| *validity == info.uidvalidity)
+                .filter_map(|(_, uid, score)| by_uid.remove(&uid).map(|m| (m, score)))
+                .collect();
+            // What is reasonably close to the best match still here (the
+            // index may hold messages deleted since its last cycle).
+            let best = current.first().map(|(_, score)| *score).unwrap_or(0.0);
+            let ranked: Vec<_> = current
+                .into_iter()
+                .filter(|(_, score)| best <= 0.0 || *score >= best * 0.5)
+                .map(|(message, _)| message)
                 .collect();
             let total = ranked.len();
             let page = ranked
@@ -2607,10 +2625,16 @@ mod tests {
         let mut settings = rmail_common::settings::open(&state.db_path).unwrap();
         rmail_common::settings::write_raw(
             &mut settings,
-            &[(
-                "classifier.embed_model".to_string(),
-                Some(serde_json::json!("e.gguf")),
-            )]
+            &[
+                (
+                    "classifier.embed_model".to_string(),
+                    Some(serde_json::json!("e.gguf")),
+                ),
+                (
+                    "classifier.enabled".to_string(),
+                    Some(serde_json::json!(true)),
+                ),
+            ]
             .into_iter()
             .collect(),
         )
@@ -2630,6 +2654,7 @@ mod tests {
             let mut line = String::new();
             BufReader::new(read).read_line(&mut line).await.unwrap();
             let reply = serde_json::json!({"ok": true, "data": {"results": [
+                {"uidvalidity": validity, "uid": 998, "score": 2.0},
                 {"uidvalidity": validity, "uid": third, "score": 0.8},
                 {"uidvalidity": validity, "uid": first, "score": 0.7},
                 {"uidvalidity": validity, "uid": 999, "score": 0.6},

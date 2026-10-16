@@ -181,16 +181,26 @@ impl Account<'_> {
                 .filter(|m| !indexed.contains(&m.uid))
                 .collect();
             todo.sort_by_key(|m| std::cmp::Reverse(m.uid));
-            todo.truncate(budget);
-            for chunk in todo.chunks(EMBED_BATCH) {
-                budget = budget.saturating_sub(chunk.len());
-                let docs: Vec<(u64, String)> = chunk
-                    .iter()
-                    .filter_map(|m| read_document(&m.path, self.cfg).map(|doc| (m.uid, doc.text)))
-                    .collect();
-                if docs.is_empty() {
-                    continue;
+            // Only embedded messages count against the budget, so unreadable
+            // ones (tried again next cycle) cannot starve older mail; reads
+            // are bounded all the same.
+            let mut reads = budget * 4;
+            let mut candidates = todo.into_iter();
+            while budget > 0 && reads > 0 {
+                let mut docs: Vec<(u64, String)> = Vec::new();
+                for message in candidates.by_ref() {
+                    reads -= 1;
+                    if let Some(doc) = read_document(&message.path, self.cfg) {
+                        docs.push((message.uid, doc.text));
+                    }
+                    if docs.len() == EMBED_BATCH.min(budget) || reads == 0 {
+                        break;
+                    }
                 }
+                if docs.is_empty() {
+                    break;
+                }
+                budget = budget.saturating_sub(docs.len());
                 let texts: Vec<String> = docs.iter().map(|(_, text)| text.clone()).collect();
                 let vectors = embedder.embed(&texts)?;
                 for ((uid, _), vector) in docs.iter().zip(vectors) {
