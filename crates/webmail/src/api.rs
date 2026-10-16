@@ -25,6 +25,7 @@ use rmail_common::mime::{
 pub(crate) mod assist;
 mod calendars;
 mod compose;
+mod contacts;
 mod invitations;
 mod mail_rules;
 mod organize;
@@ -101,6 +102,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(compose::routes())
         .merge(assist::routes())
         .merge(calendars::routes())
+        .merge(contacts::routes())
         .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())
