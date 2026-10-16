@@ -215,6 +215,8 @@ webmail = urllib.request.build_opener(
 for path, method, body in [
     ("/api/login", "POST", {"address": "alice@example.com", "password": PASSWORD}),
     ("/api/compose/settings", "PUT", {"format": "html", "language": "", "undo_seconds": 0, "ai_suggestions": True}),
+    # She agrees to the (fake) hosted model reading mail she asks about.
+    ("/api/organize", "PUT", {"enabled": False, "cloud_consent": True}),
 ]:
     webmail.open(urllib.request.Request(
         "https://127.0.0.1:18081" + path, method=method, data=json.dumps(body).encode(),

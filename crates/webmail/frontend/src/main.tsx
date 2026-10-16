@@ -358,25 +358,52 @@ function Attachments({ folder, uid, attachments }: { folder: string; uid: number
 }
 
 /** On-demand AI actions for one message, when the server offers them. */
-function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettings }: { api: Api; folder: string; message: MessageDetail; organize: Organize | null; onLabelsChanged: () => void; onOpenSettings: () => void }) {
-  const [busy, setBusy] = useState<'summary' | 'labels' | null>(null);
+type FoundEvent = { title: string; date: string; start: string | null; end: string | null; location: string | null };
+type FoundContact = { name: string | null; email: string | null; phone: string | null; organization: string | null; title: string | null };
+type Found = { events: FoundEvent[]; contact: FoundContact | null };
+
+/** Unix seconds for a found event: its times in the user's zone, or the whole day. */
+function eventTimes(event: FoundEvent): { start: number; end: number; all_day: boolean } {
+  const [y, m, d] = event.date.split('-').map(Number);
+  if (!event.start) {
+    const start = Date.UTC(y, m - 1, d) / 1000;
+    return { start, end: start + 86_400, all_day: true };
+  }
+  const at = (time: string) => { const [h, min] = time.split(':').map(Number); return new Date(y, m - 1, d, h, min).getTime() / 1000; };
+  const start = at(event.start);
+  const end = event.end ? at(event.end) : start + 3600;
+  return { start, end: end > start ? end : start + 3600, all_day: false };
+}
+
+function describeEvent(event: FoundEvent): string {
+  const [y, m, d] = event.date.split('-').map(Number);
+  const day = new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  return event.start ? `${day}, ${event.start}${event.end ? `–${event.end}` : ''}` : `${day}, all day`;
+}
+
+function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettings, onSaveContact }: { api: Api; folder: string; message: MessageDetail; organize: Organize | null; onLabelsChanged: () => void; onOpenSettings: () => void; onSaveContact: (seed: ContactSeed) => void }) {
+  const [busy, setBusy] = useState<'summary' | 'labels' | 'extract' | null>(null);
   const [summary, setSummary] = useState<string | null>(null);
   const [preview, setPreview] = useState<LabelPreview | null>(null);
+  const [found, setFound] = useState<Found | null>(null);
+  const [added, setAdded] = useState<number[]>([]);
+  const [adding, setAdding] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [consentNeeded, setConsentNeeded] = useState<string | null>(null);
-  useEffect(() => { setSummary(null); setPreview(null); setError(''); setConsentNeeded(null); }, [message.uid]);
+  useEffect(() => { setSummary(null); setPreview(null); setFound(null); setAdded([]); setAdding(null); setError(''); setConsentNeeded(null); }, [message.uid]);
   if (!organize || (!organize.ai_labels && !organize.ai_summary)) return null;
   const base = `/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`;
   // The fallback model's provider, when it is a cloud one.
   const cloud = organize.labels_cloud ? organize.cloud_providers[organize.cloud_providers.length - 1] : null;
 
-  async function run(action: 'summary' | 'labels') {
+  async function run(action: 'summary' | 'labels' | 'extract') {
     setBusy(action);
     setError('');
     setConsentNeeded(null);
     try {
-      const result = await api<{ summary?: string } & LabelPreview>(`${base}/ai`, { method: 'POST', body: JSON.stringify({ action }) });
+      const result = await api<{ summary?: string } & LabelPreview & Found>(`${base}/ai`, { method: 'POST', body: JSON.stringify({ action }) });
       if (action === 'summary') setSummary(result.summary || '');
+      else if (action === 'extract') setFound({ events: result.events ?? [], contact: result.contact ?? null });
       else setPreview(result);
     } catch (err) {
       const text = (err as Error).message;
@@ -384,6 +411,24 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
       else setError(text);
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function addEvent(event: FoundEvent, index: number) {
+    // One event per click, however fast the clicks come.
+    if (adding !== null) return;
+    setAdding(index);
+    try {
+      await api('/api/events/own:default', { method: 'POST', body: JSON.stringify({
+        summary: event.title, location: event.location ?? '',
+        description: `From the message "${message.subject}" from ${message.from}.`,
+        ...eventTimes(event), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, repeat: 'none', attendees: [],
+      }) });
+      setAdded((list) => [...list, index]);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setAdding(null);
     }
   }
 
@@ -413,7 +458,33 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
         <Sparkles size={15} className="ai-mark" />
         {organize.ai_summary && <button className="chip-button" disabled={busy !== null} onClick={() => run('summary')} title={sends}>{busy === 'summary' ? 'Summarizing…' : 'Summarize'}</button>}
         {organize.ai_labels && <button className="chip-button" disabled={busy !== null} onClick={() => run('labels')} title={sends}>{busy === 'labels' ? 'Thinking…' : 'Suggest labels'}</button>}
+        {organize.ai_summary && <button className="chip-button" disabled={busy !== null} onClick={() => run('extract')} title={sends}>{busy === 'extract' ? 'Looking…' : 'Find dates and contacts'}</button>}
       </div>
+      {found && (
+        <div className="ai-found">
+          {found.events.length === 0 && !found.contact && <span className="muted">No dates or contact details found.</span>}
+          {found.events.map((event, index) => (
+            <div key={index} className="ai-found-item">
+              <CalendarDays size={15} />
+              <span><strong>{event.title}</strong><small className="muted">{describeEvent(event)}{event.location ? ` · ${event.location}` : ''}</small></span>
+              {added.includes(index)
+                ? <span className="muted small">Added to your calendar</span>
+                : <button className="secondary small-button" disabled={adding !== null} onClick={() => addEvent(event, index)}>{adding === index ? 'Adding…' : 'Add to calendar'}</button>}
+            </div>
+          ))}
+          {found.contact && (
+            <div className="ai-found-item">
+              <BookUser size={15} />
+              <span><strong>{found.contact.name || found.contact.email || found.contact.phone}</strong>
+                <small className="muted">{[found.contact.title, found.contact.organization, found.contact.email, found.contact.phone].filter(Boolean).join(' · ')}</small></span>
+              <button className="secondary small-button" onClick={() => onSaveContact({
+                name: found.contact!.name ?? undefined, email: found.contact!.email ?? (splitAddress(message.from).address || undefined),
+                phone: found.contact!.phone ?? undefined, org: found.contact!.organization ?? undefined, title: found.contact!.title ?? undefined,
+              })}>Save contact</button>
+            </div>
+          )}
+        </div>
+      )}
       {consentNeeded && (
         <p className="ai-note">This uses {providerName(consentNeeded)}, which only receives your mail if you agree. <button className="link" onClick={onOpenSettings}>Review in Organize my mail</button></p>
       )}
@@ -922,7 +993,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
                 </div>
                 <time className="muted small" title={selected.date}>{formatFullDate(selected.internal_date)}</time>
               </div>
-              {!shared && <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} />}
+              {!shared && <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} onSaveContact={setContacts} />}
               {selected.invitation && <InvitationCard api={api} folder={folder} uid={selected.uid} invitation={selected.invitation} />}
               {selected.protection && <ProtectedMessage crypto={crypto} folder={folder} uid={selected.uid} protection={selected.protection} from={selected.from} textBody={selected.text_body} />}
               {selected.protection && ENCRYPTED.has(selected.protection) ? null : <>

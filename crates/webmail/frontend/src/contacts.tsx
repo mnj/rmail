@@ -19,7 +19,7 @@ type Book = { id: string; displayname: string; owner?: string; writable: boolean
 type Listing = { books: Book[]; contacts: Contact[] };
 
 /** A new contact, optionally from a message's sender. */
-export type ContactSeed = { name?: string; email?: string };
+export type ContactSeed = { name?: string; email?: string; phone?: string; org?: string; title?: string };
 
 const emptyFields = (): ContactFields => ({
   full_name: '', given: '', family: '', emails: [], phones: [], org: '', title: '', birthday: '', note: '', addresses: [],
@@ -195,10 +195,26 @@ export function ContactsDialog({ api, seed, onClose, onWrite }: {
       const known = seed.email && next.contacts.find((c) => c.emails.some((e) => e.value.toLowerCase() === seed.email!.toLowerCase()));
       if (known) {
         setSelected(key(known));
+        // Details found elsewhere (a signature) that the contact lacks are offered as an edit.
+        const phone = seed.phone && !known.phones.some((p) => p.value.replace(/\D/g, '') === seed.phone!.replace(/\D/g, '')) ? seed.phone : '';
+        const org = !known.org && seed.org ? seed.org : '';
+        const title = !known.title && seed.title ? seed.title : '';
+        if (phone || org || title) {
+          setEditing({ contact: known, fields: {
+            ...known,
+            phones: phone ? [...known.phones, { kind: '', value: phone }] : known.phones,
+            org: known.org || org, title: known.title || title,
+          } });
+        }
         return;
       }
       const [given, ...rest] = (seed.name || '').trim().split(/\s+/);
-      setEditing({ contact: null, fields: { ...emptyFields(), given: given || '', family: rest.join(' '), emails: seed.email ? [{ kind: '', value: seed.email }] : [] } });
+      setEditing({ contact: null, fields: {
+        ...emptyFields(), given: given || '', family: rest.join(' '),
+        emails: seed.email ? [{ kind: '', value: seed.email }] : [],
+        phones: seed.phone ? [{ kind: '', value: seed.phone }] : [],
+        org: seed.org || '', title: seed.title || '',
+      } });
     }).catch((err) => setError((err as Error).message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

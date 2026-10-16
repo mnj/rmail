@@ -62,6 +62,13 @@ demo_setting global.listeners.webmail '["127.0.0.1:18081"]'
 demo_setting compose_ai.enabled true
 demo_setting compose_ai.base_url http://127.0.0.1:18090/v1
 demo_setting compose_ai.model demo-model
+# The mail classifier's fallback model (summaries, dates and contacts) is
+# fake_ai.py too, as an OpenAI-compatible "OpenRouter" endpoint.
+demo_setting classifier.enabled true
+demo_setting classifier.chat_provider openrouter
+demo_setting classifier.openrouter_base_url http://127.0.0.1:18090/v1
+demo_setting classifier.openrouter_chat_model demo-model
+demo_setting classifier.openrouter_api_key demo-key
 for mailbox in alice@example.com bob@example.com support@example.com ops@example.org; do
   "${ctl}" add-mailbox "${mailbox}" --password Demo-pass-123 --config config.toml >/dev/null
 done
@@ -77,7 +84,7 @@ export RMAIL_WEB_STATIC_DIR="${root}/crates/webui/frontend/dist"
 export RMAIL_WEBMAIL_STATIC_DIR="${root}/crates/webmail/frontend/dist"
 python3 "${here}/fake_ai.py" 18090 &
 pids+=("$!")
-for service in smtpd imapd web webmail outbound; do
+for service in smtpd imapd web webmail outbound classifier; do
   "${bin}/rmail_${service}" > "${service}.log" 2>&1 &
   pids+=("$!")
 done

@@ -567,6 +567,50 @@ fn model_text(parsed: &rmail_common::mime::ParsedMessage, max_bytes: usize) -> S
     text
 }
 
+/// The message as the extraction reads it: headers, then the body with its
+/// lines kept (a signature is a block of short lines). A long body keeps
+/// its start and its end, where signatures are.
+fn extract_text(parsed: &rmail_common::mime::ParsedMessage, max_bytes: usize) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in parsed.text_body.lines().map(str::trim) {
+        if line.is_empty() && lines.last().is_none_or(|last| last.is_empty()) {
+            continue;
+        }
+        lines.push(line);
+    }
+    let body = lines.join("\n");
+    let head = format!(
+        "From: {}\nDate: {}\nSubject: {}\n\n",
+        parsed.from, parsed.date, parsed.subject
+    );
+    let room = max_bytes.saturating_sub(head.len());
+    if body.len() <= room {
+        return head + &body;
+    }
+    let cut = |at: usize| {
+        let mut at = at.min(body.len());
+        while !body.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    let tail = room / 4;
+    let start = cut(room - tail);
+    let end_from = cut(body.len() - tail);
+    format!("{head}{}\n[…]\n{}", &body[..start], &body[end_from..])
+}
+
+/// The day a message was written, for resolving "next Tuesday":
+/// `Thursday 2026-10-15`, from its Date header or else when it arrived.
+fn message_day(parsed: &rmail_common::mime::ParsedMessage, arrived: i64) -> String {
+    let date = chrono::DateTime::parse_from_rfc2822(parsed.date.trim())
+        .map(|date| date.date_naive())
+        .ok()
+        .or_else(|| chrono::DateTime::from_timestamp(arrived, 0).map(|date| date.date_naive()))
+        .unwrap_or_else(|| chrono::Utc::now().date_naive());
+    date.format("%A %Y-%m-%d").to_string()
+}
+
 /// Run an AI action on one message on demand: preview which labels apply,
 /// or summarize it. Uses the server's fallback model, and a cloud model
 /// only for users who agreed to that provider.
@@ -587,9 +631,10 @@ pub(crate) async fn ai_action(
     let Ok(input) = serde_json::from_slice::<AiRequest>(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid json").into_response();
     };
-    let summary = match input.action.as_str() {
-        "summary" => true,
-        "labels" => false,
+    let (summary, extract) = match input.action.as_str() {
+        "summary" => (true, false),
+        "labels" => (false, false),
+        "extract" => (false, true),
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     };
     let shared = state.clone();
@@ -597,7 +642,7 @@ pub(crate) async fn ai_action(
         let state = shared;
         let (root, domain, local) = (&state.mail_root, &session.domain, &session.localpart);
         let (server_enabled, models) = server_settings(&state.db_path);
-        let available = if summary {
+        let available = if summary || extract {
             models.chat_writes_text
         } else {
             models.chat_configured
@@ -627,14 +672,19 @@ pub(crate) async fn ai_action(
         let max_input = setting(&state.db_path, "classifier.max_input_bytes")
             .and_then(|value| value.as_u64())
             .unwrap_or(2048) as usize;
-        let text = model_text(
-            &parsed,
-            if summary {
-                max_input.max(8192)
-            } else {
-                max_input
-            },
-        );
+        let day = message_day(&parsed, message.internaldate);
+        let text = if extract {
+            extract_text(&parsed, max_input.max(8192))
+        } else {
+            model_text(
+                &parsed,
+                if summary {
+                    max_input.max(8192)
+                } else {
+                    max_input
+                },
+            )
+        };
         let mut labels = match &conn {
             Some(conn) => store::labels(conn)?,
             None => Vec::new(),
@@ -654,16 +704,18 @@ pub(crate) async fn ai_action(
         let may_propose = setting(&state.db_path, "classifier.label_discovery")
             .and_then(|value| value.as_bool())
             .unwrap_or(true);
-        Ok(Ok((text, labels, message.flags, may_propose)))
+        Ok(Ok((text, day, labels, message.flags, may_propose)))
     })
     .await;
-    let (text, labels, flags, may_propose) = match prepared {
+    let (text, today, labels, flags, may_propose) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err((status, message))) => return (status, message).into_response(),
         Err(error) => return internal_error(error),
     };
     let socket = rmail_common::classifier_control::socket_path(&state.mail_root);
-    let request = if summary {
+    let request = if extract {
+        rmail_common::classifier_control::Request::Extract { text, today }
+    } else if summary {
         rmail_common::classifier_control::Request::Summarize { text }
     } else {
         rmail_common::classifier_control::Request::Label {
@@ -688,6 +740,14 @@ pub(crate) async fn ai_action(
         Ok(reply) => reply,
         Err(error) => return (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
     };
+    if extract {
+        return Json(serde_json::json!({
+            "events": reply["events"],
+            "contact": reply["contact"],
+            "model": reply["model"],
+        }))
+        .into_response();
+    }
     if summary {
         return Json(serde_json::json!({
             "summary": reply["summary"],
@@ -772,5 +832,98 @@ async fn add_label(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Respo
         Ok(Ok(None)) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
         Ok(Err(error)) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
         Err(error) => internal_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{req, route, state};
+    use super::super::{SESSION_COOKIE, sign_session};
+    use rmail_common::imap_state;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn dates_and_a_signature_are_found_in_a_message() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let root = state.mail_root.clone();
+        imap_state::init_account(&root, "example.test", "user").unwrap();
+        let mut conn = rmail_common::settings::open(&state.db_path).unwrap();
+        rmail_common::settings::write_raw(
+            &mut conn,
+            &[
+                ("classifier.enabled".to_string(), Some(json!(true))),
+                (
+                    "classifier.chat_model".to_string(),
+                    Some(json!("model.gguf")),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let (_, uid) = imap_state::deliver_message(
+            &root,
+            "example.test",
+            "user",
+            b"From: Priya <priya@northwind.test>\r\nDate: Thu, 15 Oct 2026 09:00:00 +0000\r\nSubject: Review\r\n\r\nCan we meet next Thursday at 14:00 in Room 2?\r\n\r\nPriya Raman\r\nNorthwind\r\n+45 1234 5678\r\n",
+        )
+        .unwrap();
+
+        // A stand-in for the classifier daemon.
+        let socket = rmail_common::classifier_control::socket_path(&root);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = json!({"ok": true, "data": {
+                "model": "model.gguf",
+                "events": [{"title": "Review", "date": "2026-10-22", "start": "14:00", "end": null, "location": "Room 2"}],
+                "contact": {"name": "Priya Raman", "email": null, "phone": "+45 1234 5678", "organization": "Northwind", "title": null},
+            }});
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            request
+        });
+
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let response = route(
+            req(
+                "POST",
+                &format!("/api/folders/INBOX/messages/{uid}/ai"),
+                br#"{"action":"extract"}"#,
+                cookie,
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let found: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(found["events"][0]["date"], "2026-10-22");
+        assert_eq!(found["contact"]["organization"], "Northwind");
+        let request = daemon.await.unwrap();
+        assert_eq!(request["command"], "extract");
+        assert_eq!(request["today"], "Thursday 2026-10-15");
+        let text = request["text"].as_str().unwrap();
+        assert!(
+            text.contains("Date: Thu, 15 Oct 2026")
+                && text.contains("Priya Raman\nNorthwind\n+45 1234 5678"),
+            "{text}"
+        );
     }
 }
