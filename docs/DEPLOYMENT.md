@@ -849,6 +849,14 @@ respected.
   another booking (declined, cancelled and free-time events do not count). The reply reaches the
   organizer like any guest's, and a moved meeting is checked again. Invitations from other
   domains arrive by email and wait in the resource's inbox for a person.
+- **Directory** (global address list): an administrator can give a domain's people a read-only
+  **Directory** address book listing everyone in the domain, named as they sign their mail
+  (their JMAP identity name) or by their address, plus its aliases (an alias reaching several
+  people is a group). Turn it on per domain in the **Directory** panel on the console's Mailboxes
+  page or with `rmail_ctl directory enable <domain>`; it is off by default, since not every
+  domain's users know each other. Each user gets the book in their own store, so it shows in
+  webmail contacts, in compose suggestions and in CardDAV apps; webmail brings every account's
+  book in step every 30 minutes (and at once when the setting changes). Nobody can edit it.
 - **Contacts** in webmail's sidebar lists the user's address books and those shared with them,
   with search, and adds, edits and deletes contacts in the same store CardDAV clients sync, so
   changes reach phones and the other way round. Webmail edits the name, email addresses, phone

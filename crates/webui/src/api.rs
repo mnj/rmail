@@ -115,6 +115,10 @@ pub(crate) fn router(state: Shared) -> Router {
             "/api/two-factor-policy",
             get(two_factor_policy).put(set_two_factor_policy),
         )
+        .route(
+            "/api/directory-policy",
+            get(directory_policy).put(set_directory_policy),
+        )
         .route("/api/sharing", get(sharing).delete(delete_sharing))
         .route(
             "/api/dav-sharing",
@@ -917,6 +921,66 @@ async fn set_resource(State(state): State<Shared>, body: Bytes) -> Response {
         blocking(move || {
             rmail_common::resources::set(Path::new(&db), &input.address, kind)
                 .map(|_| json!({ "result": "ok" }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Each local domain and whether its people get the global address list.
+async fn directory_policy(State(state): State<Shared>) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            let enabled = rmail_common::directory::enabled_domains(Path::new(&db))?;
+            let mut domains = rmail_common::db::local_domains(&db)?;
+            domains.extend(enabled.iter().cloned());
+            domains.sort();
+            domains.dedup();
+            Ok(json!({
+                "domains": domains
+                    .into_iter()
+                    .map(|domain| json!({ "domain": domain, "enabled": enabled.contains(&domain) }))
+                    .collect::<Vec<_>>(),
+            }))
+        })
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct DirectoryChange {
+    domain: String,
+    enabled: bool,
+}
+
+/// Turn the directory on or off for a domain; every account's book is
+/// brought in step at once (webmail also does so every 30 minutes).
+async fn set_directory_policy(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: DirectoryChange = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    let root = state.mail_root.clone();
+    outcome(
+        blocking(move || {
+            rmail_common::directory::set_enabled(Path::new(&db), &input.domain, input.enabled)?;
+            let failed = rmail_common::directory::sync_all(Path::new(&db), &root)?;
+            if !failed.is_empty() {
+                anyhow::bail!(
+                    "saved, but these accounts' directory could not be updated yet (webmail retries every 30 minutes): {}",
+                    failed.join("; ")
+                );
+            }
+            Ok(json!({ "result": "ok" }))
         })
         .await,
         StatusCode::BAD_REQUEST,

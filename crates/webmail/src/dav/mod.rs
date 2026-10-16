@@ -217,12 +217,9 @@ impl Place {
     }
 
     /// Whether the user may change the collection and its objects. A
-    /// subscription is filled from its feed only.
+    /// subscription or the directory is filled by the server only.
     pub fn writable(&self) -> bool {
-        !self
-            .collection
-            .name
-            .starts_with(rmail_common::dav::subscription::NAME_PREFIX)
+        !self.collection.managed
             && self
                 .share
                 .as_ref()
@@ -789,8 +786,9 @@ fn make_collection(
         Target::Collection(_) => return Ok(status(StatusCode::METHOD_NOT_ALLOWED)),
         _ => return Ok(status(StatusCode::FORBIDDEN)),
     };
-    // Subscription calendars are made from webmail, from a feed.
-    if name.starts_with(rmail_common::dav::subscription::NAME_PREFIX) {
+    // Subscription calendars are made from webmail, from a feed; the
+    // directory by the server.
+    if rmail_common::dav::store::reserved_name(home_kind, &name) {
         return Ok(status(StatusCode::FORBIDDEN));
     }
     let Ok(document) = xml::parse(body) else {

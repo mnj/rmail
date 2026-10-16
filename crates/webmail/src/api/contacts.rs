@@ -530,7 +530,8 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
             id: format!("own:{}", collection.name),
             displayname: display(&collection),
             owner: None,
-            writable: true,
+            // The directory is kept by the server.
+            writable: !collection.managed,
             conn: open_account(&state.mail_root, &session.address)?,
             collection,
         });
@@ -546,7 +547,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
                 .displayname
                 .clone()
                 .unwrap_or_else(|| display(&collection)),
-            writable: grant.access == Access::ReadWrite,
+            writable: grant.access == Access::ReadWrite && !collection.managed,
             conn: open_account(&state.mail_root, &grant.owner)?,
             owner: Some(grant.owner),
             collection,
@@ -1106,5 +1107,45 @@ mod tests {
         )
         .await;
         assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn the_directory_is_listed_read_only() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        rmail_common::imap_state::init_account(&state.mail_root, "example.test", "user").unwrap();
+        rmail_common::directory::set_enabled(&state.db_path, "example.test", true).unwrap();
+        rmail_common::directory::sync_all(&state.db_path, &state.mail_root).unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let response = route(req("GET", "/api/addressbook", b"", cookie.clone()), &state).await;
+        let listing: Value = serde_json::from_slice(&response.body).unwrap();
+        let book = listing["books"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "own:directory")
+            .unwrap()
+            .clone();
+        assert_eq!(book["writable"], false);
+        assert!(
+            listing["contacts"]
+                .to_string()
+                .contains("user@example.test")
+        );
+        let body = json!({"full_name": "Nope"}).to_string();
+        let refused = route(
+            req(
+                "POST",
+                "/api/addressbook/own:directory",
+                body.as_bytes(),
+                cookie,
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(refused.status, 403);
     }
 }

@@ -329,7 +329,8 @@ pub fn subscribe(
     } else {
         displayname
     };
-    let collection = store::create(conn, Kind::Calendar, &name, Some(displayname), &["VEVENT"])?;
+    let collection =
+        store::create_managed(conn, Kind::Calendar, &name, Some(displayname), &["VEVENT"])?;
     if let Some(color) = color.filter(|c| c.len() <= 9 && c.starts_with('#')) {
         store::set_property(conn, &collection, store::Setting::Color, Some(color))?;
     }

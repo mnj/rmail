@@ -111,6 +111,14 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// The global address list: turn it on or off for a domain
+    Directory {
+        #[command(subcommand)]
+        action: DirectoryAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// DKIM signing keys and the ARC sealing key, stored in the database
     Dkim {
         #[command(subcommand)]
@@ -255,6 +263,16 @@ enum ResourceAction {
         kind: String,
     },
     /// List the resources
+    List,
+}
+
+#[derive(Subcommand)]
+enum DirectoryAction {
+    /// Give everyone in DOMAIN a read-only Directory address book of its people
+    Enable { domain: String },
+    /// Remove it again
+    Disable { domain: String },
+    /// Domains that have it
     List,
 }
 
@@ -799,6 +817,33 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Directory { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db = std::path::Path::new(&cfg.global.db_path);
+            let root = std::path::Path::new(&cfg.global.mail_root);
+            match action {
+                DirectoryAction::Enable { domain } => {
+                    rmail_common::directory::set_enabled(db, &domain, true)?;
+                    let failed = rmail_common::directory::sync_all(db, root)?;
+                    println!("{domain} now has a directory");
+                    report_directory_failures(&failed);
+                }
+                DirectoryAction::Disable { domain } => {
+                    rmail_common::directory::set_enabled(db, &domain, false)?;
+                    let failed = rmail_common::directory::sync_all(db, root)?;
+                    println!("{domain} no longer has a directory");
+                    report_directory_failures(&failed);
+                }
+                DirectoryAction::List => {
+                    for domain in rmail_common::directory::enabled_domains(db)? {
+                        println!("{domain}");
+                    }
+                }
+            }
+        }
         Commands::Feedback { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
@@ -826,6 +871,17 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Accounts whose directory book a sync could not update; webmail's
+/// background sync tries them again.
+fn report_directory_failures(failed: &[String]) {
+    for account in failed {
+        eprintln!("warning: directory not updated for {account}");
+    }
+    if !failed.is_empty() {
+        eprintln!("webmail retries these every 30 minutes");
+    }
 }
 
 fn run_share(

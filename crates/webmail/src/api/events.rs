@@ -516,9 +516,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
             owner: me.clone(),
             shared: false,
             // A subscription is filled from its feed only.
-            writable: !collection
-                .name
-                .starts_with(rmail_common::dav::subscription::NAME_PREFIX),
+            writable: !collection.managed,
             subscription: subscriptions
                 .iter()
                 .find(|s| s.collection.id == collection.id)
@@ -543,10 +541,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
                 .or_else(|| collection.displayname.clone())
                 .unwrap_or_else(|| collection.name.clone()),
             color: grant.color.clone().or_else(|| collection.color.clone()),
-            writable: grant.access == Access::ReadWrite
-                && !collection
-                    .name
-                    .starts_with(rmail_common::dav::subscription::NAME_PREFIX),
+            writable: grant.access == Access::ReadWrite && !collection.managed,
             subscription: None,
             shared: true,
             conn: open(&state.mail_root, &owner)?,
