@@ -792,6 +792,14 @@ respected.
   invitations to it reach the account (by email and from accounts here), clients see it in the
   account's `calendar-user-address-set`, and answers and events organized under it are sent from
   the alias. Aliases with several targets are groups and are not calendar addresses.
+- **Contacts** in webmail's sidebar lists the user's address books and those shared with them,
+  with search, and adds, edits and deletes contacts in the same store CardDAV clients sync, so
+  changes reach phones and the other way round. Webmail edits the name, email addresses, phone
+  numbers, company, job title, postal addresses, birthday and note; every other line of a card
+  (a photo, labels phones group with a field, a client's own fields) is kept as it was. Saves
+  check the version the user saw, so a change made meanwhile on another device is not
+  overwritten. **Add to contacts** next to a message's sender opens that person's card, or a new
+  one filled in with their name and address. Address books shared read-only cannot be changed.
 - Users can share a calendar or address book with other accounts on the server, read-only or
   with changes allowed. In webmail, **Calendar sharing** in the sidebar lists the user's
   calendars and address books with a share button on each, since Thunderbird and DAVx⁵ cannot

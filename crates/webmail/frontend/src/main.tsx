@@ -8,6 +8,7 @@ import {
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
+import { ContactSeed, ContactsDialog } from './contacts';
 import { InvitationCard } from './invitation';
 import { FilterIcon, FiltersDialog, Vacation, VacationDialog, VacationIcon, vacationNote } from './rules';
 import {
@@ -447,6 +448,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [prefs, setPrefs] = useState<ComposePrefs>({ format: 'html', language: '', undo_seconds: 0, ai_suggestions: false });
   const [identities, setIdentities] = useState<Identity[]>([]);
   const [composeSettings, setComposeSettings] = useState(false);
+  const [contacts, setContacts] = useState<ContactSeed | null | false>(false);
   const [vacation, setVacation] = useState<Vacation | null>(null);
   const [vacationOpen, setVacationOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -769,6 +771,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         <div className="sidebar-foot">
           {canSend && <button className="sidebar-link" onClick={() => setComposeSettings(true)}><PenLine size={15} />Compose settings</button>}
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
+          <button className="sidebar-link" onClick={() => setContacts(null)}><BookUser size={15} />Contacts</button>
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>
           <button className="sidebar-link" onClick={() => setFiltersOpen(true)}><FilterIcon size={15} />Filters</button>
@@ -887,7 +890,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
               <div className="message-head">
                 <div className="avatar" aria-hidden="true">{(splitAddress(selected.from).name || '?').charAt(0).toUpperCase()}</div>
                 <div className="head-text">
-                  <div><strong>{splitAddress(selected.from).name}</strong> <span className="muted">&lt;{splitAddress(selected.from).address}&gt;</span></div>
+                  <div><strong>{splitAddress(selected.from).name}</strong> <span className="muted">&lt;{splitAddress(selected.from).address}&gt;</span> <button className="link small" onClick={() => setContacts({ name: splitAddress(selected.from).name, email: splitAddress(selected.from).address })}>Add to contacts</button></div>
                   <div className="muted small">To {selected.to || address}{selected.cc && <> · Cc {selected.cc}</>}</div>
                   {selected.reply_to && selected.reply_to !== selected.from && <div className="muted small">Reply to {selected.reply_to}</div>}
                 </div>
@@ -925,6 +928,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {prompt && <PromptDialog {...prompt} />}
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
       {calendars && <CalendarsDialog api={api} onClose={() => setCalendars(false)} />}
+      {contacts !== false && <ContactsDialog api={api} seed={contacts} onClose={() => setContacts(false)} onWrite={(to, name) => { setContacts(false); if (canSend) startCompose({ to: name ? `${name} <${to}>` : to }); }} />}
       {vacationOpen && vacation && <VacationDialog api={api} initial={vacation} onClose={() => setVacationOpen(false)} onSaved={setVacation} />}
       {filtersOpen && <FiltersDialog api={api} folders={folders} labels={organize?.labels ?? []} onClose={() => setFiltersOpen(false)} />}
       {rawFor !== null && <RawDialog api={api} folder={folder} uid={rawFor} onClose={() => setRawFor(null)} />}

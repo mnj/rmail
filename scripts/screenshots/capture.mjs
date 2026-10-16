@@ -195,6 +195,21 @@ async function signIn(page) {
   await page.waitForSelector('.away-banner');
   await page.waitForTimeout(300);
   await shot(page, 'webmail-away');
+  // Contacts: the sender of a message is already a contact (from the seed),
+  // so "Add to contacts" opens the card; fill it in.
+  await page.click('button.folder-name:has-text("Inbox")');
+  await page.click('text=Q4 infrastructure review — agenda');
+  await page.click('button:has-text("Add to contacts")');
+  await page.waitForSelector('.contact-details');
+  await page.click('.contact-actions button:has-text("Edit")');
+  await page.click('.contact-editor button:has-text("Add phone")');
+  await page.fill('.contact-editor input[aria-label=Phone]', '+45 31 23 45 67');
+  await page.fill('.contact-editor label:has-text("Company") input', 'Northwind');
+  await page.fill('.contact-editor label:has-text("Job title") input', 'Infrastructure lead');
+  await page.click('.contact-editor button.primary');
+  await page.waitForSelector('.contact-details >> text=Infrastructure lead');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-contacts');
   await ctx.close();
 }
 
@@ -307,6 +322,18 @@ for (const theme of ['light', 'dark']) {
   await page.waitForTimeout(500);
   await shot(page, 'mobile-invitation');
   await page.click('button[aria-label=Back]');
+  await page.waitForTimeout(300);
+  await page.click('button[title=Folders]');
+  await page.click('.sidebar-link:has-text("Contacts")');
+  await page.waitForSelector('.contacts-list');
+  await page.waitForTimeout(300);
+  await shot(page, 'mobile-contacts');
+  await page.click('.contacts-list button:has-text("Priya Raman")');
+  await page.waitForSelector('.contact-details');
+  await page.waitForTimeout(300);
+  await shot(page, 'mobile-contact');
+  await page.click('.contacts-dialog button[aria-label=Close]');
+  await page.click('button.folder-name:has-text("Inbox")');
   await page.waitForTimeout(300);
   await compose(page, 'mobile-compose', true);
   await page.keyboard.press('Escape');

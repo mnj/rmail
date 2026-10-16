@@ -46,10 +46,11 @@ screenshots of every page, and a quick start.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
   layout. Calendar invitations show as a card with Accept, Maybe and Decline, which stores the event
   and sends the reply as a calendar app would; cancellations and unverified replies can be applied
-  from the card too. Out-of-office replies and mail filters are edited in webmail and applied on the
-  server at delivery, so they work in every mail app; filters are kept as Sieve, and a hand-written
-  script is shown and edited as text. Composing has a rich-text editor (formatting, lists, quotes,
-  links, inline images, cleaned-up pastes from Word or Google Docs) that sends HTML with a generated
+  from the card too. Contacts are edited in webmail and synced with phones over CardDAV.
+  Out-of-office replies and mail filters are edited in webmail and applied on the server at
+  delivery, so they work in every mail app; filters are kept as Sieve, and a hand-written script is
+  shown and edited as text. Composing has a rich-text editor (formatting, lists, quotes, links,
+  inline images, cleaned-up pastes from Word or Google Docs) that sends HTML with a generated
   plain-text alternative, a plain-text mode, signatures per identity, the browser's spellchecker in
   a chosen language, address suggestions from CardDAV contacts and recent recipients, autosaved
   drafts, drag-and-drop attachments, undo send and send later. Opt-in AI writing suggestions (grey

@@ -453,3 +453,55 @@ time { white-space: nowrap; }
 @media (max-width: 860px) {
   .settings-grid.two { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Contacts */
+.contacts-dialog { display: flex; flex-direction: column; }
+.contacts-dialog header h2 { display: flex; align-items: center; gap: 8px; }
+.contacts-panes { flex: 1; display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 0; min-height: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.contacts-list-pane { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; border-right: 1px solid var(--border); background: var(--surface-2); }
+.contacts-tools { display: flex; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
+.contacts-search { flex: 1; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border-strong); border-radius: 8px; padding: 0 8px; background: var(--surface); color: var(--muted); min-width: 0; }
+.contacts-search input { flex: 1; min-width: 0; width: 100%; border: 0; background: none; padding: 7px 0; color: var(--text); outline: none; }
+.contacts-list { list-style: none; margin: 0; padding: 4px; overflow: auto; }
+.contacts-list button { width: 100%; display: flex; align-items: center; gap: 10px; padding: 8px; border: 0; border-radius: 8px; background: none; text-align: left; color: var(--text); }
+.contacts-list button:hover { background: var(--hover); }
+.contacts-list button.active { background: var(--selected); }
+.contact-summary { display: grid; min-width: 0; }
+.contact-summary strong, .contact-summary small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact-summary small { color: var(--muted); font-size: 12px; }
+.contact-avatar { flex: none; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-text); font-weight: 700; font-size: 13px; }
+.contact-avatar.large { width: 56px; height: 56px; font-size: 20px; }
+.contacts-empty, .contacts-placeholder { padding: 16px; }
+.contacts-detail-pane { overflow: auto; padding: 18px 20px; min-width: 0; }
+.contacts-back { display: none; align-items: center; gap: 4px; margin-bottom: 10px; padding: 0; }
+.contact-head { display: flex; align-items: center; gap: 14px; }
+.contact-head h2 { margin: 0; font-size: 20px; overflow-wrap: anywhere; }
+.contact-head p { margin: 2px 0 0; }
+.contact-actions { display: flex; gap: 8px; margin: 14px 0 4px; }
+.contact-list { display: grid; gap: 10px; margin: 16px 0 0; }
+.contact-list > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; }
+.contact-list dt { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+.contact-list dd { margin: 0; overflow-wrap: anywhere; }
+.contact-note { margin-top: 16px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); }
+.pre { white-space: pre-line; }
+.contact-editor { display: grid; gap: 14px; }
+.contact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.contact-grid .wide { grid-column: 1 / -1; }
+.contact-editor .field input, .contact-editor .field select, .contact-row select, .contact-row input { border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 10px; background: var(--surface); color: var(--text); min-width: 0; font-weight: 400; }
+.contact-field { display: grid; gap: 8px; }
+.contact-label { font-size: 13px; font-weight: 600; color: var(--text-2); }
+.contact-row { display: flex; align-items: center; gap: 6px; }
+.contact-row input { flex: 1 1 auto; }
+.contact-row input.narrow { flex: 0 1 110px; }
+.contact-row.indent { padding-left: 0; }
+.contact-address { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; }
+.contact-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+@media (max-width: 860px) {
+  .contacts-panes { grid-template-columns: minmax(0, 1fr); }
+  .contacts-dialog.detail-open .contacts-list-pane { display: none; }
+  .contacts-dialog:not(.detail-open) .contacts-detail-pane { display: none; }
+  .contacts-back { display: inline-flex; }
+  .contact-grid { grid-template-columns: minmax(0, 1fr); }
+  .contact-list > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}
+.contacts-tools .small-button { flex: none; }
