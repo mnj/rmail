@@ -1049,6 +1049,27 @@ async fn contacts_are_address_books_and_jscontact_cards() {
     assert_eq!(changes["updated"], json!([&id]), "{changes}");
     assert_eq!(changes["created"], json!([]));
 
+    // A birthday JSContact cannot show survives an unrelated edit.
+    let card_now = rmail_common::dav::store::objects(&conn, &collection).unwrap()[0].clone();
+    let year_only = card_now.data.replace("BDAY:--04-12", "BDAY:1985");
+    rmail_common::dav::store::put(&conn, &collection, &card_now.name, &year_only, &|_| true)
+        .unwrap()
+        .unwrap();
+    let edited = client
+        .one(
+            "ContactCard/set",
+            json!({"update": {&id: {"titles": {"t1": {"name": "Buyer"}}}}}),
+        )
+        .await;
+    assert!(edited["updated"].get(&id).is_some(), "{edited}");
+    let vcard = rmail_common::dav::store::objects(&conn, &collection).unwrap()[0]
+        .data
+        .clone();
+    assert!(
+        vcard.contains("BDAY:1985") && vcard.contains("TITLE:Buyer"),
+        "{vcard}"
+    );
+
     // What cannot be stored is refused, not dropped; nor can a card move.
     let refused = client
         .one(

@@ -1195,7 +1195,7 @@ pub(crate) fn card_set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult 
             );
             continue;
         }
-        let fields = match fields_from(&card) {
+        let mut fields = match fields_from(&card) {
             Ok(fields) => fields,
             Err(Unsupported(properties)) => {
                 let names = properties.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1206,6 +1206,14 @@ pub(crate) fn card_set(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult 
                 continue;
             }
         };
+        // A birthday JSContact could not show (a year alone, say) stays as
+        // stored unless the patch sets one.
+        let touches_birthday = patch
+            .keys()
+            .any(|key| key == "anniversaries" || key.starts_with("anniversaries/"));
+        if !touches_birthday && !before.contains_key("anniversaries") {
+            fields.birthday = webmail::birthday_of(&object.data).unwrap_or_default();
+        }
         let kept_birthday =
             webmail::birthday_of(&object.data).as_deref() == Some(fields.birthday.as_str());
         if !kept_birthday && !webmail::valid_birthday(&fields.birthday) {
