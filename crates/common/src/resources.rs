@@ -43,7 +43,7 @@ impl ResourceKind {
     }
 }
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS resources (
         address TEXT PRIMARY KEY,
         kind TEXT NOT NULL
@@ -140,6 +140,11 @@ mod tests {
         assert_eq!(list(&db, None).unwrap().len(), 2);
         set(&db, "room1@example.test", None).unwrap();
         assert_eq!(kind_of(&db, "room1@example.test").unwrap(), None);
+        crate::db::remove_mailbox(&db, "beamer@other.test").unwrap();
+        assert!(
+            list(&db, None).unwrap().is_empty(),
+            "deleting the mailbox unmarks it"
+        );
         assert_eq!(ResourceKind::Equipment.cutype(), "RESOURCE");
     }
 }

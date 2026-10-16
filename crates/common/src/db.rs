@@ -415,6 +415,12 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
         "DELETE FROM vacation_responses WHERE account = ?1",
         params![address.to_ascii_lowercase()],
     )?;
+    // A deleted room is no longer bookable.
+    conn.execute_batch(crate::resources::SCHEMA)?;
+    conn.execute(
+        "DELETE FROM resources WHERE address = ?1",
+        params![address.to_ascii_lowercase()],
+    )?;
     Ok(())
 }
 

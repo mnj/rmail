@@ -305,12 +305,41 @@ fn uid_of(calendar: &text::Component) -> Option<String> {
 
 /// Put a message in `account`'s inbox and apply it to their copy of the
 /// event (RFC 6638 4.1).
+/// One lock per resource account, held from storing an invitation to
+/// answering it, so two bookings arriving together are judged one after the
+/// other (each would otherwise count the other, still unanswered, as busy).
+fn resource_lock(address: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(address.to_ascii_lowercase())
+        .or_default()
+        .clone()
+}
+
 pub(super) fn deliver_local(
     dav: &Dav,
     sender: &str,
     account: &User,
     message: &Message,
 ) -> anyhow::Result<()> {
+    // A room or piece of equipment answers for itself.
+    let resource = message.method == Method::Request
+        && match rmail_common::resources::kind_of(&dav.app.db_path, &account.address) {
+            Ok(kind) => kind.is_some(),
+            Err(error) => {
+                webmail_log!("warn", "resource_lookup_failed", { "account": account.address, "error": format!("{error:#}") });
+                false
+            }
+        };
+    let lock = resource.then(|| resource_lock(&account.address));
+    let _held = lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let conn =
         rmail_common::jmap::store::open(&dav.app.mail_root, &account.domain, &account.localpart)?;
     store::inbox_add(&conn, &message.calendar.to_text())?;
@@ -335,11 +364,9 @@ pub(super) fn deliver_local(
     })?;
     match stored {
         Ok(_) => {
-            // A room or piece of equipment answers for itself.
-            if message.method == Method::Request
-                && rmail_common::resources::kind_of(&dav.app.db_path, &account.address)?.is_some()
-            {
-                answer_as_resource(dav, account, &collection, &name)?;
+            // The invitation is stored whatever becomes of the answer.
+            if resource && let Err(error) = answer_as_resource(dav, account, &collection, &name) {
+                webmail_log!("warn", "resource_answer_failed", { "account": account.address, "error": format!("{error:#}") });
             }
             Ok(())
         }
