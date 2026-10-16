@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, ShieldOff, Trash2 } from 'lucide-react';
-import { Account, DavShare, FolderShare, TwoFactorPolicy, api } from '../api';
+import { Account, DavShare, DirectoryPolicy, FolderShare, TwoFactorPolicy, api } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
@@ -155,6 +155,41 @@ function TwoFactorPanel() {
   );
 }
 
+function DirectoryPanel() {
+  const { run } = useFeedback();
+  const policy = useResource(() => api<DirectoryPolicy>('/api/directory-policy'), [], undefined, 'directory-policy');
+  const [pending, setPending] = useState<string[]>([]);
+  async function toggle(domain: string, enabled: boolean) {
+    setPending((list) => [...list, domain]);
+    try {
+      if (await run(() => api('/api/directory-policy', 'PUT', { domain, enabled }), enabled ? `${domain} now has a directory` : `${domain} no longer has a directory`)) await policy.reload();
+    } finally {
+      setPending((list) => list.filter((d) => d !== domain));
+    }
+  }
+  return (
+    <Panel title="Directory" subtitle="A read-only address book of everyone (and every group address) in the domain, for the people in it: in webmail contacts, compose suggestions and their CardDAV apps. Off unless turned on, since not every domain's users know each other.">
+      <ErrorBanner error={policy.error} />
+      {policy.data && policy.data.domains.length > 0 && (
+        <div className="tableScroll">
+          <table>
+            <thead><tr><th>Domain</th><th>Directory</th></tr></thead>
+            <tbody>
+              {policy.data.domains.map(({ domain, enabled }) => (
+                <tr key={domain}>
+                  <td><strong>{domain}</strong></td>
+                  <td><label className="checkLabel"><input type="checkbox" checked={enabled} disabled={pending.includes(domain)} onChange={(event) => toggle(domain, event.target.checked)} /> Shared with its people</label></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {policy.data && policy.data.domains.length === 0 && <Empty>No domains yet.</Empty>}
+    </Panel>
+  );
+}
+
 function DavSharingPanel() {
   const { run, confirm } = useFeedback();
   const shares = useResource(() => api<DavShare[]>('/api/dav-sharing'), [], undefined, 'dav-sharing');
@@ -286,6 +321,7 @@ export function AccountsPage() {
         {accounts.data !== null && rows.length === 0 && <Empty>{filter ? 'No mailboxes match the filter.' : 'No mailboxes yet. Create the first one to start receiving mail.'}</Empty>}
       </Panel>
       <TwoFactorPanel />
+      <DirectoryPanel />
       <SharingPanel />
       <DavSharingPanel />
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={accounts.reload} />}

@@ -337,6 +337,17 @@ fn random_token() -> String {
 }
 
 /// Whether `name` can be a collection or object URL segment.
+/// The name of the read-only address book that holds the global address
+/// list (`crate::directory`).
+pub const DIRECTORY_NAME: &str = "directory";
+
+/// Whether a collection is filled by the server (a calendar subscription or
+/// the directory), so neither CalDAV/CardDAV clients nor webmail may change
+/// it or create one by that name.
+pub fn server_managed(name: &str) -> bool {
+    name.starts_with(super::subscription::NAME_PREFIX) || name == DIRECTORY_NAME
+}
+
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255

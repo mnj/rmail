@@ -70,7 +70,20 @@ type Shared = Arc<AppState>;
 
 /// Start the background refresh of calendar subscriptions.
 pub(crate) fn spawn_background(state: Shared) {
-    subscriptions::spawn_refresher(state);
+    subscriptions::spawn_refresher(state.clone());
+    // The global address list: soon after start, then every 30 minutes.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        loop {
+            let (db_path, mail_root) = (state.db_path.clone(), state.mail_root.clone());
+            if let Err(error) =
+                blocking(move || rmail_common::directory::sync_all(&db_path, &mail_root)).await
+            {
+                webmail_log!("warn", "directory_sync_failed", { "error": format!("{error:#}") });
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+        }
+    });
 }
 
 pub(crate) fn router(state: Shared) -> Router {
