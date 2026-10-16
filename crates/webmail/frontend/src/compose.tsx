@@ -100,6 +100,27 @@ export async function draftSeed(api: Api, message: MessageDetail, folder: string
   };
 }
 
+/**
+ * Plain text from the editor's HTML, keeping where links go: a link whose
+ * text is not its address gets the address after it (a reopened draft's
+ * file links, say, would otherwise lose their URLs).
+ */
+function htmlToTextWithLinks(html: string): string {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  for (const link of Array.from(doc.querySelectorAll('a[href]'))) {
+    const href = link.getAttribute('href') || '';
+    if (/^(https?:|mailto:)/i.test(href) && link.textContent?.trim() !== href.replace(/^mailto:/i, '')) {
+      link.after(doc.createTextNode(` <${href}>`));
+    }
+  }
+  for (const br of Array.from(doc.querySelectorAll('br'))) br.replaceWith(doc.createTextNode('\n'));
+  for (const block of Array.from(doc.querySelectorAll('p, div, li, h1, h2, h3, h4, h5, h6, blockquote, tr, pre'))) {
+    if (block.tagName === 'LI') block.prepend(doc.createTextNode('- '));
+    block.append(doc.createTextNode('\n'));
+  }
+  return (doc.body.textContent || '').replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n').trim();
+}
+
 function readFile(file: File): Promise<Upload> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -390,13 +411,21 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
   }
 
   async function removeLink(link: Linked) {
-    touch();
-    setLinks((list) => list.filter((l) => l.id !== link.id));
-    await api(`/api/files/${link.id}`, { method: 'DELETE' }).catch(() => undefined);
+    try {
+      await api(`/api/files/${link.id}`, { method: 'DELETE' });
+      touch();
+      setLinks((list) => list.filter((l) => l.id !== link.id));
+    } catch (err) {
+      setError(`${link.name} could not be removed: ${(err as Error).message}`);
+    }
   }
 
   async function send(sendAt?: Date) {
     if (busyRef.current) return;
+    if (linking) {
+      setError('Wait until the file has been uploaded.');
+      return;
+    }
     if (!addressList(to).length && !addressList(cc).length && !addressList(bcc).length) {
       setError('Add at least one recipient.');
       return;
@@ -420,7 +449,7 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
   }
 
   async function saveDraft(closeAfter: boolean, quiet = false) {
-    if (busyRef.current) return;
+    if (busyRef.current || linking) return;
     busyRef.current = 'draft';
     setBusy('draft');
     if (!quiet) setError('');
@@ -458,11 +487,22 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
   }, []);
 
   function close() {
+    // Closing mid-upload would lose the file (or leave it shared with no message).
+    if (linking) {
+      setError('Wait until the file has been uploaded, or remove it.');
+      return;
+    }
     if (dirty.current && hasContent()) saveDraft(true);
     else onClose(savedAt ? 'Draft saved' : undefined);
   }
 
   async function discard() {
+    if (linking) {
+      setError('Wait until the file has been uploaded, or remove it.');
+      return;
+    }
+    // Shared files of a discarded message are not left behind.
+    for (const link of links) await api(`/api/files/${link.id}`, { method: 'DELETE' }).catch(() => undefined);
     // A draft this window saved on its own goes too; one the user opened stays.
     if (draftUid !== undefined && draftFolder && !isDraft) {
       await api(`/api/folders/${encodeURIComponent(draftFolder)}/messages/bulk`, { method: 'POST', body: JSON.stringify({ action: 'delete', uids: [draftUid] }) }).catch(() => undefined);
@@ -476,7 +516,7 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
     // A pending rewrite belongs to the editor that is going away.
     closeRewrite();
     if (next === 'text') {
-      const plain = editorRef.current?.getText() || '';
+      const plain = htmlToTextWithLinks(editorRef.current?.getHTML() || '');
       setText(plain.replace(/\n{3,}/g, '\n\n'));
     } else {
       initialHtml.current = textToHtml(text);
@@ -606,7 +646,7 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
       {error && <p className="error compose-error">{error}</p>}
       <footer>
         <span className="send-group menu-anchor">
-          <button className="primary" disabled={busy !== null} onClick={() => send()} title={`Send (${mod}Enter)`}><Send size={14} />{busy === 'send' ? 'Sending…' : 'Send'}</button>
+          <button className="primary" disabled={busy !== null || linking !== null} onClick={() => send()} title={`Send (${mod}Enter)`}><Send size={14} />{busy === 'send' ? 'Sending…' : 'Send'}</button>
           <button className="primary send-more" disabled={busy !== null} aria-label="Send later" title="Send later" aria-expanded={laterOpen} onClick={() => setLaterOpen(!laterOpen)}><ChevronDown size={14} /></button>
           {laterOpen && (
             <div className="menu send-later" role="menu">
@@ -652,7 +692,7 @@ export function ComposeWindow({ api, from, seed, prefs, identities, onClose, onS
         )}
         <span className="spacer" />
         <span className="save-state muted small">{busy === 'draft' ? 'Saving…' : savedAt ? `Saved ${savedAt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}` : ''}</span>
-        <button className="secondary" disabled={busy !== null} onClick={() => saveDraft(false)} title={`Save draft (${mod}S)`}>Save draft</button>
+        <button className="secondary" disabled={busy !== null || linking !== null} onClick={() => saveDraft(false)} title={`Save draft (${mod}S)`}>Save draft</button>
         <button className="icon" aria-label="Discard" title="Discard" onClick={discard}><Trash2 size={16} /></button>
       </footer>
     </div>

@@ -213,8 +213,11 @@ async fn start(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response 
             return Ok(Err((StatusCode::PAYLOAD_TOO_LARGE, format!("Files can be at most {} MB.", config.max_file_mb))));
         }
         sweep(&state)?;
-        let conn = open(&state)?;
-        let used: i64 = conn.query_row(
+        let mut conn = open(&state)?;
+        // The check and the insert go together, so parallel starts cannot
+        // both fit under the allowance.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let used: i64 = tx.query_row(
             "SELECT COALESCE(SUM(size), 0) FROM shared_files WHERE address = ?1",
             params![session.address],
             |row| row.get(0),
@@ -229,10 +232,11 @@ async fn start(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response 
         let path = file_path(&state, &session.address, &id).ok_or_else(|| anyhow::anyhow!("no account directory"))?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::File::create(&path)?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO shared_files (id, address, name, size, created) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, session.address, clean_name(&input.name), input.size as i64, now()],
         )?;
+        tx.commit()?;
         Ok(Ok(json!({ "id": id, "chunk_bytes": CHUNK_BYTES })))
     })
     .await;
@@ -274,7 +278,7 @@ async fn chunk(
         return refused(StatusCode::PAYLOAD_TOO_LARGE, "chunks are at most 8 MB");
     }
     let result = blocking(move || {
-        use std::io::Write;
+        use std::io::{Seek, Write};
         let conn = open(&state)?;
         let Some((size, received)) = upload(&conn, &session.address, &id)? else {
             return Ok(Err((StatusCode::NOT_FOUND, "no such upload")));
@@ -291,13 +295,19 @@ async fn chunk(
         }
         let path =
             file_path(&state, &session.address, &id).ok_or_else(|| anyhow::anyhow!("bad id"))?;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        // Written at its offset, and counted only if nothing else counted
+        // it meanwhile: a retry racing the original lands on the same bytes.
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(std::io::SeekFrom::Start(received))?;
         file.write_all(&body)?;
         file.flush()?;
-        conn.execute(
-            "UPDATE shared_files SET received = received + ?2 WHERE id = ?1",
-            params![id, body.len() as i64],
+        let counted = conn.execute(
+            "UPDATE shared_files SET received = ?3 WHERE id = ?1 AND received = ?2",
+            params![id, received as i64, (received + body.len() as u64) as i64],
         )?;
+        if counted == 0 {
+            return Ok(Err((StatusCode::CONFLICT, "out of order")));
+        }
         Ok(Ok(received + body.len() as u64))
     })
     .await;
