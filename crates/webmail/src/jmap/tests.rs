@@ -16,7 +16,13 @@ use crate::api::{AppState, router};
 
 const USER: &str = "user@example.test";
 const FRIEND: &str = "friend@example.test";
-const USING: &[&str] = &[super::CORE, super::MAIL, super::SUBMISSION, super::VACATION];
+const USING: &[&str] = &[
+    super::CORE,
+    super::MAIL,
+    super::SUBMISSION,
+    super::VACATION,
+    super::CONTACTS,
+];
 
 fn state(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) -> Arc<AppState> {
     let db_path = td.path().join("accounts.sqlite");
@@ -938,4 +944,178 @@ async fn delayed_sending_holds_until_release_and_can_be_cancelled() {
         too_late[1][1]["notCreated"]["s"]["type"],
         "invalidProperties"
     );
+}
+
+#[tokio::test]
+async fn contacts_are_address_books_and_jscontact_cards() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td, None);
+    let client = Client::new(&state, USER);
+    let (_, _, body) = send(
+        &state,
+        "GET",
+        "/jmap/session",
+        Some(&basic(USER, "secret")),
+        vec![],
+    )
+    .await;
+    let session: Value = serde_json::from_slice(&body).unwrap();
+    assert!(session["capabilities"].get(super::CONTACTS).is_some());
+    assert_eq!(
+        session["primaryAccounts"][super::CONTACTS],
+        account_id(USER)
+    );
+
+    let books = client.one("AddressBook/get", json!({})).await;
+    let default = books["list"][0].clone();
+    assert_eq!(default["isDefault"], true, "{books}");
+    assert_eq!(default["myRights"]["mayWrite"], true);
+    let book = default["id"].as_str().unwrap().to_string();
+    let cards_state = client.one("ContactCard/get", json!({"ids": []})).await["state"].clone();
+
+    // A card made over JMAP is a vCard CardDAV clients see.
+    let created = client
+        .one(
+            "ContactCard/set",
+            json!({"create": {"k1": {
+                "@type": "Card", "version": "1.0",
+                "addressBookIds": {&book: true},
+                "name": {"components": [{"kind": "given", "value": "Ann"}, {"kind": "surname", "value": "Lee"}]},
+                "emails": {"e1": {"address": "ann@example.test", "contexts": {"work": true}}},
+                "phones": {"p1": {"number": "+45 1234", "features": {"mobile": true}}},
+                "anniversaries": {"k1": {"kind": "birth", "date": {"@type": "PartialDate", "month": 4, "day": 12}}},
+            }}}),
+        )
+        .await;
+    let id = created["created"]["k1"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    let conn = rmail_common::jmap::store::open(&state.mail_root, "example.test", "user").unwrap();
+    let collection = rmail_common::dav::store::collection(
+        &conn,
+        rmail_common::dav::store::Kind::AddressBook,
+        "default",
+    )
+    .unwrap()
+    .unwrap();
+    let objects = rmail_common::dav::store::objects(&conn, &collection).unwrap();
+    assert_eq!(objects.len(), 1);
+    let vcard = &objects[0].data;
+    assert!(
+        vcard.contains("EMAIL;TYPE=work:ann@example.test")
+            && vcard.contains("TEL;TYPE=cell:+45 1234"),
+        "{vcard}"
+    );
+    assert!(vcard.contains("BDAY:--04-12"), "{vcard}");
+
+    let card = client.one("ContactCard/get", json!({"ids": [&id]})).await;
+    let card = &card["list"][0];
+    assert_eq!(card["name"]["full"], "Ann Lee");
+    assert_eq!(card["phones"]["p1"]["features"]["mobile"], true);
+    assert_eq!(card["anniversaries"]["k1"]["date"]["month"], 4);
+
+    // Changes since the empty state: one card created.
+    let changes = client
+        .one("ContactCard/changes", json!({"sinceState": cards_state}))
+        .await;
+    assert_eq!(changes["created"], json!([&id]), "{changes}");
+    let after_create = changes["newState"].clone();
+
+    // A patch keeps lines webmail and JMAP do not know.
+    let with_photo = vcard.replace("END:VCARD", "X-CUSTOM:kept\r\nEND:VCARD");
+    rmail_common::dav::store::put(&conn, &collection, &objects[0].name, &with_photo, &|_| true)
+        .unwrap()
+        .unwrap();
+    let updated = client
+        .one(
+            "ContactCard/set",
+            json!({"update": {&id: {"emails/e1/address": "ann@new.test", "notes": {"n1": {"note": "Met at the fair"}}}}}),
+        )
+        .await;
+    assert!(updated["updated"].get(&id).is_some(), "{updated}");
+    let vcard = rmail_common::dav::store::objects(&conn, &collection).unwrap()[0]
+        .data
+        .clone();
+    assert!(
+        vcard.contains("X-CUSTOM:kept")
+            && vcard.contains("ann@new.test")
+            && vcard.contains("NOTE:Met at the fair"),
+        "{vcard}"
+    );
+    let changes = client
+        .one("ContactCard/changes", json!({"sinceState": after_create}))
+        .await;
+    assert_eq!(changes["updated"], json!([&id]), "{changes}");
+    assert_eq!(changes["created"], json!([]));
+
+    // What cannot be stored is refused, not dropped; nor can a card move.
+    let refused = client
+        .one(
+            "ContactCard/set",
+            json!({
+                "create": {"k2": {"addressBookIds": {&book: true}, "name": {"full": "X"}, "speakToAs": {"grammaticalGender": "neuter"}}},
+                "update": {&id: {"addressBookIds": {"b999": true}}},
+            }),
+        )
+        .await;
+    assert_eq!(
+        refused["notCreated"]["k2"]["properties"],
+        json!(["speakToAs"]),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["notUpdated"][&id]["properties"],
+        json!(["addressBookIds"])
+    );
+
+    // Query by text, and a new book.
+    let found = client
+        .one(
+            "ContactCard/query",
+            json!({"filter": {"text": "fair"}, "calculateTotal": true}),
+        )
+        .await;
+    assert_eq!(found["ids"], json!([&id]));
+    assert_eq!(found["total"], 1);
+    let none = client
+        .one(
+            "ContactCard/query",
+            json!({"filter": {"operator": "NOT", "conditions": [{"email": "ann"}]}}),
+        )
+        .await;
+    assert_eq!(none["ids"], json!([]));
+    let book_state = client.one("AddressBook/get", json!({"ids": []})).await["state"].clone();
+    let made = client
+        .one(
+            "AddressBook/set",
+            json!({"create": {"n": {"name": "Suppliers", "sortOrder": 3}}}),
+        )
+        .await;
+    let new_book = made["created"]["n"]["id"].as_str().unwrap().to_string();
+    let book_changes = client
+        .one("AddressBook/changes", json!({"sinceState": book_state}))
+        .await;
+    assert_eq!(book_changes["created"], json!([&new_book]));
+
+    // Destroying: a book with cards needs onDestroyRemoveContents.
+    let kept = client
+        .one("AddressBook/set", json!({"destroy": [&book]}))
+        .await;
+    assert_eq!(
+        kept["notDestroyed"][&book]["type"],
+        "addressBookHasContents"
+    );
+    let gone = client
+        .one("ContactCard/set", json!({"destroy": [&id]}))
+        .await;
+    assert_eq!(gone["destroyed"], json!([&id]));
+    let changes = client
+        .one("ContactCard/changes", json!({"sinceState": after_create}))
+        .await;
+    assert_eq!(changes["destroyed"], json!([&id]), "{changes}");
+    let removed = client
+        .one("AddressBook/set", json!({"destroy": [&new_book]}))
+        .await;
+    assert_eq!(removed["destroyed"], json!([&new_book]));
 }

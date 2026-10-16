@@ -34,7 +34,7 @@ use super::{AppState, Session, Shared, blocking, internal_error};
 const MAX_FIELD_CHARS: usize = 300;
 const MAX_NOTE_CHARS: usize = 10_000;
 const MAX_ENTRIES: usize = 20;
-const BIRTHDAY_FORMAT: &str = "Write the birthday as YYYY-MM-DD.";
+pub(crate) const BIRTHDAY_FORMAT: &str = "Write the birthday as YYYY-MM-DD.";
 
 pub(crate) fn routes() -> Router<Shared> {
     Router::new()
@@ -398,12 +398,12 @@ pub(crate) fn card_text(existing: Option<&str>, fields: &Fields, uid: &str) -> S
 }
 
 /// The birthday on a card as webmail shows it.
-fn birthday_of(data: &str) -> Option<String> {
+pub(crate) fn birthday_of(data: &str) -> Option<String> {
     text::parse(data).ok().map(|card| fields_of(&card).birthday)
 }
 
 /// Whether a birthday is one webmail writes: `YYYY-MM-DD` or `--MM-DD`.
-fn valid_birthday(birthday: &str) -> bool {
+pub(crate) fn valid_birthday(birthday: &str) -> bool {
     let birthday = birthday.trim();
     let shape = birthday.is_empty()
         || (birthday.len() == 10
@@ -415,7 +415,7 @@ fn valid_birthday(birthday: &str) -> bool {
 
 /// Why `fields` cannot be saved, for the user. The birthday's format is
 /// checked when it is saved, against the card it replaces.
-fn check(fields: &Fields) -> Result<(), &'static str> {
+pub(crate) fn check(fields: &Fields) -> Result<(), &'static str> {
     if display_name(fields).is_empty() {
         return Err("Give the contact a name or an email address.");
     }
@@ -474,7 +474,7 @@ fn check(fields: &Fields) -> Result<(), &'static str> {
 }
 
 /// The fields without empty entries.
-fn tidy(mut fields: Fields) -> Fields {
+pub(crate) fn tidy(mut fields: Fields) -> Fields {
     fields.emails.retain(|entry| !entry.value.trim().is_empty());
     fields.phones.retain(|entry| !entry.value.trim().is_empty());
     fields.addresses.retain(|address| {
@@ -715,7 +715,7 @@ fn save(
     }
 }
 
-fn uuid() -> String {
+pub(crate) fn uuid() -> String {
     let bytes: [u8; 16] = rand::random();
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!(

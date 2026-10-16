@@ -739,7 +739,7 @@ How requests are made:
 
 ### JMAP
 
-Webmail also serves JMAP (RFC 8620, RFC 8621) for mail clients that speak it, on the same
+Webmail also serves JMAP (RFC 8620, RFC 8621, and RFC 9610 contacts) for clients that speak it, on the same
 listener: the session resource at `https://<webmail host>/.well-known/jmap` (also
 `/jmap/session`), with the API, uploads, downloads and push under `/jmap/`. Nothing needs
 enabling.
@@ -761,6 +761,11 @@ enabling.
   the user may send as it.
 - Mailboxes shared with the user appear as one more JMAP account per owner, within the rights
   granted (see Shared folders).
+- Contacts over JMAP are the user's CardDAV address books (not those shared with them), so a card
+  changed in a JMAP client reaches CardDAV apps and webmail and the other way round. Clients edit
+  the fields webmail shows (name, emails, phones, organization, title, birthday, note, addresses);
+  any other line of a vCard is kept, and JSContact properties the server cannot store are refused
+  rather than dropped. The directory address book is read-only.
 - A client's vacation response (out of office) is kept in the database and answered at delivery,
   alongside the account's own Sieve script rather than replacing it. It follows Sieve vacation's
   rules: one reply per sender per week, and none to lists, automated mail or the user's own
