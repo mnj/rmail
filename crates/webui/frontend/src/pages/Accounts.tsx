@@ -159,26 +159,29 @@ function DirectoryPanel() {
   const { run } = useFeedback();
   const policy = useResource(() => api<DirectoryPolicy>('/api/directory-policy'), [], undefined, 'directory-policy');
   const [pending, setPending] = useState<string[]>([]);
-  async function toggle(domain: string, enabled: boolean) {
+  async function change(domain: string, setting: { enabled: boolean } | { freebusy_shared: boolean }, done: string) {
     setPending((list) => [...list, domain]);
     try {
-      if (await run(() => api('/api/directory-policy', 'PUT', { domain, enabled }), enabled ? `${domain} now has a directory` : `${domain} no longer has a directory`)) await policy.reload();
+      if (await run(() => api('/api/directory-policy', 'PUT', { domain, ...setting }), done)) await policy.reload();
     } finally {
       setPending((list) => list.filter((d) => d !== domain));
     }
   }
   return (
-    <Panel title="Directory" subtitle="A read-only address book of everyone (and every group address) in the domain, for the people in it: in webmail contacts, compose suggestions and their CardDAV apps. Off unless turned on, since not every domain's users know each other.">
+    <Panel title="Directory and free-busy" subtitle="The directory is a read-only address book of everyone (and every group address) in the domain, for the people in it: in webmail contacts, compose suggestions and their CardDAV apps. Free-busy times (when someone is busy, never what they do) are seen by calendar apps in the same domain; sharing them lets every domain on this server see them too. Both are off unless turned on, since not every domain's users know each other.">
       <ErrorBanner error={policy.error} />
       {policy.data && policy.data.domains.length > 0 && (
         <div className="tableScroll">
           <table>
-            <thead><tr><th>Domain</th><th>Directory</th></tr></thead>
+            <thead><tr><th>Domain</th><th>Directory</th><th>Free-busy</th></tr></thead>
             <tbody>
-              {policy.data.domains.map(({ domain, enabled }) => (
+              {policy.data.domains.map(({ domain, enabled, freebusy_shared }) => (
                 <tr key={domain}>
                   <td><strong>{domain}</strong></td>
-                  <td><label className="checkLabel"><input type="checkbox" checked={enabled} disabled={pending.includes(domain)} onChange={(event) => toggle(domain, event.target.checked)} /> Shared with its people</label></td>
+                  <td><label className="checkLabel"><input type="checkbox" checked={enabled} disabled={pending.includes(domain)}
+                    onChange={(event) => { const on = event.target.checked; change(domain, { enabled: on }, on ? `${domain} now has a directory` : `${domain} no longer has a directory`); }} /> Shared with its people</label></td>
+                  <td><label className="checkLabel"><input type="checkbox" checked={freebusy_shared} disabled={pending.includes(domain)}
+                    onChange={(event) => { const on = event.target.checked; change(domain, { freebusy_shared: on }, on ? `${domain}'s free-busy times are visible server-wide` : `${domain}'s free-busy times stay within it`); }} /> Visible to every domain here</label></td>
                 </tr>
               ))}
             </tbody>

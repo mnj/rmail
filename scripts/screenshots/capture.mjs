@@ -113,6 +113,15 @@ async function showPublishedZone(route) {
     await page.waitForTimeout(1200);
     await shot(page, name);
   }
+  // Sharing a domain's free-busy times with the whole server.
+  await page.goto(admin + '/accounts');
+  const fb = page.locator('tr:has-text("example.com") >> text=Visible to every domain here');
+  await fb.scrollIntoViewIfNeeded();
+  await fb.click();
+  await page.waitForSelector('tr:has-text("example.com") input[type=checkbox]:checked');
+  await shot(page, 'admin-directory-freebusy');
+  await fb.click();
+  await page.waitForTimeout(800);
   await ctx.close();
 }
 

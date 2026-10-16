@@ -945,6 +945,18 @@ async fn free_busy_queries_answer_for_accounts_in_the_domain() {
     );
     assert!(!data.contains("T150000Z/"));
 
+    // Unless that domain shares its free-busy times with the server.
+    rmail_common::directory::set_freebusy_shared(&state.db_path, "elsewhere.test", true).unwrap();
+    let answer = dav(&state, "POST", outbox, &calendar_type, &query(USER)).await;
+    let document = roxmltree::Document::parse(&answer.body).unwrap();
+    let statuses = document
+        .descendants()
+        .filter(|node| node.tag_name().name() == "request-status")
+        .filter_map(|node| node.text())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses[1], "2.0;Success", "{}", answer.body);
+    assert!(statuses[2].starts_with("5.3"), "remote users still are not");
+
     let forged = dav(&state, "POST", outbox, &calendar_type, &query(OTHER)).await;
     assert_eq!(forged.status, 403);
     assert!(forged.body.contains("organizer-allowed"));

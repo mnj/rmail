@@ -12,7 +12,8 @@
 //!   (`itip::attendee_view`).
 //! - Accounts in other domains on this server are reached by email too, so
 //!   one domain cannot write into another's calendars or read its
-//!   free-busy times.
+//!   free-busy times, unless an administrator shares that domain's
+//!   free-busy times with the whole server (`directory::freebusy_shared`).
 //! - The stored copy records each recipient's `SCHEDULE-STATUS`.
 //! - A change in a calendar shared with read-write access is scheduled as
 //!   the calendar's owner (RFC 6638 3.2), whoever makes it: the owner is
@@ -103,6 +104,12 @@ fn same_domain(user: &User, domain: &str) -> bool {
 /// The account in `sender`'s domain an address reaches, directly or as an
 /// alias with one target.
 fn local_account(dav: &Dav, sender: &User, address: &str) -> Option<User> {
+    account_here(dav, address).filter(|user| same_domain(sender, &user.domain))
+}
+
+/// The account `address` (or its single-target alias) reaches on this
+/// server, in any domain.
+fn account_here(dav: &Dav, address: &str) -> Option<User> {
     let canonical = rmail_common::domain::canonicalize_mailbox_address(address).ok()?;
     let target = if db::mailbox_exists(&dav.app.db_path, &canonical).ok()? {
         canonical
@@ -119,11 +126,25 @@ fn local_account(dav: &Dav, sender: &User, address: &str) -> Option<User> {
         }
     };
     let (localpart, domain) = target.rsplit_once('@')?;
-    same_domain(sender, domain).then(|| User {
+    Some(User {
         address: target.clone(),
         domain: domain.to_string(),
         localpart: localpart.to_string(),
     })
+}
+
+/// An account whose free-busy times `sender` may see: in its domain, or
+/// in a domain that shares them with the whole server.
+fn freebusy_account(dav: &Dav, sender: &User, address: &str) -> anyhow::Result<Option<User>> {
+    let Some(user) = account_here(dav, address) else {
+        return Ok(None);
+    };
+    if same_domain(sender, &user.domain)
+        || rmail_common::directory::freebusy_shared(&dav.app.db_path, &user.domain)?
+    {
+        return Ok(Some(user));
+    }
+    Ok(None)
 }
 
 fn route(dav: &Dav, sender: &User, address: &str) -> Route {
@@ -649,7 +670,7 @@ pub(crate) fn post(
     for attendee in query.properties_named("ATTENDEE").take(MAX_RECIPIENTS) {
         let (status, data) = match itip::address(&attendee.value) {
             None => ("3.7;Invalid calendar user", None),
-            Some(address) => match local_account(dav, &dav.user, &address) {
+            Some(address) => match freebusy_account(dav, &dav.user, &address)? {
                 Some(account) => (
                     "2.0;Success",
                     Some(freebusy_reply(dav, &account, query, attendee, start, end)?),

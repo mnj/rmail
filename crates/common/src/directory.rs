@@ -11,6 +11,10 @@
 //! - Entries are the domain's mailboxes, named after their JMAP identity
 //!   (the name the user signs mail with) when they set one, and its aliases
 //!   with targets (a group when there are several).
+//!
+//! Free-busy times are likewise kept within a domain unless an
+//! administrator opens a domain's to every other domain on the server
+//! ([`set_freebusy_shared`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,6 +26,9 @@ use crate::dav::store::{self, DIRECTORY_NAME, Kind};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS directory_domains (
+        domain TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS freebusy_shared_domains (
         domain TEXT PRIMARY KEY
     );
 ";
@@ -55,6 +62,46 @@ pub fn enabled_domains(db: &Path) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT domain FROM directory_domains ORDER BY domain")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Let accounts in every domain on this server query the free-busy times
+/// of `domain`'s people (CalDAV scheduling), or keep them to the domain.
+pub fn set_freebusy_shared(db: &Path, domain: &str, shared: bool) -> Result<()> {
+    let domain = crate::domain::canonicalize_domain(domain.trim())?;
+    let conn = open(db)?;
+    if shared {
+        conn.execute(
+            "INSERT OR IGNORE INTO freebusy_shared_domains (domain) VALUES (?1)",
+            params![domain],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM freebusy_shared_domains WHERE domain = ?1",
+            params![domain],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn freebusy_shared_domains(db: &Path) -> Result<Vec<String>> {
+    let conn = open(db)?;
+    let mut stmt = conn.prepare("SELECT domain FROM freebusy_shared_domains ORDER BY domain")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Whether other domains may see `domain`'s free-busy times.
+pub fn freebusy_shared(db: &Path, domain: &str) -> Result<bool> {
+    let domain = domain.to_ascii_lowercase();
+    let conn = open(db)?;
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM freebusy_shared_domains WHERE domain = ?1",
+            params![domain],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +316,19 @@ pub fn sync_all(db: &Path, mail_root: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_busy_is_kept_to_the_domain_unless_shared() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("accounts.sqlite");
+        crate::db::init_db(&db).unwrap();
+        assert!(!freebusy_shared(&db, "example.test").unwrap());
+        set_freebusy_shared(&db, "Example.TEST", true).unwrap();
+        assert!(freebusy_shared(&db, "example.test").unwrap());
+        assert_eq!(freebusy_shared_domains(&db).unwrap(), ["example.test"]);
+        set_freebusy_shared(&db, "example.test", false).unwrap();
+        assert!(freebusy_shared_domains(&db).unwrap().is_empty());
+    }
 
     #[test]
     fn the_directory_lists_a_domain_for_its_people_only_when_on() {
