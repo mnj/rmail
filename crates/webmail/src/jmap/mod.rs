@@ -227,6 +227,23 @@ async fn verify_password(state: &AppState, address: &str, password: &str) -> boo
         auth::burn_password_verification(password.to_string()).await;
         return false;
     }
+    // Mail apps (JMAP, CalDAV, CardDAV) sign in with an app password; with
+    // two-factor sign-in on, nothing else.
+    let (db_path, account, typed) = (
+        state.db_path.clone(),
+        address.to_string(),
+        password.to_string(),
+    );
+    match blocking(move || rmail_common::two_factor::protocol_password(&db_path, &account, &typed))
+        .await
+    {
+        Ok(rmail_common::two_factor::ProtocolPassword::AppPassword) => return true,
+        Ok(rmail_common::two_factor::ProtocolPassword::Refused) | Err(_) => {
+            auth::burn_password_verification(password.to_string()).await;
+            return false;
+        }
+        Ok(rmail_common::two_factor::ProtocolPassword::CheckMain) => {}
+    }
     let db_path = state.db_path.clone();
     let lookup = address.to_string();
     let hash = blocking(move || db::get_mailbox(&db_path, &lookup))

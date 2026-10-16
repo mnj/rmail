@@ -10,6 +10,7 @@
 use argon2::{Argon2, PasswordVerifier};
 use base64::Engine;
 use password_hash::PasswordHash;
+use std::path::Path;
 
 use crate::db::Mailbox;
 use hmac::Hmac;
@@ -132,6 +133,36 @@ pub async fn authenticate_password(
             };
         }
     };
+    // An app password signs in; with two-factor sign-in on, nothing else
+    // does (the main password then only works in webmail, with a code).
+    let db = db_path.cloned().unwrap_or_default();
+    let (account, typed) = (mailbox.address.clone(), password.to_string());
+    let decision = tokio::task::spawn_blocking(move || {
+        crate::two_factor::protocol_password(Path::new(&db), &account, &typed)
+    })
+    .await;
+    match decision {
+        Ok(Ok(crate::two_factor::ProtocolPassword::AppPassword)) => {
+            return PasswordAuthResult::Success(mailbox);
+        }
+        Ok(Ok(crate::two_factor::ProtocolPassword::Refused)) => {
+            burn_password_verification(password.to_string()).await;
+            return PasswordAuthResult::Rejected;
+        }
+        Ok(Ok(crate::two_factor::ProtocolPassword::CheckMain)) => {}
+        Ok(Err(error)) => {
+            return PasswordAuthResult::Unavailable {
+                mailbox: Some(mailbox),
+                message: error.to_string(),
+            };
+        }
+        Err(error) => {
+            return PasswordAuthResult::Unavailable {
+                mailbox: Some(mailbox),
+                message: error.to_string(),
+            };
+        }
+    }
     let Some(hash) = mailbox.password_hash.clone() else {
         burn_password_verification(password.to_string()).await;
         return PasswordAuthResult::Rejected;
@@ -937,6 +968,63 @@ mod tests {
     use pbkdf2::pbkdf2;
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
+
+    #[tokio::test]
+    async fn two_factor_accounts_sign_mail_apps_in_with_app_passwords_only() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("accounts.sqlite");
+        crate::db::init_db(&db).unwrap();
+        let scram = create_scram_verifier("main-password", 4096).unwrap();
+        crate::db::add_mailbox(
+            &db,
+            "ann@example.test",
+            Some("plain:main-password"),
+            None,
+            Some(&scram),
+        )
+        .unwrap();
+        let path = db.to_string_lossy().to_string();
+        let signs_in = |password: &'static str| {
+            let path = path.clone();
+            async move {
+                matches!(
+                    authenticate_password(Some(&path), "ann@example.test", password).await,
+                    PasswordAuthResult::Success(_)
+                )
+            }
+        };
+        assert!(signs_in("main-password").await);
+        let (_, app) =
+            crate::two_factor::create_app_password(&db, "ann@example.test", "Phone").unwrap();
+        let app: &'static str = Box::leak(app.into_boxed_str());
+        assert!(signs_in(app).await, "app passwords work without 2FA too");
+
+        let secret = crate::two_factor::begin(&db, "ann@example.test").unwrap();
+        let key = crate::two_factor::base32_decode(&secret).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let code = format!("{:06}", crate::two_factor::code_at(&key, now / 30));
+        crate::two_factor::confirm(&db, "ann@example.test", &code)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !signs_in("main-password").await,
+            "the main password no longer works"
+        );
+        assert!(signs_in(app).await);
+        let mailbox = crate::db::get_mailbox(&db, "ann@example.test")
+            .unwrap()
+            .unwrap();
+        assert!(mailbox.scram.is_none(), "no SCRAM from the main password");
+        assert!(mailbox.two_factor.is_some());
+        assert_ne!(
+            mailbox.session_credential(),
+            mailbox.password_hash.clone(),
+            "sessions are bound to the 2FA state"
+        );
+    }
 
     #[test]
     fn test_saslprep_basic() {

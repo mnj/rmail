@@ -3,13 +3,14 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser,
+  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck,
 } from 'lucide-react';
 import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
 import { ContactSeed, ContactsDialog } from './contacts';
 import { CalendarView } from './calendar';
+import { SecurityDialog } from './security';
 import { InvitationCard } from './invitation';
 import { FilterIcon, FiltersDialog, Vacation, VacationDialog, VacationIcon, vacationNote } from './rules';
 import {
@@ -74,7 +75,17 @@ function useApi(onUnauthorized: () => void): Api {
     // X-Rmail-Webmail marks the request as same-origin (CSRF protection).
     const res = await fetch(url, { ...options, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Rmail-Webmail': '1', ...(options?.headers || {}) } });
     if (res.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/session')) onUnauthorized();
-    if (!res.ok) throw new ApiError((await res.text()) || res.statusText, res.status);
+    if (!res.ok) {
+      const text = await res.text();
+      // Errors meant for the user come as {"error": "..."}; show just that.
+      let message = text || res.statusText;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed.error === 'string') message = parsed.error;
+        else if (parsed && parsed.two_factor === true) message = 'two_factor';
+      } catch { /* plain text */ }
+      throw new ApiError(message, res.status);
+    }
     if (res.status === 204 || res.status === 201) return undefined as T;
     const type = res.headers.get('content-type') || '';
     return (type.includes('json') ? res.json() : res.text()) as Promise<T>;
@@ -451,6 +462,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [composeSettings, setComposeSettings] = useState(false);
   const [contacts, setContacts] = useState<ContactSeed | null | false>(false);
   const [calendarMode, setCalendarMode] = useState(false);
+  const [securityOpen, setSecurityOpen] = useState(false);
   const [vacation, setVacation] = useState<Vacation | null>(null);
   const [vacationOpen, setVacationOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -779,6 +791,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>
           <button className="sidebar-link" onClick={() => setFiltersOpen(true)}><FilterIcon size={15} />Filters</button>
+          <button className="sidebar-link" onClick={() => setSecurityOpen(true)}><ShieldCheck size={15} />Security</button>
           <ThemeSwitch />
           <button className="sidebar-link" onClick={onLogout}><LogOut size={15} />Sign out</button>
         </div>
@@ -933,6 +946,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {prompt && <PromptDialog {...prompt} />}
       {sharing !== null && <FolderShareDialog api={api} folder={sharing} onClose={() => setSharing(null)} />}
       {calendars && <CalendarsDialog api={api} onClose={() => setCalendars(false)} />}
+      {securityOpen && <SecurityDialog api={api} address={address} onClose={() => setSecurityOpen(false)} />}
       {contacts !== false && <ContactsDialog api={api} seed={contacts} onClose={() => setContacts(false)} onWrite={(to, name) => { setContacts(false); if (canSend) startCompose({ to: name ? `${name} <${to}>` : to }); }} />}
       {vacationOpen && vacation && <VacationDialog api={api} initial={vacation} onClose={() => setVacationOpen(false)} onSaved={setVacation} />}
       {filtersOpen && <FiltersDialog api={api} folders={folders} labels={organize?.labels ?? []} onClose={() => setFiltersOpen(false)} />}
@@ -949,6 +963,8 @@ function App() {
   const [canSend, setCanSend] = useState(false);
   const [loginAddress, setLoginAddress] = useState('');
   const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [needCode, setNeedCode] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const api = useApi(useCallback(() => setAddress(null), []));
@@ -962,12 +978,21 @@ function App() {
     setError('');
     setBusy(true);
     try {
-      const session = await api<{ address: string; can_send: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password }) });
+      const session = await api<{ address: string; can_send: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password, ...(needCode ? { code } : {}) }) });
       setPassword('');
+      setCode('');
+      setNeedCode(false);
       setCanSend(session.can_send);
       setAddress(session.address);
     } catch (err) {
-      setError(err instanceof ApiError && err.status === 429 ? err.message : 'Invalid mailbox or password');
+      if (err instanceof ApiError && err.message === 'two_factor') {
+        setNeedCode(true);
+      } else if (err instanceof ApiError && err.status === 429) {
+        setError(err.message);
+      } else {
+        setError(needCode ? 'That code is not right. Try the newest one, or a recovery code.' : 'Invalid mailbox or password');
+        setCode('');
+      }
     } finally {
       setBusy(false);
     }
@@ -985,9 +1010,15 @@ function App() {
         <form className="login-panel" onSubmit={login}>
           <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span>Webmail</span></div></div>
           <label className="field"><span>Mailbox</span><input value={loginAddress} onChange={(e) => setLoginAddress(e.target.value)} placeholder="you@example.com" autoComplete="username" autoFocus /></label>
-          <label className="field"><span>Password</span><input value={password} onChange={(e) => setPassword(e.target.value)} type="password" autoComplete="current-password" /></label>
+          <label className="field"><span>Password</span><input value={password} onChange={(e) => setPassword(e.target.value)} type="password" autoComplete="current-password" disabled={needCode} /></label>
+          {needCode && (
+            <label className="field"><span>Code from your authenticator app</span>
+              <input value={code} onChange={(e) => setCode(e.target.value)} inputMode="numeric" autoComplete="one-time-code" placeholder="123456 or a recovery code" autoFocus />
+            </label>
+          )}
           {error && <p className="error">{error}</p>}
-          <button type="submit" className="primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+          <button type="submit" className="primary" disabled={busy || (needCode && !code.trim())}>{busy ? 'Signing in…' : needCode ? 'Verify' : 'Sign in'}</button>
+          {needCode && <button type="button" className="link" onClick={() => { setNeedCode(false); setCode(''); setPassword(''); setError(''); }}>Start over</button>}
         </form>
       </main>
     );

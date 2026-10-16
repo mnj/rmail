@@ -30,9 +30,10 @@ mod events;
 mod invitations;
 mod mail_rules;
 mod organize;
+mod security;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
-const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+pub(crate) const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 /// Room for a 10 MiB message as base64 attachments in JSON.
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// State-changing requests must carry this header; browsers cannot add it to
@@ -104,6 +105,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(assist::routes())
         .merge(calendars::routes())
         .merge(contacts::routes())
+        .merge(security::routes())
         .merge(events::routes())
         .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
@@ -219,8 +221,8 @@ impl Session {
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
         let mailbox = mailbox.ok_or(StatusCode::UNAUTHORIZED)?;
-        let bound = mailbox.password_hash.as_ref().is_some_and(|hash| {
-            websession::credential_binding(&state.session_secret, hash) == session.binding
+        let bound = mailbox.session_credential().is_some_and(|credential| {
+            websession::credential_binding(&state.session_secret, &credential) == session.binding
         });
         if !bound {
             return Err(StatusCode::UNAUTHORIZED);
@@ -251,6 +253,17 @@ fn split_address(address: &str) -> Option<(String, String)> {
     Some((local.to_string(), domain.to_string()))
 }
 
+/// The `Set-Cookie` value for a session token.
+pub(crate) fn session_cookie(state: &AppState, token: &str) -> String {
+    websession::set_cookie(
+        SESSION_COOKIE,
+        token,
+        SESSION_TTL_SECS,
+        state.secure_cookies,
+        "Strict",
+    )
+}
+
 fn with_cookie(response: impl IntoResponse, cookie: String) -> Response {
     let mut response = response.into_response();
     if let Ok(value) = HeaderValue::from_str(&cookie) {
@@ -261,11 +274,11 @@ fn with_cookie(response: impl IntoResponse, cookie: String) -> Response {
 
 #[cfg(test)]
 pub(crate) fn sign_session(state: &AppState, address: &str) -> String {
-    let hash = db::get_mailbox(&state.db_path, address)
+    let credential = db::get_mailbox(&state.db_path, address)
         .unwrap()
-        .and_then(|mailbox| mailbox.password_hash)
+        .and_then(|mailbox| mailbox.session_credential())
         .unwrap();
-    let binding = websession::credential_binding(&state.session_secret, &hash);
+    let binding = websession::credential_binding(&state.session_secret, &credential);
     websession::sign(&state.session_secret, address, &binding, SESSION_TTL_SECS)
 }
 
@@ -273,6 +286,10 @@ pub(crate) fn sign_session(state: &AppState, address: &str) -> String {
 struct LoginRequest {
     address: String,
     password: String,
+    /// The code from an authenticator app (or a recovery code), for an
+    /// account with two-factor sign-in on.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -316,12 +333,11 @@ async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes
     };
     let db_path = state.db_path.clone();
     let lookup = address.clone();
-    let hash = blocking(move || db::get_mailbox(&db_path, &lookup))
+    let mailbox = blocking(move || db::get_mailbox(&db_path, &lookup))
         .await
         .ok()
-        .flatten()
-        .and_then(|mailbox| mailbox.password_hash);
-    let Some(hash) = hash else {
+        .flatten();
+    let Some((hash, mailbox)) = mailbox.and_then(|m| Some((m.password_hash.clone()?, m))) else {
         // Same cost as a real check so unknown accounts are not revealed.
         auth::burn_password_verification(input.password).await;
         return reject();
@@ -332,12 +348,30 @@ async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes
     ) {
         return reject();
     }
+    // With two-factor sign-in on, the password alone is not enough.
+    if mailbox.two_factor.is_some() {
+        let Some(code) = input.code.filter(|code| !code.trim().is_empty()) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "two_factor": true })),
+            )
+                .into_response();
+        };
+        let (db_path, account) = (state.db_path.clone(), mailbox.address.clone());
+        let passed = blocking(move || rmail_common::two_factor::verify(&db_path, &account, &code))
+            .await
+            .unwrap_or(false);
+        if !passed {
+            return reject();
+        }
+    }
     if let Some(ip) = peer.ip() {
         state.throttle.reset(ip);
     }
     let mail_root = state.mail_root.clone();
     let _ = blocking(move || imap_state::init_account(&mail_root, &domain, &localpart)).await;
-    let binding = websession::credential_binding(&state.session_secret, &hash);
+    let credential = mailbox.session_credential().unwrap_or(hash);
+    let binding = websession::credential_binding(&state.session_secret, &credential);
     let token = websession::sign(&state.session_secret, &address, &binding, SESSION_TTL_SECS);
     with_cookie(
         Json(SessionResponse {

@@ -16,9 +16,33 @@ pub struct Mailbox {
     pub address: String,
     pub password_hash: Option<String>,
     pub maildir: Option<String>,
+    /// The SCRAM verifier; `None` while two-factor sign-in is on, since it
+    /// comes from the main password, which mail apps may then not use.
     pub scram: Option<String>,
     /// Maximum stored message bytes for this account. `None` means unlimited.
     pub quota_bytes: Option<u64>,
+    /// The TOTP secret while two-factor sign-in is on (`two_factor`).
+    pub two_factor: Option<String>,
+}
+
+impl Mailbox {
+    /// What a web session is bound to: the password and the 2FA state, so
+    /// changing either signs out other sessions.
+    pub fn session_credential(&self) -> Option<String> {
+        let hash = self.password_hash.as_ref()?;
+        Some(match &self.two_factor {
+            Some(secret) => format!("{hash}\0{secret}"),
+            None => hash.clone(),
+        })
+    }
+}
+
+/// The account's TOTP secret while 2FA is on; a database from before the
+/// table existed has none.
+fn two_factor_secret(conn: &rusqlite::Connection, address: &str) -> Option<String> {
+    crate::two_factor::enabled_secret(conn, address)
+        .ok()
+        .flatten()
 }
 
 use serde_json;
@@ -306,6 +330,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
     )?;
     ensure_outbound_columns(path)?;
     add_column_if_missing(path, "mailboxes", "quota_bytes", "INTEGER")?;
+    conn.execute_batch(crate::two_factor::SCHEMA)?;
     Ok(())
 }
 
@@ -407,12 +432,14 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
             .get::<_, Option<i64>>(4)?
             .map(u64::try_from)
             .transpose()?;
+        let two_factor = two_factor_secret(&conn, &address);
         Ok(Some(Mailbox {
+            scram: scram.filter(|_| two_factor.is_none()),
             address,
             password_hash,
             maildir,
-            scram,
             quota_bytes,
+            two_factor,
         }))
     } else {
         Ok(None)
@@ -440,12 +467,14 @@ pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result
             .get::<_, Option<i64>>(4)?
             .map(u64::try_from)
             .transpose()?;
+        let two_factor = two_factor_secret(&conn, &address);
         found = Some(Mailbox {
+            scram: scram.filter(|_| two_factor.is_none()),
             address,
             password_hash,
             maildir,
-            scram,
             quota_bytes,
+            two_factor,
         });
     }
     Ok(found)
@@ -472,12 +501,14 @@ pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
             .get::<_, Option<i64>>(4)?
             .map(u64::try_from)
             .transpose()?;
+        let two_factor = two_factor_secret(&conn, &address);
         out.push(Mailbox {
+            scram: scram.filter(|_| two_factor.is_none()),
             address,
             password_hash,
             maildir,
-            scram,
             quota_bytes,
+            two_factor,
         });
     }
     Ok(out)

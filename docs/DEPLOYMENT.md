@@ -627,6 +627,26 @@ with its headers (**View source**, or download as `.eml`), light and dark themes
 When mail organization is enabled with a fallback model, messages also offer **Summarize** and
 **Suggest labels**.
 
+### Two-factor sign-in and app passwords
+
+Users manage both under **Security** in webmail.
+
+- **App passwords** are random per-device passwords (four groups of four letters, about 75 bits)
+  for mail apps: IMAP, POP3, SMTP submission, ManageSieve, CalDAV/CardDAV and JMAP. Each has a
+  name and shows when it was last used, and can be revoked without changing the account's
+  password. Anyone can make them, with or without 2FA (at most 50 per account). Only their
+  SHA-256 digest is stored, in the accounts database.
+- **Two-factor sign-in** uses TOTP (RFC 6238: 30-second, six-digit codes from any authenticator
+  app, set up from a QR code or the key shown) and ten one-time recovery codes. A code is accepted
+  one step either side of now and never twice. Webmail then asks for a code after the password.
+- With 2FA on, the account's password works only for webmail (with a code). **Mail apps must use
+  an app password**; the main password is refused over every protocol, and SCRAM sign-in is not
+  available for the account (its verifier comes from the main password), so clients use PLAIN
+  over TLS with the app password.
+- Turning 2FA on or off, making an app password or new recovery codes all ask for the password
+  again; turning 2FA off or new recovery codes also take a code. Turning 2FA on or off signs out
+  the user's other webmail sessions.
+
 ### Sending
 
 Compose, reply, reply all and forward (with attachments up to 10 MB in total) go through this
