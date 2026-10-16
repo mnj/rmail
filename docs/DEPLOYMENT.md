@@ -799,8 +799,11 @@ respected.
   on the same server, gets an invitation email with the event attached, sent through the
   submission service like any other mail; with no loopback submission listener, those attendees
   are marked undeliverable (`SCHEDULE-STATUS` 5.1). Each attendee gets only the occurrences of a
-  recurring meeting they are invited to. Free-busy lookups answer only for accounts in the asker's
-  domain.
+  recurring meeting they are invited to. Free-busy lookups answer for accounts in the asker's
+  domain, and for accounts in other domains here whose administrator shares the domain's
+  free-busy times with the whole server (the **Free-busy** column of the console's
+  **Directory and free-busy** panel, or `rmail_ctl directory free-busy <domain> on`). Free-busy
+  shows only when someone is busy, never what the events are; it is off by default.
 - Invitation emails received from other servers (and from accounts in other domains here) are
   delivered as usual and their invitation, cancellation or reply is also put in the account's
   schedule inbox, where calendar clients offer it. Invitations and cancellations are never written
@@ -852,8 +855,8 @@ respected.
 - **Directory** (global address list): an administrator can give a domain's people a read-only
   **Directory** address book listing everyone in the domain, named as they sign their mail
   (their JMAP identity name) or by their address, plus its aliases (an alias reaching several
-  people is a group). Turn it on per domain in the **Directory** panel on the console's Mailboxes
-  page or with `rmail_ctl directory enable <domain>`; it is off by default, since not every
+  people is a group). Turn it on per domain in the **Directory and free-busy** panel on the
+  console's Mailboxes page or with `rmail_ctl directory enable <domain>`; it is off by default, since not every
   domain's users know each other. Each user gets the book in their own store, so it shows in
   webmail contacts, in compose suggestions and in CardDAV apps; webmail brings every account's
   book in step every 30 minutes (and at once when the setting changes). Nobody can edit it.

@@ -936,14 +936,20 @@ async fn directory_policy(State(state): State<Shared>) -> Response {
     outcome(
         blocking(move || {
             let enabled = rmail_common::directory::enabled_domains(Path::new(&db))?;
+            let freebusy = rmail_common::directory::freebusy_shared_domains(Path::new(&db))?;
             let mut domains = rmail_common::db::local_domains(&db)?;
             domains.extend(enabled.iter().cloned());
+            domains.extend(freebusy.iter().cloned());
             domains.sort();
             domains.dedup();
             Ok(json!({
                 "domains": domains
                     .into_iter()
-                    .map(|domain| json!({ "domain": domain, "enabled": enabled.contains(&domain) }))
+                    .map(|domain| json!({
+                        "enabled": enabled.contains(&domain),
+                        "freebusy_shared": freebusy.contains(&domain),
+                        "domain": domain,
+                    }))
                     .collect::<Vec<_>>(),
             }))
         })
@@ -955,11 +961,13 @@ async fn directory_policy(State(state): State<Shared>) -> Response {
 #[derive(serde::Deserialize)]
 struct DirectoryChange {
     domain: String,
-    enabled: bool,
+    enabled: Option<bool>,
+    freebusy_shared: Option<bool>,
 }
 
-/// Turn the directory on or off for a domain; every account's book is
-/// brought in step at once (webmail also does so every 30 minutes).
+/// Turn the directory on or off for a domain, or share its free-busy
+/// times with every domain on the server. Every account's directory book
+/// is brought in step at once (webmail also does so every 30 minutes).
 async fn set_directory_policy(State(state): State<Shared>, body: Bytes) -> Response {
     let db = match require_db(&state) {
         Ok(db) => db,
@@ -972,7 +980,13 @@ async fn set_directory_policy(State(state): State<Shared>, body: Bytes) -> Respo
     let root = state.mail_root.clone();
     outcome(
         blocking(move || {
-            rmail_common::directory::set_enabled(Path::new(&db), &input.domain, input.enabled)?;
+            if let Some(shared) = input.freebusy_shared {
+                rmail_common::directory::set_freebusy_shared(Path::new(&db), &input.domain, shared)?;
+            }
+            let Some(enabled) = input.enabled else {
+                return Ok(json!({ "result": "ok" }));
+            };
+            rmail_common::directory::set_enabled(Path::new(&db), &input.domain, enabled)?;
             let failed = rmail_common::directory::sync_all(Path::new(&db), &root)?;
             if !failed.is_empty() {
                 anyhow::bail!(

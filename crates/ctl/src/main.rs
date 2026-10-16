@@ -111,7 +111,7 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
-    /// The global address list: turn it on or off for a domain
+    /// The global address list, and free-busy visibility across domains
     Directory {
         #[command(subcommand)]
         action: DirectoryAction,
@@ -272,7 +272,14 @@ enum DirectoryAction {
     Enable { domain: String },
     /// Remove it again
     Disable { domain: String },
-    /// Domains that have it
+    /// Let every domain on this server see DOMAIN's free-busy times (on),
+    /// or keep them within the domain (off, the default)
+    FreeBusy {
+        domain: String,
+        #[arg(value_parser = ["on", "off"])]
+        shared: String,
+    },
+    /// Domains that have a directory or share free-busy times
     List,
 }
 
@@ -837,9 +844,29 @@ async fn main() -> Result<()> {
                     println!("{domain} no longer has a directory");
                     report_directory_failures(&failed);
                 }
+                DirectoryAction::FreeBusy { domain, shared } => {
+                    let shared = shared == "on";
+                    let domain = domain.trim().to_ascii_lowercase();
+                    rmail_common::directory::set_freebusy_shared(db, &domain, shared)?;
+                    if shared {
+                        println!("{domain}'s free-busy times are visible to every domain here");
+                    } else {
+                        println!("{domain}'s free-busy times stay within it");
+                    }
+                }
                 DirectoryAction::List => {
-                    for domain in rmail_common::directory::enabled_domains(db)? {
-                        println!("{domain}");
+                    let directory = rmail_common::directory::enabled_domains(db)?;
+                    let freebusy = rmail_common::directory::freebusy_shared_domains(db)?;
+                    let mut domains: Vec<&String> = directory.iter().chain(&freebusy).collect();
+                    domains.sort();
+                    domains.dedup();
+                    for domain in domains {
+                        let on = |list: &[String]| if list.contains(domain) { "on" } else { "off" };
+                        println!(
+                            "{domain}\tdirectory={}\tfree-busy={}",
+                            on(&directory),
+                            on(&freebusy)
+                        );
                     }
                 }
             }
