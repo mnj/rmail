@@ -10,4 +10,5 @@ pub mod itip;
 pub mod recur;
 pub mod share;
 pub mod store;
+pub mod subscription;
 pub mod text;

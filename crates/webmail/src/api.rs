@@ -31,6 +31,7 @@ mod invitations;
 mod mail_rules;
 mod organize;
 mod security;
+mod subscriptions;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
 pub(crate) const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -66,6 +67,11 @@ pub(crate) struct AppState {
 }
 
 type Shared = Arc<AppState>;
+
+/// Start the background refresh of calendar subscriptions.
+pub(crate) fn spawn_background(state: Shared) {
+    subscriptions::spawn_refresher(state);
+}
 
 pub(crate) fn router(state: Shared) -> Router {
     let app = Router::new()
@@ -107,6 +113,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(contacts::routes())
         .merge(security::routes())
         .merge(events::routes())
+        .merge(subscriptions::routes())
         .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())

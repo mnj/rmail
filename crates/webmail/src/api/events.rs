@@ -57,6 +57,9 @@ struct CalendarInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
     writable: bool,
+    /// For a subscribed feed: where from, when last fetched and why not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscription: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -460,6 +463,7 @@ struct Place {
     owner: User,
     shared: bool,
     writable: bool,
+    subscription: Option<serde_json::Value>,
     conn: rmail_common::sqlite_pool::SqliteConnection,
     collection: Collection,
 }
@@ -488,6 +492,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
     };
     let mut found = Vec::new();
     let conn = open(&state.mail_root, &me)?;
+    let subscriptions = rmail_common::dav::subscription::subscriptions(&conn)?;
     for collection in store::collections(&conn, Kind::Calendar)? {
         if collection.inbox
             || !(collection.components.is_empty()
@@ -504,7 +509,14 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
             color: collection.color.clone(),
             owner: me.clone(),
             shared: false,
-            writable: true,
+            // A subscription is filled from its feed only.
+            writable: !collection
+                .name
+                .starts_with(rmail_common::dav::subscription::NAME_PREFIX),
+            subscription: subscriptions
+                .iter()
+                .find(|s| s.collection.id == collection.id)
+                .map(|s| serde_json::json!({ "url": s.url, "refreshed_at": s.refreshed_at, "error": s.error })),
             conn: open(&state.mail_root, &me)?,
             collection,
         });
@@ -525,7 +537,11 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
                 .or_else(|| collection.displayname.clone())
                 .unwrap_or_else(|| collection.name.clone()),
             color: grant.color.clone().or_else(|| collection.color.clone()),
-            writable: grant.access == Access::ReadWrite,
+            writable: grant.access == Access::ReadWrite
+                && !collection
+                    .name
+                    .starts_with(rmail_common::dav::subscription::NAME_PREFIX),
+            subscription: None,
             shared: true,
             conn: open(&state.mail_root, &owner)?,
             owner,
@@ -640,6 +656,7 @@ async fn list(app: State<Shared>, headers: HeaderMap, Query(range): Query<Range>
                     color: place.color,
                     owner: place.shared.then(|| place.owner.address.clone()),
                     writable: place.writable,
+                    subscription: place.subscription,
                 })
                 .collect(),
             events,
