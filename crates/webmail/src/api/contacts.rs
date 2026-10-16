@@ -34,6 +34,7 @@ use super::{AppState, Session, Shared, blocking, internal_error};
 const MAX_FIELD_CHARS: usize = 300;
 const MAX_NOTE_CHARS: usize = 10_000;
 const MAX_ENTRIES: usize = 20;
+const BIRTHDAY_FORMAT: &str = "Write the birthday as YYYY-MM-DD.";
 
 pub(crate) fn routes() -> Router<Shared> {
     Router::new()
@@ -369,25 +370,51 @@ fn field_lines(fields: &Fields) -> Vec<String> {
 
 /// `existing` with webmail's fields replaced by `fields`, or a new card.
 pub(crate) fn card_text(existing: Option<&str>, fields: &Fields, uid: &str) -> String {
+    // A birthday left as it was keeps its line, whatever format another
+    // client wrote it in.
+    let same_birthday =
+        existing.is_some_and(|data| birthday_of(data).as_deref() == Some(fields.birthday.as_str()));
     let kept: Vec<String> = match existing {
         Some(data) => unfold(data)
             .into_iter()
             .filter(|line| {
                 let name = line_name(line);
-                !MANAGED.contains(&name.as_str()) && name != "END" && name != "BEGIN"
+                (same_birthday && name == "BDAY")
+                    || (!MANAGED.contains(&name.as_str()) && name != "END" && name != "BEGIN")
             })
             .collect(),
         None => vec!["VERSION:3.0".to_string(), format!("UID:{}", escape(uid))],
     };
+    let mut lines = field_lines(fields);
+    if same_birthday {
+        lines.retain(|line| line_name(line) != "BDAY");
+    }
     let mut out = fold("BEGIN:VCARD");
-    for line in kept.iter().chain(field_lines(fields).iter()) {
+    for line in kept.iter().chain(lines.iter()) {
         out.push_str(&fold(line));
     }
     out.push_str(&fold("END:VCARD"));
     out
 }
 
-/// Why `fields` cannot be saved, for the user.
+/// The birthday on a card as webmail shows it.
+fn birthday_of(data: &str) -> Option<String> {
+    text::parse(data).ok().map(|card| fields_of(&card).birthday)
+}
+
+/// Whether a birthday is one webmail writes: `YYYY-MM-DD` or `--MM-DD`.
+fn valid_birthday(birthday: &str) -> bool {
+    let birthday = birthday.trim();
+    let shape = birthday.is_empty()
+        || (birthday.len() == 10
+            && birthday.as_bytes()[4] == b'-'
+            && birthday.as_bytes()[7] == b'-')
+        || (birthday.len() == 7 && birthday.starts_with("--") && birthday.as_bytes()[4] == b'-');
+    shape && birthday.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
+/// Why `fields` cannot be saved, for the user. The birthday's format is
+/// checked when it is saved, against the card it replaces.
 fn check(fields: &Fields) -> Result<(), &'static str> {
     if display_name(fields).is_empty() {
         return Err("Give the contact a name or an email address.");
@@ -442,15 +469,6 @@ fn check(fields: &Fields) -> Result<(), &'static str> {
         .any(|email| !email.value.trim().is_empty() && !email.value.contains('@'))
     {
         return Err("An email address is not valid.");
-    }
-    let birthday = fields.birthday.trim();
-    let date_ok = birthday.is_empty()
-        || (birthday.len() == 10
-            && birthday.as_bytes()[4] == b'-'
-            && birthday.as_bytes()[7] == b'-')
-        || (birthday.len() == 7 && birthday.starts_with("--") && birthday.as_bytes()[4] == b'-');
-    if !date_ok || !birthday.chars().all(|c| c.is_ascii_digit() || c == '-') {
-        return Err("Write the birthday as YYYY-MM-DD.");
     }
     Ok(())
 }
@@ -663,6 +681,12 @@ fn save(
             (Some(object), Some(etag)) if &object.etag == etag => {}
             _ => return Err(PutError::PreconditionFailed),
         }
+        let previous = current.and_then(|object| birthday_of(&object.data));
+        if previous.as_deref() != Some(fields.birthday.as_str())
+            && !valid_birthday(&fields.birthday)
+        {
+            return Err(PutError::InvalidData(BIRTHDAY_FORMAT.to_string()));
+        }
         Ok(store::Prepared {
             data: card_text(current.map(|object| object.data.as_str()), &fields, &uid),
             schedule_tag: store::ScheduleTag::None,
@@ -675,6 +699,9 @@ fn save(
                 StatusCode::NOT_FOUND,
                 "The contact is gone.",
             ))),
+        Err(PutError::InvalidData(message)) if message == BIRTHDAY_FORMAT => {
+            Ok(Outcome::Refused(StatusCode::BAD_REQUEST, BIRTHDAY_FORMAT))
+        }
         Err(PutError::PreconditionFailed) if creating => Ok(Outcome::Refused(
             StatusCode::CONFLICT,
             "A contact with this name exists.",
@@ -900,6 +927,20 @@ mod tests {
     }
 
     #[test]
+    fn a_birthday_left_alone_keeps_its_own_format() {
+        let card = APPLE.replace("BDAY:1985-04-12", "BDAY;VALUE=text:circa 1985");
+        let mut fields = fields_of(&text::parse(&card).unwrap());
+        assert_eq!(fields.birthday, "circa 1985");
+        fields.title = "Lead".into();
+        let edited = card_text(Some(&card), &fields, "x");
+        assert!(edited.contains("BDAY;VALUE=text:circa 1985"));
+        assert_eq!(edited.matches("BDAY").count(), 1);
+        fields.birthday = "1985-04-12".into();
+        let edited = card_text(Some(&card), &fields, "x");
+        assert!(edited.contains("BDAY:1985-04-12") && !edited.contains("circa"));
+    }
+
+    #[test]
     fn invalid_contacts_are_refused() {
         assert!(check(&Fields::default()).is_err(), "no name");
         let named = Fields {
@@ -914,20 +955,7 @@ mod tests {
             })
             .is_err()
         );
-        assert!(
-            check(&Fields {
-                birthday: "12/04/1985".into(),
-                ..named.clone()
-            })
-            .is_err()
-        );
-        assert!(
-            check(&Fields {
-                birthday: "--04-12".into(),
-                ..named.clone()
-            })
-            .is_ok()
-        );
+        assert!(!valid_birthday("12/04/1985") && valid_birthday("--04-12") && valid_birthday(""));
         assert!(
             check(&Fields {
                 emails: vec![Entry {
@@ -1002,7 +1030,7 @@ mod tests {
         .unwrap();
         assert!(
             format!("{suggested:?}").contains("ann@example.test"),
-            "{suggested:?}"
+            "the new contact is suggested"
         );
 
         let path = format!("/api/addressbook/own:default/{name}");
@@ -1021,6 +1049,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, 409, "an old version is not overwritten");
+        let (status, _) = call(
+            "PUT",
+            path.clone(),
+            json!({"full_name": "Ann Lee", "birthday": "soon", "etag": updated["etag"]}),
+        )
+        .await;
+        assert_eq!(status, 400, "a new birthday must be a date");
         let (status, _) = call("PUT", path.clone(), json!({"full_name": "No etag"})).await;
         assert_eq!(status, 400);
         let (status, _) = call("DELETE", path.clone(), json!({"etag": etag})).await;
