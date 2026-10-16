@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, Labeling, l2_normalize};
 use crate::prompt::{
-    SUMMARY_PROMPT, label_prompt, parse_answer, parse_labels, quoted_examples, system_prompt,
-    tidy_summary,
+    SUMMARY_PROMPT, extract_prompt, extraction_schema, label_prompt, parse_answer,
+    parse_extraction, parse_labels, quoted_examples, system_prompt, tidy_summary,
 };
 
 pub const TYPESAFE_API: &str = "https://api.typesafe.ai/v1";
@@ -407,6 +407,23 @@ impl Chooser for OpenAiChooser {
         });
         Ok(tidy_summary(&self.complete(body)?))
     }
+
+    fn extract(&self, message: &str, today: &str) -> Result<Value> {
+        let body = json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 600,
+            "messages": [
+                { "role": "system", "content": extract_prompt(today) },
+                { "role": "user", "content": message },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "extraction", "strict": true, "schema": extraction_schema() },
+            },
+        });
+        Ok(parse_extraction(&self.complete(body)?))
+    }
 }
 
 impl OpenAiChooser {
@@ -598,6 +615,16 @@ impl Chooser for AnthropicChooser {
     fn summarize(&self, message: &str) -> Result<String> {
         let body = self.request(SUMMARY_PROMPT, message, 220, None);
         Ok(tidy_summary(&self.complete(body)?))
+    }
+
+    fn extract(&self, message: &str, today: &str) -> Result<Value> {
+        let body = self.request(
+            &extract_prompt(today),
+            message,
+            600,
+            Some(extraction_schema()),
+        );
+        Ok(parse_extraction(&self.complete(body)?))
     }
 }
 
@@ -1147,6 +1174,37 @@ mod tests {
         let schema = &request["response_format"]["json_schema"]["schema"];
         assert_eq!(schema["required"], json!(["labels", "new_label"]));
         assert!(schema["properties"]["new_label"]["anyOf"].is_array());
+    }
+
+    #[test]
+    fn extractions_ask_for_structured_output_and_are_checked() {
+        let answer = json!({
+            "events": [
+                {"title": "Design review", "date": "2026-10-22", "start": "14:00", "end": "15:00", "location": "Room 2"},
+                {"title": "Bad date", "date": "2026-02-30", "start": null, "end": null, "location": null},
+            ],
+            "contact": {"name": "Priya Raman", "email": "priya@northwind.test", "phone": "+45 1234 5678", "organization": "Northwind", "title": null},
+        });
+        let reply = json!({"choices": [{"message": {"content": answer.to_string()}}]});
+        let (base, requests) = serve(vec![(200, reply.to_string())]);
+        let chooser = OpenAiChooser::load(&base, "k", "m").unwrap();
+        let found = chooser.extract("…", "Thursday 2026-10-15").unwrap();
+        assert_eq!(found["events"].as_array().unwrap().len(), 1, "{found}");
+        assert_eq!(found["events"][0]["start"], "14:00");
+        assert_eq!(found["contact"]["organization"], "Northwind");
+        let (_, request) = requests.recv().unwrap();
+        assert_eq!(
+            request["response_format"]["json_schema"]["name"],
+            "extraction"
+        );
+        assert!(
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Thursday 2026-10-15")
+        );
+        let jev = JevChooser::load(TYPESAFE_API, "k", "").unwrap();
+        assert!(jev.extract("…", "today").is_err());
     }
 
     #[test]

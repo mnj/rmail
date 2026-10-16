@@ -139,6 +139,23 @@ async fn execute(shared: &Arc<Shared>, request: Request) -> Result<serde_json::V
                 "ms": started.elapsed().as_millis() as u64,
             }))
         }
+        Request::Extract { text, today } => {
+            let runtime = shared.runtime().await;
+            let chooser = runtime
+                .models
+                .chooser
+                .clone()
+                .context("no fallback model is loaded")?;
+            let started = Instant::now();
+            let found =
+                tokio::task::spawn_blocking(move || chooser.extract(&text, &today)).await??;
+            Ok(json!({
+                "model": runtime.models.chat_info.as_ref().map(|m| m.file.clone()),
+                "events": found["events"],
+                "contact": found["contact"],
+                "ms": started.elapsed().as_millis() as u64,
+            }))
+        }
         Request::Summarize { text } => {
             let runtime = shared.runtime().await;
             let chooser = runtime

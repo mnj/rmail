@@ -40,6 +40,10 @@ pub enum Request {
     /// A short summary of `text` from the fallback model, which must be one
     /// that writes text (not Jev).
     Summarize { text: String },
+    /// Dates worth a calendar entry and the sender's contact details in
+    /// `text`, from the fallback model (one that writes text). `today` is
+    /// the message's date (`Thursday 2026-10-15`), for relative dates.
+    Extract { text: String, today: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

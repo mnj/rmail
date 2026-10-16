@@ -37,6 +37,11 @@ pub trait Chooser: Send + Sync {
     fn summarize(&self, _message: &str) -> Result<String> {
         anyhow::bail!("this model picks from options and cannot write summaries")
     }
+    /// Events and a contact found in `message` (see
+    /// [`crate::prompt::parse_extraction`]), for models that write text.
+    fn extract(&self, _message: &str, _today: &str) -> Result<serde_json::Value> {
+        anyhow::bail!("this model picks from options and cannot find dates or contacts")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

@@ -98,6 +98,149 @@ pub fn label_prompt(labels: &[LabelHint], may_propose: bool) -> String {
     text
 }
 
+/// What the extraction asks for; `{today}` is the message's date.
+pub fn extract_prompt(today: &str) -> String {
+    format!(
+        "Read the email below and find (1) events its recipient may want in their calendar: \
+         meetings, calls, appointments, reservations, flights, deadlines, each with a specific date; \
+         and (2) the sender's own contact details from their signature. The email was sent on \
+         {today}; turn relative dates such as \"next Tuesday\" into dates. Answer only with JSON: \
+         {{\"events\": [{{\"title\": \"short title\", \"date\": \"YYYY-MM-DD\", \"start\": \"HH:MM\" or null, \
+         \"end\": \"HH:MM\" or null, \"location\": \"...\" or null}}], \"contact\": {{\"name\": ..., \
+         \"email\": ..., \"phone\": ..., \"organization\": ..., \"title\": ...}} or null}}. Use null for \
+         anything not stated, an empty list when there is no event, and null when there is no \
+         signature. Never invent details. Write titles in the email's language."
+    )
+}
+
+/// The JSON schema of an extraction, for models with structured output.
+pub fn extraction_schema() -> serde_json::Value {
+    let text = serde_json::json!({ "type": ["string", "null"] });
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "date": { "type": "string" },
+                        "start": text, "end": text, "location": text,
+                    },
+                    "required": ["title", "date", "start", "end", "location"],
+                    "additionalProperties": false,
+                },
+            },
+            "contact": {
+                "anyOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "name": text, "email": text, "phone": text, "organization": text, "title": text,
+                        },
+                        "required": ["name", "email", "phone", "organization", "title"],
+                        "additionalProperties": false,
+                    },
+                ],
+            },
+        },
+        "required": ["events", "contact"],
+        "additionalProperties": false,
+    })
+}
+
+const MAX_EVENTS: usize = 5;
+
+fn valid_date(date: &str) -> bool {
+    let parts: Vec<&str> = date.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return false;
+    };
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    date.len() == 10 && (1900..=2200).contains(&year) && (1..=days).contains(&day)
+}
+
+fn valid_time(time: &str) -> bool {
+    let Some((hour, minute)) = time.split_once(':') else {
+        return false;
+    };
+    time.len() == 5
+        && hour.parse::<u32>().is_ok_and(|h| h < 24)
+        && minute.parse::<u32>().is_ok_and(|m| m < 60)
+}
+
+/// An extraction as a model wrote it, checked: at most five events with a
+/// title and a real date (times `HH:MM` or null), and a contact with at
+/// least a name, an email address or a phone number, or null. Anything
+/// else in the answer is dropped.
+pub fn parse_extraction(raw: &str) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let text = raw.trim();
+    let start = text.find('{');
+    let end = text.rfind('}');
+    let parsed: Value = match (start, end) {
+        (Some(start), Some(end)) if end > start => {
+            serde_json::from_str(&text[start..=end]).unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    };
+    let field = |value: &Value, name: &str| {
+        value[name]
+            .as_str()
+            .map(|s| s.trim().chars().take(200).collect::<String>())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+    };
+    let events: Vec<Value> = parsed["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            let title = field(event, "title")?;
+            let date = field(event, "date").filter(|d| valid_date(d))?;
+            let start = field(event, "start").filter(|t| valid_time(t));
+            let end = field(event, "end")
+                .filter(|t| valid_time(t))
+                .filter(|_| start.is_some());
+            Some(json!({
+                "title": title, "date": date, "start": start, "end": end,
+                "location": field(event, "location"),
+            }))
+        })
+        .take(MAX_EVENTS)
+        .collect();
+    let contact = &parsed["contact"];
+    let email =
+        field(contact, "email").filter(|e| e.contains('@') && !e.contains(char::is_whitespace));
+    let phone =
+        field(contact, "phone").filter(|p| p.chars().filter(char::is_ascii_digit).count() >= 5);
+    let name = field(contact, "name");
+    let contact = if name.is_some() || email.is_some() || phone.is_some() {
+        json!({
+            "name": name, "email": email, "phone": phone,
+            "organization": field(contact, "organization"), "title": field(contact, "title"),
+        })
+    } else {
+        Value::Null
+    };
+    json!({ "events": events, "contact": contact })
+}
+
 pub const SUMMARY_PROMPT: &str = "Summarize the email below for its recipient in one to three short \
      sentences, in the email's own language. Say what it is about and anything the recipient must \
      do or note, such as deadlines or amounts. No preamble, no quotes, no markdown.";
@@ -256,5 +399,25 @@ mod tests {
             &folders,
         );
         assert_eq!(prose.folder, None);
+    }
+
+    #[test]
+    fn extractions_keep_only_what_checks_out() {
+        let raw = "Sure! ```json\n{\"events\": [{\"title\": \"Dentist\", \"date\": \"2026-11-03\", \"start\": \"9:5\", \"end\": \"10:00\", \"location\": \"null\"}, {\"title\": \"\", \"date\": \"2026-11-04\"}], \"contact\": {\"name\": null, \"email\": \"not an address\", \"phone\": \"12\"}}\n```";
+        let found = parse_extraction(raw);
+        assert_eq!(found["events"].as_array().unwrap().len(), 1);
+        let event = &found["events"][0];
+        assert_eq!(event["title"], "Dentist");
+        assert!(
+            event["start"].is_null() && event["end"].is_null(),
+            "no end without a start"
+        );
+        assert!(event["location"].is_null());
+        assert!(found["contact"].is_null());
+        assert_eq!(
+            parse_extraction("no json at all"),
+            serde_json::json!({"events": [], "contact": null})
+        );
+        assert!(valid_date("2028-02-29") && !valid_date("2027-02-29") && !valid_date("2026-13-01"));
     }
 }

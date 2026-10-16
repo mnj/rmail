@@ -156,6 +156,17 @@ async function signIn(page) {
   await page.click('text=Q4 infrastructure review — agenda');
   await page.waitForTimeout(700);
   await shot(page, 'webmail-message');
+  // Dates and a contact found in the agenda mail by the (fake) model.
+  await page.click('.ai-actions button:has-text("Find dates and contacts")');
+  await page.waitForSelector('.ai-found-item:has-text("Q4 infrastructure review")', { timeout: 30000 });
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-ai-found');
+  await page.click('.ai-found-item button:has-text("Add to calendar")');
+  await page.waitForSelector('.ai-found-item >> text=Added to your calendar');
+  await page.click('.ai-found-item button:has-text("Save contact")');
+  // Priya is a contact already: her card opens with the new details added.
+  await page.waitForFunction(() => [...document.querySelectorAll('.contacts-dialog input')].some((input) => input.value === 'Northwind Traders'));
+  await page.click('.contacts-dialog button[aria-label=Close]');
   await page.click('text=This week: Rust 2024');
   await page.waitForTimeout(900);
   await shot(page, 'webmail-remote-blocked');

@@ -19,8 +19,8 @@ use llama_cpp_2::token::LlamaToken;
 
 use crate::engine::{Choice, Chooser, Embedder, FolderHint, LabelHint, Labeling, l2_normalize};
 use crate::prompt::{
-    SUMMARY_PROMPT, json_escape, label_prompt, parse_answer, parse_labels, system_prompt,
-    tidy_summary,
+    SUMMARY_PROMPT, extract_prompt, json_escape, label_prompt, parse_answer, parse_extraction,
+    parse_labels, system_prompt, tidy_summary,
 };
 use rmail_common::classifier_models;
 
@@ -160,6 +160,7 @@ const MAX_ANSWER_TOKENS: usize = 96;
 /// Room for a dozen `{"name", "confidence"}` items.
 const MAX_LABEL_TOKENS: usize = 320;
 const MAX_SUMMARY_TOKENS: usize = 200;
+const MAX_EXTRACT_TOKENS: usize = 500;
 
 impl LlamaChooser {
     pub fn load(models_dir: &Path, file: &str, threads: u32) -> Result<Self> {
@@ -300,6 +301,17 @@ impl Chooser for LlamaChooser {
             |_| false,
         )?;
         Ok(tidy_summary(&answer))
+    }
+
+    fn extract(&self, message: &str, today: &str) -> Result<serde_json::Value> {
+        let answer = self.generate(
+            extract_prompt(today),
+            message,
+            None,
+            MAX_EXTRACT_TOKENS,
+            |_| false,
+        )?;
+        Ok(parse_extraction(&answer))
     }
 }
 

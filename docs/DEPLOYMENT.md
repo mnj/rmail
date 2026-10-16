@@ -624,8 +624,12 @@ journalctl -u rmail_smtpd.service -u rmail_imapd.service -u rmail_web.service -u
 paging, stars, move, archive, junk and delete (also in bulk), keyboard shortcuts, attachments
 (downloaded under a sandbox; PNG, JPEG, GIF and WebP previewed inline), the raw source of any message
 with its headers (**View source**, or download as `.eml`), light and dark themes, and a phone layout.
-When mail organization is enabled with a fallback model, messages also offer **Summarize** and
-**Suggest labels**.
+When mail organization is enabled with a fallback model, messages also offer **Summarize**,
+**Suggest labels** and, with a model that writes text, **Find dates and contacts**: meetings,
+appointments and deadlines the message mentions (relative dates read from the day it was sent)
+with **Add to calendar**, and the sender's signature with **Save contact** (a known contact's card
+opens with the new phone, company or title added). Nothing is added without the user's click.
+Hosted models only receive a message when the user has agreed to that provider.
 
 ### OpenPGP and S/MIME
 
