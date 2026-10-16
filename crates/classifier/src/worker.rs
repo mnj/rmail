@@ -879,6 +879,8 @@ mod tests {
         ready: std::sync::atomic::AtomicBool,
         /// Answer only the first question of a batch.
         partial: std::sync::atomic::AtomicBool,
+        /// A batch the provider fails to report on.
+        failing: std::sync::Mutex<Option<String>>,
     }
 
     impl crate::cloud::Batcher for FakeBatcher {
@@ -899,6 +901,9 @@ mod tests {
 
         fn poll(&self, batch: &str) -> Result<crate::cloud::BatchPoll> {
             use std::sync::atomic::Ordering;
+            if self.failing.lock().unwrap().as_deref() == Some(batch) {
+                anyhow::bail!("provider error");
+            }
             if !self.ready.load(Ordering::SeqCst) {
                 return Ok(crate::cloud::BatchPoll::Running);
             }
@@ -936,6 +941,7 @@ mod tests {
                 .into(),
             ready: false.into(),
             partial: false.into(),
+            failing: Default::default(),
         });
         let batched = Models {
             chooser: Some(chooser.clone()),
@@ -967,6 +973,21 @@ mod tests {
         }
         let conn = store::open_existing(root, D, L).unwrap().unwrap();
         assert!(store::label_requests(&conn).unwrap().is_empty());
+
+        // A batch the provider fails to report on does not stop the others.
+        batcher.ready.store(false, Ordering::SeqCst);
+        imap_state::deliver_message(root, D, L, &mail("i@j.test", "Five", "v")).unwrap();
+        run_cycle(root, &cfg(), &batched);
+        imap_state::deliver_message(root, D, L, &mail("k@l.test", "Six", "u")).unwrap();
+        run_cycle(root, &cfg(), &batched);
+        *batcher.failing.lock().unwrap() = Some("batch-2".into());
+        batcher.ready.store(true, Ordering::SeqCst);
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!(report.answered, 1, "batch-3 is collected: {report:?}");
+        assert!(report.errors.iter().any(|e| e.contains("batch-2")));
+        *batcher.failing.lock().unwrap() = None;
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!(report.answered, 1, "and batch-2 next time: {report:?}");
 
         // A question a batch ended without answering is sent again.
         batcher.partial.store(true, Ordering::SeqCst);

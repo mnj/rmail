@@ -112,7 +112,12 @@ fn run(
     report: &mut CycleReport,
 ) -> Result<()> {
     let queues = gather(mail_root, models, provider)?;
-    submit(mail_root, &queues, batcher, report)?;
+    // A failed submission leaves the questions waiting for the next cycle;
+    // batches already running are still collected.
+    if let Err(error) = submit(mail_root, &queues, batcher, report) {
+        classifier_log!("warn", "batch_submit_failed", { "error": format!("{error:#}") });
+        report.errors.push(format!("batch submit: {error:#}"));
+    }
     let queues = gather(mail_root, models, provider)?;
     collect(mail_root, cfg, &queues, batcher, report)
 }
@@ -224,8 +229,16 @@ fn collect(
             }
             polls.insert(batch.to_string(), Instant::now());
         }
-        let BatchPoll::Ended(answers) = batcher.poll(batch)? else {
-            continue;
+        // One batch the provider cannot report on does not hold up the others;
+        // it is asked about again after POLL_EVERY.
+        let answers = match batcher.poll(batch) {
+            Ok(BatchPoll::Ended(answers)) => answers,
+            Ok(BatchPoll::Running) => continue,
+            Err(error) => {
+                classifier_log!("warn", "batch_poll_failed", { "batch": batch, "error": format!("{error:#}") });
+                report.errors.push(format!("batch {batch}: {error:#}"));
+                continue;
+            }
         };
         let answers: HashMap<String, Result<String, String>> = answers.into_iter().collect();
         for queue in queues {
