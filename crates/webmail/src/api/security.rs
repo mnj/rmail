@@ -65,20 +65,20 @@ async fn overview(app: State<Shared>, headers: HeaderMap) -> Response {
 /// counted per account and lock these checks for a while
 /// (`two_factor::Check::Password`), so a stolen session cookie cannot be
 /// used to guess the password.
-async fn password_ok(state: &Shared, address: &str, password: &str) -> Result<(), Response> {
+async fn password_ok(state: &Shared, address: &str, password: &str) -> Result<(), Box<Response>> {
     let (db_path, lookup) = (state.db_path.clone(), address.to_string());
     let locked =
         blocking(move || two_factor::locked_for(&db_path, &lookup, two_factor::Check::Password))
             .await
             .unwrap_or(Some(two_factor::LOCKOUT_SECONDS));
     if let Some(seconds) = locked {
-        return Err(refused(
+        return Err(Box::new(refused(
             StatusCode::TOO_MANY_REQUESTS,
             &format!(
                 "Too many wrong passwords. Try again in {} minutes.",
                 (seconds + 59) / 60
             ),
-        ));
+        )));
     }
     let (db_path, lookup) = (state.db_path.clone(), address.to_string());
     let hash = blocking(move || db::get_mailbox(&db_path, &lookup))
@@ -105,7 +105,10 @@ async fn password_ok(state: &Shared, address: &str, password: &str) -> Result<()
     if ok {
         Ok(())
     } else {
-        Err(refused(StatusCode::FORBIDDEN, "That is not your password."))
+        Err(Box::new(refused(
+            StatusCode::FORBIDDEN,
+            "That is not your password.",
+        )))
     }
 }
 
@@ -142,7 +145,7 @@ async fn start(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response 
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
     if let Err(response) = password_ok(&state, &session.address, &input.password).await {
-        return response;
+        return *response;
     }
     let host = headers
         .get(header::HOST)
@@ -219,7 +222,7 @@ async fn disable(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Respons
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
     if let Err(response) = password_ok(&state, &session.address, &input.password).await {
-        return response;
+        return *response;
     }
     let (db_path, address) = (state.db_path.clone(), session.address.clone());
     let result = blocking(move || {
@@ -247,7 +250,7 @@ async fn recovery_codes(app: State<Shared>, headers: HeaderMap, body: Bytes) -> 
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
     if let Err(response) = password_ok(&state, &session.address, &input.password).await {
-        return response;
+        return *response;
     }
     let (db_path, address) = (state.db_path.clone(), session.address.clone());
     let result = blocking(move || {
@@ -281,7 +284,7 @@ async fn create_app_password(app: State<Shared>, headers: HeaderMap, body: Bytes
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
     if let Err(response) = password_ok(&state, &session.address, &input.password).await {
-        return response;
+        return *response;
     }
     let (db_path, address) = (state.db_path.clone(), session.address.clone());
     match blocking(move || two_factor::create_app_password(&db_path, &address, &input.name)).await {
