@@ -61,20 +61,51 @@ async fn overview(app: State<Shared>, headers: HeaderMap) -> Response {
     }
 }
 
-/// Whether `password` is the account's main password.
-async fn password_ok(state: &Shared, address: &str, password: &str) -> bool {
+/// Whether `password` is the account's main password. Wrong guesses are
+/// counted per account and lock these checks for a while
+/// (`two_factor::Check::Password`), so a stolen session cookie cannot be
+/// used to guess the password.
+async fn password_ok(state: &Shared, address: &str, password: &str) -> Result<(), Response> {
+    let (db_path, lookup) = (state.db_path.clone(), address.to_string());
+    let locked =
+        blocking(move || two_factor::locked_for(&db_path, &lookup, two_factor::Check::Password))
+            .await
+            .unwrap_or(Some(two_factor::LOCKOUT_SECONDS));
+    if let Some(seconds) = locked {
+        return Err(refused(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!(
+                "Too many wrong passwords. Try again in {} minutes.",
+                (seconds + 59) / 60
+            ),
+        ));
+    }
     let (db_path, lookup) = (state.db_path.clone(), address.to_string());
     let hash = blocking(move || db::get_mailbox(&db_path, &lookup))
         .await
         .ok()
         .flatten()
         .and_then(|mailbox| mailbox.password_hash);
-    match hash {
+    let ok = match hash {
         Some(hash) => matches!(
             auth::verify_password_async(password.to_string(), hash).await,
             Ok(true)
         ),
         None => false,
+    };
+    let (db_path, account) = (state.db_path.clone(), address.to_string());
+    let _ = blocking(move || {
+        if ok {
+            two_factor::record_success(&db_path, &account, two_factor::Check::Password)
+        } else {
+            two_factor::record_failure(&db_path, &account, two_factor::Check::Password)
+        }
+    })
+    .await;
+    if ok {
+        Ok(())
+    } else {
+        Err(refused(StatusCode::FORBIDDEN, "That is not your password."))
     }
 }
 
@@ -110,8 +141,8 @@ async fn start(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Response 
     let Ok(input) = serde_json::from_slice::<PasswordOnly>(&body) else {
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
-    if !password_ok(&state, &session.address, &input.password).await {
-        return refused(StatusCode::FORBIDDEN, "That is not your password.");
+    if let Err(response) = password_ok(&state, &session.address, &input.password).await {
+        return response;
     }
     let host = headers
         .get(header::HOST)
@@ -187,8 +218,8 @@ async fn disable(app: State<Shared>, headers: HeaderMap, body: Bytes) -> Respons
     let Ok(input) = serde_json::from_slice::<PasswordAndCode>(&body) else {
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
-    if !password_ok(&state, &session.address, &input.password).await {
-        return refused(StatusCode::FORBIDDEN, "That is not your password.");
+    if let Err(response) = password_ok(&state, &session.address, &input.password).await {
+        return response;
     }
     let (db_path, address) = (state.db_path.clone(), session.address.clone());
     let result = blocking(move || {
@@ -215,8 +246,8 @@ async fn recovery_codes(app: State<Shared>, headers: HeaderMap, body: Bytes) -> 
     let Ok(input) = serde_json::from_slice::<PasswordAndCode>(&body) else {
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
-    if !password_ok(&state, &session.address, &input.password).await {
-        return refused(StatusCode::FORBIDDEN, "That is not your password.");
+    if let Err(response) = password_ok(&state, &session.address, &input.password).await {
+        return response;
     }
     let (db_path, address) = (state.db_path.clone(), session.address.clone());
     let result = blocking(move || {
@@ -249,8 +280,8 @@ async fn create_app_password(app: State<Shared>, headers: HeaderMap, body: Bytes
     let Ok(input) = serde_json::from_slice::<NewAppPassword>(&body) else {
         return refused(StatusCode::BAD_REQUEST, "invalid json");
     };
-    if !password_ok(&state, &session.address, &input.password).await {
-        return refused(StatusCode::FORBIDDEN, "That is not your password.");
+    if let Err(response) = password_ok(&state, &session.address, &input.password).await {
+        return response;
     }
     let (db_path, address) = (state.db_path.clone(), session.address.clone());
     match blocking(move || two_factor::create_app_password(&db_path, &address, &input.name)).await {
@@ -473,6 +504,48 @@ mod tests {
         assert_eq!(
             status, 401,
             "the session after turning 2FA off is a new one"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lockout_tests {
+    use super::super::tests::{req, route, state};
+    use super::super::{SESSION_COOKIE, sign_session};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn password_guesses_with_a_session_are_limited_per_account() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let attempt = |password: &'static str| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move {
+                let body = json!({"name": "Phone", "password": password}).to_string();
+                route(
+                    req(
+                        "POST",
+                        "/api/security/app-passwords",
+                        body.as_bytes(),
+                        cookie,
+                    ),
+                    &state,
+                )
+                .await
+                .status
+            }
+        };
+        for _ in 0..rmail_common::two_factor::MAX_FAILURES {
+            assert_eq!(attempt("guess").await, 403);
+        }
+        assert_eq!(
+            attempt("secret").await,
+            429,
+            "locked, even with the right password"
         );
     }
 }

@@ -54,7 +54,88 @@ pub(crate) const SCHEMA: &str = "
         last_used_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS app_passwords_account ON app_passwords(account);
+    CREATE TABLE IF NOT EXISTS sign_in_failures (
+        account TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        failures INTEGER NOT NULL DEFAULT 0,
+        locked_until INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (account, kind)
+    );
 ";
+
+/// Failed checks in a row before a check is locked for an account...
+pub const MAX_FAILURES: i64 = 5;
+/// ...and for how long. Per account, so spreading guesses over many
+/// addresses or a stolen session does not help.
+pub const LOCKOUT_SECONDS: i64 = 15 * 60;
+
+/// What is being guessed: a 2FA code, or the password when webmail asks
+/// for it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    Code,
+    Password,
+}
+
+impl Check {
+    fn as_str(self) -> &'static str {
+        match self {
+            Check::Code => "code",
+            Check::Password => "password",
+        }
+    }
+}
+
+/// Seconds until `check` may be tried again for `account`, if it is locked.
+pub fn locked_for(db: &Path, account: &str, check: Check) -> Result<Option<i64>> {
+    let account = account_key(account)?;
+    let conn = open(db)?;
+    let until: Option<i64> = conn
+        .query_row(
+            "SELECT locked_until FROM sign_in_failures WHERE account = ?1 AND kind = ?2",
+            params![account, check.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(until.map(|until| until - now()).filter(|left| *left > 0))
+}
+
+/// Count a failed check; after [`MAX_FAILURES`] in a row it is locked.
+pub fn record_failure(db: &Path, account: &str, check: Check) -> Result<()> {
+    let account = account_key(account)?;
+    let conn = open(db)?;
+    record_failure_on(&conn, &account, check)
+}
+
+fn record_failure_on(conn: &Connection, account: &str, check: Check) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sign_in_failures (account, kind, failures) VALUES (?1, ?2, 1)
+         ON CONFLICT(account, kind) DO UPDATE SET failures = failures + 1",
+        params![account, check.as_str()],
+    )?;
+    conn.execute(
+        "UPDATE sign_in_failures SET locked_until = ?3, failures = 0
+         WHERE account = ?1 AND kind = ?2 AND failures >= ?4",
+        params![
+            account,
+            check.as_str(),
+            now() + LOCKOUT_SECONDS,
+            MAX_FAILURES
+        ],
+    )?;
+    Ok(())
+}
+
+/// A passed check clears the count.
+pub fn record_success(db: &Path, account: &str, check: Check) -> Result<()> {
+    let account = account_key(account)?;
+    let conn = open(db)?;
+    conn.execute(
+        "DELETE FROM sign_in_failures WHERE account = ?1 AND kind = ?2",
+        params![account, check.as_str()],
+    )?;
+    Ok(())
+}
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -290,6 +371,20 @@ fn replace_recovery_codes(conn: &Connection, account: &str) -> Result<Vec<String
 /// Whether `code` (from the app, or an unused recovery code) passes for an
 /// account with 2FA on; a passing code cannot be used again.
 pub fn verify(db: &Path, account: &str, code: &str) -> Result<bool> {
+    // Locked after too many wrong codes, whatever is tried.
+    if locked_for(db, account, Check::Code)?.is_some() {
+        return Ok(false);
+    }
+    let passed = verify_code(db, account, code)?;
+    if passed {
+        record_success(db, account, Check::Code)?;
+    } else {
+        record_failure(db, account, Check::Code)?;
+    }
+    Ok(passed)
+}
+
+fn verify_code(db: &Path, account: &str, code: &str) -> Result<bool> {
     let account = account_key(account)?;
     let mut conn = open(db)?;
     let tx = conn.transaction()?;
@@ -569,6 +664,28 @@ mod tests {
             ProtocolPassword::Refused
         );
         assert!(create_app_password(&db, me, " ").is_err());
+
+        // Wrong codes in a row lock the account's code checks for a while.
+        let key = base32_decode(
+            &enabled_secret(&open(&db).unwrap(), "user@example.test")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(!verify(&db, me, "000000").unwrap());
+        }
+        assert!(locked_for(&db, me, Check::Code).unwrap().is_some());
+        let good = format!("{:06}", code_at(&key, now() / STEP_SECONDS + 1));
+        assert!(
+            !verify(&db, me, &good).unwrap(),
+            "even a right code while locked"
+        );
+        open(&db)
+            .unwrap()
+            .execute("UPDATE sign_in_failures SET locked_until = 0", [])
+            .unwrap();
+        assert!(verify(&db, me, &good).unwrap());
 
         assert!(disable(&db, me).unwrap());
         assert_eq!(

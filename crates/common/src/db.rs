@@ -37,12 +37,15 @@ impl Mailbox {
     }
 }
 
-/// The account's TOTP secret while 2FA is on; a database from before the
-/// table existed has none.
-fn two_factor_secret(conn: &rusqlite::Connection, address: &str) -> Option<String> {
-    crate::two_factor::enabled_secret(conn, address)
-        .ok()
-        .flatten()
+/// The account's TOTP secret while 2FA is on. A database from before the
+/// table existed has none; any other error fails the lookup, so a database
+/// problem never reads as "2FA off".
+fn two_factor_secret(conn: &rusqlite::Connection, address: &str) -> Result<Option<String>> {
+    match crate::two_factor::enabled_secret(conn, address) {
+        Ok(secret) => Ok(secret),
+        Err(error) if error.to_string().contains("no such table") => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 use serde_json;
@@ -432,7 +435,7 @@ pub fn get_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<Option<Mail
             .get::<_, Option<i64>>(4)?
             .map(u64::try_from)
             .transpose()?;
-        let two_factor = two_factor_secret(&conn, &address);
+        let two_factor = two_factor_secret(&conn, &address)?;
         Ok(Some(Mailbox {
             scram: scram.filter(|_| two_factor.is_none()),
             address,
@@ -467,7 +470,7 @@ pub fn find_mailbox_by_localpart<P: AsRef<Path>>(path: P, local: &str) -> Result
             .get::<_, Option<i64>>(4)?
             .map(u64::try_from)
             .transpose()?;
-        let two_factor = two_factor_secret(&conn, &address);
+        let two_factor = two_factor_secret(&conn, &address)?;
         found = Some(Mailbox {
             scram: scram.filter(|_| two_factor.is_none()),
             address,
@@ -501,7 +504,7 @@ pub fn list_mailboxes<P: AsRef<Path>>(path: P) -> Result<Vec<Mailbox>> {
             .get::<_, Option<i64>>(4)?
             .map(u64::try_from)
             .transpose()?;
-        let two_factor = two_factor_secret(&conn, &address);
+        let two_factor = two_factor_secret(&conn, &address)?;
         out.push(Mailbox {
             scram: scram.filter(|_| two_factor.is_none()),
             address,
