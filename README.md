@@ -46,16 +46,18 @@ screenshots of every page, and a quick start.
 - **Webmail** with folders, search, sandboxed HTML rendering, blocked remote images and a mobile
   layout. Calendar invitations show as a card with Accept, Maybe and Decline, which stores the event
   and sends the reply as a calendar app would; cancellations and unverified replies can be applied
-  from the card too. Contacts are edited in webmail and synced with phones over CardDAV.
-  Out-of-office replies and mail filters are edited in webmail and applied on the server at
-  delivery, so they work in every mail app; filters are kept as Sieve, and a hand-written script is
-  shown and edited as text. Composing has a rich-text editor (formatting, lists, quotes, links,
-  inline images, cleaned-up pastes from Word or Google Docs) that sends HTML with a generated
-  plain-text alternative, a plain-text mode, signatures per identity, the browser's spellchecker in
-  a chosen language, address suggestions from CardDAV contacts and recent recipients, autosaved
-  drafts, drag-and-drop attachments, undo send and send later. Opt-in AI writing suggestions (grey
-  ghost-text continuations, accepted with Tab, and rewrites of a selection) come from any
-  OpenAI-compatible endpoint the admin configures, through the server so the key stays there.
+  from the card too. A calendar (week, month and agenda) and contacts are edited in webmail and
+  synced with phones over CalDAV and CardDAV; inviting guests from webmail sends invitations,
+  updates and cancellations. Out-of-office replies and mail filters are edited in webmail and
+  applied on the server at delivery, so they work in every mail app; filters are kept as Sieve, and
+  a hand-written script is shown and edited as text. Composing has a rich-text editor (formatting,
+  lists, quotes, links, inline images, cleaned-up pastes from Word or Google Docs) that sends HTML
+  with a generated plain-text alternative, a plain-text mode, signatures per identity, the browser's
+  spellchecker in a chosen language, address suggestions from CardDAV contacts and recent
+  recipients, autosaved drafts, drag-and-drop attachments, undo send and send later. Opt-in AI
+  writing suggestions (grey ghost-text continuations, accepted with Tab, and rewrites of a
+  selection) come from any OpenAI-compatible endpoint the admin configures, through the server so
+  the key stays there.
 - **JMAP** (RFC 8620, RFC 8621) for mail clients, served by webmail: mailboxes, email, threads,
   search, sending, vacation response and push.
 - **Calendars and contacts**: CalDAV and CardDAV (RFC 4791, RFC 6352) with sync-collection, so
