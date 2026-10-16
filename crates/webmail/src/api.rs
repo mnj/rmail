@@ -111,6 +111,10 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())
         .fallback(fallback)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_two_factor_setup,
+        ))
         .layer(middleware::from_fn(reject_cross_site))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(log_request))
@@ -150,6 +154,38 @@ async fn security_headers(request: Request, next: Next) -> Response {
             .or_insert(HeaderValue::from_static(value));
     }
     response
+}
+
+/// In a domain that requires two-factor sign-in, a user without it may only
+/// set it up (and sign out) until they do; webmail shows the setup instead
+/// of the mailbox. Mail apps are not affected (JMAP and DAV are not `/api/`).
+async fn require_two_factor_setup(
+    State(state): State<Shared>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let exempt = !path.starts_with("/api/")
+        || matches!(path, "/api/login" | "/api/logout" | "/api/session")
+        || path.starts_with("/api/security");
+    if !exempt && let Ok(session) = Session::signed_in(&state, request.headers()).await {
+        let (db_path, address) = (state.db_path.clone(), session.address);
+        let required =
+            blocking(move || rmail_common::two_factor::setup_required(&db_path, &address))
+                .await
+                .unwrap_or(false);
+        if required {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Set up two-factor sign-in to continue.",
+                    "two_factor_setup": true,
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn reject_cross_site(request: Request, next: Next) -> Response {
@@ -297,6 +333,8 @@ struct SessionResponse {
     address: String,
     /// Whether this server can send mail from webmail.
     can_send: bool,
+    /// The user's domain requires two-factor sign-in and it is not on yet.
+    two_factor_setup: bool,
 }
 
 async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes) -> Response {
@@ -370,11 +408,17 @@ async fn login(app: State<Shared>, Extension(peer): Extension<Peer>, body: Bytes
     }
     let mail_root = state.mail_root.clone();
     let _ = blocking(move || imap_state::init_account(&mail_root, &domain, &localpart)).await;
+    let (db_path, account) = (state.db_path.clone(), address.clone());
+    let two_factor_setup =
+        blocking(move || rmail_common::two_factor::setup_required(&db_path, &account))
+            .await
+            .unwrap_or(false);
     let credential = mailbox.session_credential().unwrap_or(hash);
     let binding = websession::credential_binding(&state.session_secret, &credential);
     let token = websession::sign(&state.session_secret, &address, &binding, SESSION_TTL_SECS);
     with_cookie(
         Json(SessionResponse {
+            two_factor_setup,
             address,
             can_send: state.submission.is_some(),
         }),
@@ -407,9 +451,15 @@ async fn session_info(app: State<Shared>, headers: HeaderMap) -> Response {
         Ok(session) => session,
         Err(status) => return status.into_response(),
     };
+    let (db_path, address) = (state.db_path.clone(), session.address.clone());
+    let two_factor_setup =
+        blocking(move || rmail_common::two_factor::setup_required(&db_path, &address))
+            .await
+            .unwrap_or(false);
     Json(SessionResponse {
         address: session.address,
         can_send: state.submission.is_some(),
+        two_factor_setup,
     })
     .into_response()
 }

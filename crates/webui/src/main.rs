@@ -52,6 +52,8 @@ struct AccountSummary {
     unseen: usize,
     used_bytes: u64,
     quota_bytes: Option<u64>,
+    two_factor: bool,
+    app_passwords: usize,
 }
 
 #[derive(Serialize)]
@@ -526,6 +528,9 @@ fn account_summaries_sync(
     db_path: Option<&str>,
 ) -> Result<Vec<AccountSummary>> {
     let mut accounts = Vec::new();
+    let app_password_counts = db_path
+        .and_then(|db| rmail_common::two_factor::app_password_counts(Path::new(db)).ok())
+        .unwrap_or_default();
     if let Some(db_path) = db_path {
         for mailbox in rmail_common::db::list_mailboxes(db_path)? {
             let mut folders = 0usize;
@@ -541,7 +546,13 @@ fn account_summaries_sync(
                 unseen = summaries.iter().map(|summary| summary.unseen).sum();
                 used_bytes = summaries.iter().map(|summary| summary.size).sum();
             }
+            let app_passwords = app_password_counts
+                .get(&mailbox.address.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0);
             accounts.push(AccountSummary {
+                two_factor: mailbox.two_factor.is_some(),
+                app_passwords,
                 address: mailbox.address,
                 auth: if mailbox.scram.is_some() {
                     "SCRAM".to_string()

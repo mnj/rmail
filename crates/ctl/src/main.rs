@@ -95,6 +95,14 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Two-factor sign-in: reset a user's, or require it for a domain
+    TwoFactor {
+        #[command(subcommand)]
+        action: TwoFactorAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// DKIM signing keys and the ARC sealing key, stored in the database
     Dkim {
         #[command(subcommand)]
@@ -213,6 +221,21 @@ enum TransportAction {
     Reject { domain: String, reply: String },
     /// Remove DOMAIN's route; its mail goes to the MX hosts again
     Remove { domain: String },
+}
+
+#[derive(Subcommand)]
+enum TwoFactorAction {
+    /// Whether ADDRESS has two-factor sign-in, and its app passwords
+    Status { address: String },
+    /// Turn off ADDRESS's two-factor sign-in (a lost phone and no recovery
+    /// codes); app passwords stay
+    Reset { address: String },
+    /// Require two-factor sign-in for every account in DOMAIN
+    Require { domain: String },
+    /// Stop requiring it for DOMAIN
+    Allow { domain: String },
+    /// Domains that require it
+    Domains,
 }
 
 #[derive(Subcommand)]
@@ -714,6 +737,17 @@ async fn main() -> Result<()> {
                 action,
                 std::path::Path::new(&cfg.global.mail_root),
                 std::path::Path::new(&cfg.global.db_path),
+            )?;
+        }
+        Commands::TwoFactor { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            run_two_factor(
+                action,
+                std::path::Path::new(&cfg.global.db_path),
+                &mut std::io::stdout(),
             )?;
         }
         Commands::Feedback { action, config } => {
@@ -1494,5 +1528,122 @@ mod tests {
         assert_eq!(summary, "alice@example.test  complaints=0 unverified=1\n");
         assert!(run(FeedbackAction::Delete { id }).is_ok());
         assert!(run(FeedbackAction::Delete { id }).is_err());
+    }
+}
+
+fn run_two_factor(
+    action: TwoFactorAction,
+    db: &std::path::Path,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    use rmail_common::two_factor;
+    match action {
+        TwoFactorAction::Status { address } => {
+            let status = two_factor::status(db, &address)?;
+            writeln!(
+                out,
+                "two-factor: {}",
+                if status.enabled {
+                    format!("on, {} recovery codes left", status.recovery_left)
+                } else if two_factor::setup_required(db, &address)? {
+                    "off (required by its domain; set up at next webmail sign-in)".to_string()
+                } else {
+                    "off".to_string()
+                }
+            )?;
+            for app in two_factor::app_passwords(db, &address)? {
+                writeln!(
+                    out,
+                    "app password {}: {} (last used {})",
+                    app.id,
+                    app.name,
+                    app.last_used_at
+                        .map_or("never".to_string(), |at| at.to_string())
+                )?;
+            }
+        }
+        TwoFactorAction::Reset { address } => {
+            if two_factor::disable(db, &address)? {
+                writeln!(out, "two-factor sign-in turned off for {address}")?;
+            } else {
+                writeln!(out, "{address} did not have two-factor sign-in")?;
+            }
+        }
+        TwoFactorAction::Require { domain } => {
+            two_factor::set_required(db, &domain, true)?;
+            writeln!(out, "{domain} now requires two-factor sign-in")?;
+        }
+        TwoFactorAction::Allow { domain } => {
+            two_factor::set_required(db, &domain, false)?;
+            writeln!(out, "{domain} no longer requires two-factor sign-in")?;
+        }
+        TwoFactorAction::Domains => {
+            for domain in two_factor::required_domains(db)? {
+                writeln!(out, "{domain}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod two_factor_tests {
+    use super::*;
+
+    #[test]
+    fn two_factor_commands() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("accounts.sqlite");
+        rmail_common::db::init_db(&db).unwrap();
+        let run = |action| {
+            let mut out = Vec::new();
+            run_two_factor(action, &db, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert!(
+            run(TwoFactorAction::Require {
+                domain: "Example.test".into()
+            })
+            .contains("now requires")
+        );
+        assert_eq!(run(TwoFactorAction::Domains), "example.test\n");
+        assert!(
+            run(TwoFactorAction::Status {
+                address: "ann@example.test".into()
+            })
+            .contains("required by its domain")
+        );
+        let secret = rmail_common::two_factor::begin(&db, "ann@example.test").unwrap();
+        let key = rmail_common::two_factor::base32_decode(&secret).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let code = format!("{:06}", rmail_common::two_factor::code_at(&key, now / 30));
+        rmail_common::two_factor::confirm(&db, "ann@example.test", &code)
+            .unwrap()
+            .unwrap();
+        assert!(
+            run(TwoFactorAction::Status {
+                address: "ann@example.test".into()
+            })
+            .contains("on, 10 recovery codes left")
+        );
+        assert!(
+            run(TwoFactorAction::Reset {
+                address: "ann@example.test".into()
+            })
+            .contains("turned off")
+        );
+        assert!(
+            run(TwoFactorAction::Reset {
+                address: "ann@example.test".into()
+            })
+            .contains("did not have")
+        );
+        run(TwoFactorAction::Allow {
+            domain: "example.test".into(),
+        });
+        assert_eq!(run(TwoFactorAction::Domains), "");
     }
 }

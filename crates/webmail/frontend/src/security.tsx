@@ -34,7 +34,11 @@ function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => void 
   );
 }
 
-export function SecurityDialog({ api, address, onClose }: { api: Api; address: string; onClose: () => void }) {
+export function SecurityDialog({ api, address, onClose, required, onChanged }: {
+  api: Api; address: string; onClose: () => void;
+  /** The domain requires 2FA and it is not on: no way out but setting it up (or signing out). */
+  required?: boolean; onChanged?: () => void;
+}) {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [step, setStep] = useState<Step>({ kind: 'idle' });
   const [password, setPassword] = useState('');
@@ -94,9 +98,12 @@ export function SecurityDialog({ api, address, onClose }: { api: Api; address: s
   const passwordStep = step.kind === 'password' ? step : null;
   const needsCode = passwordStep && (passwordStep.then === 'disable' || passwordStep.then === 'recovery');
   return (
-    <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
+    <div className="dialog-scrim" onMouseDown={(e) => !required && e.target === e.currentTarget && onClose()} onKeyDown={(e) => !required && e.key === 'Escape' && onClose()}>
       <section className="dialog security-dialog" role="dialog" aria-modal="true" aria-label="Security">
-        <header><h2>Security</h2><button type="button" className="icon" aria-label="Close" title="Close" autoFocus onClick={onClose}><X size={16} /></button></header>
+        <header><h2>Security</h2>{required
+          ? <button type="button" className="link" onClick={onClose}>Sign out</button>
+          : <button type="button" className="icon" aria-label="Close" title="Close" autoFocus onClick={onClose}><X size={16} /></button>}</header>
+        {required && <p className="dialog-intro required-notice">Your administrator requires two-factor sign-in. Set it up to continue to your mail.</p>}
         {overview === null && !error && <p className="muted">Loading…</p>}
 
         {overview && <>
@@ -115,7 +122,7 @@ export function SecurityDialog({ api, address, onClose }: { api: Api; address: s
               <div className="security-buttons"><button type="button" className="secondary" onClick={reset}>Cancel</button><span className="spacer" /><button type="button" className="primary" disabled={busy || !code.trim()} onClick={confirm}>Turn on</button></div>
             </div>
           ) : step.kind === 'codes' ? (
-            <RecoveryCodes codes={step.codes} onDone={reset} />
+            <RecoveryCodes codes={step.codes} onDone={() => { reset(); onChanged?.(); }} />
           ) : tf?.enabled ? (
             <>
               <p className="security-status on"><ShieldCheck size={16} />On{tf.since ? ` since ${formatFullDate(tf.since)}` : ''}. {tf.recovery_left} recovery code{tf.recovery_left === 1 ? '' : 's'} left.</p>
