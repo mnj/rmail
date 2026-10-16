@@ -26,6 +26,7 @@ pub(crate) mod assist;
 mod calendars;
 mod compose;
 mod contacts;
+mod events;
 mod invitations;
 mod mail_rules;
 mod organize;
@@ -103,6 +104,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(assist::routes())
         .merge(calendars::routes())
         .merge(contacts::routes())
+        .merge(events::routes())
         .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())

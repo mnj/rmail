@@ -9,6 +9,7 @@ import { OrganizeDialog } from './organize';
 import { ComposeSeed, ComposeWindow, draftSeed, forwardSeed, replySeed } from './compose';
 import { ComposeSettingsDialog } from './settings';
 import { ContactSeed, ContactsDialog } from './contacts';
+import { CalendarView } from './calendar';
 import { InvitationCard } from './invitation';
 import { FilterIcon, FiltersDialog, Vacation, VacationDialog, VacationIcon, vacationNote } from './rules';
 import {
@@ -449,6 +450,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [identities, setIdentities] = useState<Identity[]>([]);
   const [composeSettings, setComposeSettings] = useState(false);
   const [contacts, setContacts] = useState<ContactSeed | null | false>(false);
+  const [calendarMode, setCalendarMode] = useState(false);
   const [vacation, setVacation] = useState<Vacation | null>(null);
   const [vacationOpen, setVacationOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -551,6 +553,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const suggested = messages.filter((m) => m.suggestion).length;
 
   async function chooseFolder(name: string) {
+    setCalendarMode(false);
     setFolder(name);
     setSelected(null);
     setChecked([]);
@@ -686,7 +689,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
-      if (target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (calendarMode || target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
       const move = (delta: number) => {
         const index = selectedIndex < 0 ? (delta > 0 ? 0 : messages.length - 1) : selectedIndex + delta;
         const message = messages[index];
@@ -736,7 +739,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   );
 
   return (
-    <main className={`app view-${view}`}>
+    <main className={`app view-${view} ${calendarMode ? 'calendar-mode' : ''}`}>
       <aside className="sidebar">
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span title={address}>{address}</span></div></div>
         {canSend && <button className="compose-button" onClick={() => { setCompose({}); setView('list'); }}><PenSquare size={16} />Compose</button>}
@@ -771,6 +774,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         <div className="sidebar-foot">
           {canSend && <button className="sidebar-link" onClick={() => setComposeSettings(true)}><PenLine size={15} />Compose settings</button>}
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
+          <button className={`sidebar-link ${calendarMode ? 'active' : ''}`} aria-current={calendarMode ? 'page' : undefined} onClick={() => { setCalendarMode(true); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><CalendarDays size={15} />Calendar</button>
           <button className="sidebar-link" onClick={() => setContacts(null)}><BookUser size={15} />Contacts</button>
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>
@@ -846,6 +850,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
         </div>
       </section>
 
+      {calendarMode && <CalendarView api={api} flash={flash} onShowFolders={() => setView('folders')} />}
       <article className="reader">
         {selected ? (
           <>

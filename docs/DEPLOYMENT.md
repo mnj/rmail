@@ -792,6 +792,17 @@ respected.
   invitations to it reach the account (by email and from accounts here), clients see it in the
   account's `calendar-user-address-set`, and answers and events organized under it are sent from
   the alias. Aliases with several targets are groups and are not calendar addresses.
+- **Calendar** in webmail's sidebar shows the user's calendars and those shared with them by
+  week, month or as an agenda, with each calendar's color and a switch to hide it. Events are
+  created, edited and deleted in the same store CalDAV clients sync. Times are written in the
+  browser's time zone (`DTSTART;TZID=...`), so a weekly meeting keeps its local time across
+  daylight-saving changes; all-day events are dates. Guests added in webmail get an invitation
+  (by email, or straight into the calendar of an account in the same domain), and an update or a
+  cancellation when the event is moved or deleted, through the same scheduling as a CalDAV
+  client. Editing a recurring event edits the series. A repeat rule webmail cannot show (every
+  other Tuesday, say), guests' answers, alarms and other properties are kept unless changed.
+  Events the user is invited to show their answer and are answered from the invitation in mail;
+  saves check the version the user saw.
 - **Contacts** in webmail's sidebar lists the user's address books and those shared with them,
   with search, and adds, edits and deletes contacts in the same store CardDAV clients sync, so
   changes reach phones and the other way round. Webmail edits the name, email addresses, phone

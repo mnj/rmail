@@ -210,6 +210,22 @@ async function signIn(page) {
   await page.waitForSelector('.contact-details >> text=Infrastructure lead');
   await page.waitForTimeout(300);
   await shot(page, 'webmail-contacts');
+  await page.click('.contacts-dialog button[aria-label=Close]');
+  // Calendar: a meeting with a guest this week, then the month.
+  await page.click('.sidebar-link:has-text("Calendar")');
+  await page.waitForSelector('.calendar-pane .week');
+  await page.click('.calendar-bar button:has-text("New")');
+  await page.fill('.event-editor label:has-text("Title") input', 'Design review');
+  await page.fill('.event-editor label:has-text("Place") input', 'Room 2');
+  await page.fill('.event-editor label:has-text("Guests") input', 'bob@example.com');
+  await page.click('.event-editor button.primary');
+  await page.waitForSelector('.week-event:has-text("Design review")');
+  await page.waitForTimeout(400);
+  await shot(page, 'webmail-calendar');
+  await page.click('.segmented button:has-text("Month")');
+  await page.waitForSelector('.month');
+  await page.waitForTimeout(400);
+  await shot(page, 'webmail-calendar-month');
   await ctx.close();
 }
 
@@ -333,6 +349,11 @@ for (const theme of ['light', 'dark']) {
   await page.waitForTimeout(300);
   await shot(page, 'mobile-contact');
   await page.click('.contacts-dialog button[aria-label=Close]');
+  await page.click('.sidebar-link:has-text("Calendar")');
+  await page.waitForSelector('.calendar-pane .agenda, .calendar-pane .agenda-empty');
+  await page.waitForTimeout(400);
+  await shot(page, 'mobile-calendar');
+  await page.click('.calendar-pane button[aria-label=Folders]');
   await page.click('button.folder-name:has-text("Inbox")');
   await page.waitForTimeout(300);
   await compose(page, 'mobile-compose', true);
