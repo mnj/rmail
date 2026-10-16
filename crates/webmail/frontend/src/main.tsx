@@ -387,9 +387,10 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
   const [preview, setPreview] = useState<LabelPreview | null>(null);
   const [found, setFound] = useState<Found | null>(null);
   const [added, setAdded] = useState<number[]>([]);
+  const [adding, setAdding] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [consentNeeded, setConsentNeeded] = useState<string | null>(null);
-  useEffect(() => { setSummary(null); setPreview(null); setFound(null); setAdded([]); setError(''); setConsentNeeded(null); }, [message.uid]);
+  useEffect(() => { setSummary(null); setPreview(null); setFound(null); setAdded([]); setAdding(null); setError(''); setConsentNeeded(null); }, [message.uid]);
   if (!organize || (!organize.ai_labels && !organize.ai_summary)) return null;
   const base = `/api/folders/${encodeURIComponent(folder)}/messages/${message.uid}`;
   // The fallback model's provider, when it is a cloud one.
@@ -414,6 +415,9 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
   }
 
   async function addEvent(event: FoundEvent, index: number) {
+    // One event per click, however fast the clicks come.
+    if (adding !== null) return;
+    setAdding(index);
     try {
       await api('/api/events/own:default', { method: 'POST', body: JSON.stringify({
         summary: event.title, location: event.location ?? '',
@@ -423,6 +427,8 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
       setAdded((list) => [...list, index]);
     } catch (err) {
       setError((err as Error).message);
+    } finally {
+      setAdding(null);
     }
   }
 
@@ -463,7 +469,7 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
               <span><strong>{event.title}</strong><small className="muted">{describeEvent(event)}{event.location ? ` · ${event.location}` : ''}</small></span>
               {added.includes(index)
                 ? <span className="muted small">Added to your calendar</span>
-                : <button className="secondary small-button" onClick={() => addEvent(event, index)}>Add to calendar</button>}
+                : <button className="secondary small-button" disabled={adding !== null} onClick={() => addEvent(event, index)}>{adding === index ? 'Adding…' : 'Add to calendar'}</button>}
             </div>
           ))}
           {found.contact && (
