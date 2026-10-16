@@ -3,7 +3,7 @@
 // scheduling, so guests get invitations, updates and cancellations.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CalendarDays, ChevronLeft, ChevronRight, Clock, MapPin, Menu, Plus, Repeat, Trash2, Users, X } from 'lucide-react';
+import { AlertTriangle, CalendarDays, ChevronLeft, ChevronRight, Clock, MapPin, Menu, Plus, RefreshCw, Repeat, Rss, Trash2, Users, X } from 'lucide-react';
 import { Api } from './types';
 
 type Details = {
@@ -19,7 +19,11 @@ type CalEvent = {
   organizer: string | null; attendee_details: Attendee[];
   my_status: string; editable: boolean; cancelled: boolean;
 };
-type Calendar = { id: string; displayname: string; color: string | null; owner?: string; writable: boolean };
+type Calendar = {
+  id: string; displayname: string; color: string | null; owner?: string; writable: boolean;
+  /** A subscribed feed (read-only). */
+  subscription?: { url: string; refreshed_at: number | null; error: string | null };
+};
 type Listing = { calendars: Calendar[]; events: CalEvent[] };
 type Mode = 'week' | 'month' | 'agenda';
 
@@ -172,6 +176,41 @@ function EventEditor({ api, draft, calendars, onClose, onSaved }: { api: Api; dr
         <label className="field"><span>Notes</span><textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} /></label>
         {error && <p className="error" role="alert">{error}</p>}
         <footer><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button></footer>
+      </form>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions
+
+function SubscribeDialog({ api, onClose, onDone }: { api: Api; onClose: () => void; onDone: (message: string) => void }) {
+  const [url, setUrl] = useState('');
+  const [name, setName] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      const made = await api<{ events: number }>('/api/subscriptions', { method: 'POST', body: JSON.stringify({ url, name }) });
+      onDone(`Subscribed: ${made.events} event${made.events === 1 ? '' : 's'}.`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="dialog-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === 'Escape' && onClose()}>
+      <form className="dialog small" role="dialog" aria-modal="true" aria-label="Subscribe to a calendar" onSubmit={submit}>
+        <header><h2>Subscribe to a calendar</h2><button type="button" className="icon" aria-label="Close" title="Close" onClick={onClose}><X size={16} /></button></header>
+        <p className="dialog-intro">Public holidays, a sports schedule, a team's published calendar: paste its webcal or https address. It is read-only, refreshed every few hours, and shows in your calendar apps too.</p>
+        <label className="field"><span>Address</span><input autoFocus type="url" inputMode="url" placeholder="webcal://…/calendar.ics" value={url} onChange={(e) => setUrl(e.target.value)} /></label>
+        <label className="field"><span>Name (optional)</span><input maxLength={100} value={name} onChange={(e) => setName(e.target.value)} /></label>
+        {error && <p className="error" role="alert">{error}</p>}
+        <footer><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={busy || !url.trim()}>{busy ? 'Fetching…' : 'Subscribe'}</button></footer>
       </form>
     </div>
   );
@@ -360,6 +399,7 @@ export function CalendarView({ api, onShowFolders, flash }: { api: Api; onShowFo
   const [open, setOpen] = useState<CalEvent | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [hidden, setHidden] = useState<string[]>([]);
+  const [subscribing, setSubscribing] = useState(false);
 
   const range = useMemo(() => {
     if (mode === 'week') { const from = startOfWeek(anchor); return { from, to: addDays(from, 7) }; }
@@ -414,6 +454,27 @@ export function CalendarView({ api, onShowFolders, flash }: { api: Api; onShowFo
     }
   }
 
+  async function refreshFeed(calendar: Calendar) {
+    try {
+      const done = await api<{ stored: number; removed: number }>(`/api/subscriptions/${encodeURIComponent(calendar.id)}/refresh`, { method: 'POST' });
+      flash(`${calendar.displayname} refreshed${done.stored || done.removed ? ` (${done.stored} new or changed, ${done.removed} removed)` : ''}.`);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+    load();
+  }
+
+  async function unsubscribe(calendar: Calendar) {
+    if (!window.confirm(`Unsubscribe from ${calendar.displayname}? Its events disappear from your calendars.`)) return;
+    try {
+      await api(`/api/subscriptions/${encodeURIComponent(calendar.id)}`, { method: 'DELETE' });
+      flash(`Unsubscribed from ${calendar.displayname}.`);
+      load();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
   const days = Array.from({ length: 7 }, (_, i) => addDays(range.from, i));
   return (
     <section className="calendar-pane" aria-label="Calendar">
@@ -429,14 +490,24 @@ export function CalendarView({ api, onShowFolders, flash }: { api: Api; onShowFo
         </div>
         {writable.length > 0 && <button className="primary small-button" onClick={newEvent}><Plus size={14} />New</button>}
       </header>
-      {calendars.length > 1 && (
+      {listing && (
         <div className="calendar-filters">
           {calendars.map((c) => (
-            <label key={c.id} className="calendar-filter">
-              <input type="checkbox" checked={!hidden.includes(c.id)} onChange={(e) => setHidden(e.target.checked ? hidden.filter((h) => h !== c.id) : [...hidden, c.id])} />
-              <span className="calendar-dot" style={{ background: colorOf(calendars, c.id) }} />{c.displayname}{c.owner ? <small className="muted"> ({c.owner})</small> : null}
-            </label>
+            <span key={c.id} className="calendar-filter">
+              <label>
+                <input type="checkbox" checked={!hidden.includes(c.id)} onChange={(e) => setHidden(e.target.checked ? hidden.filter((h) => h !== c.id) : [...hidden, c.id])} />
+                <span className="calendar-dot" style={{ background: colorOf(calendars, c.id) }} />{c.displayname}{c.owner ? <small className="muted"> ({c.owner})</small> : null}
+              </label>
+              {c.subscription && <>
+                {c.subscription.error
+                  ? <span className="feed-error" title={`Last refresh failed: ${c.subscription.error}`}><AlertTriangle size={13} /></span>
+                  : <span className="muted" title={`Subscribed to ${c.subscription.url}`}><Rss size={12} /></span>}
+                <button type="button" className="icon tiny" aria-label={`Refresh ${c.displayname}`} title="Refresh now" onClick={() => refreshFeed(c)}><RefreshCw size={12} /></button>
+                <button type="button" className="icon tiny" aria-label={`Unsubscribe from ${c.displayname}`} title="Unsubscribe" onClick={() => unsubscribe(c)}><X size={12} /></button>
+              </>}
+            </span>
           ))}
+          <button type="button" className="link add-link" onClick={() => setSubscribing(true)}><Rss size={13} />Subscribe…</button>
         </div>
       )}
       {error && <p className="error calendar-error" role="alert">{error}</p>}
@@ -448,6 +519,7 @@ export function CalendarView({ api, onShowFolders, flash }: { api: Api; onShowFo
       </div>
       {open && <EventPopup event={open} calendar={calendars.find((c) => c.id === open.calendar)} color={colorOf(calendars, open.calendar)} onClose={() => setOpen(null)} onDelete={() => remove(open)}
         onEdit={() => { setDraft({ calendar: open.calendar, name: open.name, etag: open.etag, details: open.details }); setOpen(null); }} />}
+      {subscribing && <SubscribeDialog api={api} onClose={() => setSubscribing(false)} onDone={(message) => { setSubscribing(false); flash(message); load(); }} />}
       {draft && <EventEditor api={api} draft={draft} calendars={calendars} onClose={() => setDraft(null)} onSaved={(message) => { setDraft(null); flash(message); load(); }} />}
     </section>
   );

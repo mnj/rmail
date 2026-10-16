@@ -216,11 +216,17 @@ impl Place {
         }
     }
 
-    /// Whether the user may change the collection and its objects.
+    /// Whether the user may change the collection and its objects. A
+    /// subscription is filled from its feed only.
     pub fn writable(&self) -> bool {
-        self.share
-            .as_ref()
-            .is_none_or(|share| share.grant.access == Access::ReadWrite)
+        !self
+            .collection
+            .name
+            .starts_with(rmail_common::dav::subscription::NAME_PREFIX)
+            && self
+                .share
+                .as_ref()
+                .is_none_or(|share| share.grant.access == Access::ReadWrite)
     }
 
     /// The account whose collection it is. Scheduling acts as this
@@ -759,6 +765,7 @@ fn delete(dav: &Dav, target: Target, headers: &HeaderMap) -> anyhow::Result<Resp
         }
         Target::Collection(Place { collection, .. }) => {
             store::delete_collection(&dav.conn, &collection)?;
+            rmail_common::dav::subscription::forget(&dav.conn, collection.id)?;
             share::forget_collection(&dav.app.db_path, &dav.user.address, collection.id)?;
             Ok(status(StatusCode::NO_CONTENT))
         }
@@ -782,6 +789,10 @@ fn make_collection(
         Target::Collection(_) => return Ok(status(StatusCode::METHOD_NOT_ALLOWED)),
         _ => return Ok(status(StatusCode::FORBIDDEN)),
     };
+    // Subscription calendars are made from webmail, from a feed.
+    if name.starts_with(rmail_common::dav::subscription::NAME_PREFIX) {
+        return Ok(status(StatusCode::FORBIDDEN));
+    }
     let Ok(document) = xml::parse(body) else {
         return Ok(status(StatusCode::BAD_REQUEST));
     };

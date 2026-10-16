@@ -831,6 +831,16 @@ respected.
   other Tuesday, say), guests' answers, alarms and other properties are kept unless changed.
   Events the user is invited to show their answer and are answered from the invitation in mail;
   saves check the version the user saw.
+- **Calendar subscriptions**: **Subscribe…** in the calendar adds a read-only calendar filled from
+  a webcal or https iCalendar feed (public holidays, a team's published calendar). Webmail fetches
+  it when subscribing, every six hours after (a background task checks every 30 minutes), and on
+  **Refresh**. It is an ordinary calendar in the account's store, so CalDAV clients show it too,
+  but neither they nor webmail can change it. Because the address comes from the user, the
+  server only fetches from the public internet: every address the name resolves to must be
+  public (no loopback, private, link-local, CGNAT, multicast or reserved ranges), it connects to
+  the address it checked, and each redirect (at most three) is checked again. Feeds are capped
+  at 5 MB, 20 seconds and 5,000 events, with 20 subscriptions per account. A failed refresh keeps
+  the last events and shows a warning next to the calendar.
 - **Contacts** in webmail's sidebar lists the user's address books and those shared with them,
   with search, and adds, edits and deletes contacts in the same store CardDAV clients sync, so
   changes reach phones and the other way round. Webmail edits the name, email addresses, phone

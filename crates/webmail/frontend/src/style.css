@@ -610,3 +610,6 @@ time { white-space: nowrap; }
 .app-password-list span { display: grid; min-width: 0; }
 .app-password-list small { color: var(--muted); font-size: 12px; }
 .required-notice { color: var(--warn-text); background: var(--warn-bg); border-radius: 8px; padding: 8px 12px; }
+.calendar-filter label { display: inline-flex; align-items: center; gap: 6px; }
+.icon.tiny { width: 22px; height: 22px; padding: 0; }
+.feed-error { color: var(--danger-text); display: inline-flex; }

@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
         cfg.global.tls.clone(),
         "webmail",
     );
+    api::spawn_background(state.clone());
     let app = api::router(state);
     let listener_config = cfg.global.tcp_listener.clone();
     let mut listeners = JoinSet::new();
