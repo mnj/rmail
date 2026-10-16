@@ -127,6 +127,19 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             PRIMARY KEY (uidvalidity, uid, label)
         );
+        CREATE TABLE IF NOT EXISTS label_requests(
+            custom_id TEXT PRIMARY KEY,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            hints TEXT NOT NULL,
+            may_propose INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            body TEXT NOT NULL,
+            batch_id TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS label_requests_batch ON label_requests(batch_id);
         ",
     )?;
     // Added after the first release: stores opted in before them start with
@@ -620,6 +633,97 @@ pub fn label_counts(conn: &Connection) -> Result<BTreeMap<String, u64>> {
 
 // ---------------------------------------------------------------------------
 // Watermarks
+
+/// A labeling question waiting for a provider's batch API: queued, then
+/// submitted (`batch_id`), then answered and removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelRequest {
+    pub custom_id: String,
+    pub uidvalidity: u64,
+    pub uid: u64,
+    /// The labels offered, as JSON (`[{"name", "description"}]`), so the
+    /// answer is read against the question that was asked.
+    pub hints: String,
+    pub may_propose: bool,
+    /// Which provider and model the request is for; others are dropped.
+    pub provider: String,
+    /// The request; kept until answered, so it can be sent again.
+    pub body: String,
+    pub batch_id: Option<String>,
+    pub attempts: u32,
+    pub created_at: i64,
+}
+
+pub fn queue_label_request(conn: &Connection, request: &LabelRequest) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO label_requests
+         (custom_id, uidvalidity, uid, hints, may_propose, provider, body, batch_id, attempts, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            request.custom_id,
+            request.uidvalidity as i64,
+            request.uid as i64,
+            request.hints,
+            request.may_propose,
+            request.provider,
+            request.body,
+            request.batch_id,
+            request.attempts,
+            request.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn label_requests(conn: &Connection) -> Result<Vec<LabelRequest>> {
+    let mut stmt = conn.prepare(
+        "SELECT custom_id, uidvalidity, uid, hints, may_propose, provider, body, batch_id, attempts, created_at
+         FROM label_requests ORDER BY created_at, uid",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(LabelRequest {
+            custom_id: row.get(0)?,
+            uidvalidity: row.get::<_, i64>(1)? as u64,
+            uid: row.get::<_, i64>(2)? as u64,
+            hints: row.get(3)?,
+            may_propose: row.get(4)?,
+            provider: row.get(5)?,
+            body: row.get(6)?,
+            batch_id: row.get(7)?,
+            attempts: row.get(8)?,
+            created_at: row.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Mark requests as sent in `batch`.
+pub fn mark_label_requests(conn: &Connection, ids: &[String], batch: &str) -> Result<()> {
+    for id in ids {
+        conn.execute(
+            "UPDATE label_requests SET batch_id = ?2, attempts = attempts + 1 WHERE custom_id = ?1",
+            params![id, batch],
+        )?;
+    }
+    Ok(())
+}
+
+/// Return a request to the queue (its batch ended without an answer).
+pub fn requeue_label_request(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE label_requests SET batch_id = NULL WHERE custom_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+pub fn remove_label_request(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM label_requests WHERE custom_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watermark {

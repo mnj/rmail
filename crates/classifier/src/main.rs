@@ -23,6 +23,7 @@ macro_rules! classifier_log {
     };
 }
 
+mod batch;
 mod cloud;
 mod control;
 mod engine;

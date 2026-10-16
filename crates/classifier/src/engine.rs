@@ -154,6 +154,7 @@ fn chat_spec(cfg: &ClassifierConfig) -> Option<Spec> {
                 "anthropic",
                 &cfg.anthropic_chat_model,
                 secret(&cfg.anthropic_api_key),
+                &format!("{:?}", cfg.background_tier),
             ]),
         }),
         ChatProvider::Jev => Some(Spec {
@@ -172,6 +173,10 @@ pub struct Models {
     /// The chat model for the background worker, when it runs at a cheaper
     /// tier than calls users wait for (see `background_tier`).
     pub background: Option<Arc<dyn Chooser>>,
+    /// The provider's batch API, for labels, when `background_tier` is
+    /// `batch`; with the provider and model it answers for, so requests
+    /// queued for another are dropped.
+    pub batcher: Option<(String, Arc<dyn crate::cloud::Batcher>)>,
     pub embed_info: Option<LoadedModel>,
     pub chat_info: Option<LoadedModel>,
     /// Load failures, shown on the admin console.
@@ -220,6 +225,12 @@ impl Models {
                 models.background = match reuse(&previous.chat_info, &previous.background, &spec) {
                     Some((_, background)) => Some(background),
                     None => load_background(cfg),
+                };
+                models.batcher = match (&previous.chat_info, &previous.batcher) {
+                    (Some(info), Some(batcher)) if info.fingerprint == spec.fingerprint => {
+                        Some(batcher.clone())
+                    }
+                    _ => load_batcher(cfg).map(|batcher| (spec.label.clone(), batcher)),
                 };
             }
         }
@@ -301,6 +312,31 @@ fn load_background(cfg: &ClassifierConfig) -> Option<Arc<dyn Chooser>> {
     )
     .ok()
     .map(|chooser| Arc::new(chooser.flex()) as Arc<dyn Chooser>)
+}
+
+/// The batch API of the chat provider, when the admin chose it for
+/// background labels and the provider has one.
+fn load_batcher(cfg: &ClassifierConfig) -> Option<Arc<dyn crate::cloud::Batcher>> {
+    if cfg.background_tier != BackgroundTier::Batch {
+        return None;
+    }
+    match cfg.chat_provider {
+        ChatProvider::OpenAi => crate::cloud::OpenAiBatcher::load(
+            crate::cloud::OPENAI_API,
+            secret(&cfg.openai_api_key),
+            &cfg.openai_chat_model,
+        )
+        .ok()
+        .map(|batcher| Arc::new(batcher) as Arc<dyn crate::cloud::Batcher>),
+        ChatProvider::Anthropic => crate::cloud::AnthropicBatcher::load(
+            crate::cloud::ANTHROPIC_API,
+            secret(&cfg.anthropic_api_key),
+            &cfg.anthropic_chat_model,
+        )
+        .ok()
+        .map(|batcher| Arc::new(batcher) as Arc<dyn crate::cloud::Batcher>),
+        _ => None,
+    }
 }
 
 fn load_chooser(cfg: &ClassifierConfig, models_dir: &Path) -> Result<Arc<dyn Chooser>> {

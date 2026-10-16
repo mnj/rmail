@@ -1144,9 +1144,9 @@ pub const SETTINGS: &[SettingSpec] = &[
         "classifier.background_tier",
         "classifier",
         "Background tier",
-        "flex sends the background worker's OpenAI calls at the flex tier: about half price but slower, and retried (then sent at the standard tier) when OpenAI has no capacity. Calls users wait for in webmail always use the standard tier. Other providers ignore it.",
+        "flex sends the background worker's OpenAI calls at the flex tier: about half price but slower, and retried (then sent at the standard tier) when OpenAI has no capacity. batch labels new mail through the OpenAI or Anthropic batch API at half price; labels then arrive within minutes to hours. Calls users wait for in webmail always use the standard tier.",
         SettingKind::Choice {
-            options: &["standard", "flex"],
+            options: &["standard", "flex", "batch"],
         },
         CLASSIFIER,
     ),

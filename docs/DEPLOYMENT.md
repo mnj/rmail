@@ -903,6 +903,17 @@ Organization page (or the `classifier.*` settings):
 - **Anthropic** (`classifier.anthropic_api_key`, `classifier.anthropic_chat_model`, default
   `claude-haiku-5-5`) uses the Messages API with the same JSON schemas (`output_config.format`)
   and a low effort. Anthropic has no embeddings; pair it with a local or OpenAI embedder.
+- **Batch labels** (`classifier.background_tier` = `batch`, with the `openai` or `anthropic` chat
+  provider) send labeling questions for new mail through the provider's batch API (OpenAI Batch,
+  Anthropic Message Batches) at half price. Each question waits in the account's own
+  `classifier.sqlite`, so message text only leaves the account's directory for the provider. The
+  worker sends the waiting questions of all accounts as one batch once 100 have gathered or the
+  oldest has waited 15 minutes, asks about running batches once a minute, and applies the answers
+  as it would a direct answer. Labels therefore appear minutes to hours after delivery; a message
+  filed out of INBOX by then (by the user or by auto-move) is not labeled. Questions a batch ends
+  without answering are sent again, up to three times. Questions of users who withdraw consent or
+  turn labels off, or that were asked of another provider or model, are dropped. Folder decisions
+  for uncertain mail stay immediate, since a late suggestion is no use.
 - **Jev** (`classifier.typesafe_api_key`, `classifier.jev_model`) is TypeSafe's decision model. It
   gets one choice question whose options are the user's folders (described by example subjects) plus
   "none", and returns the chosen option with a confidence instead of generated text.
