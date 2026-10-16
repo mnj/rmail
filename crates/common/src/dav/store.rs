@@ -78,6 +78,26 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     if !has_schedule_tag {
         conn.execute_batch("ALTER TABLE dav_objects ADD COLUMN schedule_tag TEXT")?;
     }
+    // Databases from before server-filled collections lack the marker;
+    // the subscriptions they hold were made by the server.
+    let has_managed = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dav_collections') WHERE name = 'managed'")?
+        .exists([])?;
+    if !has_managed {
+        conn.execute_batch(
+            "ALTER TABLE dav_collections ADD COLUMN managed INTEGER NOT NULL DEFAULT 0",
+        )?;
+        let has_subscriptions = conn
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dav_subscriptions'",
+            )?
+            .exists([])?;
+        if has_subscriptions {
+            conn.execute_batch(
+                "UPDATE dav_collections SET managed = 1 WHERE id IN (SELECT collection_id FROM dav_subscriptions)",
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -98,6 +118,9 @@ pub struct Collection {
     pub min_seq: i64,
     /// The schedule inbox (RFC 6638 2.2), not a calendar of the user's.
     pub inbox: bool,
+    /// Filled by the server (a calendar subscription or the directory), so
+    /// neither CalDAV/CardDAV clients nor webmail may change it.
+    pub managed: bool,
 }
 
 impl Collection {
@@ -154,6 +177,7 @@ fn row_to_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<Collection> {
         sync_seq: row.get(9)?,
         min_seq: row.get(10)?,
         inbox: kind == INBOX_KIND,
+        managed: row.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -163,7 +187,7 @@ const INBOX_KIND: &str = "schedule-inbox";
 /// The most scheduling messages kept in the inbox; older ones go first.
 const MAX_INBOX: i64 = 500;
 
-const COLLECTION_COLUMNS: &str = "id, kind, name, displayname, description, color, sort_order, timezone, components, sync_seq, min_seq";
+const COLLECTION_COLUMNS: &str = "id, kind, name, displayname, description, color, sort_order, timezone, components, sync_seq, min_seq, managed";
 
 /// The account's collections of `kind`, creating a default one the first
 /// time the account has none.
@@ -336,18 +360,20 @@ fn random_token() -> String {
         .collect()
 }
 
-/// Whether `name` can be a collection or object URL segment.
 /// The name of the read-only address book that holds the global address
 /// list (`crate::directory`).
 pub const DIRECTORY_NAME: &str = "directory";
 
-/// Whether a collection is filled by the server (a calendar subscription or
-/// the directory), so neither CalDAV/CardDAV clients nor webmail may change
-/// it or create one by that name.
-pub fn server_managed(name: &str) -> bool {
-    name.starts_with(super::subscription::NAME_PREFIX) || name == DIRECTORY_NAME
+/// Whether a new collection by this name is the server's to make (a
+/// calendar subscription, the directory), so clients may not create one.
+pub fn reserved_name(kind: Kind, name: &str) -> bool {
+    match kind {
+        Kind::Calendar => name.starts_with(super::subscription::NAME_PREFIX),
+        Kind::AddressBook => name == DIRECTORY_NAME,
+    }
 }
 
+/// Whether `name` can be a collection or object URL segment.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255
@@ -365,12 +391,34 @@ pub fn create(
     displayname: Option<&str>,
     components: &[&str],
 ) -> Result<Collection> {
+    insert(conn, kind, name, displayname, components, false)
+}
+
+/// Create a collection the server fills ([`Collection::managed`]).
+pub fn create_managed(
+    conn: &Connection,
+    kind: Kind,
+    name: &str,
+    displayname: Option<&str>,
+    components: &[&str],
+) -> Result<Collection> {
+    insert(conn, kind, name, displayname, components, true)
+}
+
+fn insert(
+    conn: &Connection,
+    kind: Kind,
+    name: &str,
+    displayname: Option<&str>,
+    components: &[&str],
+    managed: bool,
+) -> Result<Collection> {
     if !valid_name(name) {
         bail!("invalid collection name");
     }
     conn.execute(
-        "INSERT INTO dav_collections(kind, name, displayname, components) VALUES(?1, ?2, ?3, ?4)",
-        params![kind.as_str(), name, displayname, components.join(",")],
+        "INSERT INTO dav_collections(kind, name, displayname, components, managed) VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![kind.as_str(), name, displayname, components.join(","), managed],
     )?;
     let id = conn.last_insert_rowid();
     Ok(conn.query_row(

@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, ShieldOff, Trash2 } from 'lucide-react';
 import { Account, DavShare, DirectoryPolicy, FolderShare, TwoFactorPolicy, api } from '../api';
-import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
+import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, invalidate, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
 
@@ -324,7 +324,7 @@ export function AccountsPage() {
       <DirectoryPanel />
       <SharingPanel />
       <DavSharingPanel />
-      {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={accounts.reload} />}
+      {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={() => { accounts.reload(); invalidate('directory-policy'); }} />}
     </>
   );
 }

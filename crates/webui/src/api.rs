@@ -973,7 +973,13 @@ async fn set_directory_policy(State(state): State<Shared>, body: Bytes) -> Respo
     outcome(
         blocking(move || {
             rmail_common::directory::set_enabled(Path::new(&db), &input.domain, input.enabled)?;
-            rmail_common::directory::sync_all(Path::new(&db), &root)?;
+            let failed = rmail_common::directory::sync_all(Path::new(&db), &root)?;
+            if !failed.is_empty() {
+                anyhow::bail!(
+                    "saved, but these accounts' directory could not be updated yet (webmail retries every 30 minutes): {}",
+                    failed.join("; ")
+                );
+            }
             Ok(json!({ "result": "ok" }))
         })
         .await,

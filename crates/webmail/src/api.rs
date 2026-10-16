@@ -76,10 +76,15 @@ pub(crate) fn spawn_background(state: Shared) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
             let (db_path, mail_root) = (state.db_path.clone(), state.mail_root.clone());
-            if let Err(error) =
-                blocking(move || rmail_common::directory::sync_all(&db_path, &mail_root)).await
-            {
-                webmail_log!("warn", "directory_sync_failed", { "error": format!("{error:#}") });
+            match blocking(move || rmail_common::directory::sync_all(&db_path, &mail_root)).await {
+                Ok(failed) => {
+                    for account in failed {
+                        webmail_log!("warn", "directory_sync_failed", { "error": account });
+                    }
+                }
+                Err(error) => {
+                    webmail_log!("warn", "directory_sync_failed", { "error": format!("{error:#}") });
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
         }

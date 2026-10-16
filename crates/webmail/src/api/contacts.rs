@@ -531,7 +531,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
             displayname: display(&collection),
             owner: None,
             // The directory is kept by the server.
-            writable: !store::server_managed(&collection.name),
+            writable: !collection.managed,
             conn: open_account(&state.mail_root, &session.address)?,
             collection,
         });
@@ -547,7 +547,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
                 .displayname
                 .clone()
                 .unwrap_or_else(|| display(&collection)),
-            writable: grant.access == Access::ReadWrite,
+            writable: grant.access == Access::ReadWrite && !collection.managed,
             conn: open_account(&state.mail_root, &grant.owner)?,
             owner: Some(grant.owner),
             collection,

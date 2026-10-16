@@ -827,13 +827,15 @@ async fn main() -> Result<()> {
             match action {
                 DirectoryAction::Enable { domain } => {
                     rmail_common::directory::set_enabled(db, &domain, true)?;
-                    rmail_common::directory::sync_all(db, root)?;
+                    let failed = rmail_common::directory::sync_all(db, root)?;
                     println!("{domain} now has a directory");
+                    report_directory_failures(&failed);
                 }
                 DirectoryAction::Disable { domain } => {
                     rmail_common::directory::set_enabled(db, &domain, false)?;
-                    rmail_common::directory::sync_all(db, root)?;
+                    let failed = rmail_common::directory::sync_all(db, root)?;
                     println!("{domain} no longer has a directory");
+                    report_directory_failures(&failed);
                 }
                 DirectoryAction::List => {
                     for domain in rmail_common::directory::enabled_domains(db)? {
@@ -869,6 +871,17 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Accounts whose directory book a sync could not update; webmail's
+/// background sync tries them again.
+fn report_directory_failures(failed: &[String]) {
+    for account in failed {
+        eprintln!("warning: directory not updated for {account}");
+    }
+    if !failed.is_empty() {
+        eprintln!("webmail retries these every 30 minutes");
+    }
 }
 
 fn run_share(

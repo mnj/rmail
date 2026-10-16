@@ -186,9 +186,16 @@ fn resource_name(address: &str) -> String {
 
 /// Bring one account's directory book in step with `entries` (or remove
 /// it with `None`, when its domain does not share one). Unchanged cards
-/// are left alone.
+/// are left alone, and so is an address book of the user's own that has
+/// the name.
 pub fn sync(conn: &Connection, entries: Option<&[Entry]>) -> Result<(usize, usize)> {
     let existing = store::collection(conn, Kind::AddressBook, DIRECTORY_NAME)?;
+    if existing
+        .as_ref()
+        .is_some_and(|collection| !collection.managed)
+    {
+        return Ok((0, 0));
+    }
     let Some(entries) = entries else {
         if let Some(collection) = existing {
             store::delete_collection(conn, &collection)?;
@@ -197,7 +204,7 @@ pub fn sync(conn: &Connection, entries: Option<&[Entry]>) -> Result<(usize, usiz
     };
     let collection = match existing {
         Some(collection) => collection,
-        None => store::create(
+        None => store::create_managed(
             conn,
             Kind::AddressBook,
             DIRECTORY_NAME,
@@ -237,23 +244,26 @@ pub fn sync(conn: &Connection, entries: Option<&[Entry]>) -> Result<(usize, usiz
 }
 
 /// Sync every account's directory book: the domain's entries where it is
-/// on, none where it is off.
-pub fn sync_all(db: &Path, mail_root: &Path) -> Result<()> {
+/// on, none where it is off. Returns the accounts that could not be synced
+/// (with why), which keep their book as it was.
+pub fn sync_all(db: &Path, mail_root: &Path) -> Result<Vec<String>> {
     let enabled = enabled_domains(db)?;
     let mut by_domain: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
     for domain in &enabled {
         by_domain.insert(domain.clone(), entries(db, mail_root, domain)?);
     }
+    let mut failed = Vec::new();
     for (domain, localpart, _) in crate::imap_state::list_accounts(mail_root)? {
-        let Ok(conn) = crate::jmap::store::open(mail_root, &domain, &localpart) else {
-            continue;
-        };
         let entries = by_domain
             .get(&domain.to_ascii_lowercase())
             .map(Vec::as_slice);
-        sync(&conn, entries)?;
+        let synced = crate::jmap::store::open(mail_root, &domain, &localpart)
+            .and_then(|conn| sync(&conn, entries));
+        if let Err(error) = synced {
+            failed.push(format!("{localpart}@{domain}: {error:#}"));
+        }
     }
-    Ok(())
+    Ok(failed)
 }
 
 #[cfg(test)]
@@ -353,11 +363,31 @@ mod tests {
             (0, 0)
         );
         set_enabled(&db, "example.test", false).unwrap();
-        sync_all(&db, &root).unwrap();
+        assert!(sync_all(&db, &root).unwrap().is_empty());
         assert!(
             store::collection(&ann, Kind::AddressBook, DIRECTORY_NAME)
                 .unwrap()
                 .is_none()
         );
+
+        // An address book of the user's own by that name stays theirs.
+        let own = store::create(&ann, Kind::AddressBook, DIRECTORY_NAME, None, &[]).unwrap();
+        store::put(
+            &ann,
+            &own,
+            "mine.vcf",
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:mine\r\nFN:Mine\r\nEND:VCARD\r\n",
+            &|_| true,
+        )
+        .unwrap()
+        .unwrap();
+        sync_all(&db, &root).unwrap();
+        set_enabled(&db, "example.test", true).unwrap();
+        sync_all(&db, &root).unwrap();
+        let kept = store::collection(&ann, Kind::AddressBook, DIRECTORY_NAME)
+            .unwrap()
+            .unwrap();
+        assert!(!kept.managed);
+        assert_eq!(store::objects(&ann, &kept).unwrap().len(), 1);
     }
 }
