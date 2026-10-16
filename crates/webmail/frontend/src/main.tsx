@@ -70,7 +70,7 @@ function ThemeSwitch() {
 // ---------------------------------------------------------------------------
 // Small pieces
 
-function useApi(onUnauthorized: () => void): Api {
+function useApi(onUnauthorized: () => void, onSetupRequired?: () => void): Api {
   return useCallback(async <T,>(url: string, options?: RequestInit): Promise<T> => {
     // X-Rmail-Webmail marks the request as same-origin (CSRF protection).
     const res = await fetch(url, { ...options, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Rmail-Webmail': '1', ...(options?.headers || {}) } });
@@ -83,13 +83,15 @@ function useApi(onUnauthorized: () => void): Api {
         const parsed = JSON.parse(text);
         if (parsed && typeof parsed.error === 'string') message = parsed.error;
         else if (parsed && parsed.two_factor === true) message = 'two_factor';
+        // The domain started requiring 2FA while the app was open.
+        if (res.status === 403 && parsed && parsed.two_factor_setup === true) onSetupRequired?.();
       } catch { /* plain text */ }
       throw new ApiError(message, res.status);
     }
     if (res.status === 204 || res.status === 201) return undefined as T;
     const type = res.headers.get('content-type') || '';
     return (type.includes('json') ? res.json() : res.text()) as Promise<T>;
-  }, [onUnauthorized]) as Api;
+  }, [onUnauthorized, onSetupRequired]) as Api;
 }
 
 function IconButton({ label, onClick, children, disabled, active, className }: { label: string; onClick: () => void; children: React.ReactNode; disabled?: boolean; active?: boolean; className?: string }) {
@@ -968,7 +970,7 @@ function App() {
   const [needCode, setNeedCode] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const api = useApi(useCallback(() => setAddress(null), []));
+  const api = useApi(useCallback(() => setAddress(null), []), useCallback(() => setSetupRequired(true), []));
 
   useEffect(() => {
     api<{ address: string; can_send: boolean; two_factor_setup: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setSetupRequired(s.two_factor_setup); setAddress(s.address); }).catch(() => setAddress(null));

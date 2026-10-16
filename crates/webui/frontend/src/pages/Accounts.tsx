@@ -109,8 +109,15 @@ const davKind: Record<DavShare['kind'], string> = { calendar: 'Calendar', addres
 function TwoFactorPanel() {
   const { run } = useFeedback();
   const policy = useResource(() => api<TwoFactorPolicy>('/api/two-factor-policy'), [], undefined, 'two-factor-policy');
+  // Domains with a change on its way; their switch waits for it.
+  const [pending, setPending] = useState<string[]>([]);
   async function toggle(domain: string, required: boolean) {
-    if (await run(() => api('/api/two-factor-policy', 'PUT', { domain, required }), required ? `${domain} now requires two-factor sign-in` : `${domain} no longer requires two-factor sign-in`)) policy.reload();
+    setPending((list) => [...list, domain]);
+    try {
+      if (await run(() => api('/api/two-factor-policy', 'PUT', { domain, required }), required ? `${domain} now requires two-factor sign-in` : `${domain} no longer requires two-factor sign-in`)) await policy.reload();
+    } finally {
+      setPending((list) => list.filter((d) => d !== domain));
+    }
   }
   return (
     <Panel title="Two-factor sign-in" subtitle="Users set it up under Security in webmail. Where a domain requires it, users without it must set it up at their next webmail sign-in; their mail apps keep working until they do, then need app passwords.">
@@ -123,7 +130,7 @@ function TwoFactorPanel() {
               {policy.data.domains.map(({ domain, required }) => (
                 <tr key={domain}>
                   <td><strong>{domain}</strong></td>
-                  <td><label className="checkLabel"><input type="checkbox" checked={required} onChange={(event) => toggle(domain, event.target.checked)} /> Required</label></td>
+                  <td><label className="checkLabel"><input type="checkbox" checked={required} disabled={pending.includes(domain)} onChange={(event) => toggle(domain, event.target.checked)} /> Required</label></td>
                 </tr>
               ))}
             </tbody>
