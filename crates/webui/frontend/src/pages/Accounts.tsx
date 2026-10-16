@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
-import { Dices, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
-import { Account, DavShare, FolderShare, api } from '../api';
+import { Dices, KeyRound, Pencil, Plus, Search, ShieldOff, Trash2 } from 'lucide-react';
+import { Account, DavShare, FolderShare, TwoFactorPolicy, api } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
@@ -106,6 +106,35 @@ function SharingPanel() {
 
 const davKind: Record<DavShare['kind'], string> = { calendar: 'Calendar', addressbook: 'Address book' };
 
+function TwoFactorPanel() {
+  const { run } = useFeedback();
+  const policy = useResource(() => api<TwoFactorPolicy>('/api/two-factor-policy'), [], undefined, 'two-factor-policy');
+  async function toggle(domain: string, required: boolean) {
+    if (await run(() => api('/api/two-factor-policy', 'PUT', { domain, required }), required ? `${domain} now requires two-factor sign-in` : `${domain} no longer requires two-factor sign-in`)) policy.reload();
+  }
+  return (
+    <Panel title="Two-factor sign-in" subtitle="Users set it up under Security in webmail. Where a domain requires it, users without it must set it up at their next webmail sign-in; their mail apps keep working until they do, then need app passwords.">
+      <ErrorBanner error={policy.error} />
+      {policy.data && policy.data.domains.length > 0 && (
+        <div className="tableScroll">
+          <table>
+            <thead><tr><th>Domain</th><th>Two-factor sign-in</th></tr></thead>
+            <tbody>
+              {policy.data.domains.map(({ domain, required }) => (
+                <tr key={domain}>
+                  <td><strong>{domain}</strong></td>
+                  <td><label className="checkLabel"><input type="checkbox" checked={required} onChange={(event) => toggle(domain, event.target.checked)} /> Required</label></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {policy.data && policy.data.domains.length === 0 && <Empty>No domains yet.</Empty>}
+    </Panel>
+  );
+}
+
 function DavSharingPanel() {
   const { run, confirm } = useFeedback();
   const shares = useResource(() => api<DavShare[]>('/api/dav-sharing'), [], undefined, 'dav-sharing');
@@ -159,6 +188,16 @@ export function AccountsPage() {
     return account[key];
   });
 
+  async function resetTwoFactor(account: Account) {
+    const ok = await confirm({
+      title: `Turn off two-factor sign-in for ${account.address}?`,
+      message: <>For a user who lost their phone and recovery codes. They sign in to webmail with their password alone and can set it up again; their app passwords stay. If their domain requires it, they are asked to set it up at the next sign-in.</>,
+      confirmLabel: 'Turn off',
+      danger: true,
+    });
+    if (ok && await run(() => api('/api/accounts/two-factor-reset', 'POST', { address: account.address }), `Two-factor sign-in turned off for ${account.address}`)) accounts.reload();
+  }
+
   async function remove(account: Account) {
     const ok = await confirm({
       title: `Delete ${account.address}?`,
@@ -200,7 +239,11 @@ export function AccountsPage() {
               return (
                 <tr key={account.address}>
                   <td><strong>{account.address}</strong><small>{account.unseen ? `${account.unseen} unread` : 'No unread mail'}</small></td>
-                  <td><span className={`pill ${account.auth === 'Unset' ? 'warn' : ''}`}>{account.auth === 'Unset' ? 'No password' : account.auth}</span></td>
+                  <td>
+                    <span className={`pill ${account.auth === 'Unset' ? 'warn' : ''}`}>{account.auth === 'Unset' ? 'No password' : account.auth}</span>
+                    {account.two_factor && <span className="pill ok" title="Two-factor sign-in is on; mail apps use app passwords">2FA</span>}
+                    {account.app_passwords > 0 && <small>{account.app_passwords} app password{account.app_passwords === 1 ? '' : 's'}</small>}
+                  </td>
                   <td className="usage num">
                     <span>{formatBytes(account.used_bytes)} / {account.quota_bytes == null ? 'unlimited' : formatBytes(account.quota_bytes)}</span>
                     {percent !== null && <div className={`usageBar ${level}`} style={{ marginLeft: 'auto' }} title={`${percent}% of quota`}><i style={{ width: `${Math.min(100, percent)}%` }} /></div>}
@@ -210,6 +253,7 @@ export function AccountsPage() {
                   <td className="num">{account.messages}</td>
                   <td className="rowActions">
                     <IconButton label={account.auth === 'Unset' ? `Set a password for ${account.address}` : `Edit ${account.address}`} onClick={() => setEditing({ mode: 'edit', account })}>{account.auth === 'Unset' ? <KeyRound size={15} /> : <Pencil size={15} />}</IconButton>
+                    {account.two_factor && <IconButton label={`Turn off two-factor sign-in for ${account.address}`} onClick={() => resetTwoFactor(account)}><ShieldOff size={15} /></IconButton>}
                     <IconButton danger label={`Delete ${account.address}`} onClick={() => remove(account)}><Trash2 size={15} /></IconButton>
                   </td>
                 </tr>
@@ -220,6 +264,7 @@ export function AccountsPage() {
         </div>
         {accounts.data !== null && rows.length === 0 && <Empty>{filter ? 'No mailboxes match the filter.' : 'No mailboxes yet. Create the first one to start receiving mail.'}</Empty>}
       </Panel>
+      <TwoFactorPanel />
       <SharingPanel />
       <DavSharingPanel />
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={accounts.reload} />}

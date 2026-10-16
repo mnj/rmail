@@ -960,6 +960,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
 
 function App() {
   const [address, setAddress] = useState<string | null | undefined>(undefined);
+  const [setupRequired, setSetupRequired] = useState(false);
   const [canSend, setCanSend] = useState(false);
   const [loginAddress, setLoginAddress] = useState('');
   const [password, setPassword] = useState('');
@@ -970,7 +971,7 @@ function App() {
   const api = useApi(useCallback(() => setAddress(null), []));
 
   useEffect(() => {
-    api<{ address: string; can_send: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setAddress(s.address); }).catch(() => setAddress(null));
+    api<{ address: string; can_send: boolean; two_factor_setup: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setSetupRequired(s.two_factor_setup); setAddress(s.address); }).catch(() => setAddress(null));
   }, [api]);
 
   async function login(event: React.FormEvent) {
@@ -978,11 +979,12 @@ function App() {
     setError('');
     setBusy(true);
     try {
-      const session = await api<{ address: string; can_send: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password, ...(needCode ? { code } : {}) }) });
+      const session = await api<{ address: string; can_send: boolean; two_factor_setup: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password, ...(needCode ? { code } : {}) }) });
       setPassword('');
       setCode('');
       setNeedCode(false);
       setCanSend(session.can_send);
+      setSetupRequired(session.two_factor_setup);
       setAddress(session.address);
     } catch (err) {
       if (err instanceof ApiError && err.message === 'two_factor') {
@@ -1022,6 +1024,10 @@ function App() {
         </form>
       </main>
     );
+  }
+  if (setupRequired) {
+    const recheck = () => api<{ two_factor_setup: boolean }>('/api/session').then((s) => setSetupRequired(s.two_factor_setup)).catch(() => undefined);
+    return <main className="login-shell"><SecurityDialog api={api} address={address} required onClose={logout} onChanged={recheck} /></main>;
   }
   return <Mailbox api={api} address={address} canSend={canSend} onLogout={logout} />;
 }

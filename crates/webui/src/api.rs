@@ -109,6 +109,11 @@ pub(crate) fn router(state: Shared) -> Router {
                 .patch(update_account)
                 .delete(delete_account),
         )
+        .route("/api/accounts/two-factor-reset", post(reset_two_factor))
+        .route(
+            "/api/two-factor-policy",
+            get(two_factor_policy).put(set_two_factor_policy),
+        )
         .route("/api/sharing", get(sharing).delete(delete_sharing))
         .route(
             "/api/dav-sharing",
@@ -850,6 +855,82 @@ async fn delete_account(State(state): State<Shared>, body: Bytes) -> Response {
     };
     outcome(
         blocking(move || delete_account_sync(&db, input).map(|_| json!({"result": "ok"}))).await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct AddressOnly {
+    address: String,
+}
+
+/// Turn off a user's two-factor sign-in (a lost phone and no recovery
+/// codes); their app passwords stay.
+async fn reset_two_factor(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: AddressOnly = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            let removed = rmail_common::two_factor::disable(Path::new(&db), &input.address)?;
+            Ok(json!({ "result": if removed { "reset" } else { "not_enabled" } }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Each local domain and whether it requires two-factor sign-in.
+async fn two_factor_policy(State(state): State<Shared>) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            let required = rmail_common::two_factor::required_domains(Path::new(&db))?;
+            let mut domains = rmail_common::db::local_domains(&db)?;
+            domains.extend(required.iter().cloned());
+            domains.sort();
+            domains.dedup();
+            Ok(json!({
+                "domains": domains
+                    .into_iter()
+                    .map(|domain| json!({ "domain": domain, "required": required.contains(&domain) }))
+                    .collect::<Vec<_>>(),
+            }))
+        })
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct PolicyChange {
+    domain: String,
+    required: bool,
+}
+
+async fn set_two_factor_policy(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: PolicyChange = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            rmail_common::two_factor::set_required(Path::new(&db), &input.domain, input.required)
+                .map(|_| json!({ "result": "ok" }))
+        })
+        .await,
         StatusCode::BAD_REQUEST,
     )
 }

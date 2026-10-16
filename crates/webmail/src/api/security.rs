@@ -549,3 +549,91 @@ mod lockout_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod policy_tests {
+    use super::super::tests::{req, route, state};
+    use super::super::{SESSION_COOKIE, sign_session};
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn a_domain_policy_asks_for_setup_before_anything_else() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        rmail_common::imap_state::init_account(&state.mail_root, "example.test", "user").unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call =
+            |method: &'static str, path: &'static str, body: Value, cookie: Option<String>| {
+                let state = state.clone();
+                async move {
+                    let body = if body.is_null() {
+                        Vec::new()
+                    } else {
+                        body.to_string().into_bytes()
+                    };
+                    let response = route(req(method, path, &body, cookie), &state).await;
+                    let set_cookie = response.header("Set-Cookie").to_string();
+                    (
+                        response.status,
+                        serde_json::from_slice::<Value>(&response.body).unwrap_or_default(),
+                        set_cookie,
+                    )
+                }
+            };
+        assert_eq!(
+            call("GET", "/api/folders", Value::Null, cookie.clone())
+                .await
+                .0,
+            200
+        );
+        rmail_common::two_factor::set_required(&state.db_path, "example.test", true).unwrap();
+        let (status, refused, _) = call("GET", "/api/folders", Value::Null, cookie.clone()).await;
+        assert_eq!(
+            (status, refused["two_factor_setup"].clone()),
+            (403, json!(true))
+        );
+        let (_, session, _) = call("GET", "/api/session", Value::Null, cookie.clone()).await;
+        assert_eq!(session["two_factor_setup"], true);
+        assert_eq!(
+            call("GET", "/api/security", Value::Null, cookie.clone())
+                .await
+                .0,
+            200
+        );
+
+        let (_, started, _) = call(
+            "POST",
+            "/api/security/totp/start",
+            json!({"password": "secret"}),
+            cookie.clone(),
+        )
+        .await;
+        let key =
+            rmail_common::two_factor::base32_decode(started["secret"].as_str().unwrap()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let code = format!("{:06}", rmail_common::two_factor::code_at(&key, now / 30));
+        let (status, _, renewed) = call(
+            "POST",
+            "/api/security/totp/confirm",
+            json!({"code": code}),
+            cookie,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let fresh = Some(renewed.split(';').next().unwrap().to_string());
+        assert_eq!(
+            call("GET", "/api/folders", Value::Null, fresh.clone())
+                .await
+                .0,
+            200
+        );
+        let (_, session, _) = call("GET", "/api/session", Value::Null, fresh).await;
+        assert_eq!(session["two_factor_setup"], false);
+    }
+}

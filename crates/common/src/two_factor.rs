@@ -61,6 +61,9 @@ pub(crate) const SCHEMA: &str = "
         locked_until INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (account, kind)
     );
+    CREATE TABLE IF NOT EXISTS two_factor_required (
+        domain TEXT PRIMARY KEY
+    );
 ";
 
 /// Failed checks in a row before a check is locked for an account...
@@ -583,6 +586,62 @@ pub fn protocol_password(db: &Path, account: &str, password: &str) -> Result<Pro
     )
 }
 
+// ---------------------------------------------------------------------------
+// Domain policy
+
+/// Require (or stop requiring) 2FA for every account in `domain`. Users
+/// without it are asked to set it up in webmail before anything else; their
+/// mail apps keep working until they do.
+pub fn set_required(db: &Path, domain: &str, required: bool) -> Result<()> {
+    let domain = crate::domain::canonicalize_domain(domain.trim())?;
+    let conn = open(db)?;
+    if required {
+        conn.execute(
+            "INSERT OR IGNORE INTO two_factor_required (domain) VALUES (?1)",
+            params![domain],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM two_factor_required WHERE domain = ?1",
+            params![domain],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn required_domains(db: &Path) -> Result<Vec<String>> {
+    let conn = open(db)?;
+    let mut stmt = conn.prepare("SELECT domain FROM two_factor_required ORDER BY domain")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Whether `account` must set up 2FA before using webmail: its domain
+/// requires it and it is not on yet.
+pub fn setup_required(db: &Path, account: &str) -> Result<bool> {
+    let account = account_key(account)?;
+    let Some((_, domain)) = account.rsplit_once('@') else {
+        return Ok(false);
+    };
+    let conn = open(db)?;
+    let required: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM two_factor_required WHERE domain = ?1)",
+        params![domain],
+        |row| row.get(0),
+    )?;
+    Ok(required && enabled_secret(&conn, &account)?.is_none())
+}
+
+/// App passwords per account, for the admin console.
+pub fn app_password_counts(db: &Path) -> Result<std::collections::HashMap<String, usize>> {
+    let conn = open(db)?;
+    let mut stmt = conn.prepare("SELECT account, COUNT(*) FROM app_passwords GROUP BY account")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +745,19 @@ mod tests {
             .execute("UPDATE sign_in_failures SET locked_until = 0", [])
             .unwrap();
         assert!(verify(&db, me, &good).unwrap());
+        // A domain policy asks the unenrolled to set it up.
+        assert!(!setup_required(&db, me).unwrap(), "2FA is on");
+        set_required(&db, "Example.TEST", true).unwrap();
+        assert_eq!(required_domains(&db).unwrap(), ["example.test"]);
+        assert!(!setup_required(&db, me).unwrap());
+        assert!(setup_required(&db, "new@example.test").unwrap());
+        assert!(!setup_required(&db, "new@other.test").unwrap());
+        assert_eq!(
+            app_password_counts(&db).unwrap().get("user@example.test"),
+            None
+        );
+        set_required(&db, "example.test", false).unwrap();
+        assert!(!setup_required(&db, "new@example.test").unwrap());
 
         assert!(disable(&db, me).unwrap());
         assert_eq!(

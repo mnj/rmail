@@ -646,6 +646,14 @@ Users manage both under **Security** in webmail.
 - Turning 2FA on or off, making an app password or new recovery codes all ask for the password
   again; turning 2FA off or new recovery codes also take a code. Turning 2FA on or off signs out
   the user's other webmail sessions.
+- Administrators can **require 2FA per domain** (the **Two-factor sign-in** panel on the Mailboxes
+  page, or `rmail_ctl two-factor require <domain>` / `allow <domain>`). A user without it is
+  then shown the setup instead of their mail at the next webmail sign-in, and webmail's API
+  refuses everything else until it is on. Their mail apps keep working with the password until
+  then, so devices are not locked out before the user can make app passwords.
+- A user who lost both their phone and recovery codes gets **2FA turned off** by an administrator:
+  the shield button on the Mailboxes page, or `rmail_ctl two-factor reset <address>` (their app
+  passwords stay). `rmail_ctl two-factor status <address>` shows the state and app passwords.
 
 ### Sending
 
