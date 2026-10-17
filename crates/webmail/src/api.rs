@@ -163,7 +163,8 @@ pub(crate) fn router(state: Shared) -> Router {
         .layer(middleware::from_fn(log_request))
         .with_state(state.clone());
     // WebDAV file storage streams large uploads: its own limits, not these.
-    rmail_common::http::harden(app, MAX_BODY_BYTES).merge(crate::webdav::routes(state))
+    let webdav = crate::webdav::routes(state).layer(middleware::from_fn(security_headers));
+    rmail_common::http::harden(app, MAX_BODY_BYTES).merge(webdav)
 }
 
 // ---------------------------------------------------------------------------

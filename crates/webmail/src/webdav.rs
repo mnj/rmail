@@ -8,14 +8,17 @@
 //!   Bearer token); webmail sends its session cookie with its CSRF header.
 //! - Class 1 plus the LOCK and UNLOCK that macOS Finder and Windows need
 //!   to write: locks are granted but not enforced (one user, own files).
+//!   Properties clients set (PROPPATCH) are kept next to the tree
+//!   (`rmail-drive-props.sqlite`) and follow moves, copies and deletes.
 //! - Uploads stream to disk and stop at the file size or quota limit, so
 //!   this route has its own body limit and a longer request deadline than
 //!   the rest of webmail.
 //! - Downloads are always attachments, never rendered, so an uploaded HTML
 //!   file cannot run as a page of this site.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::Extension;
@@ -48,6 +51,90 @@ pub(crate) fn routes(state: Arc<AppState>) -> Router {
             REQUEST_DEADLINE,
         ))
         .with_state(state)
+}
+
+/// One writer per user at a time, so parallel uploads cannot each fit
+/// under the quota and together go over it.
+static WRITERS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+fn writer(root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut writers = WRITERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    writers.entry(root.to_path_buf()).or_default().clone()
+}
+
+// ---------------------------------------------------------------------------
+// Dead properties
+
+fn props(root: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(root.with_file_name("rmail-drive-props.sqlite"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS props (path TEXT NOT NULL, ns TEXT NOT NULL, name TEXT NOT NULL,
+             value TEXT NOT NULL, PRIMARY KEY (path, ns, name))",
+    )?;
+    Ok(conn)
+}
+
+fn key(path: &[String]) -> String {
+    path.join("/")
+}
+
+/// The properties stored for `path`: (namespace, name, value).
+fn props_of(root: &Path, path: &[String]) -> Vec<(String, String, String)> {
+    let Ok(conn) = props(root) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) =
+        conn.prepare("SELECT ns, name, value FROM props WHERE path = ?1 ORDER BY ns, name")
+    else {
+        return Vec::new();
+    };
+    statement
+        .query_map([key(path)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// `from`'s properties (and its descendants') moved or copied to `to`, or
+/// forgotten (`to` = None).
+fn carry_props(
+    root: &Path,
+    from: &[String],
+    to: Option<&[String]>,
+    keep: bool,
+) -> rusqlite::Result<()> {
+    let conn = props(root)?;
+    let (from, prefix) = (key(from), format!("{}/", key(from)));
+    let rows: Vec<(String, String, String, String)> = conn
+        .prepare("SELECT path, ns, name, value FROM props WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2")?
+        .query_map([&from, &prefix], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if let Some(to) = to {
+        let to = key(to);
+        let to_prefix = format!("{to}/");
+        conn.execute(
+            "DELETE FROM props WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2",
+            [&to, &to_prefix],
+        )?;
+        for (path, ns, name, value) in &rows {
+            let moved = format!("{to}{}", &path[from.len()..]);
+            conn.execute(
+                "INSERT OR REPLACE INTO props (path, ns, name, value) VALUES (?1, ?2, ?3, ?4)",
+                [&moved, ns, name, value],
+            )?;
+        }
+    }
+    if !keep {
+        conn.execute(
+            "DELETE FROM props WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2",
+            [&from, &prefix],
+        )?;
+    }
+    Ok(())
 }
 
 fn settings(state: &AppState) -> rmail_common::config::FilesConfig {
@@ -186,7 +273,7 @@ async fn user_of(
     headers: &HeaderMap,
     peer: &Peer,
     method: &Method,
-) -> Result<User, Response> {
+) -> Result<User, Box<Response>> {
     if !headers.contains_key(header::AUTHORIZATION) {
         let reads = matches!(method.as_str(), "GET" | "HEAD" | "PROPFIND");
         if (reads || headers.contains_key("x-rmail-webmail"))
@@ -199,9 +286,7 @@ async fn user_of(
             });
         }
     }
-    jmap::authenticate(state, headers, peer)
-        .await
-        .map_err(|response| *response)
+    jmap::authenticate(state, headers, peer).await
 }
 
 async fn handle(
@@ -225,7 +310,7 @@ async fn handle(
     }
     let user = match user_of(&state, &headers, &peer, &method).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(path) = segments(uri.path()) else {
         return status(StatusCode::BAD_REQUEST);
@@ -237,7 +322,11 @@ async fn handle(
     let target = path.iter().fold(root.clone(), |dir, name| dir.join(name));
     match method.as_str() {
         "GET" | "HEAD" => get(&target, method == Method::HEAD).await,
-        "PUT" => put(&root, &target, &headers, body, &config).await,
+        "PUT" => {
+            let writer = writer(&root);
+            let _writing = writer.lock().await;
+            put(&root, &target, &headers, body, &config).await
+        }
         "PROPFIND" => {
             let depth = headers
                 .get("depth")
@@ -254,7 +343,7 @@ async fn handle(
             if !target.exists() {
                 return status(StatusCode::NOT_FOUND);
             }
-            proppatch(&path, target.is_dir(), &bytes)
+            blocking(move || proppatch(&root, &path, target.is_dir(), &bytes)).await
         }
         "MKCOL" => {
             let Ok(bytes) = read_small(body).await else {
@@ -269,7 +358,16 @@ async fn handle(
             if path.is_empty() {
                 return status(StatusCode::FORBIDDEN);
             }
-            blocking(move || delete(&target)).await
+            let writer = writer(&root);
+            let _writing = writer.lock().await;
+            blocking(move || {
+                let response = delete(&target);
+                if response.status() == StatusCode::NO_CONTENT {
+                    let _ = carry_props(&root, &path, None, false);
+                }
+                response
+            })
+            .await
         }
         "COPY" | "MOVE" => {
             let moving = method.as_str() == "MOVE";
@@ -284,7 +382,16 @@ async fn handle(
                 .fold(root.clone(), |dir, name| dir.join(name));
             let overwrite = headers.get("overwrite").and_then(|v| v.to_str().ok()) != Some("F");
             let quota = config.quota_mb * 1024 * 1024;
-            blocking(move || copy_or_move(&root, &target, &to, moving, overwrite, quota)).await
+            let writer = writer(&root);
+            let _writing = writer.lock().await;
+            blocking(move || {
+                let response = copy_or_move(&root, &target, &to, moving, overwrite, quota);
+                if response.status().is_success() {
+                    let _ = carry_props(&root, &path, Some(&destination), !moving);
+                }
+                response
+            })
+            .await
         }
         "LOCK" => {
             let _ = read_small(body).await;
@@ -471,7 +578,12 @@ fn length_over_file(declared: Option<u64>, max_file: u64) -> bool {
     declared.is_some_and(|length| length > max_file)
 }
 
-fn entry_xml(segments: &[String], meta: &std::fs::Metadata, quota: Option<(u64, u64)>) -> String {
+fn entry_xml(
+    segments: &[String],
+    meta: &std::fs::Metadata,
+    quota: Option<(u64, u64)>,
+    dead: &[(String, String, String)],
+) -> String {
     let collection = meta.is_dir();
     let name = segments.last().map(String::as_str).unwrap_or("");
     let mut props = format!("<D:displayname>{}</D:displayname>", xml_escape(name));
@@ -500,6 +612,13 @@ fn entry_xml(segments: &[String], meta: &std::fs::Metadata, quota: Option<(u64, 
             "<D:quota-used-bytes>{used}</D:quota-used-bytes><D:quota-available-bytes>{available}</D:quota-available-bytes>"
         ));
     }
+    for (ns, name, value) in dead {
+        props.push_str(&format!(
+            "<x:{name} xmlns:x=\"{}\">{}</x:{name}>",
+            xml_escape(ns),
+            xml_escape(value)
+        ));
+    }
     props.push_str("<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>");
     format!(
         "<D:response><D:href>{}</D:href><D:propstat><D:prop>{props}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
@@ -526,7 +645,7 @@ fn propfind(root: &Path, path: &[String], target: &Path, depth: &str, quota: u64
     };
     let used = if meta.is_dir() { usage(root) } else { 0 };
     let quota_info = meta.is_dir().then(|| (used, quota.saturating_sub(used)));
-    let mut body = entry_xml(path, &meta, quota_info);
+    let mut body = entry_xml(path, &meta, quota_info, &props_of(root, path));
     if meta.is_dir() && depth != "0" {
         let mut children: Vec<(String, std::fs::Metadata)> = std::fs::read_dir(target)
             .map(|entries| {
@@ -545,32 +664,61 @@ fn propfind(root: &Path, path: &[String], target: &Path, depth: &str, quota: u64
         for (name, child) in children {
             let mut segments = path.to_vec();
             segments.push(name);
-            body.push_str(&entry_xml(&segments, &child, None));
+            let dead = props_of(root, &segments);
+            body.push_str(&entry_xml(&segments, &child, None, &dead));
         }
     }
     multistatus(body)
 }
 
-/// Properties clients set (Windows timestamps, macOS tags) are accepted
-/// and not kept.
-fn proppatch(path: &[String], collection: bool, body: &[u8]) -> Response {
-    let mut props = String::new();
-    if let Ok(text) = std::str::from_utf8(body)
-        && let Ok(doc) = roxmltree::Document::parse(text)
-    {
-        for prop in doc.descendants().filter(|n| n.tag_name().name() == "prop") {
+/// Set or remove properties (Windows timestamps, macOS tags...); they are
+/// kept and listed by PROPFIND (RFC 4918 9.2).
+fn proppatch(root: &Path, path: &[String], collection: bool, body: &[u8]) -> Response {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return status(StatusCode::BAD_REQUEST);
+    };
+    let Ok(doc) = roxmltree::Document::parse(text) else {
+        return status(StatusCode::BAD_REQUEST);
+    };
+    let Ok(conn) = props(root) else {
+        return jmap::internal_response("could not open the property store");
+    };
+    let mut names = String::new();
+    for action in doc.root_element().children().filter(|n| n.is_element()) {
+        let setting = match action.tag_name().name() {
+            "set" => true,
+            "remove" => false,
+            _ => continue,
+        };
+        for prop in action.children().filter(|n| n.tag_name().name() == "prop") {
             for element in prop.children().filter(|n| n.is_element()) {
-                let ns = element.tag_name().namespace().unwrap_or("");
-                props.push_str(&format!(
-                    "<x:{} xmlns:x=\"{}\"/>",
-                    element.tag_name().name(),
-                    xml_escape(ns)
-                ));
+                let ns = element.tag_name().namespace().unwrap_or("").to_string();
+                let name = element.tag_name().name().to_string();
+                let value: String = element
+                    .descendants()
+                    .filter(|n| n.is_text())
+                    .filter_map(|n| n.text())
+                    .collect();
+                let stored = if setting {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO props (path, ns, name, value) VALUES (?1, ?2, ?3, ?4)",
+                        [&key(path), &ns, &name, &value.chars().take(4096).collect::<String>()],
+                    )
+                } else {
+                    conn.execute(
+                        "DELETE FROM props WHERE path = ?1 AND ns = ?2 AND name = ?3",
+                        [&key(path), &ns, &name],
+                    )
+                };
+                if stored.is_err() {
+                    return jmap::internal_response("could not store the property");
+                }
+                names.push_str(&format!("<x:{name} xmlns:x=\"{}\"/>", xml_escape(&ns)));
             }
         }
     }
     multistatus(format!(
-        "<D:response><D:href>{}</D:href><D:propstat><D:prop>{props}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+        "<D:response><D:href>{}</D:href><D:propstat><D:prop>{names}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
         xml_escape(&href(path, collection))
     ))
 }
@@ -626,7 +774,8 @@ fn copy_or_move(
     if !from.exists() {
         return status(StatusCode::NOT_FOUND);
     }
-    if from == to || to.starts_with(from) {
+    // Not onto itself, into itself, or over a folder that holds it.
+    if from == to || to.starts_with(from) || from.starts_with(to) {
         return status(StatusCode::FORBIDDEN);
     }
     if !to.parent().is_some_and(Path::is_dir) {
@@ -655,29 +804,46 @@ fn copy_or_move(
             return status(StatusCode::INSUFFICIENT_STORAGE);
         }
     }
-    if existed {
-        let cleared = if to.is_dir() {
-            std::fs::remove_dir_all(to)
-        } else {
-            std::fs::remove_file(to)
-        };
-        if let Err(error) = cleared {
+    // The new version is made beside the destination and swapped in, and an
+    // existing destination is set aside until then: a failure part-way
+    // leaves the destination as it was.
+    let parent = to.parent().unwrap();
+    let staged = if moving {
+        from.to_path_buf()
+    } else {
+        let staged = parent.join(format!(".rmail-upload-copy-{:016x}", rand::random::<u64>()));
+        if let Err(error) = copy_tree(from, &staged) {
+            let _ = if staged.is_dir() {
+                std::fs::remove_dir_all(&staged)
+            } else {
+                std::fs::remove_file(&staged)
+            };
             return jmap::internal_response(error);
         }
-    }
-    let done = if moving {
-        std::fs::rename(from, to)
-    } else {
-        copy_tree(from, to)
+        staged
     };
-    match done {
-        Ok(()) => status(if existed {
-            StatusCode::NO_CONTENT
-        } else {
-            StatusCode::CREATED
-        }),
-        Err(error) => jmap::internal_response(error),
+    let aside = parent.join(format!(".rmail-upload-old-{:016x}", rand::random::<u64>()));
+    if existed && let Err(error) = std::fs::rename(to, &aside) {
+        return jmap::internal_response(error);
     }
+    if let Err(error) = std::fs::rename(&staged, to) {
+        if existed {
+            let _ = std::fs::rename(&aside, to);
+        }
+        return jmap::internal_response(error);
+    }
+    if existed {
+        let _ = if aside.is_dir() {
+            std::fs::remove_dir_all(&aside)
+        } else {
+            std::fs::remove_file(&aside)
+        };
+    }
+    status(if existed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::CREATED
+    })
 }
 
 /// A lock that is granted but not enforced; locking a name that does not
@@ -932,6 +1098,108 @@ mod tests {
             .await
             .status,
             403
+        );
+
+        // Properties are kept, listed and carried along by a move.
+        let patch = br#"<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>Thu, 22 Oct 2026 10:00:00 GMT</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#;
+        assert_eq!(
+            route(dav("PROPPATCH", "/webdav/copy.txt", patch, &[]), &state)
+                .await
+                .status,
+            207
+        );
+        assert_eq!(
+            route(
+                dav(
+                    "MOVE",
+                    "/webdav/copy.txt",
+                    b"",
+                    &[("destination", "/webdav/Archive/copy.txt")]
+                ),
+                &state
+            )
+            .await
+            .status,
+            201
+        );
+        let listed = String::from_utf8(
+            route(
+                dav(
+                    "PROPFIND",
+                    "/webdav/Archive/copy.txt",
+                    b"",
+                    &[("depth", "0")],
+                ),
+                &state,
+            )
+            .await
+            .body,
+        )
+        .unwrap();
+        assert!(
+            listed.contains("Win32LastModifiedTime")
+                && listed.contains("Thu, 22 Oct 2026 10:00:00 GMT"),
+            "{listed}"
+        );
+
+        // Copying over a folder that holds the source is refused (it would
+        // delete the source); an overwriting copy replaces the destination.
+        let ancestor = route(
+            dav(
+                "COPY",
+                "/webdav/Archive/copy.txt",
+                b"",
+                &[("destination", "/webdav/Archive")],
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(ancestor.status, 403);
+        assert_eq!(
+            route(dav("GET", "/webdav/Archive/copy.txt", b"", &[]), &state)
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            route(dav("MKCOL", "/webdav/Other", b"", &[]), &state)
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            route(
+                dav(
+                    "COPY",
+                    "/webdav/Archive",
+                    b"",
+                    &[("destination", "/webdav/Other")]
+                ),
+                &state
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            route(dav("GET", "/webdav/Other/Q3%20plan.txt", b"", &[]), &state)
+                .await
+                .body,
+            b"hello again"
+        );
+        assert_eq!(
+            route(dav("DELETE", "/webdav/Other", b"", &[]), &state)
+                .await
+                .status,
+            204
+        );
+        let cached = route(dav("PROPFIND", "/webdav/", b"", &[("depth", "0")]), &state).await;
+        assert!(
+            cached
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Cache-Control" && v == "no-store"),
+            "security headers apply"
         );
 
         // The quota (1 MB here) stops an upload part-way.
