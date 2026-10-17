@@ -66,6 +66,7 @@ demo_setting compose_ai.model demo-model
 # fake_ai.py too, as an OpenAI-compatible "OpenRouter" endpoint.
 demo_setting file_links.enabled true
 demo_setting files.enabled true
+demo_setting activesync.enabled true
 demo_setting classifier.enabled true
 demo_setting classifier.chat_provider openrouter
 demo_setting classifier.openrouter_base_url http://127.0.0.1:18090/v1
@@ -120,4 +121,12 @@ printf 'quarterly numbers\n' > "${demo}/numbers.txt"
 [[ "$(dav -X MOVE -H "Destination: ${base}/Client%20check/renamed.txt" "${base}/Client%20check/numbers.txt")" == 201 ]]
 [[ "$(dav -X DELETE "${base}/Client%20check")" == 204 ]]
 echo "WebDAV client check: good"
+# ActiveSync as a phone starts: OPTIONS, then a first FolderSync in WBXML.
+eas=https://127.0.0.1:18081/Microsoft-Server-ActiveSync
+curl -sk -X OPTIONS -u "alice@example.com:Demo-pass-123" -D - -o /dev/null "${eas}" | grep -qi '^ms-asprotocolversions:.*14.1'
+printf '\x03\x01\x6a\x00\x00\x07\x56\x52\x03\x30\x00\x01\x01' > "${demo}/foldersync.wbxml"
+curl -sk -u "alice@example.com:Demo-pass-123" -H 'Content-Type: application/vnd.ms-sync.wbxml' -H 'MS-ASProtocolVersion: 14.1' \
+  --data-binary @"${demo}/foldersync.wbxml" -o "${demo}/folders.wbxml" "${eas}?Cmd=FolderSync&User=alice@example.com&DeviceId=demo1&DeviceType=Test"
+grep -qa Inbox "${demo}/folders.wbxml"
+echo "ActiveSync check: good"
 echo "Screenshots written to ${out}"

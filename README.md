@@ -53,7 +53,8 @@ screenshots of every page, and a quick start.
   updates and cancellations. Two-factor sign-in (TOTP with recovery codes) and per-device app
   passwords for mail apps are set up under Security. Files too large to attach can go as
   expiring download links, and each user can have their own file storage, in webmail and over
-  WebDAV for file managers (both when the administrator turns them on). OpenPGP and S/MIME (under
+  WebDAV for file managers, and phones can sync mail over Exchange ActiveSync (all when the
+  administrator turns them on). OpenPGP and S/MIME (under
   Encryption) sign, encrypt, verify and decrypt in the browser, with keys kept in the browser or
   locked on the server, as each user chooses. Out-of-office replies and mail filters are
   edited in webmail and applied on the server at delivery, so they work in every mail app; filters
