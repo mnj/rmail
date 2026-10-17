@@ -23,6 +23,7 @@ use rmail_common::mime::{
 };
 
 pub(crate) mod assist;
+mod bookings;
 mod calendars;
 mod compose;
 pub(crate) mod contacts;
@@ -151,6 +152,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(security::routes())
         .merge(events::routes())
         .merge(subscriptions::routes())
+        .merge(bookings::routes())
         .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())
@@ -599,6 +601,9 @@ struct MessageDetail {
     /// The calendar invitation, cancellation or reply the message carries.
     #[serde(skip_serializing_if = "Option::is_none")]
     invitation: Option<invitations::Invitation>,
+    /// A booking request for a resource the user approves bookings of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    booking: Option<bookings::Booking>,
     /// How the message is signed or encrypted (`rmail_common::mime::
     /// protection`); the browser verifies or decrypts it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1404,6 +1409,11 @@ async fn message_detail(
             .ok_or_else(|| anyhow::anyhow!("no such message"))?;
         let bytes = std::fs::read(&message.path)?;
         let invitation = invitation_card(&state, &session, &bytes, !location.shared);
+        let booking = if location.shared {
+            None
+        } else {
+            bookings::card(&state, &session, &bytes)
+        };
         let protection = rmail_common::mime::protection(&bytes);
         let parsed = parse_message(&bytes);
         let labels = labels_for(
@@ -1429,6 +1439,7 @@ async fn message_detail(
             labels,
             text_body: parsed.text_body,
             invitation,
+            booking,
             protection,
             has_remote_content: parsed.html_body.as_deref().is_some_and(has_remote_content),
             html_body: parsed

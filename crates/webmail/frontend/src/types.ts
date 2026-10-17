@@ -25,6 +25,7 @@ export type MessageDetail = {
   subject: string; date: string; text_body: string; html_body: string | null;
   has_remote_content: boolean; attachments: Attachment[]; labels: Label[];
   invitation?: Invitation;
+  booking?: Booking;
   /** How the message is signed or encrypted; the browser checks and decrypts it. */
   protection?: string;
 };
@@ -150,3 +151,11 @@ export const can = (f: Folder | undefined, right: string) => !f?.rights || f.rig
 
 /** A shared folder's name without the `Other Users/<owner>/` prefix. */
 export const sharedFolderName = (f: Folder) => (f.owner ? f.name.slice(`Other Users/${f.owner}/`.length) : f.name);
+
+/** A booking request for a resource the user approves bookings of. */
+export type Booking = {
+  resource: string; uid: string; summary: string; organizer: string;
+  start: number; end: number; all_day: boolean;
+  /** tentative (waiting), accepted, declined or gone. */
+  status: string;
+};

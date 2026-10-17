@@ -262,6 +262,9 @@ enum ResourceAction {
         /// room, equipment or person
         kind: String,
     },
+    /// Have APPROVER (a mailbox) approve the bookings of resource ADDRESS
+    /// that fit its calendar, or with "none" let it accept them itself
+    Approver { address: String, approver: String },
     /// List the resources
     List,
 }
@@ -817,9 +820,27 @@ async fn main() -> Result<()> {
                         parsed.map_or("person", |k| k.as_str())
                     );
                 }
+                ResourceAction::Approver { address, approver } => {
+                    let approver =
+                        Some(approver.trim()).filter(|a| !a.eq_ignore_ascii_case("none"));
+                    rmail_common::resources::set_approver(db, &address, approver)?;
+                    match approver {
+                        Some(approver) => println!("{approver} now approves bookings of {address}"),
+                        None => println!("{address} answers its bookings itself"),
+                    }
+                }
                 ResourceAction::List => {
+                    let approvers: std::collections::HashMap<String, String> =
+                        rmail_common::resources::approvers(db)?
+                            .into_iter()
+                            .collect();
                     for (address, kind) in rmail_common::resources::list(db, None)? {
-                        println!("{address}\t{}", kind.as_str());
+                        match approvers.get(&address) {
+                            Some(approver) => {
+                                println!("{address}\t{}\tapproved by {approver}", kind.as_str())
+                            }
+                            None => println!("{address}\t{}", kind.as_str()),
+                        }
                     }
                 }
             }

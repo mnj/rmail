@@ -20,6 +20,7 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
   const [showPassword, setShowPassword] = useState(false);
   const [quota, setQuota] = useState(existing?.quota_bytes ? String(Math.round(existing.quota_bytes / 1024 / 1024)) : '');
   const [kind, setKind] = useState<string>(existing?.resource || 'person');
+  const [approver, setApprover] = useState(existing?.approver || '');
   const [saving, setSaving] = useState(false);
 
   async function submit(event: React.FormEvent) {
@@ -32,8 +33,8 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
     else if (existing?.quota_bytes) body.quota_mib = 0;
     const ok = await run(async () => {
       await api('/api/accounts', existing ? 'PATCH' : 'POST', body);
-      if (kind !== (existing?.resource || 'person')) {
-        await api('/api/accounts/resource', 'POST', { address: address.trim(), kind: kind === 'person' ? null : kind });
+      if (kind !== (existing?.resource || 'person') || (kind !== 'person' && approver.trim() !== (existing?.approver || ''))) {
+        await api('/api/accounts/resource', 'POST', { address: address.trim(), kind: kind === 'person' ? null : kind, approver: approver.trim() || null });
       }
     }, existing ? `Updated ${address}` : `Created ${address}`);
     setSaving(false);
@@ -68,6 +69,11 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
             <option value="equipment">Equipment</option>
           </select>
         </Field>
+        {kind !== 'person' && (
+          <Field label="Approver (optional)" hint="A mailbox that approves bookings: those that fit are held as tentative until they approve or decline them in webmail. Clashes are still declined at once.">
+            <input type="email" value={approver} onChange={(event) => setApprover(event.target.value)} placeholder="facilities@example.com" />
+          </Field>
+        )}
       </form>
     </Modal>
   );
@@ -299,7 +305,7 @@ export function AccountsPage() {
                   <td><strong>{account.address}</strong><small>{account.unseen ? `${account.unseen} unread` : 'No unread mail'}</small></td>
                   <td>
                     <span className={`pill ${account.auth === 'Unset' ? 'warn' : ''}`}>{account.auth === 'Unset' ? 'No password' : account.auth}</span>
-                    {account.resource && <span className="pill">{account.resource === 'room' ? 'Room' : 'Equipment'}</span>}
+                    {account.resource && <span className="pill" title={account.approver ? `Bookings approved by ${account.approver}` : undefined}>{account.resource === 'room' ? 'Room' : 'Equipment'}{account.approver ? ' · needs approval' : ''}</span>}
                     {account.two_factor && <span className="pill ok" title="Two-factor sign-in is on; mail apps use app passwords">2FA</span>}
                     {account.app_passwords > 0 && <small>{account.app_passwords} app password{account.app_passwords === 1 ? '' : 's'}</small>}
                   </td>

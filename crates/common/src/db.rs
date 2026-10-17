@@ -422,9 +422,14 @@ pub fn remove_mailbox<P: AsRef<Path>>(path: P, address: &str) -> Result<()> {
         params![address.to_ascii_lowercase()],
     )?;
     // A deleted room is no longer bookable.
-    conn.execute_batch(crate::resources::SCHEMA)?;
+    crate::resources::ensure_schema(&conn)?;
     conn.execute(
         "DELETE FROM resources WHERE address = ?1",
+        params![address.to_ascii_lowercase()],
+    )?;
+    // ...and its bookings are no longer held for a deleted approver.
+    conn.execute(
+        "UPDATE resources SET approver = NULL WHERE approver = ?1",
         params![address.to_ascii_lowercase()],
     )?;
     Ok(())
