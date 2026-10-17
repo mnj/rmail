@@ -52,7 +52,8 @@ screenshots of every page, and a quick start.
   synced with phones over CalDAV and CardDAV; inviting guests from webmail sends invitations,
   updates and cancellations. Two-factor sign-in (TOTP with recovery codes) and per-device app
   passwords for mail apps are set up under Security. Files too large to attach can go as
-  expiring download links (when the administrator turns that on). OpenPGP and S/MIME (under
+  expiring download links, and each user can have their own file storage, in webmail and over
+  WebDAV for file managers (both when the administrator turns them on). OpenPGP and S/MIME (under
   Encryption) sign, encrypt, verify and decrypt in the browser, with keys kept in the browser or
   locked on the server, as each user chooses. Out-of-office replies and mail filters are
   edited in webmail and applied on the server at delivery, so they work in every mail app; filters

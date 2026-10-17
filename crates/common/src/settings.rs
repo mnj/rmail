@@ -149,6 +149,11 @@ pub const GROUPS: &[SettingGroup] = &[
         description: "AI continuations and rewrites while composing in webmail, from any OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Ollama, vLLM). Users opt in in their compose settings; only the draft around the cursor, the subject and a quoted original are sent. Changes apply without a restart.",
     },
     SettingGroup {
+        id: "files",
+        label: "File storage",
+        description: "Each user's own files, in webmail's Files view and over WebDAV (https://<webmail host>/webdav/) for file managers and sync apps. Changes apply without a restart.",
+    },
+    SettingGroup {
         id: "file_links",
         label: "Large files",
         description: "Files too large to attach, sent from webmail as download links that expire. Anyone with a link can download the file until then. Changes apply without a restart.",
@@ -1260,6 +1265,30 @@ pub const SETTINGS: &[SettingSpec] = &[
         LIVE,
     ),
     spec(
+        "files.enabled",
+        "files",
+        "Enabled",
+        "Give every user file storage, in webmail and over WebDAV.",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "files.quota_mb",
+        "files",
+        "Storage per user (MB)",
+        "Uploads that would go over it are refused.",
+        int(1, 1_048_576),
+        LIVE,
+    ),
+    spec(
+        "files.max_file_mb",
+        "files",
+        "Largest file (MB)",
+        "Bigger uploads are refused.",
+        int(1, 102_400),
+        LIVE,
+    ),
+    spec(
         "file_links.enabled",
         "file_links",
         "Enabled",
@@ -1528,6 +1557,16 @@ pub fn compose_ai(conn: &Connection) -> Result<crate::config::ComposeAiConfig> {
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
     serde_json::from_value(section).context("invalid writing suggestion settings")
+}
+
+pub fn files(conn: &Connection) -> Result<crate::config::FilesConfig> {
+    let stored = load_all(conn)?;
+    let tree = unflatten(stored.iter().filter(|(key, _)| key.starts_with("files.")));
+    let section = tree
+        .pointer("/files")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    serde_json::from_value(section).context("invalid file storage settings")
 }
 
 pub fn file_links(conn: &Connection) -> Result<crate::config::FileLinksConfig> {

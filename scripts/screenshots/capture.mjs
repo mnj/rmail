@@ -342,6 +342,35 @@ async function signIn(page) {
   await ctx.close();
 }
 
+// Files: a folder, an upload, a rename and a download in webmail's Files view.
+{
+  const ctx = await browser.newContext({ ...desktop, acceptDownloads: true });
+  const page = await ctx.newPage();
+  await signIn(page);
+  await page.click('.sidebar-link:has-text("Files")');
+  await page.waitForSelector('.files-dialog >> text=Nothing here yet');
+  page.once('dialog', (dialog) => dialog.accept('Projects'));
+  await page.click('.files-dialog button:has-text("New folder")');
+  await page.click('.files-list button.files-name:has-text("Projects")');
+  await page.waitForSelector('.files-path >> text=Projects');
+  const chooser = page.waitForEvent('filechooser');
+  await page.click('.files-dialog button:has-text("Upload")');
+  await (await chooser).setFiles([
+    { name: 'migration-plan.pdf', mimeType: 'application/pdf', buffer: Buffer.alloc(240 * 1024, 1) },
+    { name: 'budget 2027.xlsx', mimeType: 'application/octet-stream', buffer: Buffer.alloc(56 * 1024, 2) },
+  ]);
+  await page.waitForSelector('.files-list a.files-name:has-text("budget 2027.xlsx")');
+  page.once('dialog', (dialog) => dialog.accept('budget-2027.xlsx'));
+  await page.click('.files-list button[aria-label="Rename budget 2027.xlsx"]');
+  await page.waitForSelector('.files-list a.files-name:has-text("budget-2027.xlsx")');
+  const download = page.waitForEvent('download');
+  await page.click('.files-list a[aria-label="Download migration-plan.pdf"]');
+  if ((await (await download).createReadStream()) === null) throw new Error('no download');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-files');
+  await ctx.close();
+}
+
 // Encryption: an OpenPGP key made in the browser and an S/MIME certificate
 // imported, mail signed and encrypted with each, then read back. The raw
 // messages are left for crypto_check.py to check with GnuPG and OpenSSL.

@@ -3,9 +3,10 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck, Lock,
+  PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck, Lock, HardDrive,
 } from 'lucide-react';
 import { useCrypto } from './crypto/hook';
+const FilesDialog = React.lazy(() => import('./files').then((m) => ({ default: m.FilesDialog })));
 const EncryptionDialog = React.lazy(() => import('./crypto/settings').then((m) => ({ default: m.EncryptionDialog })));
 import { ENCRYPTED, ProtectedMessage } from './crypto/reader';
 const OrganizeDialog = React.lazy(() => import('./organize').then((m) => ({ default: m.OrganizeDialog })));
@@ -512,7 +513,7 @@ function AiPanel({ api, folder, message, organize, onLabelsChanged, onOpenSettin
 // ---------------------------------------------------------------------------
 // Mailbox
 
-function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: string; canSend: boolean; onLogout: () => void }) {
+function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address: string; canSend: boolean; files: boolean; onLogout: () => void }) {
   const [folders, setFolders] = useState<Folder[]>([]);
   const [folder, setFolder] = useState('INBOX');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -544,6 +545,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
   const [calendarMode, setCalendarMode] = useState(false);
   const [securityOpen, setSecurityOpen] = useState(false);
   const [encryptionOpen, setEncryptionOpen] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(false);
   const [crypto, cryptoPrompt] = useCrypto(api, address);
   const [vacation, setVacation] = useState<Vacation | null>(null);
   const [vacationOpen, setVacationOpen] = useState(false);
@@ -879,6 +881,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
           <button className="sidebar-link" onClick={() => setFiltersOpen(true)}><FilterIcon size={15} />Filters</button>
           <button className="sidebar-link" onClick={() => setSecurityOpen(true)}><ShieldCheck size={15} />Security</button>
           <button className="sidebar-link" onClick={() => setEncryptionOpen(true)}><Lock size={15} />Encryption</button>
+          {files && <button className="sidebar-link" onClick={() => setFilesOpen(true)}><HardDrive size={15} />Files</button>}
           <ThemeSwitch />
           <button className="sidebar-link" onClick={onLogout}><LogOut size={15} />Sign out</button>
         </div>
@@ -1041,6 +1044,7 @@ function Mailbox({ api, address, canSend, onLogout }: { api: Api; address: strin
       {securityOpen && <SecurityDialog api={api} address={address} onClose={() => setSecurityOpen(false)} />}
       {encryptionOpen && <React.Suspense fallback={null}><EncryptionDialog crypto={crypto} onClose={() => setEncryptionOpen(false)} /></React.Suspense>}
       {cryptoPrompt}
+      {filesOpen && <React.Suspense fallback={null}><FilesDialog address={address} onClose={() => setFilesOpen(false)} /></React.Suspense>}
       {contacts !== false && <ContactsDialog api={api} seed={contacts} onClose={() => setContacts(false)} onWrite={(to, name) => { setContacts(false); if (canSend) startCompose({ to: name ? `${name} <${to}>` : to }); }} />}
       {vacationOpen && vacation && <VacationDialog api={api} initial={vacation} onClose={() => setVacationOpen(false)} onSaved={setVacation} />}
       {filtersOpen && <FiltersDialog api={api} folders={folders} labels={organize?.labels ?? []} onClose={() => setFiltersOpen(false)} />}
@@ -1056,6 +1060,7 @@ function App() {
   const [address, setAddress] = useState<string | null | undefined>(undefined);
   const [setupRequired, setSetupRequired] = useState(false);
   const [canSend, setCanSend] = useState(false);
+  const [files, setFiles] = useState(false);
   const [loginAddress, setLoginAddress] = useState('');
   const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
@@ -1065,7 +1070,7 @@ function App() {
   const api = useApi(useCallback(() => setAddress(null), []), useCallback(() => setSetupRequired(true), []));
 
   useEffect(() => {
-    api<{ address: string; can_send: boolean; two_factor_setup: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setSetupRequired(s.two_factor_setup); setAddress(s.address); }).catch(() => setAddress(null));
+    api<{ address: string; can_send: boolean; two_factor_setup: boolean; files: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setFiles(Boolean(s.files)); setSetupRequired(s.two_factor_setup); setAddress(s.address); }).catch(() => setAddress(null));
   }, [api]);
 
   async function login(event: React.FormEvent) {
@@ -1073,11 +1078,12 @@ function App() {
     setError('');
     setBusy(true);
     try {
-      const session = await api<{ address: string; can_send: boolean; two_factor_setup: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password, ...(needCode ? { code } : {}) }) });
+      const session = await api<{ address: string; can_send: boolean; two_factor_setup: boolean; files: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ address: loginAddress, password, ...(needCode ? { code } : {}) }) });
       setPassword('');
       setCode('');
       setNeedCode(false);
       setCanSend(session.can_send);
+      setFiles(Boolean(session.files));
       setSetupRequired(session.two_factor_setup);
       setAddress(session.address);
     } catch (err) {
@@ -1123,7 +1129,7 @@ function App() {
     const recheck = () => api<{ two_factor_setup: boolean }>('/api/session').then((s) => setSetupRequired(s.two_factor_setup)).catch(() => undefined);
     return <main className="login-shell"><SecurityDialog api={api} address={address} required onClose={logout} onChanged={recheck} /></main>;
   }
-  return <Mailbox api={api} address={address} canSend={canSend} onLogout={logout} />;
+  return <Mailbox api={api} address={address} canSend={canSend} files={files} onLogout={logout} />;
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

@@ -245,6 +245,9 @@ pub struct Config {
     /// Files too large to attach, sent from webmail as download links.
     #[serde(default)]
     pub file_links: FileLinksConfig,
+    /// Personal file storage over WebDAV (`/webdav/`) and in webmail.
+    #[serde(default)]
+    pub files: FilesConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -1134,6 +1137,37 @@ fn default_file_links_per_user_mb() -> u64 {
 }
 fn default_file_links_days() -> u64 {
     30
+}
+
+/// Each user's own files, over WebDAV and in webmail's Files view. Off until
+/// the admin turns it on.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct FilesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Storage per user, in MB.
+    #[serde(default = "default_files_quota_mb")]
+    pub quota_mb: u64,
+    /// Largest single file, in MB.
+    #[serde(default = "default_files_max_file_mb")]
+    pub max_file_mb: u64,
+}
+
+fn default_files_quota_mb() -> u64 {
+    1024
+}
+fn default_files_max_file_mb() -> u64 {
+    1024
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quota_mb: default_files_quota_mb(),
+            max_file_mb: default_files_max_file_mb(),
+        }
+    }
 }
 
 impl Default for FileLinksConfig {
