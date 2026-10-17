@@ -1095,7 +1095,9 @@ Organization page (or the `classifier.*` settings):
 - **Batch labels** (`classifier.background_tier` = `batch`, with the `openai`, `anthropic` or
   `openrouter` chat provider) send labeling questions for new mail through the provider's batch
   API (OpenAI Batch, Anthropic Message Batches, OpenRouter's Batch API for the models it batches,
-  such as OpenAI, Anthropic and Gemini ones) at half price. Each question waits in the account's own
+  such as OpenAI, Anthropic and Gemini ones) at half price. With `openrouter`, batches are used
+  only when `openrouter_base_url` is OpenRouter's own API (another OpenAI-compatible endpoint is
+  asked directly), and questions with different label sets go in separate batches. Each question waits in the account's own
   `classifier.sqlite`, so message text only leaves the account's directory for the provider. The
   worker sends the waiting questions of all accounts as one batch once 100 have gathered or the
   oldest has waited 15 minutes, asks about running batches once a minute, and applies the answers

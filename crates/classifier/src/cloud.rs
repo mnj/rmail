@@ -652,6 +652,23 @@ pub trait Batcher: Send + Sync {
     /// Submit `(custom_id, request)` pairs; the batch id.
     fn submit(&self, requests: &[(String, Value)]) -> Result<String>;
     fn poll(&self, batch: &str) -> Result<BatchPoll>;
+    /// Requests that may share a batch have the same group.
+    fn group(&self, _request: &Value) -> String {
+        String::new()
+    }
+}
+
+/// Whether an OpenAI-compatible base URL is OpenRouter's own API (other
+/// compatible endpoints may have no Batch API).
+pub fn is_openrouter(base: &str) -> bool {
+    let host = base
+        .trim()
+        .split_once("://")
+        .map_or(base, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    host.eq_ignore_ascii_case("openrouter.ai")
 }
 
 /// Each JSONL line parsed; a line that is not JSON is skipped.
@@ -773,6 +790,12 @@ impl OpenRouterBatcher {
 impl Batcher for OpenRouterBatcher {
     fn label_request(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Value {
         openai_label_body(&self.model, message, labels, may_propose)
+    }
+
+    /// Batches for some models (Google's) must share one response schema,
+    /// and each account's labels make their own.
+    fn group(&self, request: &Value) -> String {
+        request["response_format"].to_string()
     }
 
     fn submit(&self, requests: &[(String, Value)]) -> Result<String> {
@@ -1480,6 +1503,14 @@ mod tests {
         assert_eq!(answers[1], ("q2".into(), Err("bad request".into())));
         requests.recv().unwrap();
         assert_eq!(requests.recv().unwrap().0, "GET /files/file-out/content");
+    }
+
+    #[test]
+    fn only_openrouter_itself_is_assumed_to_batch() {
+        assert!(is_openrouter("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter("https://OpenRouter.ai:443/api/v1/"));
+        assert!(!is_openrouter("http://localhost:8080/v1"));
+        assert!(!is_openrouter("https://openrouter.ai.example.test/v1"));
     }
 
     #[test]
