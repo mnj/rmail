@@ -103,6 +103,14 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Journaling: a copy of a domain's mail kept in an archive mailbox
+    Journal {
+        #[command(subcommand)]
+        action: JournalAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// Rooms and equipment: mailboxes that answer invitations themselves
     Resource {
         #[command(subcommand)]
@@ -266,6 +274,14 @@ enum ResourceAction {
     /// that fit its calendar, or with "none" let it accept them itself
     Approver { address: String, approver: String },
     /// List the resources
+    List,
+}
+
+#[derive(Subcommand)]
+enum JournalAction {
+    /// Journal DOMAIN's mail to ARCHIVE (a mailbox), or "none" to stop
+    Set { domain: String, archive: String },
+    /// List the journaled domains
     List,
 }
 
@@ -797,6 +813,28 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&cfg.global.db_path),
                 &mut std::io::stdout(),
             )?;
+        }
+        Commands::Journal { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db = std::path::Path::new(&cfg.global.db_path);
+            match action {
+                JournalAction::Set { domain, archive } => {
+                    let archive = Some(archive.trim()).filter(|a| !a.eq_ignore_ascii_case("none"));
+                    rmail_common::journal::set(db, &domain, archive)?;
+                    match archive {
+                        Some(archive) => println!("{domain}'s mail is journaled to {archive}"),
+                        None => println!("{domain}'s mail is not journaled"),
+                    }
+                }
+                JournalAction::List => {
+                    for (domain, archive) in rmail_common::journal::list(db)? {
+                        println!("{domain}\t{archive}");
+                    }
+                }
+            }
         }
         Commands::Resource { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {

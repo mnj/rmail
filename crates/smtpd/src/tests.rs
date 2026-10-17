@@ -4032,3 +4032,100 @@ async fn jmap_vacation_response_can_answer_only_contacts() {
     assert_eq!(queued.len(), 1, "only the contact gets a reply: {queued:?}");
     assert!(queued[0].contains("friend@remote.test"), "{}", queued[0]);
 }
+
+#[tokio::test]
+async fn journaled_domains_keep_a_copy_in_their_archive() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::add_mailbox(
+        &db_path,
+        "archive@example.test",
+        Some("plain:password"),
+        None,
+        None,
+    )
+    .unwrap();
+    rmail_common::journal::set(&db_path, "example.test", Some("archive@example.test")).unwrap();
+    let input = "EHLO localhost\r\n\
+        MAIL FROM:<a@remote.test>\r\nRCPT TO:<user@example.test>\r\nRCPT TO:<postmaster@example.test>\r\nDATA\r\nFrom: a@remote.test\r\nTo: user@example.test\r\nSubject: one\r\n\r\nfirst\r\n.\r\n\
+        MAIL FROM:<a@remote.test>\r\nRCPT TO:<user@example.test>\r\nRCPT TO:<archive@example.test>\r\nDATA\r\nFrom: a@remote.test\r\nSubject: two\r\n\r\nsecond\r\n.\r\n\
+        QUIT\r\n";
+    let (responses, td) = run_prepared_session(
+        input.as_bytes().to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root.clone(),
+        db_path,
+    )
+    .await;
+    assert_eq!(accepted(&responses), 2, "{responses:?}");
+    assert_eq!(inbox(&td), 2);
+    let (_, archived) =
+        rmail_common::imap_state::load_folder(&mail_root, "example.test", "archive", "INBOX")
+            .unwrap();
+    assert_eq!(
+        archived.len(),
+        2,
+        "one journal copy, and the message sent to it directly"
+    );
+    let texts: Vec<String> = archived
+        .iter()
+        .map(|m| String::from_utf8_lossy(&std::fs::read(&m.path).unwrap()).into_owned())
+        .collect();
+    let journal = texts.iter().find(|t| t.contains("Subject: one")).unwrap();
+    assert!(
+        journal.starts_with("X-Rmail-Journal: inbound; domain=example.test\r\n"),
+        "{journal}"
+    );
+    assert!(journal.contains("X-Rmail-Journal-Sender: <a@remote.test>"));
+    assert!(
+        journal.contains("X-Rmail-Journal-Recipient: <user@example.test>")
+            && journal.contains("X-Rmail-Journal-Recipient: <postmaster@example.test>"),
+        "every envelope recipient, as Bcc would be"
+    );
+    let direct = texts.iter().find(|t| t.contains("Subject: two")).unwrap();
+    assert!(
+        !direct.contains("X-Rmail-Journal:"),
+        "no second copy when the archive was a recipient"
+    );
+}
+
+#[tokio::test]
+async fn mail_sent_from_a_journaled_domain_is_journaled_as_outbound() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::add_mailbox(
+        &db_path,
+        "archive@example.test",
+        Some("plain:password"),
+        None,
+        None,
+    )
+    .unwrap();
+    rmail_common::journal::set(&db_path, "example.test", Some("archive@example.test")).unwrap();
+    let input = "EHLO localhost\r\nAUTH PLAIN AHVzZXJAZXhhbXBsZS50ZXN0AHBhc3N3b3Jk\r\n\
+        MAIL FROM:<user@example.test>\r\nRCPT TO:<friend@remote.test>\r\nDATA\r\nFrom: user@example.test\r\nTo: friend@remote.test\r\nSubject: out\r\n\r\nbody\r\n.\r\nQUIT\r\n";
+    let (responses, _td) = run_prepared_session(
+        input.as_bytes().to_vec(),
+        64 * 1024,
+        SecurityConfig::default(),
+        true,
+        SmtpService::Submission,
+        td,
+        mail_root.clone(),
+        db_path,
+    )
+    .await;
+    assert_eq!(accepted(&responses), 1, "{responses:?}");
+    let (_, archived) =
+        rmail_common::imap_state::load_folder(&mail_root, "example.test", "archive", "INBOX")
+            .unwrap();
+    assert_eq!(archived.len(), 1);
+    let copy = String::from_utf8_lossy(&std::fs::read(&archived[0].path).unwrap()).into_owned();
+    assert!(
+        copy.starts_with("X-Rmail-Journal: outbound; domain=example.test\r\n"),
+        "{copy}"
+    );
+    assert!(copy.contains("X-Rmail-Journal-Recipient: <friend@remote.test>"));
+}

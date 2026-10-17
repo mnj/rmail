@@ -118,7 +118,98 @@ impl Session {
             self.queue_remote(&mail_root, rcpt, body, forwarded, &mut report)
                 .await;
         }
+        if report.any_accepted {
+            self.journal(&mail_root, data, &report).await;
+        }
         report
+    }
+
+    /// A journal copy for each domain whose mail is archived and that
+    /// sent (authenticated sender) or received (local recipient) this
+    /// message. Failures are logged; the delivery itself stands.
+    async fn journal(&self, mail_root: &Path, data: &Bytes, report: &DeliveryReport) {
+        let Some(db_path) = self.db_path.clone() else {
+            return;
+        };
+        let domain_of = |address: &str| {
+            address
+                .rsplit_once('@')
+                .map(|(_, domain)| domain.to_ascii_lowercase())
+        };
+        let sender_domain = self.authenticated_user.as_deref().and_then(domain_of);
+        // Local recipients the message reached.
+        let mut receiving: Vec<String> = Vec::new();
+        for rcpt in &self.tx.rcpts {
+            let delivered = report
+                .lmtp_status
+                .get(rcpt)
+                .is_some_and(|status| status.starts_with("250"));
+            if delivered
+                && self.local_mailbox(rcpt).await.is_some()
+                && let Some(domain) = domain_of(rcpt)
+                && !receiving.contains(&domain)
+            {
+                receiving.push(domain);
+            }
+        }
+        let mut domains = receiving.clone();
+        if let Some(domain) = &sender_domain
+            && !domains.contains(domain)
+        {
+            domains.push(domain.clone());
+        }
+        if domains.is_empty() {
+            return;
+        }
+        let sender = self.tx.mail_from.clone().unwrap_or_default();
+        let recipients = self.tx.rcpts.clone();
+        let (root, data) = (mail_root.to_path_buf(), data.to_vec());
+        let outcome = tokio::task::spawn_blocking(move || -> Vec<String> {
+            let mut errors = Vec::new();
+            for domain in domains {
+                let archive = match rmail_common::journal::archive_of(Path::new(&db_path), &domain)
+                {
+                    Ok(Some(archive)) => archive,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        errors.push(format!("{domain}: {error:#}"));
+                        continue;
+                    }
+                };
+                // The archive already has the message when it was a recipient.
+                if recipients.iter().any(|r| r.eq_ignore_ascii_case(&archive)) {
+                    continue;
+                }
+                let direction = match (
+                    sender_domain.as_deref() == Some(domain.as_str()),
+                    receiving.contains(&domain),
+                ) {
+                    (true, true) => rmail_common::journal::Direction::Internal,
+                    (true, false) => rmail_common::journal::Direction::Outbound,
+                    _ => rmail_common::journal::Direction::Inbound,
+                };
+                let copy = rmail_common::journal::journal_copy(
+                    &data,
+                    direction,
+                    &domain,
+                    &sender,
+                    &recipients,
+                );
+                let Some((local, archive_domain)) = archive.split_once('@') else {
+                    continue;
+                };
+                if let Err(error) =
+                    rmail_common::imap_state::deliver_message(&root, archive_domain, local, &copy)
+                {
+                    errors.push(format!("{domain} to {archive}: {error:#}"));
+                }
+            }
+            errors
+        })
+        .await;
+        for error in outcome.unwrap_or_default() {
+            session_log!(self, "error", "journal_failed", { "message_id": self.message_id, "error": error });
+        }
     }
 
     async fn local_mailbox(&self, rcpt: &str) -> Option<rmail_common::db::Mailbox> {
