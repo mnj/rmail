@@ -3977,3 +3977,58 @@ async fn burl_needs_an_authenticated_submission_session() {
         "{responses:?}"
     );
 }
+
+#[tokio::test]
+async fn jmap_vacation_response_can_answer_only_contacts() {
+    let (td, mail_root, db_path) = setup_mailbox();
+    rmail_common::db::set_vacation_response(
+        &db_path,
+        "user@example.test",
+        &rmail_common::db::VacationResponse {
+            enabled: true,
+            text_body: Some("Away".to_string()),
+            contacts_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        use rmail_common::dav::store::{self, Kind};
+        let conn = rmail_common::jmap::store::open(&mail_root, "example.test", "user").unwrap();
+        let book = store::collections(&conn, Kind::AddressBook)
+            .unwrap()
+            .remove(0);
+        store::put(
+            &conn,
+            &book,
+            "friend.vcf",
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:friend\r\nFN:Friend\r\nEMAIL;TYPE=home:Friend@Remote.test\r\nEND:VCARD\r\n",
+            &|_| true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!store::address_book_has(&conn, "end@remote.test").unwrap());
+    }
+    let mut input = String::from("EHLO localhost\r\n");
+    for from in ["stranger@remote.test", "friend@remote.test"] {
+        input.push_str(&format!(
+            "MAIL FROM:<{from}>\r\nRCPT TO:<user@example.test>\r\nDATA\r\nFrom: {from}\r\nTo: user@example.test\r\nSubject: hi\r\n\r\nb\r\n.\r\n"
+        ));
+    }
+    input.push_str("QUIT\r\n");
+    let (responses, td) = run_prepared_session(
+        input.into_bytes(),
+        64 * 1024,
+        SecurityConfig::default(),
+        false,
+        SmtpService::Mta,
+        td,
+        mail_root,
+        db_path,
+    )
+    .await;
+    assert_eq!(accepted(&responses), 2, "{responses:?}");
+    let queued = queued_eml(&td);
+    assert_eq!(queued.len(), 1, "only the contact gets a reply: {queued:?}");
+    assert!(queued[0].contains("friend@remote.test"), "{}", queued[0]);
+}

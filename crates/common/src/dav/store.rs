@@ -509,6 +509,36 @@ fn row_to_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Object> {
     })
 }
 
+/// Whether a card in any of the account's address books has `address` as
+/// an email address.
+pub fn address_book_has(conn: &Connection, address: &str) -> Result<bool> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Ok(false);
+    }
+    let mut statement = conn.prepare(
+        "SELECT o.data FROM dav_objects o JOIN dav_collections c ON c.id = o.collection_id
+         WHERE c.kind = ?1 AND o.deleted = 0 AND instr(lower(o.data), lower(?2)) > 0",
+    )?;
+    let cards = statement
+        .query_map(params![Kind::AddressBook.as_str(), address], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(cards.iter().any(|data| {
+        text::parse(data).is_ok_and(|card| {
+            card.properties_named("EMAIL").any(|email| {
+                let value = email.value.trim();
+                let value = value
+                    .get(..7)
+                    .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+                    .map_or(value, |_| &value[7..]);
+                value.eq_ignore_ascii_case(address)
+            })
+        })
+    }))
+}
+
 pub fn objects(conn: &Connection, collection: &Collection) -> Result<Vec<Object>> {
     let mut statement = conn.prepare(&format!(
         "SELECT {OBJECT_COLUMNS} FROM dav_objects WHERE collection_id = ?1 AND deleted = 0

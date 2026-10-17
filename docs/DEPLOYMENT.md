@@ -873,7 +873,8 @@ enabling.
   alongside the account's own Sieve script rather than replacing it. It follows Sieve vacation's
   rules: one reply per sender per week, and none to lists, automated mail or the user's own
   address. Webmail edits the same reply under **Out of office** (with optional start and end
-  dates) and shows a banner while it is on.
+  dates, and an option to reply only to senders in the user's address books, the directory
+  included) and shows a banner while it is on.
 - **Filters** in webmail edit the account's Sieve script, so the rules run at delivery whatever app
   the mail is read in. Rules match From, To/Cc, Subject, any header or the size, and move, mark
   read, star, label, forward (keeping a copy or not) or delete. Webmail keeps them in a script
