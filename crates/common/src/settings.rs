@@ -151,7 +151,12 @@ pub const GROUPS: &[SettingGroup] = &[
     SettingGroup {
         id: "activesync",
         label: "ActiveSync",
-        description: "Exchange ActiveSync at https://<webmail host>/Microsoft-Server-ActiveSync, for the mail apps built into phones (iOS Mail, Android, Outlook). Mail only for now. Users sign in with their address and password, or an app password with two-factor sign-in. Changes apply without a restart.",
+        description: "Exchange ActiveSync at https://<webmail host>/Microsoft-Server-ActiveSync, for the mail apps built into phones (iOS Mail, Android, Outlook): mail, contacts and calendars. Users sign in with their address and password, or an app password with two-factor sign-in. Changes apply without a restart.",
+    },
+    SettingGroup {
+        id: "oidc",
+        label: "Single sign-on",
+        description: "Webmail sign-in through an OpenID Connect provider (Google, Microsoft Entra ID, Keycloak, Authentik...). Register https://<webmail host>/api/oidc/callback as the redirect URI. The provider's email must be an existing mailbox; mail apps keep using passwords or app passwords. Changes apply without a restart.",
     },
     SettingGroup {
         id: "files",
@@ -1278,6 +1283,54 @@ pub const SETTINGS: &[SettingSpec] = &[
         LIVE,
     ),
     spec(
+        "oidc.enabled",
+        "oidc",
+        "Enabled",
+        "Show the single sign-on button on webmail's sign-in page.",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "oidc.issuer",
+        "oidc",
+        "Issuer URL",
+        "For example https://accounts.google.com or https://login.microsoftonline.com/<tenant>/v2.0; must be HTTPS.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "oidc.client_id",
+        "oidc",
+        "Client ID",
+        "From the app registered with the provider.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "oidc.client_secret",
+        "oidc",
+        "Client secret",
+        "Used by the webmail server only, to exchange the sign-in code.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "oidc.button_label",
+        "oidc",
+        "Button text",
+        "What the sign-in button says, such as \"Sign in with Google\".",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "oidc.require_verified_email",
+        "oidc",
+        "Require a verified email",
+        "Refuse sign-ins whose email the provider does not mark as verified. Turn off only for providers that never send email_verified and only issue addresses they own (some Microsoft Entra setups).",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
         "files.enabled",
         "files",
         "Enabled",
@@ -1584,6 +1637,16 @@ pub fn activesync(conn: &Connection) -> Result<crate::config::ActiveSyncConfig> 
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
     serde_json::from_value(section).context("invalid ActiveSync settings")
+}
+
+pub fn oidc(conn: &Connection) -> Result<crate::config::OidcConfig> {
+    let stored = load_all(conn)?;
+    let tree = unflatten(stored.iter().filter(|(key, _)| key.starts_with("oidc.")));
+    let section = tree
+        .pointer("/oidc")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    serde_json::from_value(section).context("invalid single sign-on settings")
 }
 
 pub fn files(conn: &Connection) -> Result<crate::config::FilesConfig> {
@@ -2529,6 +2592,7 @@ mod tests {
                         | "classifier.openai_api_key"
                         | "classifier.anthropic_api_key"
                         | "compose_ai.api_key"
+                        | "oidc.client_secret"
                 )
                 || spec.key.starts_with("global.listeners.")
             {

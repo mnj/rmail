@@ -426,7 +426,7 @@ pub(crate) fn accounts(state: &AppState, user: &User) -> anyhow::Result<Vec<Acco
 // ---------------------------------------------------------------------------
 // Session resource (RFC 8620 section 2)
 
-fn base_url(state: &AppState, headers: &HeaderMap) -> String {
+pub(crate) fn base_url(state: &AppState, headers: &HeaderMap) -> String {
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())

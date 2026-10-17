@@ -68,6 +68,12 @@ demo_setting file_links.enabled true
 demo_setting files.enabled true
 demo_setting activesync.enabled true
 demo_setting classifier.enabled true
+# Single sign-on, with fake_ai.py as the provider (it signs in as Alice).
+demo_setting oidc.enabled true
+demo_setting oidc.issuer http://127.0.0.1:18090
+demo_setting oidc.client_id rmail-demo
+demo_setting oidc.client_secret demo-secret
+demo_setting oidc.button_label 'Sign in with Example SSO'
 demo_setting classifier.chat_provider openrouter
 demo_setting classifier.openrouter_base_url http://127.0.0.1:18090/v1
 demo_setting classifier.openrouter_chat_model demo-model

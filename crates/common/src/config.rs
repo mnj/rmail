@@ -251,6 +251,9 @@ pub struct Config {
     /// Exchange ActiveSync for phones' built-in mail apps.
     #[serde(default)]
     pub activesync: ActiveSyncConfig,
+    /// Webmail sign-in through an OpenID Connect provider.
+    #[serde(default)]
+    pub oidc: OidcConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -1169,6 +1172,46 @@ fn default_files_max_file_mb() -> u64 {
 pub struct ActiveSyncConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Webmail single sign-on through an OpenID Connect provider (Google,
+/// Microsoft Entra ID, Keycloak, Authentik...). Off until the admin sets it
+/// up; the provider's verified email must be an existing mailbox.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct OidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The issuer URL; its `/.well-known/openid-configuration` is read.
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SecretString>,
+    /// The sign-in button's text.
+    #[serde(default = "default_oidc_button_label")]
+    pub button_label: String,
+    /// Accept only addresses the provider says are verified
+    /// (`email_verified`).
+    #[serde(default = "default_true")]
+    pub require_verified_email: bool,
+}
+
+fn default_oidc_button_label() -> String {
+    "Sign in with single sign-on".to_string()
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: None,
+            button_label: default_oidc_button_label(),
+            require_verified_email: true,
+        }
+    }
 }
 
 impl Default for FilesConfig {

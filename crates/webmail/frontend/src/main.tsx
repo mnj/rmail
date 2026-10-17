@@ -1079,6 +1079,15 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
 // ---------------------------------------------------------------------------
 // Sign-in
 
+/** Why a single sign-on attempt came back without a session. */
+const ssoErrors: Record<string, string> = {
+  no_mailbox: 'That account has no mailbox here. Ask your administrator.',
+  unverified: 'Your sign-in provider has not verified that email address.',
+  cancelled: 'Sign-in was cancelled.',
+  expired: 'That sign-in took too long or was already used. Try again.',
+  provider: 'The sign-in provider could not be reached or refused the sign-in. Try again, or use your password.',
+};
+
 function App() {
   const [address, setAddress] = useState<string | null | undefined>(undefined);
   const [setupRequired, setSetupRequired] = useState(false);
@@ -1090,10 +1099,21 @@ function App() {
   const [needCode, setNeedCode] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [sso, setSso] = useState<{ enabled: boolean; label: string } | null>(null);
   const api = useApi(useCallback(() => setAddress(null), []), useCallback(() => setSetupRequired(true), []));
 
   useEffect(() => {
     api<{ address: string; can_send: boolean; two_factor_setup: boolean; files: boolean }>('/api/session').then((s) => { setCanSend(s.can_send); setFiles(Boolean(s.files)); setSetupRequired(s.two_factor_setup); setAddress(s.address); }).catch(() => setAddress(null));
+  }, [api]);
+
+  useEffect(() => {
+    api<{ enabled: boolean; label: string }>('/api/oidc').then(setSso).catch(() => undefined);
+    // Back from the provider without signing in: say why, once.
+    const reason = new URLSearchParams(window.location.search).get('sso_error');
+    if (reason) {
+      setError(ssoErrors[reason] ?? ssoErrors.provider);
+      window.history.replaceState(null, '', '/');
+    }
   }, [api]);
 
   async function login(event: React.FormEvent) {
@@ -1144,6 +1164,10 @@ function App() {
           {error && <p className="error">{error}</p>}
           <button type="submit" className="primary" disabled={busy || (needCode && !code.trim())}>{busy ? 'Signing in…' : needCode ? 'Verify' : 'Sign in'}</button>
           {needCode && <button type="button" className="link" onClick={() => { setNeedCode(false); setCode(''); setPassword(''); setError(''); }}>Start over</button>}
+          {sso?.enabled && !needCode && <>
+            <div className="login-or"><span>or</span></div>
+            <a className="button sso-button" href="/api/oidc/start">{sso.label}</a>
+          </>}
         </form>
       </main>
     );

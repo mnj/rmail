@@ -3,11 +3,15 @@
 
 Webmail's writing suggestions (compose_ai.* settings) point here, so the ghost
 text and rewrite shots need no real AI service. Canned answers; standard
-library only. Usage: fake_ai.py PORT
+library only. It is also a single sign-on provider (OpenID Connect) that
+signs anyone in as Alice. Usage: fake_ai.py PORT
 """
 
+import base64
 import datetime
 import json
+import time
+import urllib.parse
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,10 +59,43 @@ def embed(text):
     return [v / norm for v in vector]
 
 
+ISSUER = f"http://127.0.0.1:{sys.argv[1]}"
+
+
+def id_token(nonce):
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    claims = {"iss": ISSUER, "aud": "rmail-demo", "exp": int(time.time()) + 300, "nonce": nonce,
+              "email": "alice@example.com", "email_verified": True}
+    return f"{part({'alg': 'none'})}.{part(claims)}.x"
+
+
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        if url.path == "/.well-known/openid-configuration":
+            return self.reply({"issuer": ISSUER, "authorization_endpoint": f"{ISSUER}/auth",
+                               "token_endpoint": f"{ISSUER}/token"})
+        if url.path == "/auth":
+            # Signed in at once; the nonce rides along as the code.
+            query = dict(urllib.parse.parse_qsl(url.query))
+            back = query["redirect_uri"] + "?" + urllib.parse.urlencode({"code": query["nonce"], "state": query["state"]})
+            self.send_response(302)
+            self.send_header("Location", back)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        request = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length)
+        if self.path == "/token":
+            form = dict(urllib.parse.parse_qsl(raw.decode()))
+            return self.reply({"id_token": id_token(form["code"]), "access_token": "demo"})
+        request = json.loads(raw or b"{}")
         if self.path.endswith("/embeddings"):
             texts = request.get("input", [])
             texts = [texts] if isinstance(texts, str) else texts
