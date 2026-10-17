@@ -532,3 +532,127 @@ async fn a_phone_syncs_reads_moves_and_sends_mail() {
         Some("user@example.test")
     );
 }
+
+#[test]
+fn base64_queries_keep_their_plus_signs() {
+    // A device id whose base64 form has a "+" in it.
+    let raw = [141u8, 0, 0x09, 0x04, 3, 62, b'E', b'V', 0, 2, b'S', b'P'];
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+    assert!(encoded.contains('+'), "{encoded}");
+    assert!(super::params(&encoded).is_some());
+}
+
+#[tokio::test]
+async fn folders_follow_webmails_rules_and_empty_syncs_move_on() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let root = state.mail_root.clone();
+    imap_state::init_account(&root, "example.test", "user").unwrap();
+    let mut settings = rmail_common::settings::open(&state.db_path).unwrap();
+    rmail_common::settings::write_raw(
+        &mut settings,
+        &[("activesync.enabled".to_string(), Some(json!(true)))]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+    imap_state::create_folder(&root, "example.test", "user", "Projects").unwrap();
+    imap_state::create_folder(&root, "example.test", "user", "Projects/Alpha").unwrap();
+    let folders = call(
+        &state,
+        "FolderSync",
+        Some(
+            &Element::new("FolderHierarchy:FolderSync")
+                .with(Element::text("FolderHierarchy:SyncKey", "0")),
+        ),
+    )
+    .await;
+    let adds: Vec<&Element> = folders
+        .child("FolderHierarchy:Changes")
+        .unwrap()
+        .children_named("FolderHierarchy:Add")
+        .collect();
+    let id = |name: &str| {
+        adds.iter()
+            .find(|a| a.value("FolderHierarchy:DisplayName").as_deref() == Some(name))
+            .and_then(|a| a.value("FolderHierarchy:ServerId"))
+            .unwrap()
+    };
+    let (sent, projects, alpha) = (
+        adds.iter()
+            .find(|a| a.value("FolderHierarchy:Type").as_deref() == Some("5"))
+            .and_then(|a| a.value("FolderHierarchy:ServerId"))
+            .unwrap(),
+        id("Projects"),
+        id("Alpha"),
+    );
+
+    let rename = |id: &str, name: &str| {
+        Element::new("FolderHierarchy:FolderUpdate")
+            .with(Element::text("FolderHierarchy:SyncKey", "1"))
+            .with(Element::text("FolderHierarchy:ServerId", id))
+            .with(Element::text("FolderHierarchy:ParentId", "0"))
+            .with(Element::text("FolderHierarchy:DisplayName", name))
+    };
+    let refused = call(&state, "FolderUpdate", Some(&rename(&sent, "Outbox2"))).await;
+    assert_eq!(
+        refused.value("FolderHierarchy:Status").as_deref(),
+        Some("3"),
+        "special folders stay"
+    );
+    let create = Element::new("FolderHierarchy:FolderCreate")
+        .with(Element::text("FolderHierarchy:SyncKey", "1"))
+        .with(Element::text("FolderHierarchy:ParentId", "0"))
+        .with(Element::text(
+            "FolderHierarchy:DisplayName",
+            "Other Users/x",
+        ))
+        .with(Element::text("FolderHierarchy:Type", "12"));
+    assert_eq!(
+        call(&state, "FolderCreate", Some(&create))
+            .await
+            .value("FolderHierarchy:Status")
+            .as_deref(),
+        Some("10")
+    );
+    let renamed = call(&state, "FolderUpdate", Some(&rename(&projects, "Work"))).await;
+    assert_eq!(
+        renamed.value("FolderHierarchy:Status").as_deref(),
+        Some("1")
+    );
+    let db =
+        super::state::open(&imap_state::account_maildir(&root, "example.test", "user")).unwrap();
+    assert_eq!(
+        super::state::folder_name(&db, &alpha).unwrap().as_deref(),
+        Some("Work/Alpha"),
+        "subfolders keep their ids"
+    );
+
+    // An empty Sync repeats the last one at the current key, not the old one.
+    let inbox = id("Inbox");
+    call(&state, "Sync", Some(&sync_request(&inbox, "0", None, None))).await;
+    let first = call(&state, "Sync", Some(&sync_request(&inbox, "1", None, None))).await;
+    let key = collection(&first).value("AirSync:SyncKey").unwrap();
+    imap_state::deliver_message(
+        &root,
+        "example.test",
+        "user",
+        b"From: a@b.test\r\nSubject: New\r\n\r\nhi",
+    )
+    .unwrap();
+    let empty = route(request("Sync", None), &state).await;
+    let empty = wbxml::decode(&empty.body).unwrap();
+    let c = collection(&empty);
+    assert_eq!(
+        c.child("AirSync:Commands")
+            .unwrap()
+            .children_named("AirSync:Add")
+            .count(),
+        1
+    );
+    assert_eq!(
+        c.value("AirSync:SyncKey").unwrap().parse::<i64>().unwrap(),
+        key.parse::<i64>().unwrap() + 1,
+        "moves on"
+    );
+}

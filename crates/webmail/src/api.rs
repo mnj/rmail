@@ -1734,7 +1734,7 @@ struct FolderName {
 }
 
 /// Folder names users may create or rename to: what IMAP accepts, minus INBOX.
-fn valid_new_folder(name: &str) -> Option<String> {
+pub(crate) fn valid_new_folder(name: &str) -> Option<String> {
     let name = name.trim();
     let normalized = rmail_common::maildir::normalize_mailbox_name(name).ok()?;
     // Names under "Other Users" are where shared folders appear.

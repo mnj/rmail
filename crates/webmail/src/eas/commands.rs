@@ -221,29 +221,49 @@ fn folder_change(
             state::folder_name(&db, id)
         }
     };
-    let result: anyhow::Result<Option<String>> = match command {
+    // The same rules as webmail: valid names, nothing under Other Users,
+    // and INBOX and special folders are not renamed or deleted.
+    let new_name = |parent: Option<String>, name: String| -> Option<String> {
+        let full = match parent {
+            Some(parent) => format!("{parent}/{name}"),
+            None => name,
+        };
+        crate::api::valid_new_folder(&full)
+    };
+    let user_folder = |id: &str| -> anyhow::Result<Option<String>> {
+        let Some(name) = state::folder_name(&db, id)? else {
+            return Ok(None);
+        };
+        Ok(account
+            .folders()?
+            .into_iter()
+            .find(|f| f.name == name)
+            .filter(rmail_common::classifier_store::is_user_folder)
+            .map(|f| f.name))
+    };
+    let parent = request
+        .value("FolderHierarchy:ParentId")
+        .unwrap_or_else(|| "0".into());
+    let result: anyhow::Result<Result<Option<String>, &str>> = match command {
         "FolderCreate" => {
             let name = request
                 .value("FolderHierarchy:DisplayName")
                 .unwrap_or_default();
-            let full = match parent_name(
-                &request
-                    .value("FolderHierarchy:ParentId")
-                    .unwrap_or_else(|| "0".into()),
-            )? {
-                Some(parent) => format!("{parent}/{name}"),
-                None => name,
-            };
-            imap_state::create_folder(root, domain, local, &full)
-                .map(|_| Some(state::folder_id(&db, &full).unwrap_or_default()))
+            match new_name(parent_name(&parent)?, name) {
+                Some(full) => imap_state::create_folder(root, domain, local, &full)
+                    .map(|_| Ok(Some(state::folder_id(&db, &full).unwrap_or_default()))),
+                None => Ok(Err("10")),
+            }
         }
         "FolderDelete" => {
             let id = request
                 .value("FolderHierarchy:ServerId")
                 .unwrap_or_default();
-            match state::folder_name(&db, &id)? {
-                Some(name) => imap_state::delete_folder(root, domain, local, &name).map(|_| None),
-                None => Ok(None),
+            match user_folder(&id)? {
+                Some(name) => {
+                    imap_state::delete_folder(root, domain, local, &name).map(|_| Ok(None))
+                }
+                None => Ok(Err("3")),
             }
         }
         _ => {
@@ -253,23 +273,21 @@ fn folder_change(
             let name = request
                 .value("FolderHierarchy:DisplayName")
                 .unwrap_or_default();
-            match state::folder_name(&db, &id)? {
-                Some(old) => {
-                    let full = match parent_name(
-                        &request
-                            .value("FolderHierarchy:ParentId")
-                            .unwrap_or_else(|| "0".into()),
-                    )? {
-                        Some(parent) => format!("{parent}/{name}"),
-                        None => name,
-                    };
+            match (user_folder(&id)?, new_name(parent_name(&parent)?, name)) {
+                (Some(old), Some(full)) => {
                     imap_state::rename_folder(root, domain, local, &old, &full)
                         .and_then(|_| state::rename_folder(&db, &old, &full))
-                        .map(|_| None)
+                        .map(|_| Ok(None))
                 }
-                None => Ok(None),
+                (None, _) => Ok(Err("3")),
+                (_, None) => Ok(Err("10")),
             }
         }
+    };
+    let result = match result {
+        Ok(Err(code)) => return Ok(response.with(status(code))),
+        Ok(Ok(id)) => Ok(id),
+        Err(error) => Err(error),
     };
     match result {
         Ok(id) => {
@@ -537,7 +555,34 @@ fn sync(account: &Account, request: Option<Element>, body: &[u8]) -> anyhow::Res
             request
         }
         None => match state::last_sync(&db, &account.device)? {
-            Some(previous) => wbxml::decode(&previous)?,
+            // The same collections and options, at the current keys and
+            // without the old commands (MS-ASCMD 2.2.3.166.2).
+            Some(previous) => {
+                let mut request = wbxml::decode(&previous)?;
+                if let Some(collections) = request
+                    .children
+                    .iter_mut()
+                    .find(|c| c.is("AirSync:Collections"))
+                {
+                    for collection in collections
+                        .children
+                        .iter_mut()
+                        .filter(|c| c.is("AirSync:Collection"))
+                    {
+                        collection.children.retain(|c| !c.is("AirSync:Commands"));
+                        let id = collection.value("AirSync:CollectionId").unwrap_or_default();
+                        if let Some(known) = state::sync_state(&db, &account.device, &id)?
+                            && let Some(key) = collection
+                                .children
+                                .iter_mut()
+                                .find(|c| c.is("AirSync:SyncKey"))
+                        {
+                            key.text = Some(known.key.to_string());
+                        }
+                    }
+                }
+                request
+            }
             None => {
                 return Ok(wbxml_response(
                     &Element::new("AirSync:Sync").with(Element::text("AirSync:Status", "13")),
@@ -980,7 +1025,20 @@ async fn ping(account: Account, body: Bytes) -> Response {
         if Instant::now() + PING_POLL >= deadline {
             return status("1");
         }
-        tokio::time::sleep(PING_POLL).await;
+        // A server going down answers "nothing new" rather than holding on.
+        let mut shutdown = account.state.shutdown.clone();
+        let stopping = async {
+            match shutdown.as_mut() {
+                Some(receiver) => {
+                    let _ = receiver.wait_for(|stop| *stop).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(PING_POLL) => {}
+            _ = stopping => return status("1"),
+        }
     }
 }
 

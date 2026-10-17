@@ -87,13 +87,19 @@ impl Params {
 }
 
 fn query_decode(text: &str) -> String {
+    decode_query(text, true)
+}
+
+/// Percent-decoding, with `+` as a space only in the plain form (a `+` in
+/// the base64 form is part of it).
+fn decode_query(text: &str, plus_is_space: bool) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let hex = |at: usize| bytes.get(at).and_then(|b| (*b as char).to_digit(16));
         match bytes[i] {
-            b'+' => out.push(b' '),
+            b'+' if plus_is_space => out.push(b' '),
             b'%' if hex(i + 1).is_some() && hex(i + 2).is_some() => {
                 out.push((hex(i + 1).unwrap() * 16 + hex(i + 2).unwrap()) as u8);
                 i += 2;
@@ -132,11 +138,12 @@ const BASE64_COMMANDS: &[&str] = &[
 ];
 
 pub(crate) fn params(query: &str) -> Option<Params> {
-    if !query.contains('=') && !query.is_empty() {
+    let plain = query.split('&').any(|pair| pair.starts_with("Cmd="));
+    if !plain && !query.is_empty() {
         // The base64 form: version, command, locale, device id, policy
         // key, device type, then tagged parameters.
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(query_decode(query))
+            .decode(decode_query(query, false))
             .ok()?;
         let command = *bytes.get(1)?;
         let mut at = 4;

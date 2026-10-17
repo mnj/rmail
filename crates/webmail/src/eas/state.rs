@@ -82,8 +82,10 @@ pub fn folder_name(conn: &Connection, id: &str) -> Result<Option<String>> {
 
 /// After a rename the new name takes the old id, so devices keep it.
 pub fn rename_folder(conn: &Connection, from: &str, to: &str) -> Result<()> {
+    // Subfolders move with their parent and keep their ids too.
     conn.execute(
-        "UPDATE folder_ids SET name = ?2 WHERE name = ?1",
+        "UPDATE folder_ids SET name = ?2 || substr(name, length(?1) + 1)
+         WHERE name = ?1 OR substr(name, 1, length(?1) + 1) = ?1 || '/'",
         params![from, to],
     )?;
     Ok(())
