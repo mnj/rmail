@@ -518,10 +518,11 @@ pub fn address_book_has(conn: &Connection, address: &str) -> Result<bool> {
     }
     let mut statement = conn.prepare(
         "SELECT o.data FROM dav_objects o JOIN dav_collections c ON c.id = o.collection_id
-         WHERE c.kind = ?1 AND o.deleted = 0 AND instr(lower(o.data), lower(?2)) > 0",
+         WHERE c.kind = ?1 AND o.deleted = 0",
     )?;
     let cards = statement
-        .query_map(params![Kind::AddressBook.as_str(), address], |row| {
+        // Every card is parsed: a folded line can split an address.
+        .query_map(params![Kind::AddressBook.as_str()], |row| {
             row.get::<_, String>(0)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

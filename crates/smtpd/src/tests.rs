@@ -4002,7 +4002,7 @@ async fn jmap_vacation_response_can_answer_only_contacts() {
             &conn,
             &book,
             "friend.vcf",
-            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:friend\r\nFN:Friend\r\nEMAIL;TYPE=home:Friend@Remote.test\r\nEND:VCARD\r\n",
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:friend\r\nFN:Friend\r\nEMAIL;TYPE=home:Friend@Re\r\n mote.test\r\nEND:VCARD\r\n",
             &|_| true,
         )
         .unwrap()
