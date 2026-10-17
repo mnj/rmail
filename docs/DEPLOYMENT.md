@@ -968,6 +968,11 @@ respected.
   another booking (declined, cancelled and free-time events do not count). The reply reaches the
   organizer like any guest's, and a moved meeting is checked again. Invitations from other
   domains arrive by email and wait in the resource's inbox for a person.
+- A resource can have an **approver** (Approver in the console's mailbox editor, or
+  `rmail_ctl resource approver <address> <mailbox|none>`), a local mailbox. A booking that fits is
+  then answered tentative and the approver gets a booking request in their inbox; webmail shows it
+  with **Approve** and **Decline**, which send the resource's answer to the organizer. Clashes are
+  still declined at once. Only the approver can answer, and a moved meeting asks again.
 - **Directory** (global address list): an administrator can give a domain's people a read-only
   **Directory** address book listing everyone in the domain, named as they sign their mail
   (their JMAP identity name) or by their address, plus its aliases (an alias reaching several

@@ -895,6 +895,10 @@ struct ResourceChange {
     address: String,
     /// `room`, `equipment`, or null for a person.
     kind: Option<String>,
+    /// For a resource: the mailbox that approves its bookings, or null or
+    /// empty for none.
+    #[serde(default)]
+    approver: Option<String>,
 }
 
 /// Mark a mailbox as a room or equipment (it then answers invitations from
@@ -919,8 +923,16 @@ async fn set_resource(State(state): State<Shared>, body: Bytes) -> Response {
     };
     outcome(
         blocking(move || {
-            rmail_common::resources::set(Path::new(&db), &input.address, kind)
-                .map(|_| json!({ "result": "ok" }))
+            rmail_common::resources::set(Path::new(&db), &input.address, kind)?;
+            if kind.is_some() {
+                let approver = input
+                    .approver
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty());
+                rmail_common::resources::set_approver(Path::new(&db), &input.address, approver)?;
+            }
+            Ok(json!({ "result": "ok" }))
         })
         .await,
         StatusCode::BAD_REQUEST,

@@ -56,6 +56,8 @@ struct AccountSummary {
     app_passwords: usize,
     /// `room` or `equipment` for a resource account.
     resource: Option<&'static str>,
+    /// Who approves a resource's bookings.
+    approver: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -539,6 +541,11 @@ fn account_summaries_sync(
         .into_iter()
         .map(|(address, kind)| (address, kind.as_str()))
         .collect();
+    let approvers: std::collections::HashMap<String, String> = db_path
+        .and_then(|db| rmail_common::resources::approvers(Path::new(db)).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     if let Some(db_path) = db_path {
         for mailbox in rmail_common::db::list_mailboxes(db_path)? {
             let mut folders = 0usize;
@@ -563,6 +570,9 @@ fn account_summaries_sync(
                 resource: resources
                     .get(&mailbox.address.to_ascii_lowercase())
                     .copied(),
+                approver: approvers
+                    .get(&mailbox.address.to_ascii_lowercase())
+                    .cloned(),
                 app_passwords,
                 address: mailbox.address,
                 auth: if mailbox.scram.is_some() {

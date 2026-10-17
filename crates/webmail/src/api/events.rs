@@ -1353,4 +1353,135 @@ mod tests {
                 .contains("room1")
         );
     }
+    #[tokio::test]
+    async fn a_rooms_approver_approves_bookings_that_fit() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        for address in ["room2@example.test", "facilities@example.test"] {
+            db::add_mailbox(&state.db_path, address, Some("plain:x"), None, None).unwrap();
+        }
+        rmail_common::resources::set(
+            &state.db_path,
+            "room2@example.test",
+            Some(rmail_common::resources::ResourceKind::Room),
+        )
+        .unwrap();
+        rmail_common::resources::set_approver(
+            &state.db_path,
+            "room2@example.test",
+            Some("facilities@example.test"),
+        )
+        .unwrap();
+        let call = |who: &'static str, method: &'static str, path: String, body: Value| {
+            let state = state.clone();
+            async move {
+                let cookie = Some(format!("{SESSION_COOKIE}={}", sign_session(&state, who)));
+                let body = if body.is_null() {
+                    Vec::new()
+                } else {
+                    body.to_string().into_bytes()
+                };
+                let response = route(req(method, &path, &body, cookie), &state).await;
+                (
+                    response.status,
+                    serde_json::from_slice::<Value>(&response.body).unwrap_or_default(),
+                )
+            }
+        };
+        let book = |summary: &'static str, start: i64| {
+            let mut event = serde_json::to_value(EventFields {
+                summary: summary.into(),
+                start,
+                end: start + 3_600,
+                repeat: "none".into(),
+                ..fields()
+            })
+            .unwrap();
+            event["attendees"] = json!(["room2@example.test"]);
+            call(ME, "POST", "/api/events/own:default".into(), event)
+        };
+        let room_status = |listing: &Value, summary: &str| {
+            listing["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["details"]["summary"] == summary)
+                .and_then(|e| {
+                    e["attendee_details"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|a| a["address"] == "room2@example.test")
+                        .map(|a| a["status"].clone())
+                })
+        };
+        let listing = || {
+            call(
+                ME,
+                "GET",
+                format!("/api/events?from={}&to={}", NINE - 3_600, NINE + 86_400),
+                Value::Null,
+            )
+        };
+        assert_eq!(book("Board", NINE).await.0, 204);
+        let (_, events) = listing().await;
+        assert_eq!(
+            room_status(&events, "Board"),
+            Some(json!("tentative")),
+            "held"
+        );
+
+        // The approver has a booking request; only they see its card.
+        let (_, inbox) = call(
+            "facilities@example.test",
+            "GET",
+            "/api/folders/INBOX/messages".into(),
+            Value::Null,
+        )
+        .await;
+        let request = &inbox["messages"][0];
+        assert!(request["subject"].as_str().unwrap().contains("Board"));
+        let detail = format!("/api/folders/INBOX/messages/{}", request["uid"]);
+        let (_, message) = call("facilities@example.test", "GET", detail, Value::Null).await;
+        let card = &message["booking"];
+        assert_eq!(
+            (
+                card["resource"].as_str(),
+                card["status"].as_str(),
+                card["summary"].as_str()
+            ),
+            (Some("room2@example.test"), Some("tentative"), Some("Board"))
+        );
+        let answer = json!({"resource": "room2@example.test", "uid": card["uid"], "approve": true});
+        let (status, _) = call(ME, "POST", "/api/bookings/answer".into(), answer.clone()).await;
+        assert_eq!(status, 403, "only the approver answers");
+        let (status, approved) = call(
+            "facilities@example.test",
+            "POST",
+            "/api/bookings/answer".into(),
+            answer,
+        )
+        .await;
+        assert_eq!(status, 200, "{approved}");
+        assert_eq!(approved["booking"]["status"], "accepted");
+        let (_, events) = listing().await;
+        assert_eq!(
+            room_status(&events, "Board"),
+            Some(json!("accepted")),
+            "the organizer hears"
+        );
+
+        // A clash is still declined at once, without asking.
+        assert_eq!(book("Overlap", NINE + 600).await.0, 204);
+        let (_, events) = listing().await;
+        assert_eq!(room_status(&events, "Overlap"), Some(json!("declined")));
+        let (_, inbox) = call(
+            "facilities@example.test",
+            "GET",
+            "/api/folders/INBOX/messages".into(),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(inbox["total"], 1, "no request for a clash");
+    }
 }

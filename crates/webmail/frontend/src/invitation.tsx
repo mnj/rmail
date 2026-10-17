@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CalendarCheck, CalendarClock, CalendarDays, CalendarX, Check, CircleHelp, MapPin, Repeat, Users, X } from 'lucide-react';
-import { Api, Invitation, InvitationAction, InvitationAttendee, Proposal } from './types';
+import { Api, Booking, Invitation, InvitationAction, InvitationAttendee, Proposal } from './types';
 
 const statusWords: Record<string, string> = {
   accepted: 'Accepted', declined: 'Declined', tentative: 'Maybe', 'needs-action': 'No answer yet', delegated: 'Delegated',
@@ -237,6 +237,49 @@ export function InvitationCard({ api, folder, uid, invitation: initial }: { api:
         )}
         {sent && <p className="invite-note muted small" role="status">{sent}</p>}
         {error && <p className="error small" role="alert">{error}</p>}
+      </div>
+    </section>
+  );
+}
+
+/** A booking request for a resource the user approves bookings of. */
+export function BookingCard({ api, booking: initial }: { api: Api; booking: Booking }) {
+  const [booking, setBooking] = useState(initial);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => setBooking(initial), [initial]);
+  async function answer(approve: boolean) {
+    setBusy(true);
+    setError('');
+    try {
+      const reply = await api<{ booking: Booking }>('/api/bookings/answer', { method: 'POST', body: JSON.stringify({ resource: booking.resource, uid: booking.uid, approve }) });
+      setBooking(reply.booking);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  const gone = booking.status === 'gone';
+  const state = gone ? 'This booking was cancelled or moved elsewhere.'
+    : booking.status === 'accepted' ? 'Approved: the organizer has been told.'
+      : booking.status === 'declined' ? 'Declined: the organizer has been told.'
+        : 'It fits the calendar and is held as tentative until you answer.';
+  return (
+    <section className={`invite-card ${gone || booking.status === 'declined' ? 'cancelled' : ''}`} aria-label="Booking request">
+      <div className="invite-icon" aria-hidden="true"><CalendarClock size={20} /></div>
+      <div className="invite-body">
+        <div className="invite-headline muted small">{booking.organizer || 'Someone'} would like to book {booking.resource}</div>
+        <h2 className="invite-title">{booking.summary || '(no title)'}</h2>
+        {!gone && <div className="invite-line">{when(booking.start, booking.end, booking.all_day)}</div>}
+        <p className="invite-note muted small">{state}</p>
+        {!gone && (
+          <div className="invite-actions">
+            <button type="button" className="primary small-button" disabled={busy || booking.status === 'accepted'} onClick={() => answer(true)}><Check size={14} />Approve</button>
+            <button type="button" className="secondary small-button" disabled={busy || booking.status === 'declined'} onClick={() => answer(false)}><X size={14} />Decline</button>
+          </div>
+        )}
+        {error && <p className="error small">{error}</p>}
       </div>
     </section>
   );

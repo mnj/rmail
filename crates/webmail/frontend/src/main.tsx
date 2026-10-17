@@ -15,7 +15,7 @@ const ComposeSettingsDialog = React.lazy(() => import('./settings').then((m) => 
 import { ContactSeed, ContactsDialog } from './contacts';
 import { CalendarView } from './calendar';
 import { SecurityDialog } from './security';
-import { InvitationCard } from './invitation';
+import { BookingCard, InvitationCard } from './invitation';
 import { RelatedPanel } from './related';
 import { FilterIcon, FiltersDialog, Vacation, VacationDialog, VacationIcon, vacationNote } from './rules';
 import {
@@ -1028,6 +1028,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
               </div>
               {!shared && <AiPanel api={api} folder={folder} message={selected} organize={organize} onLabelsChanged={() => reloadMessage(selected.uid)} onOpenSettings={() => setOrganizing(true)} onSaveContact={setContacts} />}
               {selected.invitation && <InvitationCard api={api} folder={folder} uid={selected.uid} invitation={selected.invitation} />}
+              {selected.booking && <BookingCard api={api} booking={selected.booking} />}
               {selected.protection && <ProtectedMessage crypto={crypto} folder={folder} uid={selected.uid} protection={selected.protection} from={selected.from} textBody={selected.text_body} />}
               {selected.protection && ENCRYPTED.has(selected.protection) ? null : <>
               {selected.html_body && selected.has_remote_content && <div className="remote-banner"><ImageIcon size={16} /><span>Remote images are blocked to protect your privacy.</span><button onClick={loadRemoteContent}>Load images</button></div>}
