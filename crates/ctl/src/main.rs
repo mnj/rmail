@@ -103,6 +103,22 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// How long each domain keeps mail in Trash, Junk and everywhere
+    Retention {
+        #[command(subcommand)]
+        action: RetentionAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
+    /// Legal hold: nothing in a mailbox can be permanently deleted
+    Hold {
+        #[command(subcommand)]
+        action: HoldAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// Rooms and equipment: mailboxes that answer invitations themselves
     Resource {
         #[command(subcommand)]
@@ -267,6 +283,37 @@ enum ResourceAction {
     Approver { address: String, approver: String },
     /// List the resources
     List,
+}
+
+#[derive(Subcommand)]
+enum RetentionAction {
+    /// Set DOMAIN's limits in days (leave one out to keep that mail for good)
+    Set {
+        domain: String,
+        #[arg(long)]
+        trash_days: Option<u32>,
+        #[arg(long)]
+        junk_days: Option<u32>,
+        /// delete anything older, in every folder
+        #[arg(long)]
+        max_age_days: Option<u32>,
+    },
+    /// Remove DOMAIN's limits
+    Clear { domain: String },
+    /// List the domains with limits
+    List,
+    /// Apply the limits now (webmail does so hourly)
+    Run,
+}
+
+#[derive(Subcommand)]
+enum HoldAction {
+    /// Put ADDRESS on legal hold
+    On { address: String },
+    /// Lift ADDRESS's legal hold
+    Off { address: String },
+    /// Whether ADDRESS is on hold
+    Show { address: String },
 }
 
 #[derive(Subcommand)]
@@ -797,6 +844,92 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&cfg.global.db_path),
                 &mut std::io::stdout(),
             )?;
+        }
+        Commands::Retention { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db = std::path::Path::new(&cfg.global.db_path);
+            let days = |d: Option<u32>| d.map_or("keep".to_string(), |d| format!("{d} days"));
+            match action {
+                RetentionAction::Set {
+                    domain,
+                    trash_days,
+                    junk_days,
+                    max_age_days,
+                } => {
+                    let policy = rmail_common::retention::Policy {
+                        trash_days,
+                        junk_days,
+                        max_age_days,
+                    };
+                    rmail_common::retention::set(db, &domain, &policy)?;
+                    println!(
+                        "{domain}: Trash {}, Junk {}, all mail {}",
+                        days(trash_days),
+                        days(junk_days),
+                        days(max_age_days)
+                    );
+                }
+                RetentionAction::Clear { domain } => {
+                    rmail_common::retention::set(db, &domain, &Default::default())?;
+                    println!("{domain} keeps all mail");
+                }
+                RetentionAction::List => {
+                    for (domain, policy) in rmail_common::retention::list(db)? {
+                        println!(
+                            "{domain}\ttrash {}\tjunk {}\tall mail {}",
+                            days(policy.trash_days),
+                            days(policy.junk_days),
+                            days(policy.max_age_days)
+                        );
+                    }
+                }
+                RetentionAction::Run => {
+                    let report = rmail_common::retention::sweep(
+                        db,
+                        std::path::Path::new(&cfg.global.mail_root),
+                        chrono::Utc::now().timestamp(),
+                    )?;
+                    println!(
+                        "deleted {} messages; {} accounts on hold left alone",
+                        report.deleted, report.held
+                    );
+                    for error in report.errors {
+                        eprintln!("{error}");
+                    }
+                }
+            }
+        }
+        Commands::Hold { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            let cfg = Config::load(&cfg_path)?;
+            let db = std::path::Path::new(&cfg.global.db_path);
+            let root = std::path::Path::new(&cfg.global.mail_root);
+            let (address, on) = match &action {
+                HoldAction::On { address } => (address.clone(), Some(true)),
+                HoldAction::Off { address } => (address.clone(), Some(false)),
+                HoldAction::Show { address } => (address.clone(), None),
+            };
+            let address = address.trim().to_ascii_lowercase();
+            if !rmail_common::db::mailbox_exists(db, &address)? {
+                anyhow::bail!("no mailbox {address}");
+            }
+            let (local, domain) = address
+                .split_once('@')
+                .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+            rmail_common::imap_state::init_account(root, domain, local)?;
+            if let Some(on) = on {
+                rmail_common::imap_state::set_legal_hold(root, domain, local, on)?;
+            }
+            let held = rmail_common::imap_state::legal_hold(root, domain, local)?;
+            println!(
+                "{address} is {}",
+                if held { "on legal hold" } else { "not on hold" }
+            );
         }
         Commands::Resource { action, config } => {
             let cfg_path = config.unwrap_or_else(|| {

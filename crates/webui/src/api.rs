@@ -111,6 +111,8 @@ pub(crate) fn router(state: Shared) -> Router {
         )
         .route("/api/accounts/two-factor-reset", post(reset_two_factor))
         .route("/api/accounts/resource", post(set_resource))
+        .route("/api/accounts/legal-hold", post(set_legal_hold))
+        .route("/api/retention", get(retention).put(set_retention))
         .route(
             "/api/two-factor-policy",
             get(two_factor_policy).put(set_two_factor_policy),
@@ -932,6 +934,104 @@ async fn set_resource(State(state): State<Shared>, body: Bytes) -> Response {
                     .filter(|a| !a.is_empty());
                 rmail_common::resources::set_approver(Path::new(&db), &input.address, approver)?;
             }
+            Ok(json!({ "result": "ok" }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct LegalHoldChange {
+    address: String,
+    on: bool,
+}
+
+/// Put a mailbox on legal hold (nothing in it can be permanently deleted,
+/// and retention leaves it alone), or release it.
+async fn set_legal_hold(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: LegalHoldChange = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    let root = state.mail_root.clone();
+    outcome(
+        blocking(move || {
+            let address = input.address.trim().to_ascii_lowercase();
+            if !rmail_common::db::mailbox_exists(Path::new(&db), &address)? {
+                anyhow::bail!("no mailbox {address}");
+            }
+            let (local, domain) = address
+                .split_once('@')
+                .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+            rmail_common::imap_state::init_account(&root, domain, local)?;
+            rmail_common::imap_state::set_legal_hold(&root, domain, local, input.on)?;
+            Ok(json!({ "result": "ok" }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Each local domain's retention limits.
+async fn retention(State(state): State<Shared>) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            let policies: std::collections::HashMap<String, rmail_common::retention::Policy> =
+                rmail_common::retention::list(Path::new(&db))?
+                    .into_iter()
+                    .collect();
+            let mut domains = rmail_common::db::local_domains(&db)?;
+            domains.extend(policies.keys().cloned());
+            domains.sort();
+            domains.dedup();
+            Ok(json!({
+                "domains": domains
+                    .into_iter()
+                    .map(|domain| {
+                        let policy = policies.get(&domain).cloned().unwrap_or_default();
+                        json!({
+                            "domain": domain,
+                            "trash_days": policy.trash_days,
+                            "junk_days": policy.junk_days,
+                            "max_age_days": policy.max_age_days,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }))
+        })
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct RetentionChange {
+    domain: String,
+    #[serde(flatten)]
+    policy: rmail_common::retention::Policy,
+}
+
+async fn set_retention(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: RetentionChange = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            rmail_common::retention::set(Path::new(&db), &input.domain, &input.policy)?;
             Ok(json!({ "result": "ok" }))
         })
         .await,

@@ -45,6 +45,7 @@ pub mod outbound;
 pub mod proxy;
 pub mod resources;
 pub mod restart;
+pub mod retention;
 pub mod runtime;
 pub mod scanner;
 pub mod search_index;

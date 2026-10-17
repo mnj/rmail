@@ -58,6 +58,8 @@ struct AccountSummary {
     resource: Option<&'static str>,
     /// Who approves a resource's bookings.
     approver: Option<String>,
+    /// Nothing in the mailbox can be permanently deleted.
+    legal_hold: bool,
 }
 
 #[derive(Serialize)]
@@ -552,6 +554,11 @@ fn account_summaries_sync(
             let mut messages = 0usize;
             let mut unseen = 0usize;
             let mut used_bytes = 0u64;
+            let legal_hold = split_address(&mailbox.address).is_some_and(|(local, domain)| {
+                rmail_common::imap_state::account_maildir(mail_root, domain, local).exists()
+                    && rmail_common::imap_state::legal_hold(mail_root, domain, local)
+                        .unwrap_or(false)
+            });
             if let Some((local, domain)) = split_address(&mailbox.address)
                 && let Ok(summaries) =
                     rmail_common::imap_state::list_folder_summaries(mail_root, domain, local)
@@ -574,6 +581,7 @@ fn account_summaries_sync(
                     .get(&mailbox.address.to_ascii_lowercase())
                     .cloned(),
                 app_passwords,
+                legal_hold,
                 address: mailbox.address,
                 auth: if mailbox.scram.is_some() {
                     "SCRAM".to_string()
