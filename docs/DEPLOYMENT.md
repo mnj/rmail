@@ -813,6 +813,12 @@ enabling.
   the user may send as it.
 - Mailboxes shared with the user appear as one more JMAP account per owner, within the rights
   granted (see Shared folders).
+- Calendars over JMAP (following the JMAP Calendars Internet-Draft, revision 32) are the user's
+  CalDAV calendars, with events as JSCalendar: title, description, a location, times and time
+  zone, all day, a simple recurrence and attendees. Other iCalendar properties are kept on edits;
+  JSCalendar properties the server cannot store are refused. Guests hear of a JMAP change only
+  when the client asks (`sendSchedulingMessages`). Invitations are answered in webmail or a
+  CalDAV client.
 - Contacts over JMAP are the user's CardDAV address books (not those shared with them), so a card
   changed in a JMAP client reaches CardDAV apps and webmail and the other way round. Clients edit
   the fields webmail shows (name, emails, phones, organization, title, birthday, note, addresses);
