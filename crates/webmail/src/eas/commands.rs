@@ -133,7 +133,11 @@ fn folder_type(folder: &Folder) -> u8 {
 fn folder_list(account: &Account, db: &Connection) -> anyhow::Result<state::FolderList> {
     let folders = account.folders()?;
     let mut out = BTreeMap::new();
-    for folder in &folders {
+    // The notes folder is the device's Notes, not mail.
+    for folder in folders
+        .iter()
+        .filter(|f| !crate::notes::is_notes_folder(&f.name))
+    {
         let id = state::folder_id(db, &folder.name)?;
         let (parent, name) = match folder.name.rsplit_once('/') {
             Some((parent, name)) if folders.iter().any(|f| f.name == parent) => {
@@ -151,6 +155,10 @@ fn folder_list(account: &Account, db: &Connection) -> anyhow::Result<state::Fold
         out.insert(id, (parent, name, folder_type(folder)));
     }
     out.extend(super::pim::folders(account)?);
+    out.insert(
+        super::notes::ID.to_string(),
+        ("0".to_string(), "Notes".to_string(), 10),
+    );
     Ok(out)
 }
 
@@ -617,7 +625,9 @@ fn sync(account: &Account, request: Option<Element>, body: &[u8]) -> anyhow::Res
     {
         any = true;
         let id = collection.value("AirSync:CollectionId").unwrap_or_default();
-        collections.push(if super::pim::is_pim(&id) {
+        collections.push(if super::notes::is_notes(&id) {
+            super::notes::sync_collection(account, &db, collection, window)?
+        } else if super::pim::is_pim(&id) {
             super::pim::sync_collection(account, &db, collection, window)?
         } else {
             sync_collection(account, &db, collection, window)?
@@ -904,6 +914,9 @@ fn sync_collection(
 
 /// Changes waiting for a device in a collection.
 fn pending(account: &Account, db: &Connection, collection: &str) -> anyhow::Result<usize> {
+    if super::notes::is_notes(collection) {
+        return super::notes::pending(account, db);
+    }
     if super::pim::is_pim(collection) {
         return super::pim::pending(account, db, collection);
     }
@@ -940,7 +953,9 @@ fn estimate(account: &Account, request: Option<&Element>) -> anyhow::Result<Elem
         let id = collection
             .value("GetItemEstimate:CollectionId")
             .unwrap_or_default();
-        let known = super::pim::is_pim(&id) || state::folder_name(&db, &id)?.is_some();
+        let known = super::notes::is_notes(&id)
+            || super::pim::is_pim(&id)
+            || state::folder_name(&db, &id)?.is_some();
         let (status, count) = if known {
             ("1", pending(account, &db, &id)?)
         } else {

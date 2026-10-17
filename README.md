@@ -48,7 +48,7 @@ screenshots of every page, and a quick start.
   and sends the reply as a calendar app would, or **Propose a new time** (iTIP `COUNTER`); the
   organizer gets a card showing the time now and the one proposed, to accept (which moves the event
   and updates every guest) or decline. Cancellations and unverified replies can be applied from the
-  card too. A calendar (week, month and agenda), tasks and contacts are edited in webmail and
+  card too. A calendar (week, month and agenda), tasks, notes and contacts are edited in webmail and
   synced with phones over CalDAV and CardDAV; inviting guests from webmail sends invitations,
   updates and cancellations. Two-factor sign-in (TOTP with recovery codes) and per-device app
   passwords for mail apps are set up under Security, and webmail can sign in through an

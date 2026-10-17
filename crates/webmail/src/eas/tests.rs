@@ -1076,3 +1076,145 @@ async fn tasks_sync_both_ways() {
             .any(|o| o.data.contains("SUMMARY:Call the bank") && o.data.contains("BEGIN:VTODO"))
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notes_sync_both_ways_and_keep_their_ids() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let root = state.mail_root.clone();
+    imap_state::init_account(&root, "example.test", "user").unwrap();
+    let mut settings = rmail_common::settings::open(&state.db_path).unwrap();
+    rmail_common::settings::write_raw(
+        &mut settings,
+        &[("activesync.enabled".to_string(), Some(json!(true)))]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+    let first = crate::notes::save(
+        &root,
+        "user@example.test",
+        "example.test",
+        "user",
+        None,
+        "Packing list\nPassport",
+    )
+    .unwrap();
+
+    let folders = call(
+        &state,
+        "FolderSync",
+        Some(
+            &Element::new("FolderHierarchy:FolderSync")
+                .with(Element::text("FolderHierarchy:SyncKey", "0")),
+        ),
+    )
+    .await;
+    let adds: Vec<&Element> = folders
+        .child("FolderHierarchy:Changes")
+        .unwrap()
+        .children_named("FolderHierarchy:Add")
+        .collect();
+    assert!(
+        adds.iter()
+            .any(|a| a.value("FolderHierarchy:Type").as_deref() == Some("10"))
+    );
+    assert!(
+        !adds.iter().any(
+            |a| a.value("FolderHierarchy:DisplayName").as_deref() == Some("Notes")
+                && a.value("FolderHierarchy:Type").as_deref() == Some("12")
+        ),
+        "the IMAP folder is not also a mail folder"
+    );
+
+    call(
+        &state,
+        "Sync",
+        Some(&sync_request("notes", "0", None, None)),
+    )
+    .await;
+    let synced = call(
+        &state,
+        "Sync",
+        Some(&sync_request("notes", "1", None, None)),
+    )
+    .await;
+    let add = collection(&synced)
+        .child("AirSync:Commands")
+        .and_then(|c| c.child("AirSync:Add"))
+        .unwrap();
+    assert_eq!(add.value("AirSync:ServerId"), Some(first.id.clone()));
+    let data = add.child("AirSync:ApplicationData").unwrap();
+    assert_eq!(data.value("Notes:Subject").as_deref(), Some("Packing list"));
+    assert_eq!(
+        data.value("Notes:MessageClass").as_deref(),
+        Some("IPM.StickyNote")
+    );
+
+    let note = |subject: &str, body: &str| {
+        Element::new("AirSync:ApplicationData")
+            .with(Element::text("Notes:Subject", subject))
+            .with(
+                Element::new("AirSyncBase:Body")
+                    .with(Element::text("AirSyncBase:Type", "1"))
+                    .with(Element::text("AirSyncBase:Data", body)),
+            )
+    };
+    let commands = Element::new("AirSync:Commands")
+        .with(
+            Element::new("AirSync:Add")
+                .with(Element::text("AirSync:ClientId", "n1"))
+                .with(note("Ideas", "Ideas\r\nA boat")),
+        )
+        .with(
+            Element::new("AirSync:Change")
+                .with(Element::text("AirSync:ServerId", first.id.clone()))
+                .with(note("Packing list", "Passport\r\nTickets")),
+        );
+    let key = collection(&synced).value("AirSync:SyncKey").unwrap();
+    let second = call(
+        &state,
+        "Sync",
+        Some(&sync_request("notes", &key, Some(commands), None)),
+    )
+    .await;
+    assert_eq!(
+        collection(&second)
+            .child("AirSync:Responses")
+            .and_then(|r| r.child("AirSync:Add"))
+            .and_then(|a| a.value("AirSync:Status"))
+            .as_deref(),
+        Some("1")
+    );
+    assert!(
+        collection(&second).child("AirSync:Commands").is_none(),
+        "no echo"
+    );
+    let stored = crate::notes::list(&root, "example.test", "user").unwrap();
+    assert_eq!(stored.len(), 2);
+    let packing = stored
+        .iter()
+        .find(|n| n.id == first.id)
+        .expect("same id after the edit");
+    assert_eq!(
+        packing.text, "Packing list\nPassport\nTickets",
+        "the subject leads the text"
+    );
+
+    // Deleted on the server: the phone hears of it.
+    crate::notes::delete(&root, "example.test", "user", &first.id).unwrap();
+    let key = collection(&second).value("AirSync:SyncKey").unwrap();
+    let third = call(
+        &state,
+        "Sync",
+        Some(&sync_request("notes", &key, None, None)),
+    )
+    .await;
+    assert_eq!(
+        collection(&third)
+            .child("AirSync:Commands")
+            .and_then(|c| c.child("AirSync:Delete"))
+            .and_then(|d| d.value("AirSync:ServerId")),
+        Some(first.id)
+    );
+}

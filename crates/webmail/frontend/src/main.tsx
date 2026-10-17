@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertOctagon, Archive, ChevronLeft, Code2, Download, File, FileText, FolderInput, FolderPlus, FolderTree, Image as ImageIcon,
   Forward, Inbox, LogOut, Mail, MailOpen, Menu, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, PenSquare, RefreshCw, Reply,
-  ListChecks, PenLine, ReplyAll, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck, Lock, HardDrive,
+  ListChecks, PenLine, ReplyAll, StickyNote, Search, Send, Share2, Sparkles, Star, Sun, Tag, Trash2, Users, X, CalendarDays, BookUser, ShieldCheck, Lock, HardDrive,
 } from 'lucide-react';
 import { useCrypto } from './crypto/hook';
 const FilesDialog = React.lazy(() => import('./files').then((m) => ({ default: m.FilesDialog })));
@@ -16,6 +16,7 @@ import type { ContactSeed } from './contacts';
 const ContactsDialog = React.lazy(() => import('./contacts').then((m) => ({ default: m.ContactsDialog })));
 const CalendarView = React.lazy(() => import('./calendar').then((m) => ({ default: m.CalendarView })));
 const TasksView = React.lazy(() => import('./tasks').then((m) => ({ default: m.TasksView })));
+const NotesView = React.lazy(() => import('./notes').then((m) => ({ default: m.NotesView })));
 import { SecurityDialog } from './security';
 import { BookingCard, InvitationCard } from './invitation';
 import { RelatedPanel } from './related';
@@ -547,6 +548,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
   const [contacts, setContacts] = useState<ContactSeed | null | false>(false);
   const [calendarMode, setCalendarMode] = useState(false);
   const [tasksMode, setTasksMode] = useState(false);
+  const [notesMode, setNotesMode] = useState(false);
   const [securityOpen, setSecurityOpen] = useState(false);
   const [encryptionOpen, setEncryptionOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
@@ -656,6 +658,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
   async function chooseFolder(name: string) {
     setCalendarMode(false);
     setTasksMode(false);
+    setNotesMode(false);
     setFolder(name);
     setSelected(null);
     setChecked([]);
@@ -814,7 +817,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
-      if (calendarMode || tasksMode || target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (calendarMode || tasksMode || notesMode || target.closest('input, textarea, select, [contenteditable], .dialog, .compose') || compose || event.metaKey || event.ctrlKey || event.altKey) return;
       const move = (delta: number) => {
         const index = selectedIndex < 0 ? (delta > 0 ? 0 : messages.length - 1) : selectedIndex + delta;
         const message = messages[index];
@@ -864,7 +867,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
   );
 
   return (
-    <main className={`app view-${view} ${calendarMode || tasksMode ? 'calendar-mode' : ''}`}>
+    <main className={`app view-${view} ${calendarMode || tasksMode || notesMode ? 'calendar-mode' : ''}`}>
       <aside className="sidebar">
         <div className="brand"><div className="logo">rM</div><div><strong>rMail</strong><span title={address}>{address}</span></div></div>
         {canSend && <button className="compose-button" onClick={() => { setCompose({}); setView('list'); }}><PenSquare size={16} />Compose</button>}
@@ -899,8 +902,9 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
         <div className="sidebar-foot">
           {canSend && <button className="sidebar-link" onClick={() => setComposeSettings(true)}><PenLine size={15} />Compose settings</button>}
           <button className="sidebar-link" onClick={() => setOrganizing(true)}><Sparkles size={15} />Organize my mail</button>
-          <button className={`sidebar-link ${calendarMode ? 'active' : ''}`} aria-current={calendarMode ? 'page' : undefined} onClick={() => { setCalendarMode(true); setTasksMode(false); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><CalendarDays size={15} />Calendar</button>
-          <button className={`sidebar-link ${tasksMode ? 'active' : ''}`} aria-current={tasksMode ? 'page' : undefined} onClick={() => { setTasksMode(true); setCalendarMode(false); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><ListChecks size={15} />Tasks</button>
+          <button className={`sidebar-link ${calendarMode ? 'active' : ''}`} aria-current={calendarMode ? 'page' : undefined} onClick={() => { setCalendarMode(true); setTasksMode(false); setNotesMode(false); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><CalendarDays size={15} />Calendar</button>
+          <button className={`sidebar-link ${tasksMode ? 'active' : ''}`} aria-current={tasksMode ? 'page' : undefined} onClick={() => { setTasksMode(true); setCalendarMode(false); setNotesMode(false); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><ListChecks size={15} />Tasks</button>
+          <button className={`sidebar-link ${notesMode ? 'active' : ''}`} aria-current={notesMode ? 'page' : undefined} onClick={() => { setNotesMode(true); setCalendarMode(false); setTasksMode(false); setSelected(null); setChecked([]); setMoveOpen(false); setMoreOpen(false); setView('list'); }}><StickyNote size={15} />Notes</button>
           <button className="sidebar-link" onClick={() => setContacts(null)}><BookUser size={15} />Contacts</button>
           <button className="sidebar-link" onClick={() => setCalendars(true)}><CalendarDays size={15} />Calendar sharing</button>
           <button className="sidebar-link" onClick={() => setVacationOpen(true)} disabled={!vacation}><VacationIcon size={15} />Out of office{awayNote && <span className="sidebar-dot" aria-label="on" />}</button>
@@ -982,6 +986,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
 
       {calendarMode && <React.Suspense fallback={null}><CalendarView api={api} flash={flash} onShowFolders={() => setView('folders')} /></React.Suspense>}
       {tasksMode && <React.Suspense fallback={null}><TasksView api={api} flash={flash} onShowFolders={() => setView('folders')} /></React.Suspense>}
+      {notesMode && <React.Suspense fallback={null}><NotesView api={api} flash={flash} onShowFolders={() => setView('folders')} /></React.Suspense>}
       <article className="reader">
         {selected ? (
           <>

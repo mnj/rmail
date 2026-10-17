@@ -490,7 +490,7 @@ fn compact(seconds: i64) -> String {
         .to_string()
 }
 
-fn email_time(seconds: i64) -> String {
+pub(super) fn email_time(seconds: i64) -> String {
     chrono::DateTime::from_timestamp(seconds, 0)
         .unwrap_or_default()
         .format("%Y-%m-%dT%H:%M:%S.000Z")
