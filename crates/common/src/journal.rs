@@ -25,12 +25,14 @@ fn open(db: &Path) -> Result<crate::sqlite_pool::SqliteConnection> {
     Ok(conn)
 }
 
+/// A domain as account and recipient domains are stored (IDNA A-labels,
+/// lower case), so policies match what smtpd looks up.
 fn clean_domain(domain: &str) -> Result<String> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain.trim().trim_end_matches('.');
     if domain.is_empty() || domain.contains(['/', '\\', '@']) {
         bail!("invalid domain");
     }
-    Ok(domain)
+    crate::domain::canonicalize_domain(domain)
 }
 
 /// Journal `domain`'s mail to `archive` (a local mailbox), or with `None`
@@ -66,7 +68,7 @@ pub fn archive_of(db: &Path, domain: &str) -> Result<Option<String>> {
     Ok(open(db)?
         .query_row(
             "SELECT archive FROM journal_policies WHERE domain = ?1",
-            params![domain.trim().to_ascii_lowercase()],
+            params![clean_domain(domain).unwrap_or_else(|_| domain.trim().to_ascii_lowercase())],
             |row| row.get(0),
         )
         .optional()?)
@@ -154,6 +156,12 @@ mod tests {
             Some("archive@example.test")
         );
         assert_eq!(list(&db).unwrap().len(), 1);
+        set(&db, "bücher.example", Some("archive@example.test")).unwrap();
+        assert_eq!(
+            archive_of(&db, "xn--bcher-kva.example").unwrap().as_deref(),
+            Some("archive@example.test"),
+            "a Unicode domain is stored as recipients' domains are"
+        );
         set(&db, "example.test", None).unwrap();
         assert_eq!(archive_of(&db, "example.test").unwrap(), None);
 

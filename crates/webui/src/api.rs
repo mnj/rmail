@@ -1049,7 +1049,9 @@ async fn journal(State(state): State<Shared>) -> Response {
     outcome(
         blocking(move || {
             let archives: std::collections::HashMap<String, String> =
-                rmail_common::journal::list(Path::new(&db))?.into_iter().collect();
+                rmail_common::journal::list(Path::new(&db))?
+                    .into_iter()
+                    .collect();
             let mut domains = rmail_common::db::local_domains(&db)?;
             domains.extend(archives.keys().cloned());
             domains.sort();
@@ -1084,7 +1086,11 @@ async fn set_journal(State(state): State<Shared>, body: Bytes) -> Response {
     };
     outcome(
         blocking(move || {
-            let archive = input.archive.as_deref().map(str::trim).filter(|a| !a.is_empty());
+            let archive = input
+                .archive
+                .as_deref()
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
             rmail_common::journal::set(Path::new(&db), &input.domain, archive)?;
             Ok(json!({ "result": "ok" }))
         })
