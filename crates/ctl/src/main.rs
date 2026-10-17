@@ -342,7 +342,7 @@ enum JournalAction {
 
 #[derive(Subcommand)]
 enum BackupAction {
-    /// Back up everything (or one account with --account) to FILE (.tar.gz)
+    /// Back up everything (or one account with --account) to FILE (.tar.zst)
     Create {
         file: String,
         #[arg(long)]

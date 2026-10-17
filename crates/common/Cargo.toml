@@ -8,6 +8,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.7"
 anyhow = "1.0"
 tar = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
 argon2 = "0.4"
 password-hash = "0.4"
 rand = "0.8"

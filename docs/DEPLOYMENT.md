@@ -379,19 +379,19 @@ delivery.
 
 ## Backup and restore
 
-`rmail_ctl backup` makes and restores gzip-compressed tar archives of the server's data, while the
+`rmail_ctl backup` makes and restores zstd-compressed tar archives of the server's data, while the
 services keep running:
 
-- `rmail_ctl backup create /path/rmail.tar.gz` backs up everything: the configuration file (when
+- `rmail_ctl backup create /path/rmail.tar.zst` backs up everything: the configuration file (when
   readable), the database (mailboxes, settings, DKIM keys, ACME state), the TLS certificate and key
   files, and the mail root (every account's mail, calendars, contacts, notes and settings, and the
   outbound queue). SQLite databases are copied with `VACUUM INTO`, a consistent snapshot; messages
   still being written (maildir `tmp/`) and SQLite side files are left out.
-- `rmail_ctl backup create /path/ann.tar.gz --account ann@example.com` backs up one account.
+- `rmail_ctl backup create /path/ann.tar.zst --account ann@example.com` backs up one account.
 - `rmail_ctl backup show <file>` says what a backup holds.
 - Nightly backups: `systemctl enable --now rmail_backup.timer` runs `rmail_ctl backup rotate
   /var/backups/rmail --keep 7` at about 03:15, keeping the newest seven
-  (`rmail-YYYYMMDD-HHMMSS.tar.gz`). Change the directory and count with `RMAIL_BACKUP_DIR` and
+  (`rmail-YYYYMMDD-HHMMSS.tar.zst`). Change the directory and count with `RMAIL_BACKUP_DIR` and
   `RMAIL_BACKUP_KEEP` (`systemctl edit rmail_backup.service`). Copy the files off the machine too:
   a backup on the same disk does not survive the disk.
 
