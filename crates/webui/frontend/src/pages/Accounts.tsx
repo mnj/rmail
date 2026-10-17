@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, ShieldOff, Trash2 } from 'lucide-react';
-import { Account, DavShare, DirectoryPolicy, FolderShare, RetentionPolicy, TwoFactorPolicy, api } from '../api';
+import { Account, DavShare, DirectoryPolicy, FolderShare, JournalPolicy, RetentionPolicy, TwoFactorPolicy, api } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, invalidate, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
@@ -261,6 +261,42 @@ function RetentionPanel() {
   );
 }
 
+function JournalPanel() {
+  const { run } = useFeedback();
+  const policy = useResource(() => api<JournalPolicy>('/api/journal'), [], undefined, 'journal');
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  async function save(domain: string) {
+    const archive = (drafts[domain] ?? '').trim();
+    if (await run(() => api('/api/journal', 'PUT', { domain, archive: archive || null }), archive ? `${domain}'s mail is now journaled to ${archive}` : `${domain}'s mail is no longer journaled`)) {
+      setDrafts((all) => { const next = { ...all }; delete next[domain]; return next; });
+      await policy.reload();
+    }
+  }
+  return (
+    <Panel title="Journaling" subtitle="A copy of every message a domain sends or receives, kept in an archive mailbox with headers naming the sender and every recipient, Bcc included. Use a mailbox of its own and put it on legal hold so nothing in it can be deleted.">
+      <ErrorBanner error={policy.error} />
+      {policy.data && policy.data.domains.length > 0 && (
+        <div className="tableScroll">
+          <table>
+            <thead><tr><th>Domain</th><th>Archive mailbox</th><th /></tr></thead>
+            <tbody>
+              {policy.data.domains.map(({ domain, archive }) => (
+                <tr key={domain}>
+                  <td><strong>{domain}</strong></td>
+                  <td><input aria-label={`Archive mailbox for ${domain}`} type="email" placeholder="Not journaled" value={drafts[domain] ?? archive ?? ''}
+                    onChange={(event) => setDrafts((all) => ({ ...all, [domain]: event.target.value }))} /></td>
+                  <td><button className="button" disabled={drafts[domain] === undefined} onClick={() => save(domain)}>Save</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {policy.data && policy.data.domains.length === 0 && <Empty>No domains yet.</Empty>}
+    </Panel>
+  );
+}
+
 function DavSharingPanel() {
   const { run, confirm } = useFeedback();
   const shares = useResource(() => api<DavShare[]>('/api/dav-sharing'), [], undefined, 'dav-sharing');
@@ -395,6 +431,7 @@ export function AccountsPage() {
       <TwoFactorPanel />
       <DirectoryPanel />
       <RetentionPanel />
+      <JournalPanel />
       <SharingPanel />
       <DavSharingPanel />
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={() => { accounts.reload(); invalidate('directory-policy'); }} />}

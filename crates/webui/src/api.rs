@@ -111,6 +111,7 @@ pub(crate) fn router(state: Shared) -> Router {
         )
         .route("/api/accounts/two-factor-reset", post(reset_two_factor))
         .route("/api/accounts/resource", post(set_resource))
+        .route("/api/journal", get(journal).put(set_journal))
         .route("/api/accounts/legal-hold", post(set_legal_hold))
         .route("/api/retention", get(retention).put(set_retention))
         .route(
@@ -1032,6 +1033,65 @@ async fn set_retention(State(state): State<Shared>, body: Bytes) -> Response {
     outcome(
         blocking(move || {
             rmail_common::retention::set(Path::new(&db), &input.domain, &input.policy)?;
+            Ok(json!({ "result": "ok" }))
+        })
+        .await,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Each local domain and the mailbox its mail is journaled to, if any.
+async fn journal(State(state): State<Shared>) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            let archives: std::collections::HashMap<String, String> =
+                rmail_common::journal::list(Path::new(&db))?
+                    .into_iter()
+                    .collect();
+            let mut domains = rmail_common::db::local_domains(&db)?;
+            domains.extend(archives.keys().cloned());
+            domains.sort();
+            domains.dedup();
+            Ok(json!({
+                "domains": domains
+                    .into_iter()
+                    .map(|domain| json!({ "archive": archives.get(&domain), "domain": domain }))
+                    .collect::<Vec<_>>(),
+            }))
+        })
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct JournalChange {
+    domain: String,
+    /// The archive mailbox, or null or empty to stop journaling.
+    archive: Option<String>,
+}
+
+async fn set_journal(State(state): State<Shared>, body: Bytes) -> Response {
+    let db = match require_db(&state) {
+        Ok(db) => db,
+        Err(err) => return err.into_response(),
+    };
+    let input: JournalChange = match parse(&body) {
+        Ok(input) => input,
+        Err(err) => return err.into_response(),
+    };
+    outcome(
+        blocking(move || {
+            let archive = input
+                .archive
+                .as_deref()
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
+            rmail_common::journal::set(Path::new(&db), &input.domain, archive)?;
             Ok(json!({ "result": "ok" }))
         })
         .await,
