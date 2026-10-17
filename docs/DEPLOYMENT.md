@@ -363,6 +363,20 @@ ActiveSync, and by retention, which leaves held mailboxes alone. Moving messages
 still works, and a folder can only be deleted once it is empty. Removing a mailbox in the console
 removes its sign-in, not its mail on disk.
 
+## Journaling
+
+**Journaling** keeps a copy of every message a domain sends or receives in an archive mailbox, for
+compliance: set it in the **Journaling** panel on the console's Mailboxes page, or with
+`rmail_ctl journal set <domain> <archive mailbox>` (`none` stops it; `journal list` shows them).
+smtpd stores the copy when it accepts a message, so mail sent from webmail, mail apps and phones is
+included, as is mail between the domain's own people (marked `internal`). Each copy is the message
+as it arrived, below headers recording the direction and domain (`X-Rmail-Journal: inbound;
+domain=example.com`), the envelope sender and every envelope recipient, Bcc included
+(`X-Rmail-Journal-Recipient`, one per line). A message addressed to the archive mailbox itself is
+not copied twice. Use a mailbox of its own for the archive and put it on legal hold (see above) so
+nothing in it can be deleted; journaling failures are logged (`journal_failed`) and do not hold up
+delivery.
+
 ## Account storage quotas
 
 Storage quotas are optional and account-wide across every IMAP folder. Configure them from the
