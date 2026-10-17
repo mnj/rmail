@@ -45,7 +45,7 @@ export function NotesView({ api, onShowFolders, flash }: { api: Api; onShowFolde
   }
 
   async function save() {
-    if (!draft.trim()) return;
+    if (busy || !dirty || !draft.trim()) return;
     setBusy(true);
     try {
       const path = open && open !== 'new' ? `/api/notes/${encodeURIComponent(open)}` : '/api/notes';

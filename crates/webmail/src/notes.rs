@@ -33,11 +33,23 @@ pub(crate) struct Note {
     /// The message's UID now (changes with every edit).
     #[serde(skip)]
     pub uid: u64,
+    /// The folder it is in: `Notes` or one of Apple Notes' subfolders.
+    #[serde(skip)]
+    pub folder: String,
 }
 
-/// Whether `name` is the notes folder (shown as notes, not mail).
+impl Note {
+    /// What changes with every edit: the message holding it.
+    pub(crate) fn version(&self) -> String {
+        format!("{}:{}", self.folder, self.uid)
+    }
+}
+
+/// Whether `name` is the notes folder or one of its subfolders (Apple
+/// Notes' folders), shown as notes, not mail.
 pub(crate) fn is_notes_folder(name: &str) -> bool {
-    name.eq_ignore_ascii_case(FOLDER)
+    let top = name.split('/').next().unwrap_or_default();
+    top.eq_ignore_ascii_case(FOLDER)
 }
 
 fn header(raw: &[u8], name: &str) -> Option<String> {
@@ -136,7 +148,7 @@ fn date_of(text: Option<String>) -> Option<i64> {
 }
 
 /// A note from its message.
-fn read(message: &imap_state::Message) -> Option<Note> {
+fn read(folder: &str, message: &imap_state::Message) -> Option<Note> {
     let raw = std::fs::read(&message.path).ok()?;
     let parsed = mime::parse_message(&raw);
     let text = match &parsed.html_body {
@@ -164,32 +176,60 @@ fn read(message: &imap_state::Message) -> Option<Note> {
         created,
         modified,
         uid: message.uid,
+        folder: folder.to_string(),
     })
 }
 
-fn has_folder(root: &Path, domain: &str, local: &str) -> Result<bool> {
-    Ok(imap_state::list_folders(root, domain, local)?
-        .iter()
-        .any(|f| is_notes_folder(&f.name)))
+/// The notes folders as stored (any capitalisation), the top one first.
+fn folders(root: &Path, domain: &str, local: &str) -> Result<Vec<String>> {
+    let mut names: Vec<String> = imap_state::list_folders(root, domain, local)?
+        .into_iter()
+        .map(|f| f.name)
+        .filter(|name| is_notes_folder(name))
+        .collect();
+    names.sort_by_key(|name| name.contains('/'));
+    Ok(names)
 }
 
-/// The account's notes, most recently changed first.
+/// The top notes folder's stored name, if there is one.
+fn top_folder(root: &Path, domain: &str, local: &str) -> Result<Option<String>> {
+    Ok(folders(root, domain, local)?
+        .into_iter()
+        .find(|name| !name.contains('/')))
+}
+
+/// The account's notes (in `Notes` and its subfolders), most recently
+/// changed first.
 pub(crate) fn list(root: &Path, domain: &str, local: &str) -> Result<Vec<Note>> {
-    if !has_folder(root, domain, local)? {
-        return Ok(Vec::new());
+    let mut notes = Vec::new();
+    for folder in folders(root, domain, local)? {
+        let (_, messages) = imap_state::load_folder(root, domain, local, &folder)?;
+        notes.extend(
+            messages
+                .iter()
+                .filter(|m| !m.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Deleted")))
+                .filter_map(|m| read(&folder, m)),
+        );
     }
-    let (_, messages) = imap_state::load_folder(root, domain, local, FOLDER)?;
-    let mut notes: Vec<Note> = messages
-        .iter()
-        .filter(|m| !m.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Deleted")))
-        .filter_map(read)
-        .collect();
     notes.sort_by(|a, b| b.modified.cmp(&a.modified).then(b.uid.cmp(&a.uid)));
     Ok(notes)
 }
 
 fn new_id() -> String {
-    let bytes: [u8; 16] = rand::random();
+    uuid_of(rand::random())
+}
+
+/// A note id for a device's new note: the same for the same device and
+/// ClientId, so a retried Sync finds the note it stored.
+pub(crate) fn device_note_id(device: &str, client: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(format!("note\0{device}\0{client}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid_of(bytes)
+}
+
+fn uuid_of(bytes: [u8; 16]) -> String {
     let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
@@ -254,9 +294,13 @@ pub(crate) fn save(
     id: Option<&str>,
     text: &str,
 ) -> Result<Note> {
-    if !has_folder(root, domain, local)? {
-        imap_state::create_folder(root, domain, local, FOLDER)?;
-    }
+    let top = match top_folder(root, domain, local)? {
+        Some(name) => name,
+        None => {
+            imap_state::create_folder(root, domain, local, FOLDER)?;
+            FOLDER.to_string()
+        }
+    };
     let existing = match id {
         Some(id) => list(root, domain, local)?.into_iter().find(|n| n.id == id),
         None => None,
@@ -271,16 +315,18 @@ pub(crate) fn save(
         .as_ref()
         .map_or_else(|| chrono::Utc::now().timestamp(), |n| n.created);
     let data = message(address, &note_id, text.trim_end(), created);
+    // An edited note stays in its folder.
+    let folder = existing.as_ref().map_or(top, |n| n.folder.clone());
     imap_state::append_message(
         root,
         domain,
         local,
-        FOLDER,
+        &folder,
         &data,
         vec!["\\Seen".to_string()],
     )?;
     if let Some(previous) = &existing {
-        imap_state::delete_message_by_uid(root, domain, local, FOLDER, previous.uid)?;
+        imap_state::delete_message_by_uid(root, domain, local, &previous.folder, previous.uid)?;
     }
     list(root, domain, local)?
         .into_iter()
@@ -293,7 +339,7 @@ pub(crate) fn delete(root: &Path, domain: &str, local: &str, id: &str) -> Result
     let Some(note) = list(root, domain, local)?.into_iter().find(|n| n.id == id) else {
         return Ok(false);
     };
-    imap_state::delete_message_by_uid(root, domain, local, FOLDER, note.uid)?;
+    imap_state::delete_message_by_uid(root, domain, local, &note.folder, note.uid)?;
     Ok(true)
 }
 
@@ -342,6 +388,58 @@ mod tests {
         assert_eq!(notes.len(), 1, "the old message is gone");
         assert!(delete(root, "example.test", "user", &first.id).unwrap());
         assert!(list(root, "example.test", "user").unwrap().is_empty());
+    }
+
+    #[test]
+    fn notes_in_apple_subfolders_and_other_capitalisation_are_found() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        imap_state::init_account(root, "example.test", "user").unwrap();
+        imap_state::create_folder(root, "example.test", "user", "notes").unwrap();
+        imap_state::create_folder(root, "example.test", "user", "notes/Work").unwrap();
+        imap_state::append_message(
+            root,
+            "example.test",
+            "user",
+            "notes/Work",
+            &message("user@example.test", "W-1", "Standup\nTuesday", 0),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(is_notes_folder("notes/Work") && !is_notes_folder("Notebook"));
+        let made = save(
+            root,
+            "user@example.test",
+            "example.test",
+            "user",
+            None,
+            "Home\nPaint",
+        )
+        .unwrap();
+        assert_eq!(
+            made.folder, "notes",
+            "the existing folder, as it is spelled"
+        );
+        let work = save(
+            root,
+            "user@example.test",
+            "example.test",
+            "user",
+            Some("W-1"),
+            "Standup\nWednesday",
+        )
+        .unwrap();
+        assert_eq!(work.folder, "notes/Work", "an edit stays in its folder");
+        let notes = list(root, "example.test", "user").unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(
+            !imap_state::list_folders(root, "example.test", "user")
+                .unwrap()
+                .iter()
+                .any(|f| f.name == "Notes"),
+            "no second notes folder"
+        );
+        assert!(delete(root, "example.test", "user", "W-1").unwrap());
     }
 
     #[test]

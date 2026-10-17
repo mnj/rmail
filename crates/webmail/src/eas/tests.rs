@@ -1172,12 +1172,25 @@ async fn notes_sync_both_ways_and_keep_their_ids() {
                 .with(note("Packing list", "Passport\r\nTickets")),
         );
     let key = collection(&synced).value("AirSync:SyncKey").unwrap();
+    call(
+        &state,
+        "Sync",
+        Some(&sync_request("notes", &key, Some(commands.clone()), None)),
+    )
+    .await;
+    // The response was lost: the phone sends the same Sync again.
     let second = call(
         &state,
         "Sync",
         Some(&sync_request("notes", &key, Some(commands), None)),
     )
     .await;
+    let added = collection(&second)
+        .child("AirSync:Responses")
+        .and_then(|r| r.child("AirSync:Add"))
+        .unwrap();
+    assert_eq!(added.value("AirSync:ClientId").as_deref(), Some("n1"));
+    assert!(added.value("AirSync:ServerId").is_some());
     assert_eq!(
         collection(&second)
             .child("AirSync:Responses")
@@ -1186,9 +1199,13 @@ async fn notes_sync_both_ways_and_keep_their_ids() {
             .as_deref(),
         Some("1")
     );
+    // The retry's snapshot predates the change, so the stored version of
+    // the changed note comes back; the added one is not sent again.
     assert!(
-        collection(&second).child("AirSync:Commands").is_none(),
-        "no echo"
+        collection(&second)
+            .child("AirSync:Commands")
+            .is_none_or(|c| c.child("AirSync:Add").is_none()),
+        "no second copy of the added note"
     );
     let stored = crate::notes::list(&root, "example.test", "user").unwrap();
     assert_eq!(stored.len(), 2);

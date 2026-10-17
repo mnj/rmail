@@ -124,17 +124,23 @@ pub(super) fn sync_collection(
             match command.name {
                 "Add" => {
                     let client = command.value("AirSync:ClientId").unwrap_or_default();
-                    let mut answer =
-                        Element::new("AirSync:Add").with(Element::text("AirSync:ClientId", client));
-                    // A retried Sync's adds were stored by the first attempt;
-                    // the device gets them back as new notes.
-                    let stored = match command.child("AirSync:ApplicationData") {
-                        Some(data) if !retry => save(account, None, data)?,
-                        _ => None,
+                    let mut answer = Element::new("AirSync:Add")
+                        .with(Element::text("AirSync:ClientId", client.clone()));
+                    // Named after the device's ClientId: a retried Sync finds
+                    // the note its first attempt stored.
+                    let id = notes::device_note_id(&account.device, &client);
+                    let stored = match (
+                        all(account)?.into_iter().find(|n| n.id == id),
+                        command.child("AirSync:ApplicationData"),
+                    ) {
+                        (Some(note), _) => Some(note),
+                        (None, Some(data)) if !client.is_empty() => save(account, Some(&id), data)?,
+                        (None, Some(data)) => save(account, None, data)?,
+                        (None, None) => None,
                     };
                     match stored {
                         Some(note) => {
-                            base.insert(note.id.clone(), note.uid.to_string());
+                            base.insert(note.id.clone(), note.version());
                             answer.push(Element::text("AirSync:ServerId", note.id));
                             answer.push(status("1"));
                         }
@@ -152,7 +158,7 @@ pub(super) fn sync_collection(
                     };
                     match stored {
                         Some(note) => {
-                            base.insert(server_id, note.uid.to_string());
+                            base.insert(server_id, note.version());
                         }
                         None => responses.push(
                             Element::new("AirSync:Change")
@@ -216,7 +222,7 @@ pub(super) fn sync_collection(
             sent += 1;
         }
         for note in &now {
-            let version = note.uid.to_string();
+            let version = note.version();
             let tag = match base.get(&note.id) {
                 None => "AirSync:Add",
                 Some(known) if *known != version => "AirSync:Change",
@@ -260,7 +266,7 @@ pub(super) fn pending(account: &Account, db: &Connection) -> anyhow::Result<usiz
     let now = all(account)?;
     let changed = now
         .iter()
-        .filter(|n| known.1.get(&n.id) != Some(&n.uid.to_string()))
+        .filter(|n| known.1.get(&n.id) != Some(&n.version()))
         .count();
     let gone = known
         .1
