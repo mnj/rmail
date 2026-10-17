@@ -32,6 +32,7 @@ pub mod hold;
 pub mod http;
 pub mod imap_state;
 pub mod jmap;
+pub mod journal;
 pub mod local_submit;
 pub mod mail_auth;
 pub mod maildir;
