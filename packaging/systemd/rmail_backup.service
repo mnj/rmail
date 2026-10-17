@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightly rMail backup
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/rmail
+Environment=RMAIL_CONFIG=/etc/rmail/config.toml
+Environment=RMAIL_BACKUP_DIR=/var/backups/rmail
+Environment=RMAIL_BACKUP_KEEP=7
+ExecStart=/bin/sh -c 'exec /usr/bin/rmail_ctl backup rotate "$RMAIL_BACKUP_DIR" --keep "$RMAIL_BACKUP_KEEP"'
+User=rmail
+Group=rmail
+UMask=0077
+ReadWritePaths=/opt/rmail /var/backups/rmail
+PrivateTmp=true
+ProtectHome=true

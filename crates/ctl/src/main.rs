@@ -127,6 +127,14 @@ enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Back up or restore the server's data, or one account
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+        /// optional config path (defaults to RMAIL_CONFIG or config/example.toml)
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// Rooms and equipment: mailboxes that answer invitations themselves
     Resource {
         #[command(subcommand)]
@@ -330,6 +338,34 @@ enum JournalAction {
     Set { domain: String, archive: String },
     /// List the journaled domains
     List,
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Back up everything (or one account with --account) to FILE (.tar.gz)
+    Create {
+        file: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// A dated backup in DIR, keeping the newest KEEP (for a nightly timer)
+    Rotate {
+        dir: String,
+        #[arg(long, default_value_t = 7)]
+        keep: usize,
+    },
+    /// What a backup holds
+    Show { file: String },
+    /// Restore a backup. A full one needs the services stopped; --force
+    /// moves existing data aside first. An account backup can go to
+    /// another address with --as.
+    Restore {
+        file: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "as")]
+        as_address: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -966,6 +1002,98 @@ async fn main() -> Result<()> {
                     for (domain, archive) in rmail_common::journal::list(db)? {
                         println!("{domain}\t{archive}");
                     }
+                }
+            }
+        }
+        Commands::Backup { action, config } => {
+            let cfg_path = config.unwrap_or_else(|| {
+                std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
+            });
+            // A restore reads the paths from the file alone: loading the
+            // configuration would create the database it is about to restore.
+            let cfg = if matches!(action, BackupAction::Restore { .. }) {
+                let raw: Config = toml::from_str(
+                    &std::fs::read_to_string(&cfg_path)
+                        .with_context(|| format!("reading {cfg_path}"))?,
+                )
+                .with_context(|| format!("parsing {cfg_path}"))?;
+                raw
+            } else {
+                Config::load(&cfg_path)?
+            };
+            let sources = rmail_common::backup::Sources {
+                // Files this user cannot read (a root-owned config) are left out.
+                config: Some(std::path::PathBuf::from(&cfg_path))
+                    .filter(|p| std::fs::File::open(p).is_ok()),
+                db: std::path::PathBuf::from(&cfg.global.db_path),
+                mail_root: std::path::PathBuf::from(&cfg.global.mail_root),
+                // Always certificate then key: a backup's tls/<n> is matched by
+                // position, and an unset one is an empty placeholder.
+                tls: [&cfg.global.tls_cert, &cfg.global.tls_key]
+                    .into_iter()
+                    .map(|p| std::path::PathBuf::from(p.as_deref().unwrap_or_default()))
+                    .collect(),
+            };
+            let size = |bytes: u64| format!("{:.1} MB", bytes as f64 / 1_000_000.0);
+            match action {
+                BackupAction::Create { file, account } => {
+                    let out = std::path::Path::new(&file);
+                    let summary = match &account {
+                        Some(address) => {
+                            rmail_common::backup::create_account(&sources.mail_root, address, out)?
+                        }
+                        None => rmail_common::backup::create_full(&sources, out)?,
+                    };
+                    println!("{file}: {} files, {}", summary.files, size(summary.bytes));
+                }
+                BackupAction::Rotate { dir, keep } => {
+                    let (out, summary) = rmail_common::backup::create_in_dir(
+                        &sources,
+                        std::path::Path::new(&dir),
+                        keep,
+                    )?;
+                    println!(
+                        "{}: {} files, {}",
+                        out.display(),
+                        summary.files,
+                        size(summary.bytes)
+                    );
+                }
+                BackupAction::Show { file } => {
+                    let manifest =
+                        rmail_common::backup::read_manifest(std::path::Path::new(&file))?;
+                    let when = chrono::DateTime::from_timestamp(manifest.created, 0)
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_default();
+                    match manifest.account {
+                        Some(account) => println!(
+                            "account backup of {account}, made {when} by rMail {}",
+                            manifest.version
+                        ),
+                        None => println!("full backup, made {when} by rMail {}", manifest.version),
+                    }
+                }
+                BackupAction::Restore {
+                    file,
+                    force,
+                    as_address,
+                } => {
+                    let path = std::path::Path::new(&file);
+                    let manifest = rmail_common::backup::read_manifest(path)?;
+                    let summary = if manifest.kind == "account" {
+                        rmail_common::backup::restore_account(
+                            path,
+                            &sources.mail_root,
+                            as_address.as_deref(),
+                            force,
+                        )?
+                    } else {
+                        if as_address.is_some() {
+                            anyhow::bail!("--as is for account backups");
+                        }
+                        rmail_common::backup::restore_full(path, &sources, force)?
+                    };
+                    println!("restored {} files, {}", summary.files, size(summary.bytes));
                 }
             }
         }

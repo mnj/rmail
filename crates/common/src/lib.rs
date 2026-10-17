@@ -7,6 +7,7 @@
 pub mod acl;
 pub mod acme;
 pub mod auth;
+pub mod backup;
 pub mod classifier_control;
 pub mod classifier_models;
 pub mod classifier_store;

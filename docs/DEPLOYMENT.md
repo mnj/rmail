@@ -377,6 +377,38 @@ not copied twice. Use a mailbox of its own for the archive and put it on legal h
 nothing in it can be deleted; journaling failures are logged (`journal_failed`) and do not hold up
 delivery.
 
+## Backup and restore
+
+`rmail_ctl backup` makes and restores gzip-compressed tar archives of the server's data, while the
+services keep running:
+
+- `rmail_ctl backup create /path/rmail.tar.gz` backs up everything: the configuration file (when
+  readable), the database (mailboxes, settings, DKIM keys, ACME state), the TLS certificate and key
+  files, and the mail root (every account's mail, calendars, contacts, notes and settings, and the
+  outbound queue). SQLite databases are copied with `VACUUM INTO`, a consistent snapshot; messages
+  still being written (maildir `tmp/`) and SQLite side files are left out.
+- `rmail_ctl backup create /path/ann.tar.gz --account ann@example.com` backs up one account.
+- `rmail_ctl backup show <file>` says what a backup holds.
+- Nightly backups: `systemctl enable --now rmail_backup.timer` runs `rmail_ctl backup rotate
+  /var/backups/rmail --keep 7` at about 03:15, keeping the newest seven
+  (`rmail-YYYYMMDD-HHMMSS.tar.gz`). Change the directory and count with `RMAIL_BACKUP_DIR` and
+  `RMAIL_BACKUP_KEEP` (`systemctl edit rmail_backup.service`). Copy the files off the machine too:
+  a backup on the same disk does not survive the disk.
+
+Restoring:
+
+- Run restores as the services' user (`sudo -u rmail rmail_ctl backup restore …`): files a
+  restore writes belong to whoever runs it, and the services cannot read root's.
+- A whole server: stop the services, then `rmail_ctl backup restore <file>`. It refuses to write
+  over an existing database or mail root; `--force` moves them aside first
+  (`<path>.before-restore-<time>`) rather than deleting them. The configuration file in place is
+  kept (the backup's is written beside it as `<config>.from-backup`), and so are TLS files that
+  exist.
+- One account: `rmail_ctl backup restore <file>` restores it under its own address, or
+  `--as other@example.com` under another (the mailbox must exist to sign in). With `--force` the
+  account's current data is moved aside first. Mail apps see the restored folders as they were in
+  the backup and resynchronise.
+
 ## Account storage quotas
 
 Storage quotas are optional and account-wide across every IMAP folder. Configure them from the
