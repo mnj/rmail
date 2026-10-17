@@ -1643,3 +1643,69 @@ async fn subscribe_and_unsubscribe_update_lsub_state() {
     let _logout = read_until_contains(&mut reader, "A009 OK").await;
     server_task.await.expect("join").expect("server");
 }
+#[tokio::test]
+async fn expunge_is_refused_on_legal_hold() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let mail_root = td.path().join("mail");
+    let db_path = td.path().join("config.db");
+    rmail_common::db::init_db(&db_path).expect("init db");
+    rmail_common::db::add_mailbox(
+        &db_path,
+        "user@example.test",
+        Some("plain:password"),
+        None,
+        None,
+    )
+    .expect("add mailbox");
+    rmail_common::maildir::deliver(
+        &mail_root,
+        "example.test",
+        "user",
+        b"Subject: one\r\n\r\nfirst\r\n",
+    )
+    .expect("deliver");
+    rmail_common::imap_state::init_account(&mail_root, "example.test", "user").expect("init");
+    rmail_common::imap_state::set_legal_hold(&mail_root, "example.test", "user", true)
+        .expect("hold");
+
+    let (client, server) = duplex(32 * 1024);
+    let root = mail_root.to_string_lossy().to_string();
+    let server_task = tokio::spawn(async move {
+        process_stream(
+            Box::new(server),
+            root,
+            None::<Arc<crate::tls::TlsContext>>,
+            Some(db_path.to_string_lossy().to_string()),
+            None,
+            true,
+        )
+        .await
+    });
+    let mut reader = BufReader::new(client);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.expect("greeting");
+    let mut capability = String::new();
+    reader.read_line(&mut capability).await.expect("capability");
+    reader
+        .get_mut()
+        .write_all(
+            b"A001 LOGIN \"user@example.test\" \"password\"\r\nA002 SELECT INBOX\r\nA003 STORE 1 +FLAGS (\\Deleted)\r\nA004 EXPUNGE\r\nA005 LOGOUT\r\n",
+        )
+        .await
+        .expect("write commands");
+    reader.get_mut().flush().await.expect("flush");
+    let _select = read_until_contains(&mut reader, "A002 OK").await;
+    let _store = read_until_contains(&mut reader, "A003 OK").await;
+    let expunge = read_until_contains(&mut reader, "A004 ").await;
+    assert!(
+        expunge
+            .iter()
+            .any(|l| l.starts_with("A004 NO [NOPERM]") && l.contains("legal hold")),
+        "{expunge:?}"
+    );
+    let _logout = read_until_contains(&mut reader, "A005 OK").await;
+    server_task.await.expect("join").expect("server");
+    let (_, messages) =
+        rmail_common::imap_state::load_folder(&mail_root, "example.test", "user", "INBOX").unwrap();
+    assert_eq!(messages.len(), 1, "the message is kept");
+}

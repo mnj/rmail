@@ -153,6 +153,19 @@ async fn run(
     .await;
     match delete_result {
         Ok(Ok(_)) => {}
+        // A legal hold is a refusal, not an outage (RFC 5530 NOPERM).
+        Ok(Err(error))
+            if error
+                .downcast_ref::<rmail_common::imap_state::LegalHold>()
+                .is_some() =>
+        {
+            return failure(
+                Response::new().status(
+                    StatusLine::tagged(tag, Status::No, format!("{command} failed: {error}"))
+                        .with_code("NOPERM"),
+                ),
+            );
+        }
         Ok(Err(error)) => return failure(unavailable(tag, command, error)),
         Err(error) => return failure(unavailable(tag, command, error)),
     }
