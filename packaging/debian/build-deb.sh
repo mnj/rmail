@@ -81,6 +81,8 @@ install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_outbound.service" "${PKG_RO
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_classifier.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_classifier.service"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_restart.path" "${PKG_ROOT}/usr/lib/systemd/system/rmail_restart.path"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_restart.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_restart.service"
+install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_backup.service" "${PKG_ROOT}/usr/lib/systemd/system/rmail_backup.service"
+install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail_backup.timer" "${PKG_ROOT}/usr/lib/systemd/system/rmail_backup.timer"
 install -m 0644 "${ROOT_DIR}/packaging/systemd/rmail.env" "${PKG_ROOT}/etc/default/rmail"
 install -m 0644 "${ROOT_DIR}/config/example.toml" "${PKG_ROOT}/etc/rmail/config.toml"
 
@@ -118,6 +120,10 @@ mkdir -p /opt/rmail/mail /opt/rmail/config /etc/rmail
 chown -R rmail:rmail /opt/rmail
 # The database holds password hashes, DKIM keys and relay passwords.
 chmod 0700 /opt/rmail/config
+# Nightly backups (rmail_backup.timer, off until enabled) go here.
+mkdir -p /var/backups/rmail
+chown rmail:rmail /var/backups/rmail
+chmod 0700 /var/backups/rmail
 systemctl daemon-reload || true
 # Lets the admin console restart services after settings changes.
 systemctl enable --now rmail_restart.path >/dev/null 2>&1 || true
