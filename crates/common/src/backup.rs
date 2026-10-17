@@ -210,6 +210,9 @@ fn write_archive(
             fs::set_permissions(&partial, fs::Permissions::from_mode(0o600))?;
         }
         let mut encoder = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+        // A checksum per frame, so a corrupted backup fails to restore
+        // rather than restoring wrong bytes.
+        encoder.include_checksum(true)?;
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
         encoder.multithread(threads as u32)?;
         let mut archive = tar::Builder::new(encoder);
