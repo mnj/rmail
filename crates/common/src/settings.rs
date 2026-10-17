@@ -149,6 +149,11 @@ pub const GROUPS: &[SettingGroup] = &[
         description: "AI continuations and rewrites while composing in webmail, from any OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Ollama, vLLM). Users opt in in their compose settings; only the draft around the cursor, the subject and a quoted original are sent. Changes apply without a restart.",
     },
     SettingGroup {
+        id: "activesync",
+        label: "ActiveSync",
+        description: "Exchange ActiveSync at https://<webmail host>/Microsoft-Server-ActiveSync, for the mail apps built into phones (iOS Mail, Android, Outlook). Mail only for now. Users sign in with their address and password, or an app password with two-factor sign-in. Changes apply without a restart.",
+    },
+    SettingGroup {
         id: "files",
         label: "File storage",
         description: "Each user's own files, in webmail's Files view and over WebDAV (https://<webmail host>/webdav/) for file managers and sync apps. Changes apply without a restart.",
@@ -1265,6 +1270,14 @@ pub const SETTINGS: &[SettingSpec] = &[
         LIVE,
     ),
     spec(
+        "activesync.enabled",
+        "activesync",
+        "Enabled",
+        "Let phones sync mail over Exchange ActiveSync.",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
         "files.enabled",
         "files",
         "Enabled",
@@ -1557,6 +1570,20 @@ pub fn compose_ai(conn: &Connection) -> Result<crate::config::ComposeAiConfig> {
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
     serde_json::from_value(section).context("invalid writing suggestion settings")
+}
+
+pub fn activesync(conn: &Connection) -> Result<crate::config::ActiveSyncConfig> {
+    let stored = load_all(conn)?;
+    let tree = unflatten(
+        stored
+            .iter()
+            .filter(|(key, _)| key.starts_with("activesync.")),
+    );
+    let section = tree
+        .pointer("/activesync")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    serde_json::from_value(section).context("invalid ActiveSync settings")
 }
 
 pub fn files(conn: &Connection) -> Result<crate::config::FilesConfig> {

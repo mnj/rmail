@@ -248,6 +248,9 @@ pub struct Config {
     /// Personal file storage over WebDAV (`/webdav/`) and in webmail.
     #[serde(default)]
     pub files: FilesConfig,
+    /// Exchange ActiveSync for phones' built-in mail apps.
+    #[serde(default)]
+    pub activesync: ActiveSyncConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -1158,6 +1161,14 @@ fn default_files_quota_mb() -> u64 {
 }
 fn default_files_max_file_mb() -> u64 {
     1024
+}
+
+/// Exchange ActiveSync (`/Microsoft-Server-ActiveSync`). Off until the
+/// admin turns it on.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+pub struct ActiveSyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl Default for FilesConfig {

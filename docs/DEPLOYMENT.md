@@ -638,6 +638,25 @@ The search box then offers **By meaning**, which lists the open folder's message
 query, best first. Turning it off deletes the index. With a hosted embedding model, indexing and
 searches only happen for users who agreed to that provider.
 
+### Exchange ActiveSync
+
+With **ActiveSync** turned on in the console's settings (`activesync.enabled`, off by default),
+the mail apps built into phones (iOS Mail, Android's and Outlook's Exchange accounts) can sync
+over Exchange ActiveSync (protocol 14.1) at `https://<webmail host>/Microsoft-Server-ActiveSync`,
+without IMAP. In the phone, add an Exchange account with the address, the password (or an app
+password when two-factor sign-in is on) and the webmail host as the server.
+
+- Mail: the folder list (and creating, renaming and deleting folders), mail with read and flagged
+  state both ways, deleting (to Trash) and moving, whole messages and attachments on request,
+  sending, replying and forwarding (with a copy in Sent), push (Ping) and the sync window the
+  phone picks. Contacts and calendars still sync over CardDAV and CalDAV.
+- Provisioning answers with a policy that asks nothing of the device, and is not enforced:
+  rMail does not manage or wipe devices.
+- What each device has been sent is kept per account (`rmail-eas.sqlite` in the account's
+  directory), so each sync sends only what changed.
+- A reverse proxy must pass `/Microsoft-Server-ActiveSync` through with request bodies up to
+  40 MB and a read timeout above 30 minutes: push holds a request open until mail arrives.
+
 ### File storage (WebDAV)
 
 With **File storage** turned on in the console's settings (`files.enabled`, off by default), every

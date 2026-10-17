@@ -163,8 +163,12 @@ pub(crate) fn router(state: Shared) -> Router {
         .layer(middleware::from_fn(log_request))
         .with_state(state.clone());
     // WebDAV file storage streams large uploads: its own limits, not these.
-    let webdav = crate::webdav::routes(state).layer(middleware::from_fn(security_headers));
-    rmail_common::http::harden(app, MAX_BODY_BYTES).merge(webdav)
+    let webdav = crate::webdav::routes(state.clone()).layer(middleware::from_fn(security_headers));
+    // ActiveSync holds requests open for push (Ping): its own deadline.
+    let activesync = crate::eas::routes(state.clone()).layer(middleware::from_fn(security_headers));
+    rmail_common::http::harden(app, MAX_BODY_BYTES)
+        .merge(webdav)
+        .merge(activesync)
 }
 
 // ---------------------------------------------------------------------------
@@ -1730,7 +1734,7 @@ struct FolderName {
 }
 
 /// Folder names users may create or rename to: what IMAP accepts, minus INBOX.
-fn valid_new_folder(name: &str) -> Option<String> {
+pub(crate) fn valid_new_folder(name: &str) -> Option<String> {
     let name = name.trim();
     let normalized = rmail_common::maildir::normalize_mailbox_name(name).ok()?;
     // Names under "Other Users" are where shared folders appear.
