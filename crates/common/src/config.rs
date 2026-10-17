@@ -254,6 +254,9 @@ pub struct Config {
     /// Webmail sign-in through an OpenID Connect provider.
     #[serde(default)]
     pub oidc: OidcConfig,
+    /// Copies of the nightly backups kept off the machine.
+    #[serde(default)]
+    pub backup_upload: BackupUploadConfig,
     /// Revision of the database-managed settings this config was built from.
     /// Zero when the config came from a file only.
     #[serde(skip)]
@@ -1172,6 +1175,106 @@ fn default_files_max_file_mb() -> u64 {
 pub struct ActiveSyncConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Where nightly backups are copied: S3-compatible storage (AWS, Google
+/// Cloud Storage, R2, B2, MinIO...), Azure Blob Storage or SFTP. Off until
+/// the admin picks a target.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct BackupUploadConfig {
+    /// `none`, `s3`, `azure` or `sftp`.
+    #[serde(default = "default_upload_target")]
+    pub target: String,
+    /// Remote backups kept (older ones are deleted); 0 keeps them all.
+    #[serde(default)]
+    pub keep: u32,
+    #[serde(default)]
+    pub s3_endpoint: String,
+    #[serde(default)]
+    pub s3_region: String,
+    #[serde(default)]
+    pub s3_bucket: String,
+    #[serde(default)]
+    pub s3_prefix: String,
+    #[serde(default)]
+    pub s3_access_key_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_secret_access_key: Option<SecretString>,
+    /// `STANDARD_IA`, `GLACIER_IR`, `DEEP_ARCHIVE`, `NEARLINE`, `COLDLINE`,
+    /// `ARCHIVE`...; empty uses the bucket's default.
+    #[serde(default)]
+    pub s3_storage_class: String,
+    /// `bucket` in the path rather than the host name (MinIO, Garage).
+    #[serde(default)]
+    pub s3_path_style: bool,
+    #[serde(default)]
+    pub azure_account: String,
+    #[serde(default)]
+    pub azure_container: String,
+    #[serde(default)]
+    pub azure_prefix: String,
+    /// The storage account's access key (base64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_key: Option<SecretString>,
+    /// A SAS token for the container, instead of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_sas: Option<SecretString>,
+    /// `Hot`, `Cool`, `Cold` or `Archive`; empty uses the account's default.
+    #[serde(default)]
+    pub azure_tier: String,
+    /// Another endpoint than `https://<account>.blob.core.windows.net`
+    /// (sovereign clouds, Azurite).
+    #[serde(default)]
+    pub azure_endpoint: String,
+    #[serde(default)]
+    pub sftp_host: String,
+    #[serde(default = "default_sftp_port")]
+    pub sftp_port: u16,
+    #[serde(default)]
+    pub sftp_user: String,
+    /// A private key file the rmail user can read (no passphrase).
+    #[serde(default)]
+    pub sftp_key_path: String,
+    /// The remote directory.
+    #[serde(default)]
+    pub sftp_path: String,
+}
+
+fn default_sftp_port() -> u16 {
+    22
+}
+
+fn default_upload_target() -> String {
+    "none".to_string()
+}
+
+impl Default for BackupUploadConfig {
+    fn default() -> Self {
+        Self {
+            target: default_upload_target(),
+            keep: 0,
+            s3_endpoint: String::new(),
+            s3_region: String::new(),
+            s3_bucket: String::new(),
+            s3_prefix: String::new(),
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: None,
+            s3_storage_class: String::new(),
+            s3_path_style: false,
+            azure_account: String::new(),
+            azure_container: String::new(),
+            azure_prefix: String::new(),
+            azure_key: None,
+            azure_sas: None,
+            azure_tier: String::new(),
+            azure_endpoint: String::new(),
+            sftp_host: String::new(),
+            sftp_port: default_sftp_port(),
+            sftp_user: String::new(),
+            sftp_key_path: String::new(),
+            sftp_path: String::new(),
+        }
+    }
 }
 
 /// Webmail single sign-on through an OpenID Connect provider (Google,

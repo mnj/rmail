@@ -42,6 +42,7 @@ pub mod mime;
 pub mod mime_section;
 pub mod net;
 pub mod oauth;
+pub mod offsite;
 pub mod oidc;
 pub mod outbound;
 pub mod proxy;

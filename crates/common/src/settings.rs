@@ -154,6 +154,11 @@ pub const GROUPS: &[SettingGroup] = &[
         description: "Exchange ActiveSync at https://<webmail host>/Microsoft-Server-ActiveSync, for the mail apps built into phones (iOS Mail, Android, Outlook): mail, contacts and calendars. Users sign in with their address and password, or an app password with two-factor sign-in. Changes apply without a restart.",
     },
     SettingGroup {
+        id: "backup_upload",
+        label: "Backup upload",
+        description: "Copies of the nightly backups (rmail_backup.timer) kept off the machine: S3-compatible storage (AWS S3, Google Cloud Storage with an HMAC key, Cloudflare R2, Backblaze B2, MinIO...), Azure Blob Storage, or a server over SFTP. Backups hold password hashes and keys: use a private bucket or container. Archive storage classes are cheapest but are charged for a minimum time (often 90 to 365 days) and take hours to read back.",
+    },
+    SettingGroup {
         id: "oidc",
         label: "Single sign-on",
         description: "Webmail sign-in through an OpenID Connect provider (Google, Microsoft Entra ID, Keycloak, Authentik...). Register https://<webmail host>/api/oidc/callback as the redirect URI. The provider's email must be an existing mailbox; mail apps keep using passwords or app passwords. Changes apply without a restart.",
@@ -1283,6 +1288,184 @@ pub const SETTINGS: &[SettingSpec] = &[
         LIVE,
     ),
     spec(
+        "backup_upload.target",
+        "backup_upload",
+        "Upload to",
+        "Where each nightly backup is copied after it is made.",
+        SettingKind::Choice {
+            options: &["none", "s3", "azure", "sftp"],
+        },
+        LIVE,
+    ),
+    spec(
+        "backup_upload.keep",
+        "backup_upload",
+        "Remote backups kept",
+        "Older uploaded backups are deleted; 0 keeps them all. With archive storage, deleting before the class's minimum time is still charged for it.",
+        int(0, 100_000),
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_endpoint",
+        "backup_upload",
+        "S3 endpoint",
+        "For example https://s3.eu-central-1.amazonaws.com, https://storage.googleapis.com or https://<account>.r2.cloudflarestorage.com.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_region",
+        "backup_upload",
+        "S3 region",
+        "The bucket's region (us-east-1 when the service has none, auto for R2).",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_bucket",
+        "backup_upload",
+        "S3 bucket",
+        "A private bucket.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_prefix",
+        "backup_upload",
+        "S3 prefix",
+        "A folder in the bucket, such as rmail/ (optional).",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_access_key_id",
+        "backup_upload",
+        "S3 access key ID",
+        "For Google Cloud Storage, an HMAC key's access ID.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_secret_access_key",
+        "backup_upload",
+        "S3 secret key",
+        "Allow it to write, list and delete objects in the bucket only.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_storage_class",
+        "backup_upload",
+        "S3 storage class",
+        "Empty for the bucket's default; STANDARD_IA, GLACIER_IR or DEEP_ARCHIVE on AWS; NEARLINE, COLDLINE or ARCHIVE on Google Cloud.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.s3_path_style",
+        "backup_upload",
+        "S3 path-style addresses",
+        "Put the bucket in the path rather than the host name (MinIO, Garage and other self-hosted servers).",
+        SettingKind::Bool,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_account",
+        "backup_upload",
+        "Azure storage account",
+        "The account name.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_container",
+        "backup_upload",
+        "Azure container",
+        "A private container.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_prefix",
+        "backup_upload",
+        "Azure prefix",
+        "A folder in the container, such as rmail/ (optional).",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_key",
+        "backup_upload",
+        "Azure account key",
+        "The storage account's access key, or leave empty and give a SAS token.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_sas",
+        "backup_upload",
+        "Azure SAS token",
+        "A SAS token for the container with read, write, list and delete permissions.",
+        SettingKind::Secret,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_tier",
+        "backup_upload",
+        "Azure access tier",
+        "Empty for the account's default; Hot, Cool, Cold or Archive.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.azure_endpoint",
+        "backup_upload",
+        "Azure endpoint",
+        "Only for sovereign clouds or Azurite; empty uses https://<account>.blob.core.windows.net.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.sftp_host",
+        "backup_upload",
+        "SFTP host",
+        "The server's host key is trusted on first connection and checked after that.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.sftp_port",
+        "backup_upload",
+        "SFTP port",
+        "Usually 22.",
+        int(1, 65_535),
+        LIVE,
+    ),
+    spec(
+        "backup_upload.sftp_user",
+        "backup_upload",
+        "SFTP user",
+        "The account on the server.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.sftp_key_path",
+        "backup_upload",
+        "SFTP private key file",
+        "A key without a passphrase that the rmail user can read, such as /opt/rmail/config/backup_ed25519.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
+        "backup_upload.sftp_path",
+        "backup_upload",
+        "SFTP directory",
+        "Where the backups go on the server.",
+        SettingKind::Text,
+        LIVE,
+    ),
+    spec(
         "oidc.enabled",
         "oidc",
         "Enabled",
@@ -1639,6 +1822,20 @@ pub fn activesync(conn: &Connection) -> Result<crate::config::ActiveSyncConfig> 
     serde_json::from_value(section).context("invalid ActiveSync settings")
 }
 
+pub fn backup_upload(conn: &Connection) -> Result<crate::config::BackupUploadConfig> {
+    let stored = load_all(conn)?;
+    let tree = unflatten(
+        stored
+            .iter()
+            .filter(|(key, _)| key.starts_with("backup_upload.")),
+    );
+    let section = tree
+        .pointer("/backup_upload")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    serde_json::from_value(section).context("invalid backup upload settings")
+}
+
 pub fn oidc(conn: &Connection) -> Result<crate::config::OidcConfig> {
     let stored = load_all(conn)?;
     let tree = unflatten(stored.iter().filter(|(key, _)| key.starts_with("oidc.")));
@@ -1891,6 +2088,7 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
     crate::acme::validate_config(config)?;
     crate::compose_ai::validate_config(&config.compose_ai)?;
     crate::oidc::validate_config(&config.oidc)?;
+    crate::offsite::validate_config(&config.backup_upload)?;
     Ok(())
 }
 
@@ -2594,6 +2792,9 @@ mod tests {
                         | "classifier.anthropic_api_key"
                         | "compose_ai.api_key"
                         | "oidc.client_secret"
+                        | "backup_upload.s3_secret_access_key"
+                        | "backup_upload.azure_key"
+                        | "backup_upload.azure_sas"
                 )
                 || spec.key.starts_with("global.listeners.")
             {
