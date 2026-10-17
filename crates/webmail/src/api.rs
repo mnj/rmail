@@ -88,6 +88,30 @@ pub(crate) fn spawn_background(state: Shared) {
             }
         }
     });
+    // Retention policies: a few minutes after start, then hourly.
+    let retained = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        loop {
+            let (db_path, mail_root) = (retained.db_path.clone(), retained.mail_root.clone());
+            let now = chrono::Utc::now().timestamp();
+            match blocking(move || rmail_common::retention::sweep(&db_path, &mail_root, now)).await
+            {
+                Ok(report) => {
+                    if report.deleted > 0 {
+                        webmail_log!("info", "retention_swept", { "deleted": report.deleted, "held": report.held });
+                    }
+                    for error in report.errors {
+                        webmail_log!("warn", "retention_failed", { "error": error });
+                    }
+                }
+                Err(error) => {
+                    webmail_log!("warn", "retention_failed", { "error": format!("{error:#}") });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
     // The global address list: soon after start, then every 30 minutes.
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -281,6 +305,17 @@ where
 }
 
 fn internal_error(error: anyhow::Error) -> Response {
+    // A legal hold refuses a deletion; it is not a server fault.
+    if error
+        .downcast_ref::<rmail_common::imap_state::LegalHold>()
+        .is_some()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "This mailbox is on legal hold: messages can't be permanently deleted.",
+        )
+            .into_response();
+    }
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
 }
 

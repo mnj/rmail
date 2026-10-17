@@ -346,6 +346,23 @@ rmail_ctl feedback delete 42
 Prometheus exposes `rmail_feedback_reports_total{type="abuse"}` (and `fraud`, `virus`, `other`,
 `not-spam`, `auth-failure`, `unknown`). Reports larger than 4 MiB are delivered but not parsed.
 
+## Retention and legal hold
+
+**Retention** limits how long each domain keeps mail, in days (the **Retention** panel on the
+console's Mailboxes page, or `rmail_ctl retention set <domain> --trash-days 30 --junk-days 30
+--max-age-days 3650`; `retention list`, `retention clear <domain>`, and `retention run` to apply
+it at once). Trash and Junk are emptied of messages that have been there longer than their limit
+(counted from when they were moved there); the all-mail limit deletes anything older, by when it
+was received, in every folder. Webmail applies the limits hourly. A domain without limits keeps
+everything.
+
+A **legal hold** on a mailbox (Legal hold in the console's mailbox editor, or
+`rmail_ctl hold on|off|show <address>`) stops anything in it from being permanently deleted: by
+the user in any mail app (IMAP EXPUNGE answers `NO [NOPERM]`), in webmail, over JMAP, POP3 or
+ActiveSync, and by retention, which leaves held mailboxes alone. Moving messages between folders
+still works, and a folder can only be deleted once it is empty. Removing a mailbox in the console
+removes its sign-in, not its mail on disk.
+
 ## Account storage quotas
 
 Storage quotas are optional and account-wide across every IMAP folder. Configure them from the

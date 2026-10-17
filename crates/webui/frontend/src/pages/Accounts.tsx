@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Dices, KeyRound, Pencil, Plus, Search, ShieldOff, Trash2 } from 'lucide-react';
-import { Account, DavShare, DirectoryPolicy, FolderShare, TwoFactorPolicy, api } from '../api';
+import { Account, DavShare, DirectoryPolicy, FolderShare, RetentionPolicy, TwoFactorPolicy, api } from '../api';
 import { Empty, ErrorBanner, Field, formatBytes, generatePassword, IconButton, invalidate, Modal, Panel, SkeletonRows, SortHeader, useFeedback, useResource, useSort } from '../ui';
 
 type Column = 'address' | 'storage' | 'folders' | 'messages';
@@ -21,6 +21,7 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
   const [quota, setQuota] = useState(existing?.quota_bytes ? String(Math.round(existing.quota_bytes / 1024 / 1024)) : '');
   const [kind, setKind] = useState<string>(existing?.resource || 'person');
   const [approver, setApprover] = useState(existing?.approver || '');
+  const [hold, setHold] = useState(Boolean(existing?.legal_hold));
   const [saving, setSaving] = useState(false);
 
   async function submit(event: React.FormEvent) {
@@ -35,6 +36,9 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
       await api('/api/accounts', existing ? 'PATCH' : 'POST', body);
       if (kind !== (existing?.resource || 'person') || (kind !== 'person' && approver.trim() !== (existing?.approver || ''))) {
         await api('/api/accounts/resource', 'POST', { address: address.trim(), kind: kind === 'person' ? null : kind, approver: approver.trim() || null });
+      }
+      if (hold !== Boolean(existing?.legal_hold)) {
+        await api('/api/accounts/legal-hold', 'POST', { address: address.trim(), on: hold });
       }
     }, existing ? `Updated ${address}` : `Created ${address}`);
     setSaving(false);
@@ -74,6 +78,9 @@ function AccountModal({ editing, onClose, onSaved }: { editing: Editing; onClose
             <input type="email" value={approver} onChange={(event) => setApprover(event.target.value)} placeholder="facilities@example.com" />
           </Field>
         )}
+        <Field label="Legal hold" hint={hold ? 'Nothing in this mailbox can be permanently deleted, by the user, any mail app or retention, until the hold is lifted. Moving between folders still works.' : 'Keep everything in the mailbox, for an investigation or a lawsuit.'}>
+          <label className="checkLabel"><input type="checkbox" checked={hold} onChange={(event) => setHold(event.target.checked)} /> On hold</label>
+        </Field>
       </form>
     </Modal>
   );
@@ -199,6 +206,61 @@ function DirectoryPanel() {
   );
 }
 
+const retentionFields: { key: 'trash_days' | 'junk_days' | 'max_age_days'; label: string }[] = [
+  { key: 'trash_days', label: 'Trash' }, { key: 'junk_days', label: 'Junk' }, { key: 'max_age_days', label: 'All mail' },
+];
+
+function RetentionPanel() {
+  const { run, confirm } = useFeedback();
+  const policy = useResource(() => api<RetentionPolicy>('/api/retention'), [], undefined, 'retention');
+  const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({});
+  const value = (domain: string, key: string, saved: number | null) => drafts[domain]?.[key] ?? (saved == null ? '' : String(saved));
+  async function save(domain: string, saved: RetentionPolicy['domains'][number]) {
+    const days = (key: 'trash_days' | 'junk_days' | 'max_age_days') => { const text = value(domain, key, saved[key]).trim(); return text ? Number(text) : null; };
+    const body = { domain, trash_days: days('trash_days'), junk_days: days('junk_days'), max_age_days: days('max_age_days') };
+    // A new or shorter all-mail limit deletes old mail at the next sweep.
+    if (body.max_age_days != null && (saved.max_age_days == null || body.max_age_days < saved.max_age_days)) {
+      const ok = await confirm({
+        title: `Delete old mail in ${domain}?`,
+        message: <>Within the hour, every message older than {body.max_age_days} days is permanently deleted from every folder of {domain}'s mailboxes, except those on legal hold. This cannot be undone.</>,
+        confirmLabel: 'Set the limit',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    if (await run(() => api('/api/retention', 'PUT', body), `Retention for ${domain} saved`)) {
+      setDrafts((all) => { const next = { ...all }; delete next[domain]; return next; });
+      await policy.reload();
+    }
+  }
+  return (
+    <Panel title="Retention" subtitle="How long mail is kept, per domain, in days; empty keeps it for good. Trash and Junk are emptied of messages that have been there longer; All mail deletes anything older, in every folder. Webmail applies this hourly. Mailboxes on legal hold are left alone.">
+      <ErrorBanner error={policy.error} />
+      {policy.data && policy.data.domains.length > 0 && (
+        <div className="tableScroll">
+          <table>
+            <thead><tr><th>Domain</th>{retentionFields.map((f) => <th key={f.key}>{f.label}</th>)}<th /></tr></thead>
+            <tbody>
+              {policy.data.domains.map((saved) => (
+                <tr key={saved.domain}>
+                  <td><strong>{saved.domain}</strong></td>
+                  {retentionFields.map((f) => (
+                    <td key={f.key}><input aria-label={`${f.label} days for ${saved.domain}`} type="number" min={1} max={36500} placeholder="Keep" style={{ width: '6.5em' }}
+                      value={value(saved.domain, f.key, saved[f.key])}
+                      onChange={(event) => setDrafts((all) => ({ ...all, [saved.domain]: { ...all[saved.domain], [f.key]: event.target.value } }))} /></td>
+                  ))}
+                  <td><button className="button" disabled={!drafts[saved.domain]} onClick={() => save(saved.domain, saved)}>Save</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {policy.data && policy.data.domains.length === 0 && <Empty>No domains yet.</Empty>}
+    </Panel>
+  );
+}
+
 function DavSharingPanel() {
   const { run, confirm } = useFeedback();
   const shares = useResource(() => api<DavShare[]>('/api/dav-sharing'), [], undefined, 'dav-sharing');
@@ -306,6 +368,7 @@ export function AccountsPage() {
                   <td>
                     <span className={`pill ${account.auth === 'Unset' ? 'warn' : ''}`}>{account.auth === 'Unset' ? 'No password' : account.auth}</span>
                     {account.resource && <span className="pill" title={account.approver ? `Bookings approved by ${account.approver}` : undefined}>{account.resource === 'room' ? 'Room' : 'Equipment'}{account.approver ? ' · needs approval' : ''}</span>}
+                    {account.legal_hold && <span className="pill" title="Nothing can be permanently deleted">Legal hold</span>}
                     {account.two_factor && <span className="pill ok" title="Two-factor sign-in is on; mail apps use app passwords">2FA</span>}
                     {account.app_passwords > 0 && <small>{account.app_passwords} app password{account.app_passwords === 1 ? '' : 's'}</small>}
                   </td>
@@ -331,6 +394,7 @@ export function AccountsPage() {
       </Panel>
       <TwoFactorPanel />
       <DirectoryPanel />
+      <RetentionPanel />
       <SharingPanel />
       <DavSharingPanel />
       {editing && <AccountModal editing={editing} onClose={() => setEditing(null)} onSaved={() => { accounts.reload(); invalidate('directory-policy'); }} />}

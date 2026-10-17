@@ -59,6 +59,18 @@ pub struct QresyncChanges {
     pub changed_messages: Vec<Message>,
 }
 
+/// A permanent deletion refused because the account is on legal hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegalHold;
+
+impl std::fmt::Display for LegalHold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("this mailbox is on legal hold: messages cannot be permanently deleted")
+    }
+}
+
+impl std::error::Error for LegalHold {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageQuotaExceeded {
     pub used: u64,
@@ -182,6 +194,12 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "folders",
         "highest_modseq",
         "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "account_settings",
+        "legal_hold",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(
         conn,
@@ -315,6 +333,31 @@ pub fn set_storage_quota(
         params![quota_bytes],
     )?;
     Ok(())
+}
+
+/// Put an account on legal hold (or take it off): while on hold, nothing
+/// in it can be permanently deleted, by any protocol or by retention.
+/// Moving between folders still works.
+pub fn set_legal_hold(maildir_root: &Path, domain: &str, localpart: &str, on: bool) -> Result<()> {
+    let conn = open_account(maildir_root, domain, localpart)?;
+    conn.execute(
+        "UPDATE account_settings SET legal_hold = ?1 WHERE singleton = 1",
+        params![i64::from(on)],
+    )?;
+    Ok(())
+}
+
+pub fn legal_hold(maildir_root: &Path, domain: &str, localpart: &str) -> Result<bool> {
+    let conn = open_account(maildir_root, domain, localpart)?;
+    held(&conn)
+}
+
+fn held(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT legal_hold FROM account_settings WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 /// Return indexed storage use and the configured limit for one account.
@@ -575,6 +618,24 @@ pub fn delete_folder(
     }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     let id = folder_id(&conn, &name)?.context("mailbox does not exist")?;
+    // On hold, a folder goes only when it holds no mail, counting files
+    // not yet indexed.
+    let held_now = held(&conn)?;
+    if held_now {
+        reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    }
+    if held_now
+        && conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE folder_id = ?1 LIMIT 1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+    {
+        return Err(LegalHold.into());
+    }
     let child_prefix = format!("{name}/");
     let has_children = conn
         .query_row(
@@ -1005,6 +1066,9 @@ pub fn delete_messages_by_uid(
         return Ok(Vec::new());
     }
     let mut conn = open_account(maildir_root, domain, localpart)?;
+    if held(&conn)? {
+        return Err(LegalHold.into());
+    }
     ensure_folder(&conn, maildir_root, domain, localpart, &name)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (deleted, staged) =
@@ -2146,6 +2210,10 @@ pub fn replace_message(
     let metadata = validate_staged_appends(maildir_root, domain, localpart, &staged)?;
     let source = normalize_mailbox_name(source_mailbox)?;
     let destination = normalize_mailbox_name(destination)?;
+    // REPLACE expunges the original: not while on legal hold.
+    if held(&*open_account(maildir_root, domain, localpart)?)? {
+        return Err(LegalHold.into());
+    }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &source)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
