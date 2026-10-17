@@ -32,6 +32,7 @@ pub(crate) mod events;
 mod files;
 pub(crate) mod invitations;
 mod mail_rules;
+mod notes;
 mod oidc;
 mod organize;
 mod security;
@@ -155,6 +156,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(events::routes())
         .merge(subscriptions::routes())
         .merge(tasks::routes())
+        .merge(notes::routes())
         .merge(bookings::routes())
         .merge(oidc::routes())
         .merge(mail_rules::routes())
@@ -897,6 +899,8 @@ async fn folders(app: State<Shared>, headers: HeaderMap) -> Response {
                 .folder
                 .name
                 .starts_with(OTHER_USERS.trim_end_matches('/'))
+                // Notes have their own view.
+                && !crate::notes::is_notes_folder(&summary.folder.name)
         })
         .map(|summary| FolderResponse {
             name: summary.folder.name,

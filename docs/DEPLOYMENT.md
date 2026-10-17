@@ -638,6 +638,12 @@ properties (subtasks, alarms, categories, repeat rules) are kept. They are the s
 apps show (Apple Reminders, Thunderbird, Tasks.org or jtx Board through DAVx5) and phones get over
 ActiveSync. Ticking off a repeating task marks the whole task done.
 
+**Notes**: webmail's Notes view keeps notes in the account's `Notes` folder, in the form Apple
+Notes uses over IMAP, so iPhone and Mac Notes show the same notes for the mail account, and phones
+get them over ActiveSync. A note's first line is its title. Webmail and phones edit notes as plain
+text: formatting made in Apple Notes (bold, lists, checklists) is not kept when a note is edited
+there. The folder is not shown among webmail's mail folders.
+
 **Search by meaning** (with an embedding model configured): users turn it on under **Organize my
 mail**; the classifier then indexes their folders (not Trash or Junk) in the background, newest
 first, up to 256 messages per account per cycle, and forgets messages that are deleted or moved.
@@ -668,6 +674,8 @@ password when two-factor sign-in is on) and the webmail host as the server.
 - Tasks: each calendar that takes to-dos is also a tasks folder (the default one is the phone's
   Tasks), with the title, notes, due date, importance (high, normal, low) and done state both ways;
   repeat rules and alarms stay as they are.
+- Notes: the `Notes` folder is the phone's Notes (not a mail folder); each note keeps its id
+  across edits, with the subject as its first line.
 - Invitations show as meeting requests: accepting, declining or answering tentatively on the
   phone replies to the organizer and updates the calendar, as webmail's invitation card does.
 - Provisioning answers with a policy that asks nothing of the device, and is not enforced:

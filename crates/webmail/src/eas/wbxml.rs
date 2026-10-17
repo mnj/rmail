@@ -236,6 +236,17 @@ const PAGES: &[Page] = &[
         ],
     ),
     (
+        23,
+        "Notes",
+        &[
+            (0x05, "Subject"),
+            (0x06, "MessageClass"),
+            (0x07, "LastModifiedDate"),
+            (0x08, "Categories"),
+            (0x09, "Category"),
+        ],
+    ),
+    (
         5,
         "Move",
         &[

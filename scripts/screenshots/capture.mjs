@@ -272,6 +272,15 @@ async function signIn(page) {
   await page.waitForSelector('.task-group.done .task-row:has-text("Review the DMARC")');
   await page.waitForTimeout(300);
   await shot(page, 'webmail-tasks');
+  // Notes: open one and start another.
+  await page.click('.sidebar-link:has-text("Notes")');
+  await page.click('.note-item:has-text("Offsite ideas")');
+  await page.waitForSelector('.note-editor textarea');
+  await page.fill('.note-editor textarea', 'Offsite ideas\nBoat trip on Saturday afternoon\nTeam dinner at the harbour\nAsk Priya about the budget\nBook the bus');
+  await page.click('.note-actions button:has-text("Save")');
+  await page.waitForSelector('.note-actions >> text=Saved');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-notes');
   // Security: an app password for a phone, then the start of 2FA setup.
   await page.click('.sidebar-link:has-text("Security")');
   await page.waitForSelector('.security-dialog >> text=New app password');

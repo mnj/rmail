@@ -253,4 +253,14 @@ for task in [
         headers={"X-Rmail-Webmail": "1", "Content-Type": "application/json"},
     )).read()
 
+# Two notes in Alice's Notes folder.
+for text in [
+    "Offsite ideas\nBoat trip on Saturday afternoon\nTeam dinner at the harbour\nAsk Priya about the budget",
+    "Wi-Fi at the office\nNetwork: example-guest\nPassword is on the whiteboard",
+]:
+    webmail.open(urllib.request.Request(
+        "https://127.0.0.1:18081/api/notes", method="POST", data=json.dumps({"text": text}).encode(),
+        headers={"X-Rmail-Webmail": "1", "Content-Type": "application/json"},
+    )).read()
+
 print("seeded demo data")

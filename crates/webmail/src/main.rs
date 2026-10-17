@@ -23,6 +23,7 @@ mod assets;
 mod dav;
 mod eas;
 mod jmap;
+mod notes;
 mod webdav;
 use rmail_common::local_submit as submit;
 
