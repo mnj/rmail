@@ -680,7 +680,7 @@ async fn contacts_calendars_and_invitations() {
         &conn,
         &book,
         "c1.vcf",
-        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c1\r\nFN:Ann Smith\r\nN:Smith;Ann;;;\r\nEMAIL:ann@remote.test\r\nTEL;TYPE=CELL:+4512345678\r\nX-KEPT:yes\r\nEND:VCARD\r\n",
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c1\r\nFN:Ann Smith\r\nN:Smith;Ann;;;\r\nEMAIL:ann@remote.test\r\nEMAIL:a2@remote.test\r\nEMAIL:a3@remote.test\r\nEMAIL:a4@remote.test\r\nTEL;TYPE=CELL:+4512345678\r\nBDAY:--0315\r\nX-KEPT:yes\r\nEND:VCARD\r\n",
         &|_| true,
     )
     .unwrap()
@@ -762,6 +762,13 @@ async fn contacts_calendars_and_invitations() {
                 ),
         );
     let key = collection(&first).value("AirSync:SyncKey").unwrap();
+    call(
+        &state,
+        "Sync",
+        Some(&sync_request(&contacts, &key, Some(commands.clone()), None)),
+    )
+    .await;
+    // The response was lost: the phone sends the same Sync again.
     let second = call(
         &state,
         "Sync",
@@ -773,12 +780,28 @@ async fn contacts_calendars_and_invitations() {
         .and_then(|r| r.child("AirSync:Add"))
         .unwrap();
     assert_eq!(added.value("AirSync:Status").as_deref(), Some("1"));
-    assert!(
-        collection(&second).child("AirSync:Commands").is_none(),
-        "no echo"
+    // Bob is not echoed; Ann comes back merged, with what she was not sent.
+    let back = collection(&second)
+        .child("AirSync:Commands")
+        .expect("Ann's merged card");
+    assert!(back.child("AirSync:Add").is_none(), "no echo of the add");
+    let merged = back.child("AirSync:Change").unwrap();
+    assert_eq!(
+        merged
+            .child("AirSync:ApplicationData")
+            .and_then(|d| d.value("Contacts:Email2Address"))
+            .as_deref(),
+        Some("a4@remote.test")
     );
     let stored = store::objects(&conn, &book).unwrap();
-    assert!(stored.iter().any(|o| o.data.contains("bob@x.test")));
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|o| o.data.contains("bob@x.test"))
+            .count(),
+        1,
+        "a retried Add is not stored twice"
+    );
     let ann = stored.iter().find(|o| o.name == "c1.vcf").unwrap();
     assert!(
         ann.data.contains("TITLE:Engineer") && ann.data.contains("X-KEPT:yes"),
@@ -786,8 +809,13 @@ async fn contacts_calendars_and_invitations() {
         ann.data
     );
     assert!(
-        !ann.data.contains("+4512345678"),
-        "the phone's version replaces the fields"
+        !ann.data.contains("+4512345678") && !ann.data.contains("a2@remote.test"),
+        "the phone's version replaces the fields it was sent"
+    );
+    assert!(
+        ann.data.contains("a4@remote.test") && ann.data.contains("--0315"),
+        "what it was not sent is kept: {}",
+        ann.data
     );
 
     // A server-side delete reaches the phone.
@@ -815,17 +843,36 @@ async fn contacts_calendars_and_invitations() {
         Some(&sync_request(&calendar, "0", None, None)),
     )
     .await;
-    let event = Element::new("AirSync:Commands").with(
-        Element::new("AirSync:Add")
-            .with(Element::text("AirSync:ClientId", "e1"))
-            .with(
-                Element::new("AirSync:ApplicationData")
-                    .with(Element::text("Calendar:AllDayEvent", "1"))
-                    .with(Element::text("Calendar:StartTime", "20261021T220000Z"))
-                    .with(Element::text("Calendar:EndTime", "20261022T220000Z"))
-                    .with(Element::text("Calendar:Subject", "Holiday")),
-            ),
-    );
+    let event = Element::new("AirSync:Commands")
+        .with(
+            Element::new("AirSync:Add")
+                .with(Element::text("AirSync:ClientId", "e1"))
+                .with(
+                    Element::new("AirSync:ApplicationData")
+                        .with(Element::text("Calendar:AllDayEvent", "1"))
+                        .with(Element::text("Calendar:StartTime", "20261021T220000Z"))
+                        .with(Element::text("Calendar:EndTime", "20261022T220000Z"))
+                        .with(Element::text("Calendar:Subject", "Holiday")),
+                ),
+        )
+        .with(
+            // New Zealand in summer (UTC+13): bias -720, daylight bias -60.
+            Element::new("AirSync:Add")
+                .with(Element::text("AirSync:ClientId", "e2"))
+                .with(
+                    Element::new("AirSync:ApplicationData")
+                        .with(Element::text("Calendar:TimeZone", {
+                            let mut zone = [0u8; 172];
+                            zone[..4].copy_from_slice(&(-720i32).to_le_bytes());
+                            zone[168..].copy_from_slice(&(-60i32).to_le_bytes());
+                            base64::engine::general_purpose::STANDARD.encode(zone)
+                        }))
+                        .with(Element::text("Calendar:AllDayEvent", "1"))
+                        .with(Element::text("Calendar:StartTime", "20261021T110000Z"))
+                        .with(Element::text("Calendar:EndTime", "20261022T110000Z"))
+                        .with(Element::text("Calendar:Subject", "Kiwi")),
+                ),
+        );
     let synced = call(
         &state,
         "Sync",
@@ -846,6 +893,13 @@ async fn contacts_calendars_and_invitations() {
         .find(|c| c.name == "default")
         .unwrap();
     let holiday = store::objects(&conn, &cal).unwrap();
+    assert!(
+        holiday
+            .iter()
+            .any(|o| o.data.contains("SUMMARY:Kiwi")
+                && o.data.contains("DTSTART;VALUE=DATE:20261022")),
+        "the date in the phone's zone"
+    );
     assert!(
         holiday.iter().any(|o| o.data.contains("SUMMARY:Holiday")
             && o.data.contains("DTSTART;VALUE=DATE:20261022")),

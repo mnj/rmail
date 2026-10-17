@@ -91,6 +91,10 @@ fn collection_of(conn: &Connection, id: &str) -> anyhow::Result<Option<Collectio
     Ok(store::collection_by_id(conn, number)?.filter(|c| c.kind == kind && !c.inbox))
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// An item's ServerId (at most 64 characters).
 fn item_id(name: &str) -> String {
     if name.len() <= 60
@@ -101,13 +105,7 @@ fn item_id(name: &str) -> String {
         name.to_string()
     } else {
         let digest = Sha256::digest(name.as_bytes());
-        format!(
-            "h{}",
-            digest[..20]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        )
+        format!("h{}", hex(&digest[..20]))
     }
 }
 
@@ -166,6 +164,58 @@ fn address_tags(kind: &str) -> [&'static str; 5] {
     }
 }
 
+/// Which ActiveSync phone field each phone goes in (phones that fit
+/// none are not sent): (field, index into `phones`).
+fn phone_slots(phones: &[Entry]) -> Vec<(&'static str, usize)> {
+    let mut used: Vec<(&'static str, usize)> = Vec::new();
+    for (index, phone) in phones.iter().enumerate() {
+        let free = |tag: &&str| !used.iter().any(|(t, _)| t == tag);
+        let slot = PHONE_SLOTS
+            .iter()
+            .find(|(tag, kinds)| free(tag) && kinds.contains(&phone.kind.as_str()))
+            .or_else(|| {
+                PHONE_SLOTS.iter().find(|(tag, _)| {
+                    free(tag)
+                        && (*tag == "Contacts:Home2PhoneNumber"
+                            || *tag == "Contacts:Business2PhoneNumber")
+                })
+            })
+            .map(|(tag, _)| *tag);
+        if let Some(slot) = slot {
+            used.push((slot, index));
+        }
+    }
+    used
+}
+
+/// Which ActiveSync address (work, home, other) each address goes in:
+/// (kind, index into `addresses`).
+fn address_slots(addresses: &[PostalAddress]) -> Vec<(&'static str, usize)> {
+    let mut used: Vec<(&'static str, usize)> = Vec::new();
+    for (index, address) in addresses.iter().enumerate() {
+        let free = |kind: &str| !used.iter().any(|(k, _)| *k == kind);
+        let kind = match address.kind.as_str() {
+            "work" if free("work") => "work",
+            "home" if free("home") => "home",
+            _ if free("other") => "other",
+            _ => continue,
+        };
+        used.push((kind, index));
+    }
+    used
+}
+
+/// Whether a contact has emails, phones or addresses a device is not sent.
+fn has_unsent(object: &Object) -> bool {
+    let Ok(card) = text::parse(&object.data) else {
+        return false;
+    };
+    let fields = contacts::fields_of(&card);
+    fields.emails.len() > 3
+        || phone_slots(&fields.phones).len() < fields.phones.len()
+        || address_slots(&fields.addresses).len() < fields.addresses.len()
+}
+
 fn contact_data(tag: &str, object: &Object) -> anyhow::Result<Element> {
     let card = text::parse(&object.data).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let fields = contacts::fields_of(&card);
@@ -195,34 +245,11 @@ fn contact_data(tag: &str, object: &Object) -> anyhow::Result<Element> {
             &email.value,
         );
     }
-    let mut used: Vec<&str> = Vec::new();
-    for phone in &fields.phones {
-        let kind = phone.kind.as_str();
-        let slot = PHONE_SLOTS
-            .iter()
-            .find(|(tag, kinds)| !used.contains(tag) && kinds.contains(&kind))
-            .or_else(|| {
-                PHONE_SLOTS.iter().find(|(tag, _)| {
-                    !used.contains(tag)
-                        && (*tag == "Contacts:Home2PhoneNumber"
-                            || *tag == "Contacts:Business2PhoneNumber")
-                })
-            })
-            .map(|(tag, _)| *tag);
-        if let Some(slot) = slot {
-            used.push(slot);
-            put(slot, &phone.value);
-        }
+    for (slot, index) in phone_slots(&fields.phones) {
+        put(slot, &fields.phones[index].value);
     }
-    let mut kinds_used: Vec<&str> = Vec::new();
-    for address in &fields.addresses {
-        let kind = match address.kind.as_str() {
-            "work" if !kinds_used.contains(&"work") => "work",
-            "home" if !kinds_used.contains(&"home") => "home",
-            _ if !kinds_used.contains(&"other") => "other",
-            _ => continue,
-        };
-        kinds_used.push(kind);
+    for (kind, index) in address_slots(&fields.addresses) {
+        let address = &fields.addresses[index];
         let tags = address_tags(kind);
         for (tag, value) in tags.iter().zip([
             &address.street,
@@ -257,9 +284,11 @@ fn contact_data(tag: &str, object: &Object) -> anyhow::Result<Element> {
     Ok(data)
 }
 
-/// The fields a device's contact sets (a change replaces them all, as
-/// ActiveSync clients send every property).
-fn contact_fields(data: &Element) -> Fields {
+/// The fields a device's contact sets. A change replaces what the device
+/// was sent (ActiveSync clients send every property); what it could not
+/// be sent (`previous` beyond its fields) is kept, and kinds it has no
+/// field for stay as they were.
+fn contact_fields(data: &Element, previous: Option<&Fields>) -> Fields {
     let value = |tag: &str| data.value(tag).unwrap_or_default().trim().to_string();
     let mut fields = Fields {
         given: value("Contacts:FirstName"),
@@ -274,11 +303,14 @@ fn contact_fields(data: &Element) -> Fields {
     } else {
         String::new()
     };
-    for tag in [
+    for (index, tag) in [
         "Contacts:Email1Address",
         "Contacts:Email2Address",
         "Contacts:Email3Address",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let raw = value(tag);
         let address = rmail_common::jmap::address::parse(&raw)
             .into_iter()
@@ -286,26 +318,44 @@ fn contact_fields(data: &Element) -> Fields {
             .map(|a| a.email)
             .unwrap_or(raw);
         if !address.is_empty() {
+            let kind = previous
+                .and_then(|p| p.emails.get(index))
+                .filter(|e| e.value.eq_ignore_ascii_case(&address))
+                .map(|e| e.kind.clone())
+                .unwrap_or_default();
             fields.emails.push(Entry {
-                kind: String::new(),
+                kind,
                 value: address,
             });
         }
     }
+    let empty = Fields::default();
+    let previous = previous.unwrap_or(&empty);
+    let sent_phones = phone_slots(&previous.phones);
     for (tag, kinds) in PHONE_SLOTS {
         let number = value(tag);
         if !number.is_empty() {
+            let kind = sent_phones
+                .iter()
+                .find(|(t, _)| t == tag)
+                .map(|(_, i)| &previous.phones[*i])
+                .filter(|p| p.value == number)
+                .map_or_else(|| kinds[0].to_string(), |p| p.kind.clone());
             fields.phones.push(Entry {
-                kind: kinds[0].to_string(),
+                kind,
                 value: number,
             });
         }
     }
+    let sent_addresses = address_slots(&previous.addresses);
     for kind in ["work", "home", "other"] {
         let tags = address_tags(kind);
         let part = |i: usize| value(tags[i]);
         let address = PostalAddress {
-            kind: kind.to_string(),
+            kind: sent_addresses.iter().find(|(k, _)| *k == kind).map_or_else(
+                || kind.to_string(),
+                |(_, i)| previous.addresses[*i].kind.clone(),
+            ),
             street: part(0),
             city: part(1),
             region: part(2),
@@ -328,7 +378,24 @@ fn contact_fields(data: &Element) -> Fields {
     let birthday = value("Contacts:Birthday");
     if birthday.len() >= 10 {
         fields.birthday = birthday[..10].to_string();
+    } else if previous.birthday.starts_with("--") {
+        // A birthday without a year is not sent.
+        fields.birthday = previous.birthday.clone();
     }
+    // What the device was not sent.
+    fields
+        .emails
+        .extend(previous.emails.iter().skip(3).cloned());
+    fields.phones.extend(
+        (0..previous.phones.len())
+            .filter(|i| !sent_phones.iter().any(|(_, s)| s == i))
+            .map(|i| previous.phones[i].clone()),
+    );
+    fields.addresses.extend(
+        (0..previous.addresses.len())
+            .filter(|i| !sent_addresses.iter().any(|(_, s)| s == i))
+            .map(|i| previous.addresses[i].clone()),
+    );
     fields.note = data
         .child("AirSyncBase:Body")
         .and_then(|b| b.value("AirSyncBase:Data"))
@@ -344,6 +411,29 @@ fn contact_fields(data: &Element) -> Fields {
 /// sent in UTC.
 fn utc_zone() -> String {
     base64::engine::general_purpose::STANDARD.encode([0u8; 172])
+}
+
+/// The UTC offsets (seconds, local = UTC + offset) of a device's
+/// TIME_ZONE_INFORMATION blob: standard time, then daylight time.
+fn zone_offsets(zone: &str) -> Vec<i64> {
+    let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(zone.trim()) else {
+        return Vec::new();
+    };
+    if blob.len() < 172 {
+        return Vec::new();
+    }
+    let at = |i: usize| {
+        i64::from(i32::from_le_bytes([
+            blob[i],
+            blob[i + 1],
+            blob[i + 2],
+            blob[i + 3],
+        ]))
+    };
+    // Bias, then StandardName (64), StandardDate (16), StandardBias,
+    // DaylightName (64), DaylightDate (16), DaylightBias; UTC = local + bias.
+    let bias = at(0);
+    vec![-(bias + at(84)) * 60, -(bias + at(168)) * 60]
 }
 
 fn compact(seconds: i64) -> String {
@@ -583,8 +673,20 @@ fn event_fields(data: &Element, previous: Option<&EventFields>) -> Option<EventF
             .collect(),
         None => previous.map(|p| p.attendees.clone()).unwrap_or_default(),
     };
-    // All-day times are local midnights in UTC: the nearest midnight.
-    let midnight = |t: i64| (t + 43_200).div_euclid(86_400) * 86_400;
+    // All-day times are the device's local midnights in UTC: the date is
+    // taken in its zone (standard or daylight time, whichever makes a
+    // midnight), else from the nearest UTC midnight.
+    let offsets = data
+        .value("Calendar:TimeZone")
+        .map(|zone| zone_offsets(&zone))
+        .unwrap_or_default();
+    let midnight = |t: i64| {
+        offsets
+            .iter()
+            .map(|offset| t + offset)
+            .find(|local| local.rem_euclid(86_400) == 0)
+            .unwrap_or_else(|| (t + 43_200).div_euclid(86_400) * 86_400)
+    };
     Some(EventFields {
         summary: data
             .value("Calendar:Subject")
@@ -637,13 +739,17 @@ fn store_item(
     conn: &Connection,
     collection: &Collection,
     existing: Option<&Object>,
+    new_uid: &str,
     data: &Element,
 ) -> anyhow::Result<Option<String>> {
     if collection.managed {
         return Ok(None);
     }
     if collection.kind == Kind::AddressBook {
-        let fields = contact_fields(data);
+        let previous = existing
+            .and_then(|o| text::parse(&o.data).ok())
+            .map(|card| contacts::fields_of(&card));
+        let fields = contact_fields(data, previous.as_ref());
         if contacts::check(&fields).is_err() || !contacts::valid_birthday(&fields.birthday) {
             return Ok(None);
         }
@@ -654,8 +760,12 @@ fn store_item(
                 Some(object.etag.clone()),
             ),
             None => {
-                let uid = contacts::uuid();
-                (format!("{uid}.vcf"), uid, None)
+                let name = format!("{new_uid}.vcf");
+                // A repeated Add (a retried Sync) finds what it stored.
+                if store::object(conn, collection, &name)?.is_some() {
+                    return Ok(Some(name));
+                }
+                (name, new_uid.to_string(), None)
             }
         };
         let text = contacts::card_text(existing.map(|o| o.data.as_str()), &fields, &uid);
@@ -681,9 +791,22 @@ fn store_item(
     if events::check(&fields).is_err() {
         return Ok(None);
     }
-    let uid = data
-        .value("Calendar:UID")
-        .filter(|u| !u.trim().is_empty() && existing.is_none());
+    let uid = match existing {
+        Some(_) => None,
+        None => {
+            let uid = data
+                .value("Calendar:UID")
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| new_uid.to_string());
+            // A repeated Add (a retried Sync) finds what it stored.
+            if let Some((found, object)) = store::find_by_uid(conn, &uid)?
+                && found.id == collection.id
+            {
+                return Ok(Some(object.name));
+            }
+            Some(uid)
+        }
+    };
     let saved = events::save(
         &account.state,
         &session(account),
@@ -750,8 +873,18 @@ pub(super) fn sync_collection(
             match command.name {
                 "Add" => {
                     let client = command.value("AirSync:ClientId").unwrap_or_default();
+                    // Named after the device's ClientId, so a retried Sync
+                    // does not add it twice.
+                    let new_uid = if client.is_empty() {
+                        contacts::uuid()
+                    } else {
+                        let digest = Sha256::digest(format!("{}\0{id}\0{client}", account.device));
+                        format!("eas-{}", hex(&digest[..16]))
+                    };
                     let stored = match command.child("AirSync:ApplicationData") {
-                        Some(data) => store_item(account, &conn, &collection, None, data)?,
+                        Some(data) => {
+                            store_item(account, &conn, &collection, None, &new_uid, data)?
+                        }
                         None => None,
                     };
                     let mut answer =
@@ -769,11 +902,18 @@ pub(super) fn sync_collection(
                     }
                     responses.push(answer);
                 }
+                // A retried Sync's changes were made by the first attempt;
+                // the device gets the stored version back.
+                "Change" if key != known.0 => {}
                 "Change" => {
                     let existing = find(&conn, &collection, &server_id)?;
+                    // When a contact had more than the device was sent, the
+                    // merged version goes back to it.
+                    let echo = collection.kind == Kind::AddressBook
+                        && existing.as_ref().is_some_and(has_unsent);
                     let stored = match (&existing, command.child("AirSync:ApplicationData")) {
                         (Some(object), Some(data)) => {
-                            store_item(account, &conn, &collection, Some(object), data)?
+                            store_item(account, &conn, &collection, Some(object), "", data)?
                         }
                         _ => None,
                     };
@@ -781,7 +921,9 @@ pub(super) fn sync_collection(
                         .and_then(|name| store::object(&conn, &collection, &name).ok().flatten())
                     {
                         Some(object) => {
-                            base.insert(server_id, object.etag.clone());
+                            if !echo {
+                                base.insert(server_id, object.etag.clone());
+                            }
                         }
                         None => responses.push(
                             Element::new("AirSync:Change")
