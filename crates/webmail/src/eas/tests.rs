@@ -1034,7 +1034,6 @@ async fn tasks_sync_both_ways() {
                 .with(
                     Element::new("AirSync:ApplicationData")
                         .with(Element::text("Tasks:Subject", "Renew passport"))
-                        .with(Element::text("Tasks:Importance", "2"))
                         .with(Element::text("Tasks:DueDate", "2026-11-01T00:00:00.000Z"))
                         .with(Element::text(
                             "Tasks:UtcDueDate",
@@ -1067,7 +1066,7 @@ async fn tasks_sync_both_ways() {
     assert!(
         passport.data.contains("STATUS:COMPLETED")
             && passport.data.contains("DUE;VALUE=DATE:20261101")
-            && passport.data.contains("PRIORITY:1"),
+            && passport.data.contains("PRIORITY:1"), // left out, so kept
         "{}",
         passport.data
     );

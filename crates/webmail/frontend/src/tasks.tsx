@@ -44,7 +44,8 @@ function groupOf(task: Task): Group {
   const date = dueDate(task);
   if (!date) return 'someday';
   const today = startOfToday();
-  const tomorrow = new Date(today.getTime() + 86_400_000);
+  // The next calendar day (not 24 hours: clock changes make days 23 or 25).
+  const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
   if (task.due_all_day ? date < today : date.getTime() < Date.now()) return 'overdue';
   return date < tomorrow ? 'today' : 'upcoming';
 }

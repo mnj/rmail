@@ -840,7 +840,9 @@ fn task_fields_from(data: &Element, previous: Option<&tasks::TaskFields>) -> tas
         _ => (None, false),
     };
     let previous_priority = previous.map_or(0, |p| p.priority);
+    // An importance the device leaves out stays as it was (MS-ASTASK).
     let priority = match data.value("Tasks:Importance").as_deref() {
+        None => previous_priority,
         Some("2") if importance(previous_priority) == "2" => previous_priority,
         Some("2") => 1,
         Some("0") if importance(previous_priority) == "0" => previous_priority,
