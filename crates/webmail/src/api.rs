@@ -129,6 +129,10 @@ pub(crate) fn router(state: Shared) -> Router {
         )
         .route("/api/folders/{folder}/messages/{uid}/raw", get(raw_message))
         .route(
+            "/api/folders/{folder}/messages/{uid}/related",
+            get(related_messages),
+        )
+        .route(
             "/api/folders/{folder}/messages/{uid}/invitation",
             post(answer_invitation),
         )
@@ -621,6 +625,121 @@ const MAX_SEMANTIC_RESULTS: usize = 50;
 /// The folder's messages closest in meaning to `query`, best first, as
 /// (uidvalidity, uid, score): from the classifier daemon and the user's
 /// search index. Only the user's own folders have one.
+/// Related messages shown under an open message, at most...
+const MAX_RELATED: usize = 5;
+/// ...and at least this close in meaning (cosine; vectors are normalized).
+const MIN_RELATED_SCORE: f32 = 0.5;
+
+/// A message close in meaning to an open one.
+#[derive(Serialize, Deserialize, Debug)]
+pub(crate) struct RelatedMessage {
+    pub folder: String,
+    pub uid: u64,
+    pub from: String,
+    pub subject: String,
+    pub internal_date: i64,
+}
+
+/// The messages in any of the user's own folders closest in meaning to
+/// one, from the vectors search by meaning already keeps (nothing is sent
+/// to a model). Empty when search by meaning is off or the message is not
+/// indexed yet.
+async fn related_messages(
+    app: State<Shared>,
+    headers: HeaderMap,
+    Path((folder, uid)): Path<(String, u64)>,
+) -> Response {
+    let state = app.0;
+    let session = match Session::signed_in(&state, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    let result = blocking(move || -> Result<Vec<RelatedMessage>> {
+        let location = locate(&state, &session, &folder)?;
+        if location.is_shared() {
+            return Ok(Vec::new());
+        }
+        let Some(conn) = rmail_common::classifier_store::open_existing(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        if !rmail_common::classifier_store::prefs(&conn)?.search_enabled {
+            return Ok(Vec::new());
+        }
+        let (info, _) = imap_state::load_folder(
+            &state.mail_root,
+            &session.domain,
+            &session.localpart,
+            &location.folder,
+        )?;
+        let Some((model, wanted)) = rmail_common::classifier_store::search_vector(
+            &conn,
+            &location.folder,
+            info.uidvalidity,
+            uid,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut scored: Vec<(f32, String, u64, u64)> =
+            rmail_common::classifier_store::all_search_vectors(&conn, &model)?
+                .into_iter()
+                .filter(|(f, _, u, _)| !(*f == location.folder && *u == uid))
+                .map(|(f, validity, u, vector)| {
+                    let score = vector.iter().zip(&wanted).map(|(a, b)| a * b).sum::<f32>();
+                    (score, f, validity, u)
+                })
+                .filter(|(score, ..)| *score >= MIN_RELATED_SCORE)
+                .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // Only messages still there (the index may lag behind deletions).
+        let mut folders: std::collections::HashMap<String, (u64, Vec<imap_state::Message>)> =
+            Default::default();
+        let mut found = Vec::new();
+        for (_, name, validity, u) in scored {
+            if found.len() == MAX_RELATED {
+                break;
+            }
+            if !folders.contains_key(&name) {
+                let loaded = imap_state::load_folder(
+                    &state.mail_root,
+                    &session.domain,
+                    &session.localpart,
+                    &name,
+                )
+                .map(|(info, messages)| (info.uidvalidity, messages))
+                .unwrap_or_default();
+                folders.insert(name.clone(), loaded);
+            }
+            let (current, messages) = &folders[&name];
+            let Some(message) = messages.iter().find(|m| *current == validity && m.uid == u) else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read(&message.path) else {
+                continue;
+            };
+            let parsed = parse_message(&raw);
+            found.push(RelatedMessage {
+                folder: name,
+                uid: u,
+                from: parsed.from,
+                subject: parsed.subject,
+                internal_date: message.internaldate,
+            });
+        }
+        Ok(found)
+    })
+    .await;
+    match result {
+        Ok(found) => Json(serde_json::json!({ "messages": found })).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn semantic_ranking(
     state: &Shared,
     session: &Session,
@@ -2626,6 +2745,89 @@ pub(crate) mod tests {
         send["entity"] = serde_json::json!("Content-Type: text/plain\r\n\r\nbare\nnewline\r\n");
         let refused = call("POST", "/api/send", send.to_string().into_bytes()).await;
         assert_eq!(refused.status, 422);
+    }
+
+    #[tokio::test]
+    async fn related_messages_come_from_the_search_index_across_folders() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        let (root, d, l) = (state.mail_root.clone(), "example.test", "user");
+        imap_state::init_account(&root, d, l).unwrap();
+        let mut uids = Vec::new();
+        for subject in ["Sailing club", "Regatta", "Invoice 7"] {
+            let message = format!("From: a@b.test\r\nSubject: {subject}\r\n\r\nbody");
+            uids.push(
+                imap_state::deliver_message(&root, d, l, message.as_bytes())
+                    .unwrap()
+                    .1,
+            );
+        }
+        let (archive_validity, archived) = imap_state::append_message(
+            &root,
+            d,
+            l,
+            "Archive",
+            b"From: c@d.test\r\nSubject: Boat for sale\r\n\r\nbody",
+            Vec::new(),
+        )
+        .unwrap();
+        let validity = imap_state::load_folder(&root, d, l, "INBOX")
+            .unwrap()
+            .0
+            .uidvalidity;
+        let store = rmail_common::classifier_store::open_or_create(&root, d, l).unwrap();
+        let put = |folder: &str, validity: u64, uid: u64, model: &str, vector: [f32; 2]| {
+            rmail_common::classifier_store::put_search_vector(
+                &store, folder, validity, uid, model, &vector,
+            )
+            .unwrap()
+        };
+        put("INBOX", validity, uids[0], "m", [1.0, 0.0]);
+        put("INBOX", validity, uids[1], "m", [0.8, 0.6]);
+        put("INBOX", validity, uids[2], "m", [0.0, 1.0]);
+        put("Archive", archive_validity, archived, "m", [0.6, 0.8]);
+        put("INBOX", validity, 999, "m", [1.0, 0.0]); // deleted since
+        put(
+            "Archive",
+            archive_validity,
+            archived + 1,
+            "other",
+            [1.0, 0.0],
+        );
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let path = format!("/api/folders/INBOX/messages/{}/related", uids[0]);
+        let related = |response: &TestResponse| {
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["folder"].as_str().unwrap().to_string(),
+                        m["subject"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let off = route(req("GET", &path, b"", cookie.clone()), &state).await;
+        assert_eq!(off.status, 200);
+        assert!(related(&off).is_empty(), "nothing while search is off");
+        let mut prefs = rmail_common::classifier_store::prefs(&store).unwrap();
+        prefs.search_enabled = true;
+        rmail_common::classifier_store::set_prefs(&store, &prefs).unwrap();
+        let on = route(req("GET", &path, b"", cookie), &state).await;
+        assert_eq!(
+            related(&on),
+            vec![
+                ("INBOX".to_string(), "Regatta".to_string()),
+                ("Archive".to_string(), "Boat for sale".to_string()),
+            ],
+            "closest first, across folders, without the far one or the gone one"
+        );
     }
 
     #[tokio::test]

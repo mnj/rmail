@@ -635,7 +635,9 @@ Hosted models only receive a message when the user has agreed to that provider.
 mail**; the classifier then indexes their folders (not Trash or Junk) in the background, newest
 first, up to 256 messages per account per cycle, and forgets messages that are deleted or moved.
 The search box then offers **By meaning**, which lists the open folder's messages closest to the
-query, best first. Turning it off deletes the index. With a hosted embedding model, indexing and
+query, best first. An open message also lists up to five **Related messages** from any of the
+user's folders, compared from the stored index alone (nothing is sent to a model). Turning it off
+deletes the index. With a hosted embedding model, indexing and
 searches only happen for users who agreed to that provider.
 
 ### Exchange ActiveSync

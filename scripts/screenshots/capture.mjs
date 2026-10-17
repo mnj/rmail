@@ -301,6 +301,12 @@ async function signIn(page) {
   await page.waitForSelector('.message-list .row:first-child:has-text("Regatta on Saturday")');
   await page.waitForTimeout(300);
   await shot(page, 'webmail-search-meaning');
+  // The open message lists others close in meaning, from the same index.
+  await openMessage(page, 'Regatta on Saturday');
+  await page.waitForSelector('.related li');
+  await page.locator('.related').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-related');
   await ctx.close();
 }
 

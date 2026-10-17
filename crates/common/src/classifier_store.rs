@@ -989,6 +989,51 @@ pub fn search_vectors(
     Ok(rows)
 }
 
+/// One message's indexed vector and the model that made it.
+pub fn search_vector(
+    conn: &Connection,
+    folder: &str,
+    uidvalidity: u64,
+    uid: u64,
+) -> Result<Option<(String, Vec<f32>)>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT model_id, embedding FROM search_vectors
+             WHERE folder = ?1 AND uidvalidity = ?2 AND uid = ?3",
+            params![folder, uidvalidity as i64, uid as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    decode_embedding(&row.get::<_, Vec<u8>>(1)?),
+                ))
+            },
+        )
+        .optional()?)
+}
+
+/// Every indexed vector made with `model_id`, in every folder:
+/// (folder, uidvalidity, uid, vector).
+pub fn all_search_vectors(
+    conn: &Connection,
+    model_id: &str,
+) -> Result<Vec<(String, u64, u64, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT folder, uidvalidity, uid, embedding FROM search_vectors WHERE model_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![model_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                decode_embedding(&row.get::<_, Vec<u8>>(3)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn search_count(conn: &Connection) -> Result<u64> {
     Ok(
         conn.query_row("SELECT COUNT(*) FROM search_vectors", [], |row| {

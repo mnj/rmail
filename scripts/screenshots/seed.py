@@ -164,6 +164,16 @@ for subject, body in [
 imap._simple_command("SETACL", '"Team Projects"', "alice@example.com", "lrs")
 imap.logout()
 
+# An older message of Alice's, filed in Archive: related to the regatta.
+imap = imaplib.IMAP4("127.0.0.1", 1143)
+imap.starttls(ssl_context=TLS)
+imap.login("alice@example.com", PASSWORD)
+berth = message('"Harbour Sailing Club" <club@harbour-sailing.test>', "alice@example.com",
+                "Marina berth renewal", "Your berth at the marina is due for renewal; the club "
+                "keeps it for your boat until the end of the month.", ago=60 * 60 * 24 * 40)
+imap.append("Archive", "(\\Seen)", None, berth.as_bytes())
+imap.logout()
+
 # Alice's address book (CardDAV), for address suggestions while composing.
 auth = "Basic " + __import__("base64").b64encode(f"alice@example.com:{PASSWORD}".encode()).decode()
 for uid, name, email in [
