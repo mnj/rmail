@@ -395,6 +395,34 @@ services keep running:
   `RMAIL_BACKUP_KEEP` (`systemctl edit rmail_backup.service`). Copy the files off the machine too:
   a backup on the same disk does not survive the disk.
 
+Off-site copies (optional): pick a target under **Backup upload** in the console's settings and the
+nightly backup is copied there after it is made, keeping the newest `backup_upload.keep` (0 keeps
+all). A failed upload leaves the local backup in place and fails the timer's run, so it shows in
+`systemctl status rmail_backup` and the journal.
+
+- **S3-compatible**: AWS S3, Google Cloud Storage (`https://storage.googleapis.com` with an HMAC key
+  from *Cloud Storage → Settings → Interoperability*), Cloudflare R2, Backblaze B2, Wasabi, and
+  self-hosted servers such as Garage, SeaweedFS or Ceph (turn on path-style addresses for those).
+  Requests are signed with AWS Signature Version 4; backups above 64 MB go up as multipart uploads.
+  A storage class can be set: `STANDARD_IA`, `GLACIER_IR` or `DEEP_ARCHIVE` on AWS, `NEARLINE`,
+  `COLDLINE` or `ARCHIVE` on Google Cloud.
+- **Azure Blob Storage**: a storage account and container, with the account key or a SAS token for
+  the container (read, write, list, delete), and an optional access tier (`Cool`, `Cold`,
+  `Archive`).
+- **SFTP**: any SSH server, with a private key file without a passphrase that the `rmail` user can
+  read. The OpenSSH `sftp` client is used; the server's host key is trusted on first connection and
+  checked after that (kept in `<mail_root>/backup-known-hosts`). Files are uploaded under a
+  `.partial` name and renamed when complete.
+
+Archive classes and tiers (`DEEP_ARCHIVE`, `ARCHIVE`, Azure `Archive`) are by far the cheapest per
+GB, but they charge for a minimum storage time (90 to 365 days, depending on provider and tier) even
+when a backup is deleted sooner, and reading one back takes hours (a rehydration or restore request
+at the provider first). Set `keep` with that in mind, or use a cool class (`STANDARD_IA`,
+`NEARLINE`, `Cool`) for the recent copies. Backups hold password hashes, DKIM keys and every
+message, and rMail does not encrypt them: use a private bucket or container, with the provider's
+encryption at rest. `rmail_ctl backup upload <file>` uploads one by hand, `backup remote` lists the
+uploaded backups, and `backup fetch <name> <file>` downloads one to restore it.
+
 Restoring:
 
 - Run restores as the services' user (`sudo -u rmail rmail_ctl backup restore …`): files a

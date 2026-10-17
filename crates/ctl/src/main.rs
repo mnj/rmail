@@ -356,6 +356,12 @@ enum BackupAction {
     },
     /// What a backup holds
     Show { file: String },
+    /// Upload FILE to the configured off-site target (Backup upload settings)
+    Upload { file: String },
+    /// List the backups at the off-site target
+    Remote,
+    /// Download backup NAME from the off-site target to FILE
+    Fetch { name: String, file: String },
     /// Restore a backup. A full one needs the services stopped; --force
     /// moves existing data aside first. An account backup can go to
     /// another address with --as.
@@ -505,6 +511,16 @@ struct ServiceCommandOptions {
     /// Print systemctl commands without running them
     #[arg(long)]
     dry_run: bool,
+}
+
+/// The off-site backup target, or an error saying it is not set up.
+fn offsite_target(
+    cfg: &Config,
+    sources: &rmail_common::backup::Sources,
+) -> Result<rmail_common::offsite::Target> {
+    rmail_common::offsite::target(&cfg.backup_upload, &sources.mail_root)?.ok_or_else(|| {
+        anyhow::anyhow!("no backup upload target is set (Backup upload settings in the console)")
+    })
 }
 
 #[tokio::main]
@@ -1058,6 +1074,36 @@ async fn main() -> Result<()> {
                         summary.files,
                         size(summary.bytes)
                     );
+                    // A copy off the machine, when set up. The local backup
+                    // stands even if this fails (the exit status says so).
+                    if let Some(target) =
+                        rmail_common::offsite::target(&cfg.backup_upload, &sources.mail_root)?
+                    {
+                        let pruned = target
+                            .upload_and_prune(&out, cfg.backup_upload.keep)
+                            .await
+                            .with_context(|| format!("uploading to {}", target.describe()))?;
+                        println!("uploaded to {}", target.describe());
+                        for name in pruned {
+                            println!("deleted the older {name} there");
+                        }
+                    }
+                }
+                BackupAction::Upload { file } => {
+                    let target = offsite_target(&cfg, &sources)?;
+                    let name = target.upload(std::path::Path::new(&file)).await?;
+                    println!("uploaded {name} to {}", target.describe());
+                }
+                BackupAction::Remote => {
+                    let target = offsite_target(&cfg, &sources)?;
+                    for name in target.list().await? {
+                        println!("{name}");
+                    }
+                }
+                BackupAction::Fetch { name, file } => {
+                    let target = offsite_target(&cfg, &sources)?;
+                    target.download(&name, std::path::Path::new(&file)).await?;
+                    println!("downloaded {name} to {file}");
                 }
                 BackupAction::Show { file } => {
                     let manifest =
