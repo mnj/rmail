@@ -397,6 +397,13 @@ pub(super) fn deliver_local(
         ),
         None => return Ok(()),
     };
+    // The resource's copy before the change, to tell a new time from an
+    // edit that leaves an approved booking as it was.
+    let before = if resource {
+        store::object(&conn, &collection, &name)?.and_then(|object| text::parse(&object.data).ok())
+    } else {
+        None
+    };
     let stored = store::put_with(&conn, &collection, &name, &mut |current| {
         let copy = current.and_then(|object| text::parse(&object.data).ok());
         apply(message, copy.as_ref(), sender, &recipient).ok_or(store::PutError::PreconditionFailed)
@@ -404,7 +411,10 @@ pub(super) fn deliver_local(
     match stored {
         Ok(_) => {
             // The invitation is stored whatever becomes of the answer.
-            if resource && let Err(error) = answer_as_resource(dav, account, &collection, &name) {
+            if resource
+                && let Err(error) =
+                    answer_as_resource(dav, account, &collection, &name, before.as_ref())
+            {
                 webmail_log!("warn", "resource_answer_failed", { "account": account.address, "error": format!("{error:#}") });
             }
             Ok(())
@@ -428,43 +438,88 @@ fn answer_as_resource(
     resource: &User,
     collection: &store::Collection,
     name: &str,
+    before: Option<&text::Component>,
 ) -> anyhow::Result<()> {
     let resource_dav = resource_dav(&dav.app, resource)?;
     let Some(object) = store::object(&resource_dav.conn, collection, name)? else {
         return Ok(());
     };
     let calendar = text::parse(&object.data)?;
-    let now = chrono::Utc::now().timestamp();
-    let (from, until) = (now - 86_400, now + RESOURCE_HORIZON);
-    let wanted = recur::occurrences(&calendar, from, until);
-    let taken = busy_except(
-        &resource_dav,
-        resource,
-        from,
-        until,
-        uid_of(&calendar).as_deref(),
-    )?;
-    let clash = wanted.iter().any(|occurrence| {
-        taken
-            .iter()
-            .any(|(begin, finish, _)| occurrence.start < *finish && *begin < occurrence.end)
-    });
+    let clash = clashes(&resource_dav, resource, &calendar)?;
     let approver = if clash {
         None
     } else {
         rmail_common::resources::approver_of(&dav.app.db_path, &resource.address)?
     };
+    // An approved booking stays approved through edits that keep its times.
+    let own = addresses(&resource_dav, resource);
+    let kept = before.is_some_and(|before| {
+        own_answer(before, &own).as_deref() == Some("ACCEPTED") && times(before) == times(&calendar)
+    });
     let partstat = match (clash, &approver) {
         (true, _) => "DECLINED",
-        (false, Some(_)) => "TENTATIVE",
-        (false, None) => "ACCEPTED",
+        (false, Some(_)) if !kept => "TENTATIVE",
+        (false, _) => "ACCEPTED",
     };
     if set_resource_answer(&resource_dav, resource, collection, name, partstat)?
+        && partstat == "TENTATIVE"
         && let Some(approver) = approver
     {
         request_approval(&dav.app, resource, &approver, &calendar)?;
     }
     Ok(())
+}
+
+/// Whether an occurrence (within [`RESOURCE_HORIZON`]) overlaps another
+/// of the resource's bookings.
+fn clashes(
+    resource_dav: &Dav,
+    resource: &User,
+    calendar: &text::Component,
+) -> anyhow::Result<bool> {
+    let now = chrono::Utc::now().timestamp();
+    let (from, until) = (now - 86_400, now + RESOURCE_HORIZON);
+    let wanted = recur::occurrences(calendar, from, until);
+    let taken = busy_except(
+        resource_dav,
+        resource,
+        from,
+        until,
+        uid_of(calendar).as_deref(),
+    )?;
+    Ok(wanted.iter().any(|occurrence| {
+        taken
+            .iter()
+            .any(|(begin, finish, _)| occurrence.start < *finish && *begin < occurrence.end)
+    }))
+}
+
+/// When an event happens (within [`RESOURCE_HORIZON`]).
+fn times(calendar: &text::Component) -> Vec<(i64, i64)> {
+    let now = chrono::Utc::now().timestamp();
+    recur::occurrences(calendar, now - 86_400, now + RESOURCE_HORIZON)
+        .iter()
+        .map(|occurrence| (occurrence.start, occurrence.end))
+        .collect()
+}
+
+/// The PARTSTAT of whichever of `own` the event invites.
+fn own_answer(calendar: &text::Component, own: &[String]) -> Option<String> {
+    calendar
+        .components
+        .iter()
+        .filter(|c| c.name != "VTIMEZONE")
+        .flat_map(|c| c.properties_named("ATTENDEE"))
+        .find(|attendee| {
+            itip::address(&attendee.value)
+                .is_some_and(|found| own.iter().any(|o| o.eq_ignore_ascii_case(&found)))
+        })
+        .map(|attendee| {
+            attendee
+                .param("PARTSTAT")
+                .unwrap_or("NEEDS-ACTION")
+                .to_ascii_uppercase()
+        })
 }
 
 fn resource_dav(
@@ -549,12 +604,8 @@ fn request_approval(
     let Some((local, domain)) = approver.split_once('@') else {
         return Ok(());
     };
-    let summary = calendar
-        .components
-        .iter()
-        .find(|c| c.name == "VEVENT")
-        .and_then(|event| event.property("SUMMARY"))
-        .map(|summary| summary.value.replace(['\r', '\n'], " "))
+    let summary = crate::api::events::fields_of(calendar, None)
+        .map(|fields| fields.summary.replace(['\r', '\n'], " "))
         .unwrap_or_default();
     let organizer = itip::organizer(calendar).unwrap_or_default();
     let when = recur::occurrences(calendar, i64::MIN / 4, i64::MAX / 4)
@@ -596,25 +647,46 @@ fn request_approval(
     Ok(())
 }
 
+/// What became of an approver's answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BookingAnswer {
+    Answered,
+    /// The booking is gone, or no longer invites the resource.
+    Gone,
+    /// Approving would double-book the resource.
+    Clash,
+}
+
 /// The approver's answer to a booking held for approval: the resource's
-/// reply goes to the organizer. False when there is no such booking.
+/// reply goes to the organizer. An approval is checked for clashes again,
+/// under the resource's lock, since other bookings may have come since.
 pub(crate) fn answer_booking(
     app: &std::sync::Arc<crate::api::AppState>,
     resource: &User,
     uid: &str,
     approve: bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<BookingAnswer> {
+    let lock = resource_lock(&resource.address);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let resource_dav = resource_dav(app, resource)?;
     let Some((collection, object)) = store::find_by_uid(&resource_dav.conn, uid)? else {
-        return Ok(false);
+        return Ok(BookingAnswer::Gone);
     };
-    set_resource_answer(
+    if approve && clashes(&resource_dav, resource, &text::parse(&object.data)?)? {
+        return Ok(BookingAnswer::Clash);
+    }
+    let answered = set_resource_answer(
         &resource_dav,
         resource,
         &collection,
         &object.name,
         if approve { "ACCEPTED" } else { "DECLINED" },
-    )
+    )?;
+    Ok(if answered {
+        BookingAnswer::Answered
+    } else {
+        BookingAnswer::Gone
+    })
 }
 
 /// The recipient's copy after a message from `sender`, or `None` when the

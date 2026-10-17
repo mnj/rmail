@@ -1471,6 +1471,30 @@ mod tests {
             "the organizer hears"
         );
 
+        // Retitled at the same time: still approved, without asking again.
+        let board = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["details"]["summary"] == "Board")
+            .unwrap()
+            .clone();
+        let mut change = board["details"].clone();
+        change["summary"] = json!("Board meeting");
+        change["attendees"] = json!(["room2@example.test"]);
+        change["etag"] = board["etag"].clone();
+        let path = format!(
+            "/api/events/own:default/{}",
+            board["name"].as_str().unwrap()
+        );
+        let (status, _) = call(ME, "PUT", path, change).await;
+        assert_eq!(status, 204);
+        let (_, events) = listing().await;
+        assert_eq!(
+            room_status(&events, "Board meeting"),
+            Some(json!("accepted"))
+        );
+
         // A clash is still declined at once, without asking.
         assert_eq!(book("Overlap", NINE + 600).await.0, 204);
         let (_, events) = listing().await;
@@ -1482,6 +1506,55 @@ mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(inbox["total"], 1, "no request for a clash");
+        assert_eq!(inbox["total"], 1, "no request for a clash or a retitle");
+
+        // Declined, then the time taken by another booking: no longer
+        // approvable, so the room is never double-booked.
+        assert_eq!(book("Offsite, Q4", NINE + 7_200).await.0, 204);
+        let card_of = |subject: &'static str| async move {
+            let (_, inbox) = call(
+                "facilities@example.test",
+                "GET",
+                "/api/folders/INBOX/messages".into(),
+                Value::Null,
+            )
+            .await;
+            let uid = inbox["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["subject"].as_str().unwrap().contains(subject))
+                .unwrap()["uid"]
+                .clone();
+            let detail = format!("/api/folders/INBOX/messages/{uid}");
+            call("facilities@example.test", "GET", detail, Value::Null)
+                .await
+                .1["booking"]
+                .clone()
+        };
+        let offsite = card_of("Offsite, Q4 (room2").await;
+        let answer = |approve: bool| json!({"resource": "room2@example.test", "uid": offsite["uid"], "approve": approve});
+        let approver = "facilities@example.test";
+        let (status, _) = call(
+            approver,
+            "POST",
+            "/api/bookings/answer".into(),
+            answer(false),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(book("Training", NINE + 7_200).await.0, 204);
+        let (_, events) = listing().await;
+        assert_eq!(room_status(&events, "Training"), Some(json!("tentative")));
+        let (status, refused) = call(
+            approver,
+            "POST",
+            "/api/bookings/answer".into(),
+            answer(true),
+        )
+        .await;
+        assert_eq!(status, 409, "{refused}");
+        let (_, events) = listing().await;
+        assert_eq!(room_status(&events, "Offsite, Q4"), Some(json!("declined")));
     }
 }

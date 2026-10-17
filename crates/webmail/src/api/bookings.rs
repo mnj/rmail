@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{AppState, Session, Shared, blocking, internal_error};
-use crate::dav::schedule::{BOOKING_HEADER, answer_booking};
+use crate::dav::schedule::{BOOKING_HEADER, BookingAnswer, answer_booking};
 use crate::jmap::User;
 
 pub(crate) fn routes() -> Router<Shared> {
@@ -152,11 +152,20 @@ async fn answer(State(state): State<Shared>, headers: HeaderMap, body: Bytes) ->
             let Some(user) = user_of(&resource) else {
                 return Ok(Err((StatusCode::NOT_FOUND, "No such resource.")));
             };
-            if !answer_booking(&state, &user, &input.uid, input.approve)? {
-                return Ok(Err((
-                    StatusCode::CONFLICT,
-                    "This booking is no longer there to answer.",
-                )));
+            match answer_booking(&state, &user, &input.uid, input.approve)? {
+                BookingAnswer::Answered => {}
+                BookingAnswer::Gone => {
+                    return Ok(Err((
+                        StatusCode::CONFLICT,
+                        "This booking is no longer there to answer.",
+                    )));
+                }
+                BookingAnswer::Clash => {
+                    return Ok(Err((
+                        StatusCode::CONFLICT,
+                        "It now overlaps another booking of this resource, so it can't be approved.",
+                    )));
+                }
             }
             Ok(booking(&state, &resource, &input.uid)?.ok_or((
                 StatusCode::CONFLICT,
