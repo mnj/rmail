@@ -301,6 +301,24 @@ async function signIn(page) {
   await page.waitForSelector('.message-list .row:first-child:has-text("Regatta on Saturday")');
   await page.waitForTimeout(300);
   await shot(page, 'webmail-search-meaning');
+  // The open message lists others close in meaning, from the same index,
+  // once the archived one is indexed too.
+  for (let i = 0; i < 60; i++) {
+    const found = await page.evaluate(async () => {
+      const headers = { 'X-Rmail-Webmail': '1' };
+      const list = await (await fetch('/api/folders/INBOX/messages?limit=50', { headers })).json();
+      const regatta = list.messages.find((m) => m.subject === 'Regatta on Saturday');
+      const related = await (await fetch(`/api/folders/INBOX/messages/${regatta.uid}/related`, { headers })).json();
+      return related.messages.some((m) => m.subject === 'Marina berth renewal');
+    });
+    if (found) break;
+    await page.waitForTimeout(1000);
+  }
+  await openMessage(page, 'Regatta on Saturday');
+  await page.waitForSelector('.related li');
+  await page.locator('.related').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-related');
   await ctx.close();
 }
 

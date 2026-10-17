@@ -16,6 +16,7 @@ import { ContactSeed, ContactsDialog } from './contacts';
 import { CalendarView } from './calendar';
 import { SecurityDialog } from './security';
 import { InvitationCard } from './invitation';
+import { RelatedPanel } from './related';
 import { FilterIcon, FiltersDialog, Vacation, VacationDialog, VacationIcon, vacationNote } from './rules';
 import {
   Api, ApiError, Attachment, CalendarListing, ComposePrefs, DavCollection, Folder, Grant, Identity, Label, LabelPreview, Message, MessageDetail, MessagePage, Organize, SendResult,
@@ -684,6 +685,26 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
     }
   }
 
+  /** Open a related message, in its own folder. */
+  async function openRelated(target: string, uid: number) {
+    try {
+      if (target !== folder) await chooseFolder(target);
+      const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(target)}/messages/${uid}`);
+      setSelected(detail);
+      setRemoteLoaded(false);
+      setView('message');
+      setMoreOpen(false);
+      setMoveOpen(false);
+      if (!hasFlag(detail.flags, '\\Seen') && can(folders.find((f) => f.name === target), 's')) {
+        await api(`/api/folders/${encodeURIComponent(target)}/messages/${uid}`, { method: 'PATCH', body: JSON.stringify({ seen: true }) });
+        setMessages((list) => list.map((m) => (m.uid === uid ? { ...m, flags: [...m.flags, '\\Seen'] } : m)));
+        loadFolders().catch(() => undefined);
+      }
+    } catch (err) {
+      flash((err as Error).message);
+    }
+  }
+
   async function loadRemoteContent() {
     if (!selected) return;
     const detail = await api<MessageDetail>(`/api/folders/${encodeURIComponent(folder)}/messages/${selected.uid}?remote_content=1`);
@@ -1015,6 +1036,7 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
                 : <pre className="text-message">{selected.text_body}</pre>}
               <Attachments folder={folder} uid={selected.uid} attachments={selected.attachments} />
               </>}
+              {!shared && organize?.search_enabled && <RelatedPanel api={api} folder={folder} uid={selected.uid} onOpen={openRelated} />}
             </div>
           </>
         ) : (
