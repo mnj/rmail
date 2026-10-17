@@ -29,7 +29,7 @@ pub(crate) mod contacts;
 mod crypto;
 pub(crate) mod events;
 mod files;
-mod invitations;
+pub(crate) mod invitations;
 mod mail_rules;
 mod organize;
 mod security;

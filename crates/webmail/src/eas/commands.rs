@@ -25,30 +25,30 @@ const MAX_WINDOW: usize = 512;
 /// How often a waiting Ping looks for new mail.
 const PING_POLL: Duration = Duration::from_secs(5);
 
-struct Account {
-    state: Arc<AppState>,
-    user: User,
-    device: String,
+pub(super) struct Account {
+    pub(super) state: Arc<AppState>,
+    pub(super) user: User,
+    pub(super) device: String,
 }
 
 impl Account {
-    fn dir(&self) -> PathBuf {
+    pub(super) fn dir(&self) -> PathBuf {
         imap_state::account_maildir(
             &self.state.mail_root,
             &self.user.domain,
             &self.user.localpart,
         )
     }
-    fn db(&self) -> anyhow::Result<Connection> {
+    pub(super) fn db(&self) -> anyhow::Result<Connection> {
         state::open(&self.dir())
     }
-    fn root(&self) -> &std::path::Path {
+    pub(super) fn root(&self) -> &std::path::Path {
         &self.state.mail_root
     }
-    fn folders(&self) -> anyhow::Result<Vec<Folder>> {
+    pub(super) fn folders(&self) -> anyhow::Result<Vec<Folder>> {
         imap_state::list_folders(self.root(), &self.user.domain, &self.user.localpart)
     }
-    fn messages(&self, folder: &str) -> anyhow::Result<(Folder, Vec<Message>)> {
+    pub(super) fn messages(&self, folder: &str) -> anyhow::Result<(Folder, Vec<Message>)> {
         imap_state::load_folder(self.root(), &self.user.domain, &self.user.localpart, folder)
     }
 }
@@ -86,6 +86,11 @@ pub(super) async fn run(
             "GetItemEstimate" => wbxml_response(&estimate(&account, request.as_ref())?),
             "ItemOperations" => wbxml_response(&item_operations(&account, request.as_ref())?),
             "MoveItems" => wbxml_response(&move_items(&account, request.as_ref())?),
+            "MeetingResponse" => wbxml_response(&super::pim::meeting_response(
+                &account,
+                &account.db()?,
+                request.as_ref(),
+            )?),
             "SendMail" | "SmartReply" | "SmartForward" => {
                 send(&account, &params, request.as_ref(), &body, raw_mime)?
             }
@@ -145,6 +150,7 @@ fn folder_list(account: &Account, db: &Connection) -> anyhow::Result<state::Fold
         };
         out.insert(id, (parent, name, folder_type(folder)));
     }
+    out.extend(super::pim::folders(account)?);
     Ok(out)
 }
 
@@ -456,7 +462,16 @@ fn email_data(
             ))
             .with(Element::text("AirSyncBase:Data", content)),
     );
-    data.push(Element::text("Email:MessageClass", "IPM.Note"));
+    // Invitations show as meeting requests, answered with MeetingResponse.
+    match super::pim::meeting(&raw) {
+        Some((class, request)) => {
+            data.push(Element::text("Email:MessageClass", class));
+            if let Some(request) = request {
+                data.push(request);
+            }
+        }
+        None => data.push(Element::text("Email:MessageClass", "IPM.Note")),
+    }
     data.push(Element::text("Email:InternetCPID", "65001"));
     let mut flag = Element::new("Email:Flag");
     if has("\\Flagged") {
@@ -601,7 +616,12 @@ fn sync(account: &Account, request: Option<Element>, body: &[u8]) -> anyhow::Res
         .unwrap_or_default()
     {
         any = true;
-        collections.push(sync_collection(account, &db, collection, window)?);
+        let id = collection.value("AirSync:CollectionId").unwrap_or_default();
+        collections.push(if super::pim::is_pim(&id) {
+            super::pim::sync_collection(account, &db, collection, window)?
+        } else {
+            sync_collection(account, &db, collection, window)?
+        });
     }
     if !any {
         return Ok(wbxml_response(
@@ -884,6 +904,9 @@ fn sync_collection(
 
 /// Changes waiting for a device in a collection.
 fn pending(account: &Account, db: &Connection, collection: &str) -> anyhow::Result<usize> {
+    if super::pim::is_pim(collection) {
+        return super::pim::pending(account, db, collection);
+    }
     let Some(folder) = state::folder_name(db, collection)? else {
         return Ok(0);
     };
@@ -917,9 +940,11 @@ fn estimate(account: &Account, request: Option<&Element>) -> anyhow::Result<Elem
         let id = collection
             .value("GetItemEstimate:CollectionId")
             .unwrap_or_default();
-        let (status, count) = match state::folder_name(&db, &id)? {
-            Some(_) => ("1", pending(account, &db, &id)?),
-            None => ("2", 0),
+        let known = super::pim::is_pim(&id) || state::folder_name(&db, &id)?.is_some();
+        let (status, count) = if known {
+            ("1", pending(account, &db, &id)?)
+        } else {
+            ("2", 0)
         };
         response.push(
             Element::new("GetItemEstimate:Response")
