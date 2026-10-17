@@ -764,8 +764,9 @@ provider, with `https://<webmail host>/api/oidc/callback` as its redirect URI an
 
 - The provider's email address must be an existing mailbox (not an alias);
   sign-in does not create mailboxes. By default the provider must mark it verified
-  (`email_verified`); turn `oidc.require_verified_email` off only for providers that never send it
-  and only issue addresses they own.
+  (`email_verified`). Turning `oidc.require_verified_email` off lets anyone whose provider account
+  can set its own email address sign in as that mailbox, so leave it on unless the provider only
+  ever issues addresses it controls. The issuer is checked when the settings are saved.
 - Signing in this way stands in for the password and the two-factor code: the provider is trusted
   to ask for its own. A domain that requires two-factor sign-in still has users set it up.
 - It uses the authorization code flow with PKCE, a nonce and a state cookie. The ID token comes

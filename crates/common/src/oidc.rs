@@ -63,6 +63,14 @@ fn check_url(text: &str) -> Result<reqwest::Url> {
     }
 }
 
+/// Settings check on save: an issuer must be a usable URL.
+pub fn validate_config(config: &OidcConfig) -> Result<()> {
+    if !config.issuer.trim().is_empty() {
+        check_url(&config.issuer).context("oidc.issuer")?;
+    }
+    Ok(())
+}
+
 /// Whether the settings are complete enough to offer sign-in.
 pub fn configured(config: &OidcConfig) -> bool {
     config.enabled
@@ -289,6 +297,18 @@ mod tests {
         assert!(with("nonce", json!("m")).is_err());
         assert!(!with("email_verified", json!(null)).unwrap().email_verified);
         assert!(check_id_token("garbage", &provider(), &config(), "n", 900).is_err());
+    }
+
+    #[test]
+    fn issuers_are_checked_when_saved() {
+        assert!(validate_config(&config()).is_ok());
+        let issuer = |issuer: &str| OidcConfig {
+            issuer: issuer.into(),
+            ..config()
+        };
+        assert!(validate_config(&issuer("http://id.example.test")).is_err());
+        assert!(validate_config(&issuer("not a url")).is_err());
+        assert!(validate_config(&issuer("")).is_ok(), "empty until set up");
     }
 
     #[test]

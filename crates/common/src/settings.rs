@@ -1326,7 +1326,7 @@ pub const SETTINGS: &[SettingSpec] = &[
         "oidc.require_verified_email",
         "oidc",
         "Require a verified email",
-        "Refuse sign-ins whose email the provider does not mark as verified. Turn off only for providers that never send email_verified and only issue addresses they own (some Microsoft Entra setups).",
+        "Refuse sign-ins whose email the provider does not mark as verified. Turned off, anyone whose provider account can set its own email address could sign in as that mailbox.",
         SettingKind::Bool,
         LIVE,
     ),
@@ -1890,6 +1890,7 @@ pub fn validate_semantics(config: &Config) -> Result<()> {
     }
     crate::acme::validate_config(config)?;
     crate::compose_ai::validate_config(&config.compose_ai)?;
+    crate::oidc::validate_config(&config.oidc)?;
     Ok(())
 }
 
