@@ -36,6 +36,7 @@ use serde_json::{Map, Value, json};
 use crate::api::AppState;
 
 mod blob;
+mod calendars;
 mod contacts;
 mod email;
 pub(crate) mod identity;
@@ -54,6 +55,7 @@ pub(crate) const CORE: &str = "urn:ietf:params:jmap:core";
 pub(crate) const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub(crate) const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 pub(crate) const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
+pub(crate) use calendars::CALENDARS;
 pub(crate) use contacts::CONTACTS;
 
 const MAX_CALLS_IN_REQUEST: usize = 64;
@@ -477,6 +479,7 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
         if account.is_personal() {
             capabilities.insert(VACATION.to_string(), json!({}));
             capabilities.insert(CONTACTS.to_string(), contacts::account_capability());
+            capabilities.insert(CALENDARS.to_string(), calendars::account_capability());
         }
         if account.is_personal() && can_send {
             capabilities.insert(
@@ -527,6 +530,8 @@ fn session_object(state: &AppState, user: &User, accounts: &[Account], base: &st
     primary.insert(VACATION.to_string(), json!(own));
     capabilities.insert(CONTACTS.to_string(), json!({}));
     primary.insert(CONTACTS.to_string(), json!(own));
+    capabilities.insert(CALENDARS.to_string(), json!({}));
+    primary.insert(CALENDARS.to_string(), json!(own));
     if can_send {
         capabilities.insert(SUBMISSION.to_string(), json!({}));
         primary.insert(SUBMISSION.to_string(), json!(own));
@@ -766,6 +771,7 @@ fn method_capability(name: &str) -> &'static str {
         "Identity" | "EmailSubmission" => SUBMISSION,
         "VacationResponse" => VACATION,
         "AddressBook" | "ContactCard" => CONTACTS,
+        "Calendar" | "CalendarEvent" | "ParticipantIdentity" => CALENDARS,
         _ => MAIL,
     }
 }
@@ -810,6 +816,15 @@ fn call_method(ctx: &mut Ctx, name: &str, args: Map<String, Value>) -> MethodRes
         "ContactCard/query" => contacts::card_query(ctx, args),
         "ContactCard/queryChanges" => query::cannot_calculate(ctx, args),
         "ContactCard/set" => contacts::card_set(ctx, args),
+        "Calendar/get" => calendars::calendar_get(ctx, args),
+        "Calendar/changes" => calendars::calendar_changes(ctx, args),
+        "Calendar/set" => calendars::calendar_set(ctx, args),
+        "CalendarEvent/get" => calendars::event_get(ctx, args),
+        "CalendarEvent/changes" => calendars::event_changes(ctx, args),
+        "CalendarEvent/query" => calendars::event_query(ctx, args),
+        "CalendarEvent/queryChanges" => query::cannot_calculate(ctx, args),
+        "CalendarEvent/set" => calendars::event_set(ctx, args),
+        "ParticipantIdentity/get" => calendars::identity_get(ctx, args),
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
@@ -911,7 +926,7 @@ pub(crate) fn process(ctx: &mut Ctx, request: &Value) -> Result<Value, (&'static
         let capability = capability
             .as_str()
             .ok_or((NOT_REQUEST, "using holds a non-string".to_string()))?;
-        let known = [CORE, MAIL, VACATION, CONTACTS].contains(&capability)
+        let known = [CORE, MAIL, VACATION, CONTACTS, CALENDARS].contains(&capability)
             || (capability == SUBMISSION && ctx.app.submission.is_some());
         if !known {
             return Err((

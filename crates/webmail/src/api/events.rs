@@ -39,7 +39,7 @@ use crate::jmap::User;
 const MAX_RANGE: i64 = 400 * 86_400;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_DESCRIPTION_CHARS: usize = 10_000;
-const MAX_ATTENDEES: usize = 100;
+pub(crate) const MAX_ATTENDEES: usize = 100;
 
 pub(crate) fn routes() -> Router<Shared> {
     Router::new()
@@ -176,7 +176,7 @@ fn repeat_of(component: &Component) -> String {
 }
 
 /// The master event (no RECURRENCE-ID), or the first one.
-fn master(calendar: &Component) -> Option<&Component> {
+pub(crate) fn master(calendar: &Component) -> Option<&Component> {
     let events = || calendar.components.iter().filter(|c| c.name == "VEVENT");
     events()
         .find(|c| c.property("RECURRENCE-ID").is_none())
@@ -209,7 +209,7 @@ fn span(component: &Component) -> (i64, i64, bool) {
     (start, end, all_day)
 }
 
-fn attendees_of(component: &Component) -> Vec<Attendee> {
+pub(crate) fn attendees_of(component: &Component) -> Vec<Attendee> {
     component
         .properties_named("ATTENDEE")
         .filter_map(|attendee| {
@@ -226,7 +226,7 @@ fn attendees_of(component: &Component) -> Vec<Attendee> {
 }
 
 /// The fields of a calendar object's master event.
-fn fields_of(calendar: &Component, organizer: Option<&str>) -> Option<EventFields> {
+pub(crate) fn fields_of(calendar: &Component, organizer: Option<&str>) -> Option<EventFields> {
     let event = master(calendar)?;
     let (start, end, all_day) = span(event);
     Some(EventFields {
@@ -417,7 +417,7 @@ fn calendar_text(
 }
 
 /// Why `fields` cannot be saved, for the user.
-fn check(fields: &EventFields) -> Result<(), &'static str> {
+pub(crate) fn check(fields: &EventFields) -> Result<(), &'static str> {
     if fields.summary.chars().count() > MAX_TEXT_CHARS
         || fields.location.chars().count() > MAX_TEXT_CHARS
         || fields.description.chars().count() > MAX_DESCRIPTION_CHARS
@@ -712,6 +712,8 @@ fn uuid() -> String {
 }
 
 type Outcome = Result<(), (StatusCode, &'static str)>;
+/// What saving an event came to: the resource name it is stored under.
+pub(crate) type Saved = Result<String, (StatusCode, &'static str)>;
 
 fn dav_for(state: &std::sync::Arc<AppState>, session: &Session) -> anyhow::Result<Dav> {
     let user = User {
@@ -726,13 +728,32 @@ fn dav_for(state: &std::sync::Arc<AppState>, session: &Session) -> anyhow::Resul
     })
 }
 
-fn save(
+/// Store `fields` in `calendar` (a place id, `own:<name>` or
+/// `shared:<owner>:<name>`), as a new event or over `name` when the
+/// stored version is still `etag`. With `schedule`, guests hear of the
+/// change as from a CalDAV client.
+/// What to store: the fields, the version they replace (`etag`), whether
+/// guests hear of it, and a UID for a new event (else one is made).
+pub(crate) struct Change {
+    pub fields: EventFields,
+    pub etag: Option<String>,
+    pub schedule: bool,
+    pub uid: Option<String>,
+}
+
+pub(crate) fn save(
     state: &std::sync::Arc<AppState>,
     session: &Session,
     calendar: &str,
     name: Option<&str>,
-    input: Save,
-) -> anyhow::Result<Outcome> {
+    change: Change,
+) -> anyhow::Result<Saved> {
+    let Change {
+        fields,
+        etag,
+        schedule,
+        uid,
+    } = change;
     let Some(place) = places(state, session)?
         .into_iter()
         .find(|p| p.id == calendar)
@@ -749,15 +770,25 @@ fn save(
     let owner_addresses =
         rmail_common::db::calendar_addresses(&state.db_path, &place.owner.address)
             .unwrap_or_else(|_| vec![place.owner.address.clone()]);
-    let uid = uuid();
+    let uid = uid.unwrap_or_else(uuid);
     let resource_types: std::collections::HashMap<String, &'static str> =
         rmail_common::resources::list(&state.db_path, None)?
             .into_iter()
             .map(|(address, kind)| (address, kind.cutype()))
             .collect();
-    let name = name.map_or_else(|| format!("{uid}.ics"), str::to_string);
-    let etag = input.etag.clone();
-    let fields = input.fields;
+    // A client's UID names the resource only when it is safe in a URL
+    // path; otherwise the event keeps its UID under a generated name.
+    let name = name.map_or_else(
+        || {
+            let safe = !uid.is_empty()
+                && uid.len() <= 200
+                && uid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+            format!("{}.ics", if safe { uid.clone() } else { uuid() })
+        },
+        str::to_string,
+    );
     let mut outgoing = Vec::new();
     let stored = store::put_with(&place.conn, &place.collection, &name, &mut |current| {
         match (current, &etag) {
@@ -782,6 +813,12 @@ fn save(
             &place.owner.address,
             &resource_types,
         );
+        if !schedule {
+            return Ok(store::Prepared {
+                data,
+                schedule_tag: store::ScheduleTag::Keep,
+            });
+        }
         let (prepared, messages) = schedule::prepare_put(&dav, &place.owner, current, &data);
         outgoing = messages;
         Ok(prepared)
@@ -789,7 +826,7 @@ fn save(
     Ok(match stored {
         Ok(_) => {
             schedule::deliver(&dav, outgoing);
-            Ok(())
+            Ok(name)
         }
         Err(PutError::PreconditionFailed) => Err((
             StatusCode::CONFLICT,
@@ -823,8 +860,23 @@ async fn write(
     if let Err(message) = check(&input.fields) {
         return refused(StatusCode::BAD_REQUEST, message);
     }
-    match blocking(move || save(&state, &session, &calendar, name.as_deref(), input)).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+    let result = blocking(move || {
+        save(
+            &state,
+            &session,
+            &calendar,
+            name.as_deref(),
+            Change {
+                fields: input.fields,
+                etag: input.etag,
+                schedule: true,
+                uid: None,
+            },
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err((status, message))) => refused(status, message),
         Err(error) => internal_error(error),
     }
@@ -867,45 +919,59 @@ async fn remove(
     let Ok(input) = serde_json::from_slice::<Remove>(&body) else {
         return refused(StatusCode::BAD_REQUEST, "missing etag");
     };
-    let result = blocking(move || -> anyhow::Result<Outcome> {
-        let Some(place) = places(&state, &session)?
-            .into_iter()
-            .find(|p| p.id == calendar)
-        else {
-            return Ok(Err((StatusCode::NOT_FOUND, "No such calendar.")));
-        };
-        if !place.writable {
-            return Ok(Err((
-                StatusCode::FORBIDDEN,
-                "This calendar is shared with you read-only.",
-            )));
-        }
-        let etag = input.etag;
-        let precondition =
-            |current: Option<&store::Object>| current.is_some_and(|o| o.etag == etag);
-        Ok(
-            match store::delete(&place.conn, &place.collection, &name, &precondition)? {
-                store::Deleted::Deleted(previous) => {
-                    // Cancellations from the organizer, a decline from a guest.
-                    let dav = dav_for(&state, &session)?;
-                    let messages = schedule::prepare_delete(&dav, &place.owner, &previous);
-                    schedule::deliver(&dav, messages);
-                    Ok(())
-                }
-                store::Deleted::NotFound => Err((StatusCode::NOT_FOUND, "The event is gone.")),
-                store::Deleted::PreconditionFailed => Err((
-                    StatusCode::CONFLICT,
-                    "This event was changed elsewhere. Reload and try again.",
-                )),
-            },
-        )
-    })
-    .await;
+    let result =
+        blocking(move || remove_event(&state, &session, &calendar, &name, Some(input.etag), true))
+            .await;
     match result {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err((status, message))) => refused(status, message),
         Err(error) => internal_error(error),
     }
+}
+
+/// Delete event `name` from `calendar` (when still at `etag`, if given);
+/// with `schedule`, guests hear of it.
+pub(crate) fn remove_event(
+    state: &std::sync::Arc<AppState>,
+    session: &Session,
+    calendar: &str,
+    name: &str,
+    etag: Option<String>,
+    schedule: bool,
+) -> anyhow::Result<Outcome> {
+    let Some(place) = places(state, session)?
+        .into_iter()
+        .find(|p| p.id == calendar)
+    else {
+        return Ok(Err((StatusCode::NOT_FOUND, "No such calendar.")));
+    };
+    if !place.writable {
+        return Ok(Err((
+            StatusCode::FORBIDDEN,
+            "This calendar is shared with you read-only.",
+        )));
+    }
+    let precondition = |current: Option<&store::Object>| {
+        current.is_some_and(|o| etag.as_ref().is_none_or(|etag| &o.etag == etag))
+    };
+    Ok(
+        match store::delete(&place.conn, &place.collection, name, &precondition)? {
+            store::Deleted::Deleted(previous) => {
+                // Cancellations from the organizer, a decline from a guest.
+                if schedule {
+                    let dav = dav_for(state, session)?;
+                    let messages = schedule::prepare_delete(&dav, &place.owner, &previous);
+                    schedule::deliver(&dav, messages);
+                }
+                Ok(())
+            }
+            store::Deleted::NotFound => Err((StatusCode::NOT_FOUND, "The event is gone.")),
+            store::Deleted::PreconditionFailed => Err((
+                StatusCode::CONFLICT,
+                "This event was changed elsewhere. Reload and try again.",
+            )),
+        },
+    )
 }
 
 #[cfg(test)]

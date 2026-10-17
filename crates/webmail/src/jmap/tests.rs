@@ -22,6 +22,7 @@ const USING: &[&str] = &[
     super::SUBMISSION,
     super::VACATION,
     super::CONTACTS,
+    super::CALENDARS,
 ];
 
 fn state(td: &tempfile::TempDir, submission: Option<std::net::SocketAddr>) -> Arc<AppState> {
@@ -1139,4 +1140,234 @@ async fn contacts_are_address_books_and_jscontact_cards() {
         .one("AddressBook/set", json!({"destroy": [&new_book]}))
         .await;
     assert_eq!(removed["destroyed"], json!([&new_book]));
+}
+
+#[tokio::test]
+async fn calendars_are_jscalendar_events_over_the_caldav_store() {
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td, None);
+    let client = Client::new(&state, USER);
+    let (_, _, body) = send(
+        &state,
+        "GET",
+        "/jmap/session",
+        Some(&basic(USER, "secret")),
+        vec![],
+    )
+    .await;
+    let session: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        session["primaryAccounts"][super::CALENDARS],
+        account_id(USER)
+    );
+
+    let calendars = client.one("Calendar/get", json!({})).await;
+    let default = calendars["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["isDefault"] == true)
+        .unwrap_or_else(|| panic!("{calendars}"))
+        .clone();
+    let calendar = default["id"].as_str().unwrap().to_string();
+    assert_eq!(default["myRights"]["mayWriteAll"], true);
+    let empty = client.one("CalendarEvent/get", json!({"ids": []})).await["state"].clone();
+
+    let created = client
+        .one(
+            "CalendarEvent/set",
+            json!({"create": {"e1": {
+                "@type": "Event",
+                "calendarIds": {&calendar: true},
+                "title": "Design review",
+                "description": "Bring the drafts",
+                "locations": {"l1": {"@type": "Location", "name": "Room 2"}},
+                "start": "2026-10-22T14:00:00",
+                "timeZone": "Europe/Copenhagen",
+                "duration": "PT1H30M",
+                "recurrenceRules": [{"@type": "RecurrenceRule", "frequency": "weekly"}],
+                "participants": {
+                    "me": {"@type": "Participant", "roles": {"owner": true}, "sendTo": {"imip": format!("mailto:{USER}")}},
+                    "ann": {"@type": "Participant", "roles": {"attendee": true}, "sendTo": {"imip": "mailto:ann@remote.test"}},
+                },
+                "status": "confirmed",
+                "freeBusyStatus": "busy",
+            }}}),
+        )
+        .await;
+    let id = created["created"]["e1"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+
+    let conn = rmail_common::jmap::store::open(&state.mail_root, "example.test", "user").unwrap();
+    let stored = rmail_common::dav::store::find_by_uid(
+        &conn,
+        created["created"]["e1"]["uid"].as_str().unwrap(),
+    )
+    .unwrap()
+    .unwrap()
+    .1;
+    let data = stored.data.replace("\r\n ", "");
+    assert!(
+        data.contains("DTSTART;TZID=Europe/Copenhagen:20261022T140000"),
+        "{data}"
+    );
+    assert!(
+        data.contains("RRULE:FREQ=WEEKLY")
+            && data.contains("ann@remote.test")
+            && data.contains("LOCATION:Room 2"),
+        "{data}"
+    );
+
+    let got = client.one("CalendarEvent/get", json!({"ids": [&id], "properties": ["title", "start", "timeZone", "duration", "recurrenceRules", "participants", "utcStart"]})).await;
+    let event = &got["list"][0];
+    assert_eq!(event["start"], "2026-10-22T14:00:00");
+    assert_eq!(event["duration"], "PT1H30M");
+    assert_eq!(event["utcStart"], "2026-10-22T12:00:00Z");
+    assert_eq!(event["recurrenceRules"][0]["frequency"], "weekly");
+    assert!(
+        event["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|p| p["participationStatus"] == "needs-action")
+    );
+
+    let changes = client
+        .one("CalendarEvent/changes", json!({"sinceState": empty}))
+        .await;
+    assert_eq!(changes["created"], json!([&id]));
+    let after_create = changes["newState"].clone();
+
+    // A patch keeps what JMAP does not show (here a property a client added).
+    let extra = stored
+        .data
+        .replace("END:VEVENT", "X-CLIENT-THING:kept\r\nEND:VEVENT");
+    let cal =
+        rmail_common::dav::store::collections(&conn, rmail_common::dav::store::Kind::Calendar)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "default")
+            .unwrap();
+    rmail_common::dav::store::put(&conn, &cal, &stored.name, &extra, &|_| true)
+        .unwrap()
+        .unwrap();
+    let patched = client.one("CalendarEvent/set", json!({"update": {&id: {"title": "Design review (moved)", "start": "2026-10-22T15:00:00"}}})).await;
+    assert!(patched["updated"].get(&id).is_some(), "{patched}");
+    let data = rmail_common::dav::store::object(&conn, &cal, &stored.name)
+        .unwrap()
+        .unwrap()
+        .data
+        .replace("\r\n ", "");
+    assert!(
+        data.contains("X-CLIENT-THING:kept")
+            && data.contains("SUMMARY:Design review (moved)")
+            && data.contains("T150000"),
+        "{data}"
+    );
+    let changes = client
+        .one("CalendarEvent/changes", json!({"sinceState": after_create}))
+        .await;
+    assert_eq!(changes["updated"], json!([&id]));
+
+    // Refused rather than dropped; an event stays in its calendar.
+    let refused = client
+        .one(
+            "CalendarEvent/set",
+            json!({
+                "create": {"e2": {"calendarIds": {&calendar: true}, "title": "x", "start": "2026-10-23T10:00:00", "duration": "PT1H", "alerts": {"a1": {"@type": "Alert", "trigger": {"@type": "OffsetTrigger", "offset": "-PT15M"}}}}},
+                "update": {&id: {"calendarIds": {"cal999": true}}},
+            }),
+        )
+        .await;
+    assert_eq!(
+        refused["notCreated"]["e2"]["properties"],
+        json!(["alerts"]),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["notUpdated"][&id]["properties"],
+        json!(["calendarIds"])
+    );
+
+    // A later occurrence of the weekly event matches a later time range.
+    let later = client
+        .one(
+            "CalendarEvent/query",
+            json!({"filter": {"after": "2026-12-01T00:00:00Z", "before": "2026-12-31T00:00:00Z"}}),
+        )
+        .await;
+    assert_eq!(later["ids"], json!([&id]), "{later}");
+    // A UID that is not URL-safe stays the UID, under a generated name.
+    let odd = client
+        .one("CalendarEvent/set", json!({"create": {"o": {"calendarIds": {&calendar: true}, "uid": "a/b c@x.test", "title": "Odd", "start": "2026-11-02T10:00:00", "duration": "PT1H"}}}))
+        .await;
+    assert_eq!(odd["created"]["o"]["uid"], "a/b c@x.test", "{odd}");
+    let odd_name = rmail_common::dav::store::find_by_uid(&conn, "a/b c@x.test")
+        .unwrap()
+        .unwrap()
+        .1
+        .name;
+    assert!(!odd_name.contains(['/', ' ', '@']), "{odd_name}");
+    client
+        .one(
+            "CalendarEvent/set",
+            json!({"destroy": [odd["created"]["o"]["id"]]}),
+        )
+        .await;
+    // A calendar update with one bad key changes nothing.
+    let bad = client
+        .one(
+            "Calendar/set",
+            json!({"update": {&calendar: {"name": "Renamed", "unknown": 1}}}),
+        )
+        .await;
+    assert!(bad["notUpdated"].get(&calendar).is_some());
+    let unchanged = client
+        .one("Calendar/get", json!({"ids": [&calendar]}))
+        .await;
+    assert_ne!(unchanged["list"][0]["name"], "Renamed");
+
+    // Query by time and text; a new calendar; destroying needs care.
+    let found = client.one("CalendarEvent/query", json!({"filter": {"after": "2026-10-22T00:00:00Z", "before": "2026-10-23T00:00:00Z", "text": "moved"}, "calculateTotal": true})).await;
+    assert_eq!(
+        (found["ids"].clone(), found["total"].clone()),
+        (json!([&id]), json!(1))
+    );
+    let none = client
+        .one(
+            "CalendarEvent/query",
+            json!({"filter": {"before": "2026-10-01T00:00:00Z"}}),
+        )
+        .await;
+    assert_eq!(none["ids"], json!([]));
+    let made = client
+        .one(
+            "Calendar/set",
+            json!({"create": {"c": {"name": "Team", "color": "#3366ff"}}}),
+        )
+        .await;
+    let team = made["created"]["c"]["id"].as_str().unwrap().to_string();
+    let kept = client
+        .one("Calendar/set", json!({"destroy": [&calendar]}))
+        .await;
+    assert_eq!(kept["notDestroyed"][&calendar]["type"], "calendarHasEvent");
+    assert_eq!(
+        client
+            .one("CalendarEvent/set", json!({"destroy": [&id]}))
+            .await["destroyed"],
+        json!([&id])
+    );
+    assert_eq!(
+        client
+            .one("Calendar/set", json!({"destroy": [&team]}))
+            .await["destroyed"],
+        json!([&team])
+    );
+    let identities = client.one("ParticipantIdentity/get", json!({})).await;
+    assert_eq!(
+        identities["list"][0]["calendarAddress"],
+        format!("mailto:{USER}")
+    );
 }

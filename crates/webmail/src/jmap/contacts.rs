@@ -70,7 +70,7 @@ pub(crate) fn account_capability() -> Value {
     json!({ "maxAddressBooksPerCard": 1, "mayCreateAddressBook": true })
 }
 
-fn b64(text: &str) -> String {
+pub(crate) fn b64(text: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text)
 }
 
@@ -182,14 +182,14 @@ fn card_state(books: &[Collection]) -> String {
     card_state_of(books.iter().map(|book| (book.id, book.sync_seq)))
 }
 
-fn card_state_of(entries: impl Iterator<Item = (i64, i64)>) -> String {
+pub(crate) fn card_state_of(entries: impl Iterator<Item = (i64, i64)>) -> String {
     let entries = entries
         .map(|(id, seq)| format!("{id}.{seq}"))
         .collect::<Vec<_>>();
     format!("s{}", entries.join("_"))
 }
 
-fn parse_state(state: &str) -> Option<BTreeMap<i64, String>> {
+pub(crate) fn parse_state(state: &str) -> Option<BTreeMap<i64, String>> {
     let rest = state.strip_prefix('s')?;
     if rest.is_empty() {
         return Some(BTreeMap::new());
@@ -202,20 +202,20 @@ fn parse_state(state: &str) -> Option<BTreeMap<i64, String>> {
         .collect()
 }
 
-fn since_arg(args: &Map<String, Value>) -> Result<BTreeMap<i64, String>, MethodError> {
+pub(crate) fn since_arg(args: &Map<String, Value>) -> Result<BTreeMap<i64, String>, MethodError> {
     let since = str_arg(args, "sinceState")?
         .ok_or_else(|| MethodError::invalid("sinceState is required"))?;
     parse_state(since).ok_or_else(|| MethodError::new("cannotCalculateChanges"))
 }
 
-fn max_changes(args: &Map<String, Value>) -> Result<Option<usize>, MethodError> {
+pub(crate) fn max_changes(args: &Map<String, Value>) -> Result<Option<usize>, MethodError> {
     match uint_arg(args, "maxChanges")? {
         Some(0) => Err(MethodError::invalid("maxChanges must be positive")),
         max => Ok(max.map(|max| max as usize)),
     }
 }
 
-fn null_if_empty(map: Map<String, Value>) -> Value {
+pub(crate) fn null_if_empty(map: Map<String, Value>) -> Value {
     if map.is_empty() {
         Value::Null
     } else {
@@ -851,7 +851,10 @@ fn fields_from(card: &Map<String, Value>) -> Result<Fields, Unsupported> {
 }
 
 /// Apply a JMAP PatchObject (RFC 8620 5.3) to `object`.
-fn apply_patch(object: &mut Map<String, Value>, patch: &Map<String, Value>) -> Result<(), String> {
+pub(crate) fn apply_patch(
+    object: &mut Map<String, Value>,
+    patch: &Map<String, Value>,
+) -> Result<(), String> {
     for (path, value) in patch {
         let parts = path
             .split('/')
@@ -948,14 +951,27 @@ pub(crate) fn card_get(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult 
     )])
 }
 
-pub(crate) fn card_changes(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
-    let (account, conn) = open(ctx, &args)?;
-    let since = since_arg(&args)?;
-    let max = max_changes(&args)?;
-    let books = books(&conn)?;
+/// What changed in a set of collections since a state.
+pub(crate) struct Changes {
+    pub created: Vec<String>,
+    pub updated: Vec<String>,
+    pub destroyed: Vec<String>,
+    pub new_state: String,
+    pub has_more: bool,
+}
+
+/// Object changes across `collections` since the per-collection state
+/// `since` (see [`card_state_of`]), at most `max`. `id` names an object.
+pub(crate) fn collection_changes(
+    conn: &rusqlite::Connection,
+    collections: &[Collection],
+    since: &BTreeMap<i64, String>,
+    max: Option<usize>,
+    id: impl Fn(&Collection, &str) -> String,
+) -> Result<Changes, MethodError> {
     if since
         .keys()
-        .any(|id| !books.iter().any(|book| book.id == *id))
+        .any(|known| !collections.iter().any(|collection| collection.id == *known))
     {
         return Err(MethodError::new("cannotCalculateChanges"));
     }
@@ -964,8 +980,8 @@ pub(crate) fn card_changes(ctx: &mut Ctx, args: Map<String, Value>) -> MethodRes
     let mut destroyed = Vec::new();
     let mut reached: Vec<(i64, i64)> = Vec::new();
     let mut has_more = false;
-    for book in &books {
-        let from = match since.get(&book.id) {
+    for collection in collections {
+        let from = match since.get(&collection.id) {
             Some(seq) => seq
                 .parse::<i64>()
                 .map_err(|_| MethodError::new("cannotCalculateChanges"))?,
@@ -973,9 +989,9 @@ pub(crate) fn card_changes(ctx: &mut Ctx, args: Map<String, Value>) -> MethodRes
         };
         let mut at = from;
         if !has_more {
-            let changes = store::object_changes(&conn, book, from)?
+            let changes = store::object_changes(conn, collection, from)?
                 .ok_or_else(|| MethodError::new("cannotCalculateChanges"))?;
-            // Changes come oldest first; only the last one per card counts.
+            // Changes come oldest first; only the last one per object counts.
             let mut last: BTreeMap<String, &store::ObjectChange> = BTreeMap::new();
             let mut order = Vec::new();
             for change in &changes {
@@ -992,32 +1008,47 @@ pub(crate) fn card_changes(ctx: &mut Ctx, args: Map<String, Value>) -> MethodRes
                     has_more = true;
                     break;
                 }
-                let id = card_id(book, &change.name);
+                let object = id(collection, &change.name);
                 let new = change.created_seq > from;
                 match (change.deleted, new) {
                     (true, true) => {}
-                    (true, false) => destroyed.push(id),
-                    (false, true) => created.push(id),
-                    (false, false) => updated.push(id),
+                    (true, false) => destroyed.push(object),
+                    (false, true) => created.push(object),
+                    (false, false) => updated.push(object),
                 }
                 at = change.modseq;
             }
             if !has_more {
-                at = book.sync_seq;
+                at = collection.sync_seq;
             }
         }
-        reached.push((book.id, at));
+        reached.push((collection.id, at));
     }
+    Ok(Changes {
+        created,
+        updated,
+        destroyed,
+        new_state: card_state_of(reached.into_iter()),
+        has_more,
+    })
+}
+
+pub(crate) fn card_changes(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResult {
+    let (account, conn) = open(ctx, &args)?;
+    let since = since_arg(&args)?;
+    let max = max_changes(&args)?;
+    let books = books(&conn)?;
+    let changes = collection_changes(&conn, &books, &since, max, card_id)?;
     Ok(vec![(
         "ContactCard/changes".to_string(),
         json!({
             "accountId": account.id,
             "oldState": str_arg(&args, "sinceState")?,
-            "newState": card_state_of(reached.into_iter()),
-            "hasMoreChanges": has_more,
-            "created": created,
-            "updated": updated,
-            "destroyed": destroyed,
+            "newState": changes.new_state,
+            "hasMoreChanges": changes.has_more,
+            "created": changes.created,
+            "updated": changes.updated,
+            "destroyed": changes.destroyed,
         }),
     )])
 }

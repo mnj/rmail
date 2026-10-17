@@ -27,7 +27,7 @@ mod calendars;
 mod compose;
 pub(crate) mod contacts;
 mod crypto;
-mod events;
+pub(crate) mod events;
 mod files;
 mod invitations;
 mod mail_rules;
