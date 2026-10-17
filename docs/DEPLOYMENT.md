@@ -649,7 +649,15 @@ password when two-factor sign-in is on) and the webmail host as the server.
 - Mail: the folder list (and creating, renaming and deleting folders), mail with read and flagged
   state both ways, deleting (to Trash) and moving, whole messages and attachments on request,
   sending, replying and forwarding (with a copy in Sent), push (Ping) and the sync window the
-  phone picks. Contacts and calendars still sync over CardDAV and CalDAV.
+  phone picks.
+- Contacts and calendars: the user's own address books and event calendars, both ways, through
+  the same fields webmail edits (other vCard and iCalendar properties are kept). Events go out in
+  UTC; repeats webmail can edit (daily, weekly, monthly, yearly) are changed both ways, others
+  shown and kept unless changed. Inviting guests from the phone sends invitations as webmail
+  does. Subscribed calendars are read-only, and calendars shared with the user stay in
+  webmail and CalDAV.
+- Invitations show as meeting requests: accepting, declining or answering tentatively on the
+  phone replies to the organizer and updates the calendar, as webmail's invitation card does.
 - Provisioning answers with a policy that asks nothing of the device, and is not enforced:
   rMail does not manage or wipe devices.
 - What each device has been sent is kept per account (`rmail-eas.sqlite` in the account's

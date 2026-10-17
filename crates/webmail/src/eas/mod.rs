@@ -13,6 +13,7 @@
 //!   since its sync key can be worked out.
 
 mod commands;
+mod pim;
 mod state;
 pub(crate) mod wbxml;
 

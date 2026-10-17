@@ -227,3 +227,51 @@ pub fn forget_collection(conn: &Connection, device: &str, collection: &str) -> R
     )?;
     Ok(())
 }
+
+/// A contacts or calendar collection's state: (key, items, previous key,
+/// its items), items being ServerId -> ETag.
+pub type ItemsState = (i64, Items, i64, Items);
+pub type Items = BTreeMap<String, String>;
+
+pub fn items_state(
+    conn: &Connection,
+    device: &str,
+    collection: &str,
+) -> Result<Option<ItemsState>> {
+    Ok(conn
+        .query_row(
+            "SELECT sync_key, snapshot, prev_key, prev_snapshot FROM sync_state
+             WHERE device_id = ?1 AND collection = ?2",
+            params![device, collection],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default(),
+                    row.get(2)?,
+                    serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+                ))
+            },
+        )
+        .optional()?)
+}
+
+pub fn save_items(
+    conn: &Connection,
+    device: &str,
+    collection: &str,
+    key: i64,
+    items: &Items,
+    prev: Option<(i64, &Items)>,
+) -> Result<()> {
+    let (prev_key, prev_items) = prev.map_or((-1, String::from("{}")), |(k, s)| {
+        (k, serde_json::to_string(s).unwrap_or_default())
+    });
+    conn.execute(
+        "INSERT INTO sync_state (device_id, collection, sync_key, snapshot, prev_key, prev_snapshot, filter)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+         ON CONFLICT(device_id, collection) DO UPDATE SET sync_key = excluded.sync_key, snapshot = excluded.snapshot,
+             prev_key = excluded.prev_key, prev_snapshot = excluded.prev_snapshot",
+        params![device, collection, key, serde_json::to_string(items)?, prev_key, prev_items],
+    )?;
+    Ok(())
+}

@@ -656,3 +656,240 @@ async fn folders_follow_webmails_rules_and_empty_syncs_move_on() {
         "moves on"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contacts_calendars_and_invitations() {
+    use rmail_common::dav::store::{self, Kind};
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let root = state.mail_root.clone();
+    imap_state::init_account(&root, "example.test", "user").unwrap();
+    let mut settings = rmail_common::settings::open(&state.db_path).unwrap();
+    rmail_common::settings::write_raw(
+        &mut settings,
+        &[("activesync.enabled".to_string(), Some(json!(true)))]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+    let conn = rmail_common::jmap::store::open(&root, "example.test", "user").unwrap();
+    let book = store::collections(&conn, Kind::AddressBook)
+        .unwrap()
+        .remove(0);
+    store::put(
+        &conn,
+        &book,
+        "c1.vcf",
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c1\r\nFN:Ann Smith\r\nN:Smith;Ann;;;\r\nEMAIL:ann@remote.test\r\nTEL;TYPE=CELL:+4512345678\r\nX-KEPT:yes\r\nEND:VCARD\r\n",
+        &|_| true,
+    )
+    .unwrap()
+    .unwrap();
+
+    let folders = call(
+        &state,
+        "FolderSync",
+        Some(
+            &Element::new("FolderHierarchy:FolderSync")
+                .with(Element::text("FolderHierarchy:SyncKey", "0")),
+        ),
+    )
+    .await;
+    let of_type = |kind: &str| {
+        folders
+            .child("FolderHierarchy:Changes")
+            .unwrap()
+            .children_named("FolderHierarchy:Add")
+            .find(|a| a.value("FolderHierarchy:Type").as_deref() == Some(kind))
+            .and_then(|a| a.value("FolderHierarchy:ServerId"))
+            .unwrap_or_else(|| panic!("a folder of type {kind}"))
+    };
+    let (contacts, calendar, inbox) = (of_type("9"), of_type("8"), of_type("2"));
+
+    // The server's contact goes to the phone.
+    call(
+        &state,
+        "Sync",
+        Some(&sync_request(&contacts, "0", None, None)),
+    )
+    .await;
+    let first = call(
+        &state,
+        "Sync",
+        Some(&sync_request(&contacts, "1", None, None)),
+    )
+    .await;
+    let add = collection(&first)
+        .child("AirSync:Commands")
+        .and_then(|c| c.child("AirSync:Add"))
+        .expect("the contact");
+    assert_eq!(add.value("AirSync:ServerId").as_deref(), Some("c1.vcf"));
+    let data = add.child("AirSync:ApplicationData").unwrap();
+    assert_eq!(data.value("Contacts:FirstName").as_deref(), Some("Ann"));
+    assert_eq!(
+        data.value("Contacts:Email1Address").as_deref(),
+        Some("ann@remote.test")
+    );
+    assert_eq!(
+        data.value("Contacts:MobilePhoneNumber").as_deref(),
+        Some("+4512345678")
+    );
+
+    // The phone adds one and changes the other.
+    let commands = Element::new("AirSync:Commands")
+        .with(
+            Element::new("AirSync:Add")
+                .with(Element::text("AirSync:ClientId", "x1"))
+                .with(
+                    Element::new("AirSync:ApplicationData")
+                        .with(Element::text("Contacts:FirstName", "Bob"))
+                        .with(Element::text("Contacts:LastName", "Lee"))
+                        .with(Element::text(
+                            "Contacts:Email1Address",
+                            "\"Bob Lee\" <bob@x.test>",
+                        )),
+                ),
+        )
+        .with(
+            Element::new("AirSync:Change")
+                .with(Element::text("AirSync:ServerId", "c1.vcf"))
+                .with(
+                    Element::new("AirSync:ApplicationData")
+                        .with(Element::text("Contacts:FirstName", "Ann"))
+                        .with(Element::text("Contacts:LastName", "Smith"))
+                        .with(Element::text("Contacts:JobTitle", "Engineer"))
+                        .with(Element::text("Contacts:Email1Address", "ann@remote.test")),
+                ),
+        );
+    let key = collection(&first).value("AirSync:SyncKey").unwrap();
+    let second = call(
+        &state,
+        "Sync",
+        Some(&sync_request(&contacts, &key, Some(commands), None)),
+    )
+    .await;
+    let added = collection(&second)
+        .child("AirSync:Responses")
+        .and_then(|r| r.child("AirSync:Add"))
+        .unwrap();
+    assert_eq!(added.value("AirSync:Status").as_deref(), Some("1"));
+    assert!(
+        collection(&second).child("AirSync:Commands").is_none(),
+        "no echo"
+    );
+    let stored = store::objects(&conn, &book).unwrap();
+    assert!(stored.iter().any(|o| o.data.contains("bob@x.test")));
+    let ann = stored.iter().find(|o| o.name == "c1.vcf").unwrap();
+    assert!(
+        ann.data.contains("TITLE:Engineer") && ann.data.contains("X-KEPT:yes"),
+        "{}",
+        ann.data
+    );
+    assert!(
+        !ann.data.contains("+4512345678"),
+        "the phone's version replaces the fields"
+    );
+
+    // A server-side delete reaches the phone.
+    store::delete(&conn, &book, "c1.vcf", &|_| true).unwrap();
+    let key = collection(&second).value("AirSync:SyncKey").unwrap();
+    let third = call(
+        &state,
+        "Sync",
+        Some(&sync_request(&contacts, &key, None, None)),
+    )
+    .await;
+    assert_eq!(
+        collection(&third)
+            .child("AirSync:Commands")
+            .and_then(|c| c.child("AirSync:Delete"))
+            .and_then(|d| d.value("AirSync:ServerId"))
+            .as_deref(),
+        Some("c1.vcf")
+    );
+
+    // An event from the phone lands in the calendar, all-day dates intact.
+    call(
+        &state,
+        "Sync",
+        Some(&sync_request(&calendar, "0", None, None)),
+    )
+    .await;
+    let event = Element::new("AirSync:Commands").with(
+        Element::new("AirSync:Add")
+            .with(Element::text("AirSync:ClientId", "e1"))
+            .with(
+                Element::new("AirSync:ApplicationData")
+                    .with(Element::text("Calendar:AllDayEvent", "1"))
+                    .with(Element::text("Calendar:StartTime", "20261021T220000Z"))
+                    .with(Element::text("Calendar:EndTime", "20261022T220000Z"))
+                    .with(Element::text("Calendar:Subject", "Holiday")),
+            ),
+    );
+    let synced = call(
+        &state,
+        "Sync",
+        Some(&sync_request(&calendar, "1", Some(event), None)),
+    )
+    .await;
+    assert_eq!(
+        collection(&synced)
+            .child("AirSync:Responses")
+            .and_then(|r| r.child("AirSync:Add"))
+            .and_then(|a| a.value("AirSync:Status"))
+            .as_deref(),
+        Some("1")
+    );
+    let cal = store::collections(&conn, Kind::Calendar)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "default")
+        .unwrap();
+    let holiday = store::objects(&conn, &cal).unwrap();
+    assert!(
+        holiday.iter().any(|o| o.data.contains("SUMMARY:Holiday")
+            && o.data.contains("DTSTART;VALUE=DATE:20261022")),
+        "{holiday:?}"
+    );
+
+    // An invitation shows as a meeting request and is answered from the phone.
+    let invite = "From: org@remote.test\r\nTo: user@example.test\r\nSubject: Planning\r\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\r\nBEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:plan-1\r\nDTSTAMP:20261001T000000Z\r\nDTSTART:20261030T100000Z\r\nDTEND:20261030T110000Z\r\nSUMMARY:Planning\r\nORGANIZER:mailto:org@remote.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:user@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    imap_state::deliver_message(&root, "example.test", "user", invite.as_bytes()).unwrap();
+    call(&state, "Sync", Some(&sync_request(&inbox, "0", None, None))).await;
+    let mail = call(&state, "Sync", Some(&sync_request(&inbox, "1", None, None))).await;
+    let message = collection(&mail)
+        .child("AirSync:Commands")
+        .and_then(|c| c.child("AirSync:Add"))
+        .unwrap();
+    let data = message.child("AirSync:ApplicationData").unwrap();
+    assert_eq!(
+        data.value("Email:MessageClass").as_deref(),
+        Some("IPM.Schedule.Meeting.Request")
+    );
+    let request = data.child("Email:MeetingRequest").expect("meeting request");
+    assert_eq!(
+        request.value("Email:StartTime").as_deref(),
+        Some("2026-10-30T10:00:00.000Z")
+    );
+    let answer = Element::new("MeetingResponse:MeetingResponse").with(
+        Element::new("MeetingResponse:Request")
+            .with(Element::text("MeetingResponse:UserResponse", "1"))
+            .with(Element::text("MeetingResponse:CollectionId", inbox.clone()))
+            .with(Element::text(
+                "MeetingResponse:RequestId",
+                message.value("AirSync:ServerId").unwrap(),
+            )),
+    );
+    let answered = call(&state, "MeetingResponse", Some(&answer)).await;
+    let result = answered.child("MeetingResponse:Result").unwrap();
+    assert_eq!(result.value("MeetingResponse:Status").as_deref(), Some("1"));
+    assert!(result.value("MeetingResponse:CalendarId").is_some());
+    let (_, accepted) = store::find_by_uid(&conn, "plan-1")
+        .unwrap()
+        .expect("in the calendar");
+    assert!(
+        accepted.data.contains("PARTSTAT=ACCEPTED"),
+        "{}",
+        accepted.data
+    );
+}
