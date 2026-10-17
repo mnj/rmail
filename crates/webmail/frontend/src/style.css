@@ -130,7 +130,7 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .share-who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .new-folder, .sidebar-link { display: flex; align-items: center; gap: 10px; border: 0; background: none; color: var(--sidebar-muted); padding: 8px 10px; border-radius: 7px; text-align: left; }
 .new-folder:hover, .sidebar-link:hover { color: #fff; background: var(--sidebar-hover); }
-.sidebar-foot { display: grid; gap: 6px; border-top: 1px solid var(--sidebar-active); padding-top: 10px; }
+.sidebar-foot { display: grid; gap: 6px; border-top: 1px solid var(--sidebar-active); padding-top: 10px; align-content: start; max-height: 42vh; overflow-y: auto; }
 .theme-switch { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; padding: 3px; border-radius: 8px; background: var(--sidebar-hover); }
 .theme-switch button { border: 0; background: none; color: var(--sidebar-muted); border-radius: 6px; padding: 4px 0; display: grid; place-items: center; }
 .theme-switch button[aria-pressed="true"] { background: var(--sidebar-active); color: #fff; }

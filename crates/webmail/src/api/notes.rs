@@ -111,3 +111,65 @@ async fn remove(
         Err(error) => internal_error(error),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{req, route, state};
+    use super::super::{SESSION_COOKIE, sign_session};
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn notes_have_their_own_view_and_leave_the_mail_folders_alone() {
+        let td = tempfile::tempdir().unwrap();
+        let state = state(&td);
+        rmail_common::imap_state::init_account(&state.mail_root, "example.test", "user").unwrap();
+        let cookie = Some(format!(
+            "{SESSION_COOKIE}={}",
+            sign_session(&state, "user@example.test")
+        ));
+        let call = |method: &'static str, path: String, body: Value| {
+            let (state, cookie) = (state.clone(), cookie.clone());
+            async move {
+                let body = if body.is_null() {
+                    Vec::new()
+                } else {
+                    body.to_string().into_bytes()
+                };
+                let response = route(req(method, &path, &body, cookie), &state).await;
+                (
+                    response.status,
+                    serde_json::from_slice::<Value>(&response.body).unwrap_or_default(),
+                )
+            }
+        };
+        let (_, before) = call("GET", "/api/folders".into(), Value::Null).await;
+        let (status, saved) = call(
+            "POST",
+            "/api/notes".into(),
+            json!({"text": "Shopping\nMilk"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["note"]["title"], "Shopping");
+        let (_, after) = call("GET", "/api/folders".into(), Value::Null).await;
+        assert_eq!(
+            before, after,
+            "the Notes folder is not a mail folder: {after}"
+        );
+        let id = saved["note"]["id"].as_str().unwrap().to_string();
+        let (status, _) = call(
+            "PUT",
+            format!("/api/notes/{id}"),
+            json!({"text": "Shopping\nMilk\nEggs"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (_, list) = call("GET", "/api/notes".into(), Value::Null).await;
+        assert_eq!(list["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(list["notes"][0]["text"], "Shopping\nMilk\nEggs");
+        let (status, _) = call("DELETE", format!("/api/notes/{id}"), Value::Null).await;
+        assert_eq!(status, 204);
+        let (status, _) = call("PUT", format!("/api/notes/{id}"), json!({"text": "x"})).await;
+        assert_eq!(status, 404);
+    }
+}
