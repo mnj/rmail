@@ -310,7 +310,7 @@ fn internal_error(error: anyhow::Error) -> Response {
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "This mailbox is on legal hold: messages can't be permanently deleted." })),
+            "This mailbox is on legal hold: messages can't be permanently deleted.",
         )
             .into_response();
     }

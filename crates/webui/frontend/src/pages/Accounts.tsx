@@ -211,13 +211,23 @@ const retentionFields: { key: 'trash_days' | 'junk_days' | 'max_age_days'; label
 ];
 
 function RetentionPanel() {
-  const { run } = useFeedback();
+  const { run, confirm } = useFeedback();
   const policy = useResource(() => api<RetentionPolicy>('/api/retention'), [], undefined, 'retention');
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({});
   const value = (domain: string, key: string, saved: number | null) => drafts[domain]?.[key] ?? (saved == null ? '' : String(saved));
   async function save(domain: string, saved: RetentionPolicy['domains'][number]) {
     const days = (key: 'trash_days' | 'junk_days' | 'max_age_days') => { const text = value(domain, key, saved[key]).trim(); return text ? Number(text) : null; };
     const body = { domain, trash_days: days('trash_days'), junk_days: days('junk_days'), max_age_days: days('max_age_days') };
+    // A new or shorter all-mail limit deletes old mail at the next sweep.
+    if (body.max_age_days != null && (saved.max_age_days == null || body.max_age_days < saved.max_age_days)) {
+      const ok = await confirm({
+        title: `Delete old mail in ${domain}?`,
+        message: <>Within the hour, every message older than {body.max_age_days} days is permanently deleted from every folder of {domain}'s mailboxes, except those on legal hold. This cannot be undone.</>,
+        confirmLabel: 'Set the limit',
+        danger: true,
+      });
+      if (!ok) return;
+    }
     if (await run(() => api('/api/retention', 'PUT', body), `Retention for ${domain} saved`)) {
       setDrafts((all) => { const next = { ...all }; delete next[domain]; return next; });
       await policy.reload();

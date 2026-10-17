@@ -61,10 +61,8 @@ fn check(days: Option<u32>) -> Result<Option<u32>> {
 
 /// Set a domain's policy; an empty one removes it.
 pub fn set(db: &Path, domain: &str, policy: &Policy) -> Result<()> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if domain.is_empty() || domain.contains(['/', '\\', '@']) {
-        bail!("invalid domain");
-    }
+    // As account domains are stored (IDNA A-labels, lower case).
+    let domain = crate::domain::canonicalize_domain(domain.trim().trim_end_matches('.'))?;
     let (trash, junk, max_age) = (
         check(policy.trash_days)?,
         check(policy.junk_days)?,
@@ -92,7 +90,10 @@ pub fn get(db: &Path, domain: &str) -> Result<Policy> {
     Ok(open(db)?
         .query_row(
             "SELECT trash_days, junk_days, max_age_days FROM retention_policies WHERE domain = ?1",
-            params![domain.to_ascii_lowercase()],
+            params![
+                crate::domain::canonicalize_domain(domain.trim().trim_end_matches('.'))
+                    .unwrap_or_else(|_| domain.to_ascii_lowercase())
+            ],
             |row| {
                 Ok(Policy {
                     trash_days: row.get(0)?,

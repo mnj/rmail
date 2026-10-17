@@ -618,8 +618,13 @@ pub fn delete_folder(
     }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     let id = folder_id(&conn, &name)?.context("mailbox does not exist")?;
-    // On hold, a folder goes only when it holds no mail.
-    if held(&conn)?
+    // On hold, a folder goes only when it holds no mail, counting files
+    // not yet indexed.
+    let held_now = held(&conn)?;
+    if held_now {
+        reconcile_folder(&conn, maildir_root, domain, localpart, &name)?;
+    }
+    if held_now
         && conn
             .query_row(
                 "SELECT 1 FROM messages WHERE folder_id = ?1 LIMIT 1",
@@ -2205,6 +2210,10 @@ pub fn replace_message(
     let metadata = validate_staged_appends(maildir_root, domain, localpart, &staged)?;
     let source = normalize_mailbox_name(source_mailbox)?;
     let destination = normalize_mailbox_name(destination)?;
+    // REPLACE expunges the original: not while on legal hold.
+    if held(&*open_account(maildir_root, domain, localpart)?)? {
+        return Err(LegalHold.into());
+    }
     let mut conn = open_account(maildir_root, domain, localpart)?;
     ensure_folder(&conn, maildir_root, domain, localpart, &source)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
