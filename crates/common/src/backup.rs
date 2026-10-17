@@ -1,5 +1,5 @@
 //! Backup and restore: the whole server's data, or one account, as a
-//! gzip-compressed tar archive.
+//! zstd-compressed tar archive (`.tar.zst`).
 //!
 //! - A full backup holds the configuration file, the main database
 //!   (mailboxes, settings, DKIM keys, ACME state), the TLS certificate and
@@ -19,9 +19,6 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
 const MANIFEST: &str = "rmail-backup.json";
@@ -66,7 +63,11 @@ pub struct Summary {
     pub bytes: u64,
 }
 
-type Archive = tar::Builder<GzEncoder<File>>;
+type Archive = tar::Builder<zstd::stream::write::Encoder<'static, File>>;
+type Reader = Box<dyn Read>;
+
+/// zstd level 3: about gzip's ratio or better, several times faster.
+const ZSTD_LEVEL: i32 = 3;
 
 /// Whether `path` is a SQLite database (by its header).
 fn is_sqlite(path: &Path) -> bool {
@@ -208,7 +209,13 @@ fn write_archive(
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&partial, fs::Permissions::from_mode(0o600))?;
         }
-        let mut archive = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+        let mut encoder = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+        // A checksum per frame, so a corrupted backup fails to restore
+        // rather than restoring wrong bytes.
+        encoder.include_checksum(true)?;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+        encoder.multithread(threads as u32)?;
+        let mut archive = tar::Builder::new(encoder);
         archive.follow_symlinks(false);
         let summary = fill(&mut archive, &scratch)?;
         archive.into_inner()?.finish()?.sync_all()?;
@@ -319,9 +326,11 @@ pub fn create_account(mail_root: &Path, address: &str, out: &Path) -> Result<Sum
     })
 }
 
-fn open_archive(path: &Path) -> Result<tar::Archive<GzDecoder<File>>> {
+/// A backup for reading.
+fn open_archive(path: &Path) -> Result<tar::Archive<Reader>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    Ok(tar::Archive::new(GzDecoder::new(file)))
+    let decoder = zstd::stream::read::Decoder::new(file).context("not an rMail backup")?;
+    Ok(tar::Archive::new(Box::new(decoder) as Reader))
 }
 
 /// The manifest of a backup.
@@ -383,11 +392,7 @@ fn clear(path: &Path, force: bool, stamp: i64) -> Result<()> {
     Ok(())
 }
 
-fn unpack(
-    entry: &mut tar::Entry<'_, GzDecoder<File>>,
-    target: &Path,
-    summary: &mut Summary,
-) -> Result<()> {
+fn unpack(entry: &mut tar::Entry<'_, Reader>, target: &Path, summary: &mut Summary) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -538,12 +543,12 @@ pub fn restore_account(
     Ok(summary)
 }
 
-/// A dated full backup in `dir` (`rmail-YYYYMMDD-HHMMSS.tar.gz`), keeping
+/// A dated full backup in `dir` (`rmail-YYYYMMDD-HHMMSS.tar.zst`), keeping
 /// the newest `keep` of them.
 pub fn create_in_dir(sources: &Sources, dir: &Path, keep: usize) -> Result<(PathBuf, Summary)> {
     fs::create_dir_all(dir)?;
     let name = format!(
-        "rmail-{}.tar.gz",
+        "rmail-{}.tar.zst",
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
     let out = dir.join(name);
@@ -553,7 +558,7 @@ pub fn create_in_dir(sources: &Sources, dir: &Path, keep: usize) -> Result<(Path
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rmail-") && n.ends_with(".tar.gz"))
+                .is_some_and(|n| n.starts_with("rmail-") && n.ends_with(".tar.zst"))
         })
         .collect();
     existing.sort();
@@ -602,7 +607,7 @@ mod tests {
     fn a_full_backup_restores_into_an_empty_server() {
         let td = tempfile::tempdir().unwrap();
         let sources = server(&td.path().join("live"));
-        let out = td.path().join("backups/full.tar.gz");
+        let out = td.path().join("backups/full.tar.zst");
         let summary = create_full(&sources, &out).unwrap();
         assert!(summary.files >= 3, "{summary:?}");
         assert_eq!(read_manifest(&out).unwrap().kind, "full");
@@ -660,7 +665,7 @@ mod tests {
     fn an_account_backup_restores_one_mailbox_even_under_another_name() {
         let td = tempfile::tempdir().unwrap();
         let sources = server(&td.path().join("live"));
-        let out = td.path().join("user.tar.gz");
+        let out = td.path().join("user.tar.zst");
         create_account(&sources.mail_root, "user@example.test", &out).unwrap();
         assert!(
             restore_full(&out, &sources, true).is_err(),
@@ -693,8 +698,8 @@ mod tests {
         let dir = td.path().join("nightly");
         fs::create_dir_all(&dir).unwrap();
         for name in [
-            "rmail-20200101-000000.tar.gz",
-            "rmail-20200102-000000.tar.gz",
+            "rmail-20200101-000000.tar.zst",
+            "rmail-20200102-000000.tar.zst",
             "notes.txt",
         ] {
             fs::write(dir.join(name), b"x").unwrap();
@@ -709,7 +714,7 @@ mod tests {
         assert_eq!(left.len(), 3, "{left:?}");
         assert!(
             left.contains(&"notes.txt".to_string())
-                && left.contains(&"rmail-20200102-000000.tar.gz".to_string())
+                && left.contains(&"rmail-20200102-000000.tar.zst".to_string())
         );
     }
 }
