@@ -5,6 +5,7 @@ Used by capture.sh; expects the services started there (SMTP 2525, submission 25
 admin console 18080) and the demo password below. Standard library only.
 """
 
+import datetime
 import http.cookiejar
 import imaplib
 import json
@@ -233,6 +234,22 @@ for path, method, body in [
 ]:
     webmail.open(urllib.request.Request(
         "https://127.0.0.1:18081" + path, method=method, data=json.dumps(body).encode(),
+        headers={"X-Rmail-Webmail": "1", "Content-Type": "application/json"},
+    )).read()
+
+# A few tasks in Alice's calendar (dates relative to today).
+today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+day = lambda offset: int((today + datetime.timedelta(days=offset)).timestamp())
+for task in [
+    {"summary": "Send the signed contract to Fabrikam", "due": day(-1), "due_all_day": True, "priority": 1},
+    {"summary": "Review the DMARC report numbers", "due": day(0), "due_all_day": True, "priority": 5,
+     "notes": "Before Thursday's infrastructure review."},
+    {"summary": "Book flights for the offsite", "due": day(3), "due_all_day": True},
+    {"summary": "Renew the TLS certificate for the staging host", "due": day(9), "due_all_day": True, "priority": 9},
+    {"summary": "Clean up old mailing list subscriptions"},
+]:
+    webmail.open(urllib.request.Request(
+        "https://127.0.0.1:18081/api/tasks/own:default", method="POST", data=json.dumps(task).encode(),
         headers={"X-Rmail-Webmail": "1", "Content-Type": "application/json"},
     )).read()
 

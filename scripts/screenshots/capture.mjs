@@ -261,6 +261,17 @@ async function signIn(page) {
   await page.waitForSelector('.month');
   await page.waitForTimeout(400);
   await shot(page, 'webmail-calendar-month');
+  // Tasks: the seeded ones, one added and one ticked off here.
+  await page.click('.sidebar-link:has-text("Tasks")');
+  await page.waitForSelector('.task-row:has-text("Book flights")');
+  await page.fill('input[aria-label="New task"]', 'Order a new laptop dock');
+  await page.press('input[aria-label="New task"]', 'Enter');
+  await page.waitForSelector('.task-row:has-text("Order a new laptop dock")');
+  await page.click('.task-row:has-text("Review the DMARC") input[type=checkbox]');
+  await page.click('.calendar-bar label:has-text("Show done") input');
+  await page.waitForSelector('.task-group.done .task-row:has-text("Review the DMARC")');
+  await page.waitForTimeout(300);
+  await shot(page, 'webmail-tasks');
   // Security: an app password for a phone, then the start of 2FA setup.
   await page.click('.sidebar-link:has-text("Security")');
   await page.waitForSelector('.security-dialog >> text=New app password');

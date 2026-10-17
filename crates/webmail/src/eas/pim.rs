@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use rmail_common::dav::store::{self, Collection, Kind, Object};
-use rmail_common::dav::{itip, text};
+use rmail_common::dav::{itip, recur, text};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -25,12 +25,35 @@ use super::wbxml::Element;
 use crate::api::Session;
 use crate::api::contacts::{self, Entry, Fields, PostalAddress};
 use crate::api::events::{self, EventFields};
+use crate::api::tasks;
 
 pub(super) const CONTACTS_PREFIX: &str = "ab";
 pub(super) const CALENDAR_PREFIX: &str = "cal";
+pub(super) const TASKS_PREFIX: &str = "task";
 
 pub(super) fn is_pim(id: &str) -> bool {
-    id.starts_with(CONTACTS_PREFIX) || id.starts_with(CALENDAR_PREFIX)
+    class_of(id).is_some()
+}
+
+/// What a PIM folder holds; a calendar that takes both events and to-dos
+/// is a calendar folder and a tasks folder, as on Exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Contacts,
+    Events,
+    Tasks,
+}
+
+fn class_of(id: &str) -> Option<Class> {
+    if id.starts_with(TASKS_PREFIX) {
+        Some(Class::Tasks)
+    } else if id.starts_with(CALENDAR_PREFIX) {
+        Some(Class::Events)
+    } else if id.starts_with(CONTACTS_PREFIX) {
+        Some(Class::Contacts)
+    } else {
+        None
+    }
 }
 
 fn conn(account: &Account) -> anyhow::Result<rmail_common::sqlite_pool::SqliteConnection> {
@@ -41,11 +64,11 @@ fn conn(account: &Account) -> anyhow::Result<rmail_common::sqlite_pool::SqliteCo
     )
 }
 
-fn event_calendars(conn: &Connection) -> anyhow::Result<Vec<Collection>> {
+fn calendars_for(conn: &Connection, component: &str) -> anyhow::Result<Vec<Collection>> {
     Ok(store::collections(conn, Kind::Calendar)?
         .into_iter()
         .filter(|c| {
-            !c.inbox && (c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT"))
+            !c.inbox && (c.components.is_empty() || c.components.iter().any(|k| k == component))
         })
         .collect())
 }
@@ -67,18 +90,31 @@ pub(super) fn folders(account: &Account) -> anyhow::Result<state::FolderList> {
             ("0".to_string(), name(&book), kind),
         );
     }
-    for calendar in event_calendars(&conn)? {
+    for calendar in calendars_for(&conn, "VEVENT")? {
         let kind = if calendar.name == "default" { 8 } else { 13 };
         out.insert(
             format!("{CALENDAR_PREFIX}{}", calendar.id),
             ("0".to_string(), name(&calendar), kind),
         );
     }
+    for list in calendars_for(&conn, "VTODO")? {
+        let (kind, title) = if list.name == "default" {
+            (7, "Tasks".to_string())
+        } else {
+            (15, name(&list))
+        };
+        out.insert(
+            format!("{TASKS_PREFIX}{}", list.id),
+            ("0".to_string(), title, kind),
+        );
+    }
     Ok(out)
 }
 
 fn collection_of(conn: &Connection, id: &str) -> anyhow::Result<Option<Collection>> {
-    let (kind, number) = if let Some(n) = id.strip_prefix(CALENDAR_PREFIX) {
+    let (kind, number) = if let Some(n) = id.strip_prefix(TASKS_PREFIX) {
+        (Kind::Calendar, n)
+    } else if let Some(n) = id.strip_prefix(CALENDAR_PREFIX) {
         (Kind::Calendar, n)
     } else if let Some(n) = id.strip_prefix(CONTACTS_PREFIX) {
         (Kind::AddressBook, n)
@@ -109,17 +145,28 @@ fn item_id(name: &str) -> String {
     }
 }
 
-fn objects(conn: &Connection, collection: &Collection) -> anyhow::Result<Vec<Object>> {
+fn objects(
+    conn: &Connection,
+    collection: &Collection,
+    class: Class,
+) -> anyhow::Result<Vec<Object>> {
     Ok(store::objects(conn, collection)?
         .into_iter()
-        .filter(|o| {
-            collection.kind == Kind::AddressBook || o.component.as_deref() == Some("VEVENT")
+        .filter(|o| match class {
+            Class::Contacts => true,
+            Class::Events => o.component.as_deref() == Some("VEVENT"),
+            Class::Tasks => o.component.as_deref() == Some("VTODO"),
         })
         .collect())
 }
 
-fn find(conn: &Connection, collection: &Collection, id: &str) -> anyhow::Result<Option<Object>> {
-    Ok(objects(conn, collection)?
+fn find(
+    conn: &Connection,
+    collection: &Collection,
+    class: Class,
+    id: &str,
+) -> anyhow::Result<Option<Object>> {
+    Ok(objects(conn, collection, class)?
         .into_iter()
         .find(|o| item_id(&o.name) == id))
 }
@@ -715,6 +762,142 @@ fn event_fields(data: &Element, previous: Option<&EventFields>) -> Option<EventF
 }
 
 // ---------------------------------------------------------------------------
+// Tasks
+
+/// ActiveSync's importance (0 low, 1 normal, 2 high) for an iCalendar
+/// PRIORITY.
+fn importance(priority: u8) -> &'static str {
+    match priority {
+        1..=4 => "2",
+        6..=9 => "0",
+        _ => "1",
+    }
+}
+
+fn task_data(tag: &str, object: &Object) -> anyhow::Result<Element> {
+    let calendar = text::parse(&object.data).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let fields = tasks::task_fields(&calendar).ok_or_else(|| anyhow::anyhow!("no task"))?;
+    let todo = tasks::todo(&calendar).ok_or_else(|| anyhow::anyhow!("no task"))?;
+    let mut data = Element::new(tag);
+    if !fields.notes.is_empty() {
+        data.push(
+            Element::new("AirSyncBase:Body")
+                .with(Element::text("AirSyncBase:Type", "1"))
+                .with(Element::text(
+                    "AirSyncBase:EstimatedDataSize",
+                    fields.notes.len().to_string(),
+                ))
+                .with(Element::text(
+                    "AirSyncBase:Data",
+                    fields.notes.replace('\n', "\r\n"),
+                )),
+        );
+    }
+    data.push(Element::text("Tasks:Subject", fields.summary.clone()));
+    data.push(Element::text(
+        "Tasks:Importance",
+        importance(fields.priority),
+    ));
+    if let Some(start) = todo.property("DTSTART").and_then(recur::instant) {
+        data.push(Element::text("Tasks:UtcStartDate", email_time(start)));
+        data.push(Element::text("Tasks:StartDate", email_time(start)));
+    }
+    if let Some(due) = fields.due {
+        data.push(Element::text("Tasks:UtcDueDate", email_time(due)));
+        data.push(Element::text("Tasks:DueDate", email_time(due)));
+    }
+    data.push(Element::text(
+        "Tasks:Complete",
+        if fields.completed { "1" } else { "0" },
+    ));
+    if fields.completed {
+        let done = todo
+            .property("COMPLETED")
+            .and_then(recur::instant)
+            .unwrap_or(object.modified);
+        data.push(Element::text("Tasks:DateCompleted", email_time(done)));
+    }
+    data.push(Element::text("Tasks:Sensitivity", "0"));
+    data.push(Element::text("Tasks:ReminderSet", "0"));
+    Ok(data)
+}
+
+/// The task fields a device's task sets; what it has no field for (the
+/// time of a date-only due date, a priority between the three levels) is
+/// kept from `previous`.
+fn task_fields_from(data: &Element, previous: Option<&tasks::TaskFields>) -> tasks::TaskFields {
+    let value = |tag: &str| data.value(tag).unwrap_or_default().trim().to_string();
+    // DueDate is the device's local time written as if UTC: a midnight
+    // there is a date without a time.
+    let local_due = data.value("Tasks:DueDate").and_then(|d| parse_time(&d));
+    let utc_due = data
+        .value("Tasks:UtcDueDate")
+        .and_then(|d| parse_time(&d))
+        .or(local_due);
+    let (due, due_all_day) = match (local_due, utc_due) {
+        (Some(local), _) if local.rem_euclid(86_400) == 0 => (Some(local), true),
+        (_, Some(utc)) => (Some(utc), false),
+        _ => (None, false),
+    };
+    let previous_priority = previous.map_or(0, |p| p.priority);
+    let priority = match data.value("Tasks:Importance").as_deref() {
+        Some("2") if importance(previous_priority) == "2" => previous_priority,
+        Some("2") => 1,
+        Some("0") if importance(previous_priority) == "0" => previous_priority,
+        Some("0") => 9,
+        _ if importance(previous_priority) == "1" => previous_priority,
+        _ => 0,
+    };
+    tasks::TaskFields {
+        summary: value("Tasks:Subject").replace(['\r', '\n'], " "),
+        notes: data
+            .child("AirSyncBase:Body")
+            .and_then(|b| b.value("AirSyncBase:Data"))
+            .unwrap_or_default()
+            .replace("\r\n", "\n"),
+        due,
+        due_all_day,
+        priority,
+        completed: value("Tasks:Complete") == "1",
+    }
+}
+
+fn store_task(
+    account: &Account,
+    conn: &Connection,
+    collection: &Collection,
+    existing: Option<&Object>,
+    new_uid: &str,
+    data: &Element,
+) -> anyhow::Result<Option<String>> {
+    let previous = existing
+        .and_then(|o| text::parse(&o.data).ok())
+        .and_then(|c| tasks::task_fields(&c));
+    let fields = task_fields_from(data, previous.as_ref());
+    let (name, uid) = match existing {
+        Some(object) => (Some(object.name.clone()), None),
+        None => {
+            // A repeated Add (a retried Sync) finds what it stored.
+            let name = format!("{new_uid}.ics");
+            if store::object(conn, collection, &name)?.is_some() {
+                return Ok(Some(name));
+            }
+            (None, Some(new_uid.to_string()))
+        }
+    };
+    let saved = tasks::save(
+        &account.state,
+        &session(account),
+        &format!("own:{}", collection.name),
+        name.as_deref(),
+        &fields,
+        existing.map(|o| o.etag.clone()),
+        uid,
+    )?;
+    Ok(saved.ok())
+}
+
+// ---------------------------------------------------------------------------
 // Sync
 
 fn session(account: &Account) -> Session {
@@ -725,11 +908,11 @@ fn session(account: &Account) -> Session {
     }
 }
 
-fn item_data(collection: &Collection, object: &Object, me: &[String]) -> anyhow::Result<Element> {
-    if collection.kind == Kind::AddressBook {
-        contact_data("AirSync:ApplicationData", object)
-    } else {
-        event_data("AirSync:ApplicationData", object, me)
+fn item_data(class: Class, object: &Object, me: &[String]) -> anyhow::Result<Element> {
+    match class {
+        Class::Contacts => contact_data("AirSync:ApplicationData", object),
+        Class::Events => event_data("AirSync:ApplicationData", object, me),
+        Class::Tasks => task_data("AirSync:ApplicationData", object),
     }
 }
 
@@ -738,6 +921,7 @@ fn store_item(
     account: &Account,
     conn: &Connection,
     collection: &Collection,
+    class: Class,
     existing: Option<&Object>,
     new_uid: &str,
     data: &Element,
@@ -745,7 +929,10 @@ fn store_item(
     if collection.managed {
         return Ok(None);
     }
-    if collection.kind == Kind::AddressBook {
+    if class == Class::Tasks {
+        return store_task(account, conn, collection, existing, new_uid, data);
+    }
+    if class == Class::Contacts {
         let previous = existing
             .and_then(|o| text::parse(&o.data).ok())
             .map(|card| contacts::fields_of(&card));
@@ -836,7 +1023,7 @@ pub(super) fn sync_collection(
     let mut response = Element::new("AirSync:Collection");
     let status = |code: &str| Element::text("AirSync:Status", code);
     let conn = conn(account)?;
-    let Some(collection) = collection_of(&conn, &id)? else {
+    let (Some(collection), Some(class)) = (collection_of(&conn, &id)?, class_of(&id)) else {
         return Ok(response
             .with(Element::text("AirSync:CollectionId", id))
             .with(status("8")));
@@ -883,7 +1070,7 @@ pub(super) fn sync_collection(
                     };
                     let stored = match command.child("AirSync:ApplicationData") {
                         Some(data) => {
-                            store_item(account, &conn, &collection, None, &new_uid, data)?
+                            store_item(account, &conn, &collection, class, None, &new_uid, data)?
                         }
                         None => None,
                     };
@@ -906,14 +1093,14 @@ pub(super) fn sync_collection(
                 // the device gets the stored version back.
                 "Change" if key != known.0 => {}
                 "Change" => {
-                    let existing = find(&conn, &collection, &server_id)?;
+                    let existing = find(&conn, &collection, class, &server_id)?;
                     // When a contact had more than the device was sent, the
                     // merged version goes back to it.
-                    let echo = collection.kind == Kind::AddressBook
-                        && existing.as_ref().is_some_and(has_unsent);
+                    let echo =
+                        class == Class::Contacts && existing.as_ref().is_some_and(has_unsent);
                     let stored = match (&existing, command.child("AirSync:ApplicationData")) {
                         (Some(object), Some(data)) => {
-                            store_item(account, &conn, &collection, Some(object), "", data)?
+                            store_item(account, &conn, &collection, class, Some(object), "", data)?
                         }
                         _ => None,
                     };
@@ -933,10 +1120,10 @@ pub(super) fn sync_collection(
                     }
                 }
                 "Delete" => {
-                    if let Some(object) = find(&conn, &collection, &server_id)?
+                    if let Some(object) = find(&conn, &collection, class, &server_id)?
                         && !collection.managed
                     {
-                        if collection.kind == Kind::Calendar {
+                        if class == Class::Events {
                             events::remove_event(
                                 &account.state,
                                 &session(account),
@@ -952,12 +1139,12 @@ pub(super) fn sync_collection(
                     }
                     base.remove(&server_id);
                 }
-                "Fetch" => match find(&conn, &collection, &server_id)? {
+                "Fetch" => match find(&conn, &collection, class, &server_id)? {
                     Some(object) => responses.push(
                         Element::new("AirSync:Fetch")
                             .with(Element::text("AirSync:ServerId", server_id))
                             .with(status("1"))
-                            .with(item_data(&collection, &object, &me)?),
+                            .with(item_data(class, &object, &me)?),
                     ),
                     None => responses.push(
                         Element::new("AirSync:Fetch")
@@ -969,7 +1156,7 @@ pub(super) fn sync_collection(
             }
         }
     }
-    let now: Vec<Object> = objects(&conn, &collection)?;
+    let now: Vec<Object> = objects(&conn, &collection, class)?;
     let current: Items = now
         .iter()
         .map(|o| (item_id(&o.name), o.etag.clone()))
@@ -1013,7 +1200,7 @@ pub(super) fn sync_collection(
                 more = true;
                 break;
             }
-            let Ok(data) = item_data(&collection, object, &me) else {
+            let Ok(data) = item_data(class, object, &me) else {
                 continue;
             };
             commands.push(
@@ -1045,13 +1232,13 @@ pub(super) fn sync_collection(
 /// Changes waiting for a device in a contacts or calendar folder.
 pub(super) fn pending(account: &Account, db: &Connection, id: &str) -> anyhow::Result<usize> {
     let conn = conn(account)?;
-    let Some(collection) = collection_of(&conn, id)? else {
+    let (Some(collection), Some(class)) = (collection_of(&conn, id)?, class_of(id)) else {
         return Ok(0);
     };
     let Some(known) = state::items_state(db, &account.device, id)? else {
         return Ok(1);
     };
-    let current: Items = objects(&conn, &collection)?
+    let current: Items = objects(&conn, &collection, class)?
         .iter()
         .map(|o| (item_id(&o.name), o.etag.clone()))
         .collect();
@@ -1192,17 +1379,19 @@ pub(super) fn meeting_response(
             // From the calendar: the stored event, as an invitation.
             let conn = conn(account)?;
             match collection_of(&conn, &collection)? {
-                Some(calendar) => find(&conn, &calendar, &request_id)?.map(|object| {
-                    let body = object.data.replacen(
-                        "BEGIN:VCALENDAR\r\n",
-                        "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\n",
-                        1,
-                    );
-                    format!(
+                Some(calendar) => {
+                    find(&conn, &calendar, Class::Events, &request_id)?.map(|object| {
+                        let body = object.data.replacen(
+                            "BEGIN:VCALENDAR\r\n",
+                            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\n",
+                            1,
+                        );
+                        format!(
                         "Content-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\r\n{body}"
                     )
                     .into_bytes()
-                }),
+                    })
+                }
                 None => None,
             }
         } else {
