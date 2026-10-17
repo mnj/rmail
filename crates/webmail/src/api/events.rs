@@ -776,7 +776,19 @@ pub(crate) fn save(
             .into_iter()
             .map(|(address, kind)| (address, kind.cutype()))
             .collect();
-    let name = name.map_or_else(|| format!("{uid}.ics"), str::to_string);
+    // A client's UID names the resource only when it is safe in a URL
+    // path; otherwise the event keeps its UID under a generated name.
+    let name = name.map_or_else(
+        || {
+            let safe = !uid.is_empty()
+                && uid.len() <= 200
+                && uid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+            format!("{}.ics", if safe { uid.clone() } else { uuid() })
+        },
+        str::to_string,
+    );
     let mut outgoing = Vec::new();
     let stored = store::put_with(&place.conn, &place.collection, &name, &mut |current| {
         match (current, &etag) {

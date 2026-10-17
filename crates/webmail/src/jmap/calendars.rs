@@ -320,56 +320,52 @@ fn apply_calendar(
     collection: &Collection,
     patch: &Map<String, Value>,
 ) -> Result<(), Value> {
+    // Every key is checked before anything is written: an update succeeds
+    // or fails as a whole (RFC 8620 5.3).
+    let mut writes: Vec<(store::Setting, Option<String>)> = Vec::new();
     for (key, value) in patch {
         let invalid = |description: &str| {
             set_error_properties("invalidProperties", description, &[key.as_str()])
         };
-        let result = match key.as_str() {
+        match key.as_str() {
             "name" => match value.as_str().map(str::trim) {
                 Some(name) if !name.is_empty() && name.len() <= 255 => {
-                    store::set_property(conn, collection, store::Setting::DisplayName, Some(name))
+                    writes.push((store::Setting::DisplayName, Some(name.to_string())))
                 }
                 _ => return Err(invalid("a name of 1 to 255 octets is required")),
             },
             "description" => match value {
-                Value::Null => {
-                    store::set_property(conn, collection, store::Setting::Description, None)
-                }
+                Value::Null => writes.push((store::Setting::Description, None)),
                 Value::String(text) if text.len() <= 10_000 => {
-                    store::set_property(conn, collection, store::Setting::Description, Some(text))
+                    writes.push((store::Setting::Description, Some(text.clone())))
                 }
                 _ => return Err(invalid("must be a string or null")),
             },
             "color" => match value {
-                Value::Null => store::set_property(conn, collection, store::Setting::Color, None),
+                Value::Null => writes.push((store::Setting::Color, None)),
                 Value::String(color)
                     if color.len() <= 64 && !color.contains(['<', '>', '\r', '\n']) =>
                 {
-                    store::set_property(conn, collection, store::Setting::Color, Some(color))
+                    writes.push((store::Setting::Color, Some(color.clone())))
                 }
                 _ => return Err(invalid("must be a CSS color or null")),
             },
             "sortOrder" => match value.as_u64() {
-                Some(order) => store::set_property(
-                    conn,
-                    collection,
-                    store::Setting::SortOrder,
-                    Some(&order.to_string()),
-                ),
+                Some(order) => writes.push((store::Setting::SortOrder, Some(order.to_string()))),
                 None => return Err(invalid("must be an unsigned integer")),
             },
             // Shown and kept by the client.
-            "isSubscribed" | "isVisible" if value.is_boolean() => Ok(()),
-            "includeInAvailability" if value.as_str() == Some("all") => Ok(()),
+            "isSubscribed" | "isVisible" if value.is_boolean() => {}
+            "includeInAvailability" if value.as_str() == Some("all") => {}
             "timeZone" | "shareWith" | "defaultAlertsWithTime" | "defaultAlertsWithoutTime"
-                if value.is_null() =>
-            {
-                Ok(())
-            }
+                if value.is_null() => {}
             "id" | "isDefault" | "myRights" => return Err(invalid("set by the server")),
             _ => return Err(invalid("not supported here")),
-        };
-        result.map_err(|error| set_error("serverFail", format!("{error:#}")))?;
+        }
+    }
+    for (setting, value) in writes {
+        store::set_property(conn, collection, setting, value.as_deref())
+            .map_err(|error| set_error("serverFail", format!("{error:#}")))?;
     }
     Ok(())
 }
@@ -1257,6 +1253,9 @@ struct Row {
     uid: String,
     modified: i64,
     fields: EventFields,
+    /// Where the event and all its occurrences fall (an open end for a
+    /// recurrence without one).
+    span: (Option<i64>, Option<i64>),
 }
 
 fn contains(haystack: &str, needle: &str) -> bool {
@@ -1297,8 +1296,14 @@ fn matches(filter: &Map<String, Value>, row: &Row) -> Result<bool, MethodError> 
         let ok = match key.as_str() {
             "inCalendar" => row.calendar == text,
             "uid" => row.uid == text,
-            "after" => f.end > instant()?,
-            "before" => f.start < instant()?,
+            "after" => {
+                let at = instant()?;
+                row.span.1.is_none_or(|end| end > at)
+            }
+            "before" => {
+                let at = instant()?;
+                row.span.0.unwrap_or(f.start) < at
+            }
             "title" => contains(&f.summary, text),
             "description" => contains(&f.description, text),
             "location" => contains(&f.location, text),
@@ -1341,6 +1346,7 @@ pub(crate) fn event_query(ctx: &mut Ctx, args: Map<String, Value>) -> MethodResu
             uid: object.uid.clone().unwrap_or_default(),
             modified: object.modified,
             fields,
+            span: (object.start, object.end),
         });
     }
     if let Some(filter) = args.get("filter").filter(|f| !f.is_null()) {

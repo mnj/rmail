@@ -1291,6 +1291,44 @@ async fn calendars_are_jscalendar_events_over_the_caldav_store() {
         json!(["calendarIds"])
     );
 
+    // A later occurrence of the weekly event matches a later time range.
+    let later = client
+        .one(
+            "CalendarEvent/query",
+            json!({"filter": {"after": "2026-12-01T00:00:00Z", "before": "2026-12-31T00:00:00Z"}}),
+        )
+        .await;
+    assert_eq!(later["ids"], json!([&id]), "{later}");
+    // A UID that is not URL-safe stays the UID, under a generated name.
+    let odd = client
+        .one("CalendarEvent/set", json!({"create": {"o": {"calendarIds": {&calendar: true}, "uid": "a/b c@x.test", "title": "Odd", "start": "2026-11-02T10:00:00", "duration": "PT1H"}}}))
+        .await;
+    assert_eq!(odd["created"]["o"]["uid"], "a/b c@x.test", "{odd}");
+    let odd_name = rmail_common::dav::store::find_by_uid(&conn, "a/b c@x.test")
+        .unwrap()
+        .unwrap()
+        .1
+        .name;
+    assert!(!odd_name.contains(['/', ' ', '@']), "{odd_name}");
+    client
+        .one(
+            "CalendarEvent/set",
+            json!({"destroy": [odd["created"]["o"]["id"]]}),
+        )
+        .await;
+    // A calendar update with one bad key changes nothing.
+    let bad = client
+        .one(
+            "Calendar/set",
+            json!({"update": {&calendar: {"name": "Renamed", "unknown": 1}}}),
+        )
+        .await;
+    assert!(bad["notUpdated"].get(&calendar).is_some());
+    let unchanged = client
+        .one("Calendar/get", json!({"ids": [&calendar]}))
+        .await;
+    assert_ne!(unchanged["list"][0]["name"], "Renamed");
+
     // Query by time and text; a new calendar; destroying needs care.
     let found = client.one("CalendarEvent/query", json!({"filter": {"after": "2026-10-22T00:00:00Z", "before": "2026-10-23T00:00:00Z", "text": "moved"}, "calculateTotal": true})).await;
     assert_eq!(
