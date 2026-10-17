@@ -966,6 +966,8 @@ mod tests {
         partial: std::sync::atomic::AtomicBool,
         /// A batch the provider fails to report on.
         failing: std::sync::Mutex<Option<String>>,
+        /// Each message's question in a batch of its own.
+        apart: std::sync::atomic::AtomicBool,
     }
 
     impl crate::cloud::Batcher for FakeBatcher {
@@ -976,6 +978,14 @@ mod tests {
             _may_propose: bool,
         ) -> serde_json::Value {
             serde_json::json!({ "message": message, "labels": labels.len() })
+        }
+
+        fn group(&self, request: &serde_json::Value) -> String {
+            if self.apart.load(std::sync::atomic::Ordering::SeqCst) {
+                request["message"].to_string()
+            } else {
+                String::new()
+            }
         }
 
         fn submit(&self, requests: &[(String, serde_json::Value)]) -> Result<String> {
@@ -1009,6 +1019,42 @@ mod tests {
     }
 
     #[test]
+    fn batch_requests_go_in_one_batch_per_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        imap_state::init_account(root, D, L).unwrap();
+        imap_state::deliver_message(root, D, L, &mail("a@b.test", "One", "x")).unwrap();
+        imap_state::deliver_message(root, D, L, &mail("c@d.test", "Two", "y")).unwrap();
+        enable_labels(root, &[("To do", "Needs action")]);
+        let batcher = Arc::new(FakeBatcher {
+            submitted: Default::default(),
+            answer: String::new(),
+            ready: false.into(),
+            partial: false.into(),
+            failing: Default::default(),
+            apart: true.into(),
+        });
+        let batched = Models {
+            chooser: Some(Arc::new(fake::Fixed::labelling(&[]))),
+            batcher: Some(("fake:model".into(), batcher.clone())),
+            ..Models::default()
+        };
+        let report = run_cycle(root, &cfg(), &batched);
+        assert_eq!(report.submitted, 2, "{report:?}");
+        let submitted = batcher.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 2, "two groups, two batches");
+        assert!(submitted.iter().all(|batch| batch.len() == 1));
+        let conn = store::open_existing(root, D, L).unwrap().unwrap();
+        let mut ids: Vec<_> = store::label_requests(&conn)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r.batch_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["batch-1", "batch-2"]);
+    }
+
+    #[test]
     fn batch_labels_are_queued_sent_together_and_applied_when_answered() {
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
@@ -1027,6 +1073,7 @@ mod tests {
             ready: false.into(),
             partial: false.into(),
             failing: Default::default(),
+            apart: false.into(),
         });
         let batched = Models {
             chooser: Some(chooser.clone()),

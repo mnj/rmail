@@ -652,6 +652,23 @@ pub trait Batcher: Send + Sync {
     /// Submit `(custom_id, request)` pairs; the batch id.
     fn submit(&self, requests: &[(String, Value)]) -> Result<String>;
     fn poll(&self, batch: &str) -> Result<BatchPoll>;
+    /// Requests that may share a batch have the same group.
+    fn group(&self, _request: &Value) -> String {
+        String::new()
+    }
+}
+
+/// Whether an OpenAI-compatible base URL is OpenRouter's own API (other
+/// compatible endpoints may have no Batch API).
+pub fn is_openrouter(base: &str) -> bool {
+    let host = base
+        .trim()
+        .split_once("://")
+        .map_or(base, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    host.eq_ignore_ascii_case("openrouter.ai")
 }
 
 /// Each JSONL line parsed; a line that is not JSON is skipped.
@@ -748,6 +765,86 @@ impl Batcher for OpenAiBatcher {
             }
             _ => Ok(BatchPoll::Running),
         }
+    }
+}
+
+/// OpenRouter's Batch API: requests go up inline, and a finished batch
+/// carries its results inline.
+pub struct OpenRouterBatcher {
+    api: Api,
+    model: String,
+}
+
+impl OpenRouterBatcher {
+    pub fn load(base: &str, key: &str, model: &str) -> Result<Self> {
+        if model.trim().is_empty() {
+            bail!("no chat model id is set");
+        }
+        Ok(Self {
+            api: Api::new(base, key)?,
+            model: model.trim().to_string(),
+        })
+    }
+}
+
+impl Batcher for OpenRouterBatcher {
+    fn label_request(&self, message: &str, labels: &[LabelHint], may_propose: bool) -> Value {
+        openai_label_body(&self.model, message, labels, may_propose)
+    }
+
+    /// Batches for some models (Google's) must share one response schema,
+    /// and each account's labels make their own.
+    fn group(&self, request: &Value) -> String {
+        request["response_format"].to_string()
+    }
+
+    fn submit(&self, requests: &[(String, Value)]) -> Result<String> {
+        let requests: Vec<Value> = requests
+            .iter()
+            .map(|(id, body)| json!({ "custom_id": id, "body": body }))
+            .collect();
+        // OpenRouter wants `requests` after the other fields; serde_json's
+        // sorted keys put it last.
+        let batch = self.api.post(
+            "/batches",
+            &json!({
+                "endpoint": "/v1/chat/completions",
+                "model": self.model,
+                "completion_window": "24h",
+                "requests": requests,
+            }),
+        )?;
+        Ok(batch["id"].as_str().context("batch has no id")?.to_string())
+    }
+
+    fn poll(&self, batch: &str) -> Result<BatchPoll> {
+        let state = self.api.get(&format!("/batches/{batch}"))?;
+        if !matches!(
+            state["status"].as_str().unwrap_or_default(),
+            "completed" | "expired" | "failed" | "cancelled"
+        ) {
+            return Ok(BatchPoll::Running);
+        }
+        let mut answers = Vec::new();
+        for item in state["results"].as_array().into_iter().flatten() {
+            let Some(id) = item["custom_id"].as_str() else {
+                continue;
+            };
+            let response = &item["response"];
+            let answer = match (
+                response["status_code"].as_u64(),
+                response["body"]["choices"][0]["message"]["content"].as_str(),
+            ) {
+                (Some(200), Some(text)) => Ok(text.to_string()),
+                _ => Err(item["error"]["message"]
+                    .as_str()
+                    .or_else(|| response["body"]["error"]["message"].as_str())
+                    .unwrap_or("no answer")
+                    .to_string()),
+            };
+            answers.push((id.to_string(), answer));
+        }
+        Ok(BatchPoll::Ended(answers))
     }
 }
 
@@ -1406,6 +1503,60 @@ mod tests {
         assert_eq!(answers[1], ("q2".into(), Err("bad request".into())));
         requests.recv().unwrap();
         assert_eq!(requests.recv().unwrap().0, "GET /files/file-out/content");
+    }
+
+    #[test]
+    fn only_openrouter_itself_is_assumed_to_batch() {
+        assert!(is_openrouter("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter("https://OpenRouter.ai:443/api/v1/"));
+        assert!(!is_openrouter("http://localhost:8080/v1"));
+        assert!(!is_openrouter("https://openrouter.ai.example.test/v1"));
+    }
+
+    #[test]
+    fn openrouter_batches_go_up_and_come_back_inline() {
+        let finished = json!({"id": "or_1", "status": "completed", "results": [
+            {"id": "r1", "custom_id": "q1", "response": {"status_code": 200, "request_id": null, "body": {"choices": [{"message": {"content": "{\"labels\": []}"}}]}}, "error": null},
+            {"id": "r2", "custom_id": "q2", "response": null, "error": {"type": "invalid_request", "message": "too long", "param": null}},
+        ]});
+        let (base, requests) = serve_paths(vec![
+            (
+                202,
+                json!({"id": "or_1", "status": "validating", "results": null}).to_string(),
+            ),
+            (
+                200,
+                json!({"id": "or_1", "status": "in_progress", "results": null}).to_string(),
+            ),
+            (200, finished.to_string()),
+        ]);
+        let batcher =
+            OpenRouterBatcher::load(&base, "sk-or", "anthropic/claude-haiku-5-5").unwrap();
+        let body = batcher.label_request("Hello", &[], true);
+        let batch = batcher
+            .submit(&[("q1".into(), body.clone()), ("q2".into(), body)])
+            .unwrap();
+        assert_eq!(batch, "or_1");
+        let (target, auth, create) = requests.recv().unwrap();
+        assert_eq!(
+            (target.as_str(), auth.as_str()),
+            ("POST /batches", "Bearer sk-or")
+        );
+        assert_eq!(create["endpoint"], "/v1/chat/completions");
+        assert_eq!(create["model"], "anthropic/claude-haiku-5-5");
+        assert_eq!(create["requests"][1]["custom_id"], "q2");
+        assert_eq!(
+            create["requests"][0]["body"]["model"],
+            "anthropic/claude-haiku-5-5"
+        );
+
+        assert_eq!(batcher.poll(&batch).unwrap(), BatchPoll::Running);
+        assert_eq!(requests.recv().unwrap().0, "GET /batches/or_1");
+        let BatchPoll::Ended(answers) = batcher.poll(&batch).unwrap() else {
+            panic!("ended")
+        };
+        assert_eq!(answers[0], ("q1".into(), Ok("{\"labels\": []}".into())));
+        assert_eq!(answers[1], ("q2".into(), Err("too long".into())));
     }
 
     #[test]

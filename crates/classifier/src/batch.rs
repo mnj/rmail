@@ -33,7 +33,8 @@ use crate::worker::{CycleReport, apply_labeling};
 const BATCH_MIN: usize = 100;
 /// ...or the oldest has waited this long (seconds).
 const BATCH_WAIT: i64 = if cfg!(test) { 0 } else { 15 * 60 };
-/// Questions in one batch; well under both providers' limits.
+/// Questions in one batch; well under every provider's limits (OpenRouter's
+/// is a 200 MB request).
 const BATCH_MAX: usize = 2_000;
 /// Times a question is sent before it is given up.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -179,31 +180,37 @@ fn submit(
     if !due {
         return Ok(());
     }
-    let chosen = &waiting[..waiting.len().min(BATCH_MAX)];
-    let requests: Vec<(String, Value)> = chosen
-        .iter()
-        .filter_map(|(_, request)| {
-            Some((
-                request.custom_id.clone(),
-                serde_json::from_str(&request.body).ok()?,
-            ))
-        })
-        .collect();
-    let batch = batcher.submit(&requests)?;
-    let mut by_account: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
-    for (queue, request) in chosen {
-        by_account
-            .entry((&queue.domain, &queue.localpart))
-            .or_default()
-            .push(request.custom_id.clone());
-    }
-    for ((domain, localpart), ids) in by_account {
-        if let Some(conn) = store::open_existing(mail_root, domain, localpart)? {
-            store::mark_label_requests(&conn, &ids, &batch)?;
+    // One batch per group of requests that may go together.
+    let mut groups: BTreeMap<String, Vec<(&Queue, &LabelRequest, Value)>> = BTreeMap::new();
+    for (queue, request) in &waiting[..waiting.len().min(BATCH_MAX)] {
+        if let Ok(body) = serde_json::from_str::<Value>(&request.body) {
+            groups
+                .entry(batcher.group(&body))
+                .or_default()
+                .push((queue, request, body));
         }
     }
-    classifier_log!("info", "batch_submitted", { "batch": batch, "requests": requests.len() });
-    report.submitted += requests.len();
+    for chosen in groups.into_values() {
+        let requests: Vec<(String, Value)> = chosen
+            .iter()
+            .map(|(_, request, body)| (request.custom_id.clone(), body.clone()))
+            .collect();
+        let batch = batcher.submit(&requests)?;
+        let mut by_account: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
+        for (queue, request, _) in &chosen {
+            by_account
+                .entry((&queue.domain, &queue.localpart))
+                .or_default()
+                .push(request.custom_id.clone());
+        }
+        for ((domain, localpart), ids) in by_account {
+            if let Some(conn) = store::open_existing(mail_root, domain, localpart)? {
+                store::mark_label_requests(&conn, &ids, &batch)?;
+            }
+        }
+        classifier_log!("info", "batch_submitted", { "batch": batch, "requests": requests.len() });
+        report.submitted += requests.len();
+    }
     Ok(())
 }
 
