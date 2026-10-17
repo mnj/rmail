@@ -421,7 +421,10 @@ at the provider first). Set `keep` with that in mind, or use a cool class (`STAN
 `NEARLINE`, `Cool`) for the recent copies. Backups hold password hashes, DKIM keys and every
 message, and rMail does not encrypt them: use a private bucket or container, with the provider's
 encryption at rest. `rmail_ctl backup upload <file>` uploads one by hand, `backup remote` lists the
-uploaded backups, and `backup fetch <name> <file>` downloads one to restore it.
+uploaded backups, and `backup fetch <name> <file>` downloads one to restore it. On a new machine with no
+database yet, give the same settings in the configuration file's `[backup_upload]` section (for
+example `target = "s3"`, `s3_bucket = "…"`, `s3_secret_access_key = "…"`), fetch the newest backup
+and restore it; the restored database brings the console's settings back.
 
 Restoring:
 

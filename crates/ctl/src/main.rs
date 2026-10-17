@@ -1025,9 +1025,19 @@ async fn main() -> Result<()> {
             let cfg_path = config.unwrap_or_else(|| {
                 std::env::var("RMAIL_CONFIG").unwrap_or_else(|_| "config/example.toml".to_string())
             });
-            // A restore reads the paths from the file alone: loading the
-            // configuration would create the database it is about to restore.
-            let cfg = if matches!(action, BackupAction::Restore { .. }) {
+            // A restore, and a fetch on a machine without a database yet,
+            // read the configuration file alone: loading it would create the
+            // database a restore is about to write. (A fresh machine then
+            // takes the upload settings from a [backup_upload] section.)
+            let fresh = {
+                let raw: Option<Config> = std::fs::read_to_string(&cfg_path)
+                    .ok()
+                    .and_then(|text| toml::from_str(&text).ok());
+                raw.is_some_and(|raw| !std::path::Path::new(&raw.global.db_path).exists())
+            };
+            let cfg = if matches!(action, BackupAction::Restore { .. })
+                || (fresh && matches!(action, BackupAction::Fetch { .. } | BackupAction::Remote))
+            {
                 let raw: Config = toml::from_str(
                     &std::fs::read_to_string(&cfg_path)
                         .with_context(|| format!("reading {cfg_path}"))?,

@@ -61,7 +61,9 @@ pub fn is_backup_name(name: &str) -> bool {
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(30 * 60))
+        // No limit on a whole request (a large backup downloads for a long
+        // time); a connection that stalls for five minutes fails.
+        .read_timeout(Duration::from_secs(5 * 60))
         .user_agent(concat!("rMail-backup/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }
@@ -947,15 +949,36 @@ pub fn target(config: &BackupUploadConfig, mail_root: &Path) -> Result<Option<Ta
         }
         "sftp" => Kind::Sftp(Sftp {
             program: PathBuf::from("sftp"),
-            host: required(&config.sftp_host, "the SFTP host")?,
+            host: ssh_word(
+                &required(&config.sftp_host, "the SFTP host")?,
+                "the SFTP host",
+                b".-:[]",
+            )?,
             port: config.sftp_port,
-            user: required(&config.sftp_user, "the SFTP user")?,
+            user: ssh_word(
+                &required(&config.sftp_user, "the SFTP user")?,
+                "the SFTP user",
+                b"._-",
+            )?,
             key: PathBuf::from(required(&config.sftp_key_path, "the SFTP key file")?),
             dir: required(&config.sftp_path, "the SFTP directory")?,
             known_hosts: mail_root.join("backup-known-hosts"),
         }),
         other => bail!("backup upload: unknown target {other}"),
     })))
+}
+
+/// A host or user name for the `sftp` command line: plain characters, and
+/// never starting with `-`, which ssh would take as an option.
+fn ssh_word(value: &str, what: &str, extra: &[u8]) -> Result<String> {
+    if value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    {
+        bail!("backup upload: {what} has characters it cannot have");
+    }
+    Ok(value.to_string())
 }
 
 /// Settings check on save: a chosen target must be complete.
@@ -1267,6 +1290,18 @@ mod tests {
         assert!(is_backup_name("rmail-20261017-031500.tar.zst"));
         assert!(!is_backup_name("../rmail-1.tar.zst") && !is_backup_name("notes.txt"));
         assert!(quoted("a\"b").is_err());
+        let sftp = |user: &str, host: &str| BackupUploadConfig {
+            target: "sftp".into(),
+            sftp_host: host.into(),
+            sftp_user: user.into(),
+            sftp_key_path: "/k".into(),
+            sftp_path: "/b".into(),
+            ..BackupUploadConfig::default()
+        };
+        assert!(validate_config(&sftp("rmail", "backup.example.test")).is_ok());
+        assert!(validate_config(&sftp("-oProxyCommand=touch x", "h")).is_err());
+        assert!(validate_config(&sftp("rmail", "-oProxyCommand=x")).is_err());
+        assert!(validate_config(&sftp("rm ail", "h")).is_err());
         assert_eq!(folder("/rmail/"), "rmail/");
     }
 }
