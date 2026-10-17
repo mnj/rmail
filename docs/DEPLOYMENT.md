@@ -631,6 +631,13 @@ with **Add to calendar**, and the sender's signature with **Save contact** (a kn
 opens with the new phone, company or title added). Nothing is added without the user's click.
 Hosted models only receive a message when the user has agreed to that provider.
 
+**Tasks**: webmail's Tasks view lists the to-dos (`VTODO`) of the user's calendars and of
+calendars shared with them, grouped as overdue, today, upcoming, no date and done. Tasks are added,
+ticked off, given a due date (with or without a time), a priority and notes, or deleted; other
+properties (subtasks, alarms, categories, repeat rules) are kept. They are the same tasks CalDAV
+apps show (Apple Reminders, Thunderbird, Tasks.org or jtx Board through DAVx5) and phones get over
+ActiveSync. Ticking off a repeating task marks the whole task done.
+
 **Search by meaning** (with an embedding model configured): users turn it on under **Organize my
 mail**; the classifier then indexes their folders (not Trash or Junk) in the background, newest
 first, up to 256 messages per account per cycle, and forgets messages that are deleted or moved.
@@ -658,6 +665,9 @@ password when two-factor sign-in is on) and the webmail host as the server.
   shown and kept unless changed. Inviting guests from the phone sends invitations as webmail
   does. Subscribed calendars are read-only, and calendars shared with the user stay in
   webmail and CalDAV.
+- Tasks: each calendar that takes to-dos is also a tasks folder (the default one is the phone's
+  Tasks), with the title, notes, due date, importance (high, normal, low) and done state both ways;
+  repeat rules and alarms stay as they are.
 - Invitations show as meeting requests: accepting, declining or answering tentatively on the
   phone replies to the organizer and updates the calendar, as webmail's invitation card does.
 - Provisioning answers with a policy that asks nothing of the device, and is not enforced:

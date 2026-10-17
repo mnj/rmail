@@ -947,3 +947,132 @@ async fn contacts_calendars_and_invitations() {
         accepted.data
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks_sync_both_ways() {
+    use rmail_common::dav::store::{self, Kind};
+    let td = tempfile::tempdir().unwrap();
+    let state = state(&td);
+    let root = state.mail_root.clone();
+    imap_state::init_account(&root, "example.test", "user").unwrap();
+    let mut settings = rmail_common::settings::open(&state.db_path).unwrap();
+    rmail_common::settings::write_raw(
+        &mut settings,
+        &[("activesync.enabled".to_string(), Some(json!(true)))]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+    let conn = rmail_common::jmap::store::open(&root, "example.test", "user").unwrap();
+    let calendar = store::collections(&conn, Kind::Calendar)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "default")
+        .unwrap();
+    store::put(
+        &conn,
+        &calendar,
+        "t1.ics",
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:t1\r\nSUMMARY:Renew passport\r\nDUE;VALUE=DATE:20261101\r\nPRIORITY:1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+        &|_| true,
+    )
+    .unwrap()
+    .unwrap();
+
+    let folders = call(
+        &state,
+        "FolderSync",
+        Some(
+            &Element::new("FolderHierarchy:FolderSync")
+                .with(Element::text("FolderHierarchy:SyncKey", "0")),
+        ),
+    )
+    .await;
+    let tasks = folders
+        .child("FolderHierarchy:Changes")
+        .unwrap()
+        .children_named("FolderHierarchy:Add")
+        .find(|a| a.value("FolderHierarchy:Type").as_deref() == Some("7"))
+        .and_then(|a| a.value("FolderHierarchy:ServerId"))
+        .expect("a tasks folder");
+
+    call(&state, "Sync", Some(&sync_request(&tasks, "0", None, None))).await;
+    let first = call(&state, "Sync", Some(&sync_request(&tasks, "1", None, None))).await;
+    let added: Vec<&Element> = collection(&first)
+        .child("AirSync:Commands")
+        .unwrap()
+        .children_named("AirSync:Add")
+        .collect();
+    assert_eq!(added.len(), 1, "tasks only, no events");
+    let data = added[0].child("AirSync:ApplicationData").unwrap();
+    assert_eq!(
+        data.value("Tasks:Subject").as_deref(),
+        Some("Renew passport")
+    );
+    assert_eq!(data.value("Tasks:Importance").as_deref(), Some("2"));
+    assert_eq!(
+        data.value("Tasks:DueDate").as_deref(),
+        Some("2026-11-01T00:00:00.000Z")
+    );
+    assert_eq!(data.value("Tasks:Complete").as_deref(), Some("0"));
+
+    // The phone adds one and completes the other.
+    let commands = Element::new("AirSync:Commands")
+        .with(
+            Element::new("AirSync:Add")
+                .with(Element::text("AirSync:ClientId", "c1"))
+                .with(
+                    Element::new("AirSync:ApplicationData")
+                        .with(Element::text("Tasks:Subject", "Call the bank"))
+                        .with(Element::text("Tasks:Importance", "1"))
+                        .with(Element::text("Tasks:Complete", "0")),
+                ),
+        )
+        .with(
+            Element::new("AirSync:Change")
+                .with(Element::text("AirSync:ServerId", "t1.ics"))
+                .with(
+                    Element::new("AirSync:ApplicationData")
+                        .with(Element::text("Tasks:Subject", "Renew passport"))
+                        .with(Element::text("Tasks:DueDate", "2026-11-01T00:00:00.000Z"))
+                        .with(Element::text(
+                            "Tasks:UtcDueDate",
+                            "2026-10-31T23:00:00.000Z",
+                        ))
+                        .with(Element::text("Tasks:Complete", "1"))
+                        .with(Element::text(
+                            "Tasks:DateCompleted",
+                            "2026-10-17T10:00:00.000Z",
+                        )),
+                ),
+        );
+    let key = collection(&first).value("AirSync:SyncKey").unwrap();
+    let second = call(
+        &state,
+        "Sync",
+        Some(&sync_request(&tasks, &key, Some(commands), None)),
+    )
+    .await;
+    assert_eq!(
+        collection(&second)
+            .child("AirSync:Responses")
+            .and_then(|r| r.child("AirSync:Add"))
+            .and_then(|a| a.value("AirSync:Status"))
+            .as_deref(),
+        Some("1")
+    );
+    let stored = store::objects(&conn, &calendar).unwrap();
+    let passport = stored.iter().find(|o| o.name == "t1.ics").unwrap();
+    assert!(
+        passport.data.contains("STATUS:COMPLETED")
+            && passport.data.contains("DUE;VALUE=DATE:20261101")
+            && passport.data.contains("PRIORITY:1"), // left out, so kept
+        "{}",
+        passport.data
+    );
+    assert!(
+        stored
+            .iter()
+            .any(|o| o.data.contains("SUMMARY:Call the bank") && o.data.contains("BEGIN:VTODO"))
+    );
+}

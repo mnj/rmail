@@ -36,6 +36,7 @@ mod oidc;
 mod organize;
 mod security;
 mod subscriptions;
+pub(crate) mod tasks;
 
 const SESSION_COOKIE: &str = "rmail_webmail";
 pub(crate) const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -153,6 +154,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(security::routes())
         .merge(events::routes())
         .merge(subscriptions::routes())
+        .merge(tasks::routes())
         .merge(bookings::routes())
         .merge(oidc::routes())
         .merge(mail_rules::routes())

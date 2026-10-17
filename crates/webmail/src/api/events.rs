@@ -132,14 +132,14 @@ struct Listing {
 // ---------------------------------------------------------------------------
 // Reading events
 
-fn text_of(component: &Component, name: &str) -> String {
+pub(crate) fn text_of(component: &Component, name: &str) -> String {
     component
         .property(name)
         .map(|property| itip::unescape(&property.value).trim().to_string())
         .unwrap_or_default()
 }
 
-fn is_date(property: &Property) -> bool {
+pub(crate) fn is_date(property: &Property) -> bool {
     property
         .param("VALUE")
         .is_some_and(|value| value.eq_ignore_ascii_case("DATE"))
@@ -270,7 +270,7 @@ fn zone(name: &str) -> Option<chrono_tz::Tz> {
 
 /// DTSTART or DTEND for `seconds`: a date for an all-day event, local time
 /// with TZID in a known zone, else UTC.
-fn time_property(name: &str, seconds: i64, all_day: bool, timezone: &str) -> Property {
+pub(crate) fn time_property(name: &str, seconds: i64, all_day: bool, timezone: &str) -> Property {
     use chrono::TimeZone;
     let utc = chrono::Utc
         .timestamp_opt(seconds, 0)
@@ -292,7 +292,7 @@ fn time_property(name: &str, seconds: i64, all_day: bool, timezone: &str) -> Pro
     }
 }
 
-fn set_text(event: &mut Component, name: &str, value: &str) {
+pub(crate) fn set_text(event: &mut Component, name: &str, value: &str) {
     event
         .properties
         .retain(|p| !p.name.eq_ignore_ascii_case(name));
@@ -461,17 +461,17 @@ pub(crate) fn check(fields: &EventFields) -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 // Calendars
 
-struct Place {
-    id: String,
-    displayname: String,
-    color: Option<String>,
+pub(crate) struct Place {
+    pub id: String,
+    pub displayname: String,
+    pub color: Option<String>,
     /// The calendar's owner: the user, or who shared it.
-    owner: User,
-    shared: bool,
-    writable: bool,
-    subscription: Option<serde_json::Value>,
-    conn: rmail_common::sqlite_pool::SqliteConnection,
-    collection: Collection,
+    pub owner: User,
+    pub shared: bool,
+    pub writable: bool,
+    pub subscription: Option<serde_json::Value>,
+    pub conn: rmail_common::sqlite_pool::SqliteConnection,
+    pub collection: Collection,
 }
 
 fn user_of(address: &str) -> Option<User> {
@@ -491,6 +491,19 @@ fn open(
 }
 
 fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
+    places_for(state, session, "VEVENT")
+}
+
+/// The user's own calendars and those shared with them that take
+/// `component` (`VEVENT` or `VTODO`).
+pub(crate) fn places_for(
+    state: &AppState,
+    session: &Session,
+    component: &str,
+) -> anyhow::Result<Vec<Place>> {
+    let takes = |collection: &Collection| {
+        collection.components.is_empty() || collection.components.iter().any(|c| c == component)
+    };
     let me = User {
         address: session.address.clone(),
         domain: session.domain.clone(),
@@ -500,10 +513,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
     let conn = open(&state.mail_root, &me)?;
     let subscriptions = rmail_common::dav::subscription::subscriptions(&conn)?;
     for collection in store::collections(&conn, Kind::Calendar)? {
-        if collection.inbox
-            || !(collection.components.is_empty()
-                || collection.components.iter().any(|c| c == "VEVENT"))
-        {
+        if collection.inbox || !takes(&collection) {
             continue;
         }
         found.push(Place {
@@ -527,7 +537,7 @@ fn places(state: &AppState, session: &Session) -> anyhow::Result<Vec<Place>> {
     }
     let grants = share::shared_with(&state.db_path, &session.address)?;
     for (grant, collection) in share::with_collections(&state.mail_root, grants)? {
-        if collection.kind != Kind::Calendar {
+        if collection.kind != Kind::Calendar || !takes(&collection) {
             continue;
         }
         let Some(owner) = user_of(&grant.owner) else {
