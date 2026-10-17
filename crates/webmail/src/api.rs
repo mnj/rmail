@@ -685,17 +685,19 @@ async fn related_messages(
         else {
             return Ok(Vec::new());
         };
-        let mut scored: Vec<(f32, String, u64, u64)> =
-            rmail_common::classifier_store::all_search_vectors(&conn, &model)?
-                .into_iter()
-                .filter(|(f, _, u, _)| !(*f == location.folder && *u == uid))
-                .map(|(f, validity, u, vector)| {
-                    let score = vector.iter().zip(&wanted).map(|(a, b)| a * b).sum::<f32>();
-                    (score, f, validity, u)
-                })
-                .filter(|(score, ..)| *score >= MIN_RELATED_SCORE)
-                .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // A few spare candidates, for messages deleted since indexing.
+        let scored = rmail_common::classifier_store::best_search_matches(
+            &conn,
+            &model,
+            MAX_RELATED * 4,
+            |f, _, u, vector| {
+                if f == location.folder && u == uid {
+                    return None;
+                }
+                let score = vector.iter().zip(&wanted).map(|(a, b)| a * b).sum::<f32>();
+                (score >= MIN_RELATED_SCORE).then_some(score)
+            },
+        )?;
         // Only messages still there (the index may lag behind deletions).
         let mut folders: std::collections::HashMap<String, (u64, Vec<imap_state::Message>)> =
             Default::default();

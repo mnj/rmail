@@ -1012,26 +1012,36 @@ pub fn search_vector(
         .optional()?)
 }
 
-/// Every indexed vector made with `model_id`, in every folder:
-/// (folder, uidvalidity, uid, vector).
-pub fn all_search_vectors(
+/// The `keep` best-scoring indexed messages made with `model_id`, in every
+/// folder, best first: (score, folder, uidvalidity, uid). Rows are scored
+/// one at a time, so the whole index is never held in memory; `score`
+/// returns `None` for a row to skip.
+pub fn best_search_matches(
     conn: &Connection,
     model_id: &str,
-) -> Result<Vec<(String, u64, u64, Vec<f32>)>> {
+    keep: usize,
+    mut score: impl FnMut(&str, u64, u64, &[f32]) -> Option<f32>,
+) -> Result<Vec<(f32, String, u64, u64)>> {
     let mut stmt = conn.prepare(
         "SELECT folder, uidvalidity, uid, embedding FROM search_vectors WHERE model_id = ?1",
     )?;
-    let rows = stmt
-        .query_map(params![model_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as u64,
-                decode_embedding(&row.get::<_, Vec<u8>>(3)?),
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let mut rows = stmt.query(params![model_id])?;
+    let mut best: Vec<(f32, String, u64, u64)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let folder: String = row.get(0)?;
+        let (validity, uid) = (row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64);
+        let vector = decode_embedding(&row.get::<_, Vec<u8>>(3)?);
+        if let Some(found) = score(&folder, validity, uid, &vector) {
+            best.push((found, folder, validity, uid));
+            if best.len() > keep * 2 {
+                best.sort_by(|a, b| b.0.total_cmp(&a.0));
+                best.truncate(keep);
+            }
+        }
+    }
+    best.sort_by(|a, b| b.0.total_cmp(&a.0));
+    best.truncate(keep);
+    Ok(best)
 }
 
 pub fn search_count(conn: &Connection) -> Result<u64> {

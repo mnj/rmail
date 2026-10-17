@@ -693,6 +693,13 @@ function Mailbox({ api, address, canSend, files, onLogout }: { api: Api; address
       setSelected(detail);
       setRemoteLoaded(false);
       setView('message');
+      setMoreOpen(false);
+      setMoveOpen(false);
+      if (!hasFlag(detail.flags, '\\Seen') && can(folders.find((f) => f.name === target), 's')) {
+        await api(`/api/folders/${encodeURIComponent(target)}/messages/${uid}`, { method: 'PATCH', body: JSON.stringify({ seen: true }) });
+        setMessages((list) => list.map((m) => (m.uid === uid ? { ...m, flags: [...m.flags, '\\Seen'] } : m)));
+        loadFolders().catch(() => undefined);
+      }
     } catch (err) {
       flash((err as Error).message);
     }
