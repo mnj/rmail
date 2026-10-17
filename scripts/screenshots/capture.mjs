@@ -141,7 +141,7 @@ async function signIn(page) {
   const ctx = await browser.newContext(desktop);
   const page = await ctx.newPage();
   await page.goto(webmail);
-  await page.waitForSelector('.login-panel');
+  await page.waitForSelector('.login-panel .sso-button');
   await shot(page, 'webmail-login');
   await signIn(page);
   // Read a few messages so the list shows both read and unread mail.
@@ -643,6 +643,17 @@ for (const theme of ['light', 'dark']) {
   await page.click('.compose button[aria-label="Discard"]');
   await page.waitForSelector('.toast', { state: 'detached', timeout: 10000 });
   await ghostText(page, 'mobile-compose-ai', true);
+  await ctx.close();
+}
+
+// Single sign-on: the button goes to the provider and back, signed in.
+{
+  const ctx = await browser.newContext(desktop);
+  const page = await ctx.newPage();
+  await page.goto(webmail);
+  await page.click('.login-panel .sso-button');
+  await page.waitForSelector('.message-list .row');
+  console.log('Single sign-on check: good');
   await ctx.close();
 }
 

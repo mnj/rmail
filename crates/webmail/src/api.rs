@@ -32,6 +32,7 @@ pub(crate) mod events;
 mod files;
 pub(crate) mod invitations;
 mod mail_rules;
+mod oidc;
 mod organize;
 mod security;
 mod subscriptions;
@@ -153,6 +154,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .merge(events::routes())
         .merge(subscriptions::routes())
         .merge(bookings::routes())
+        .merge(oidc::routes())
         .merge(mail_rules::routes())
         .merge(crate::jmap::routes())
         .merge(crate::dav::routes())

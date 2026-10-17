@@ -239,6 +239,9 @@ time { white-space: nowrap; }
 .text-message { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; line-height: 1.55; color: var(--text); }
 .empty { height: 100%; display: grid; place-content: center; justify-items: center; gap: 6px; color: var(--muted); text-align: center; padding: 24px; }
 .empty p { margin: 0; font-size: 15px; color: var(--text-2); }
+.login-or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+.login-or::before, .login-or::after { content: ''; flex: 1; border-top: 1px solid var(--border); }
+.sso-button { display: flex; justify-content: center; text-decoration: none; }
 .remote-banner, .suggestion-banner { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
 .remote-banner { background: var(--warn-bg); color: var(--warn-text); }
 .suggestion-banner { background: var(--info-bg); color: var(--info-text); }

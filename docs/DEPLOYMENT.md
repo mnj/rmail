@@ -754,6 +754,28 @@ Users manage both under **Security** in webmail.
   the shield button on the Mailboxes page, or `rmail_ctl two-factor reset <address>` (their app
   passwords stay). `rmail_ctl two-factor status <address>` shows the state and app passwords.
 
+### Single sign-on (OpenID Connect)
+
+Webmail can sign people in through an OpenID Connect provider (Google, Microsoft Entra ID,
+Keycloak, Authentik and others) next to the password form. Register a web application with the
+provider, with `https://<webmail host>/api/oidc/callback` as its redirect URI and the `openid` and
+`email` scopes, then fill in the console's **Single sign-on** settings (`oidc.issuer`,
+`oidc.client_id`, `oidc.client_secret`, `oidc.button_label`) and turn it on.
+
+- The provider's email address must be an existing mailbox (not an alias);
+  sign-in does not create mailboxes. By default the provider must mark it verified
+  (`email_verified`). Turning `oidc.require_verified_email` off lets anyone whose provider account
+  can set its own email address sign in as that mailbox, so leave it on unless the provider only
+  ever issues addresses it controls. The issuer is checked when the settings are saved.
+- Signing in this way stands in for the password and the two-factor code: the provider is trusted
+  to ask for its own. A domain that requires two-factor sign-in still has users set it up.
+- It uses the authorization code flow with PKCE, a nonce and a state cookie. The ID token comes
+  directly from the provider's token endpoint over TLS, so its issuer, audience, expiry and nonce
+  are checked rather than its signature (OIDC Core 3.1.3.7). The issuer must be HTTPS (plain HTTP
+  only on the loopback address).
+- Mail apps (IMAP, SMTP, CalDAV, ActiveSync) keep using passwords or app passwords, and the admin
+  console keeps its own sign-in.
+
 ### Sending
 
 Compose, reply, reply all and forward (with attachments up to 10 MB in total) go through this

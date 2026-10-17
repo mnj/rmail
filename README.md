@@ -51,7 +51,8 @@ screenshots of every page, and a quick start.
   card too. A calendar (week, month and agenda) and contacts are edited in webmail and
   synced with phones over CalDAV and CardDAV; inviting guests from webmail sends invitations,
   updates and cancellations. Two-factor sign-in (TOTP with recovery codes) and per-device app
-  passwords for mail apps are set up under Security. Files too large to attach can go as
+  passwords for mail apps are set up under Security, and webmail can sign in through an
+  OpenID Connect provider (single sign-on). Files too large to attach can go as
   expiring download links, and each user can have their own file storage, in webmail and over
   WebDAV for file managers, and phones can sync mail, contacts and calendars over Exchange ActiveSync (all when the
   administrator turns them on). OpenPGP and S/MIME (under
