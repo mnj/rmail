@@ -333,6 +333,13 @@ fn load_batcher(cfg: &ClassifierConfig) -> Option<Arc<dyn crate::cloud::Batcher>
         )
         .ok()
         .map(|batcher| Arc::new(batcher) as Arc<dyn crate::cloud::Batcher>),
+        ChatProvider::OpenRouter => crate::cloud::OpenRouterBatcher::load(
+            &cfg.openrouter_base_url,
+            secret(&cfg.openrouter_api_key),
+            &cfg.openrouter_chat_model,
+        )
+        .ok()
+        .map(|batcher| Arc::new(batcher) as Arc<dyn crate::cloud::Batcher>),
         ChatProvider::Anthropic => crate::cloud::AnthropicBatcher::load(
             crate::cloud::ANTHROPIC_API,
             secret(&cfg.anthropic_api_key),

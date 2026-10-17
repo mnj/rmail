@@ -1092,9 +1092,10 @@ Organization page (or the `classifier.*` settings):
 - **Anthropic** (`classifier.anthropic_api_key`, `classifier.anthropic_chat_model`, default
   `claude-haiku-5-5`) uses the Messages API with the same JSON schemas (`output_config.format`)
   and a low effort. Anthropic has no embeddings; pair it with a local or OpenAI embedder.
-- **Batch labels** (`classifier.background_tier` = `batch`, with the `openai` or `anthropic` chat
-  provider) send labeling questions for new mail through the provider's batch API (OpenAI Batch,
-  Anthropic Message Batches) at half price. Each question waits in the account's own
+- **Batch labels** (`classifier.background_tier` = `batch`, with the `openai`, `anthropic` or
+  `openrouter` chat provider) send labeling questions for new mail through the provider's batch
+  API (OpenAI Batch, Anthropic Message Batches, OpenRouter's Batch API for the models it batches,
+  such as OpenAI, Anthropic and Gemini ones) at half price. Each question waits in the account's own
   `classifier.sqlite`, so message text only leaves the account's directory for the provider. The
   worker sends the waiting questions of all accounts as one batch once 100 have gathered or the
   oldest has waited 15 minutes, asks about running batches once a minute, and applies the answers

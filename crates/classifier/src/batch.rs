@@ -33,7 +33,8 @@ use crate::worker::{CycleReport, apply_labeling};
 const BATCH_MIN: usize = 100;
 /// ...or the oldest has waited this long (seconds).
 const BATCH_WAIT: i64 = if cfg!(test) { 0 } else { 15 * 60 };
-/// Questions in one batch; well under both providers' limits.
+/// Questions in one batch; well under every provider's limits (OpenRouter's
+/// is a 200 MB request).
 const BATCH_MAX: usize = 2_000;
 /// Times a question is sent before it is given up.
 pub const MAX_ATTEMPTS: u32 = 3;
