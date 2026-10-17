@@ -224,6 +224,23 @@ impl Session {
         if !response.active_at(chrono::Utc::now().timestamp()) {
             return;
         }
+        if response.contacts_only {
+            // Only to senders in the account's address books: the envelope
+            // sender, which the reply goes to.
+            let sender = self.tx.mail_from.clone().unwrap_or_default();
+            let (root, account) = (mail_root.to_path_buf(), rcpt.to_string());
+            let known = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                let (local, domain) = account
+                    .split_once('@')
+                    .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+                let conn = rmail_common::jmap::store::open(&root, domain, local)?;
+                rmail_common::dav::store::address_book_has(&conn, &sender)
+            })
+            .await;
+            if !matches!(known, Ok(Ok(true))) {
+                return;
+            }
+        }
         let text = response.text_body.clone().unwrap_or_default();
         let (reason, mime) = match &response.html_body {
             None => (text, false),

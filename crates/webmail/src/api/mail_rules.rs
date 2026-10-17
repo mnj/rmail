@@ -60,6 +60,9 @@ struct Vacation {
     until: Option<i64>,
     subject: String,
     text: String,
+    /// Reply only to people in the user's contacts.
+    #[serde(default)]
+    contacts_only: bool,
 }
 
 async fn get_vacation(app: axum::extract::State<Shared>, headers: HeaderMap) -> Response {
@@ -77,6 +80,7 @@ async fn get_vacation(app: axum::extract::State<Shared>, headers: HeaderMap) -> 
             until: response.to_date,
             subject: response.subject.unwrap_or_default(),
             text: response.text_body.unwrap_or_default(),
+            contacts_only: response.contacts_only,
         })
         .into_response(),
         Err(error) => internal_error(error),
@@ -120,6 +124,7 @@ async fn put_vacation(
             // Webmail writes plain text; an HTML version set over JMAP
             // would no longer match it.
             html_body: None,
+            contacts_only: input.contacts_only,
         };
         // Logged before saving, as JMAP's VacationResponse/set does, so a
         // saved change is never missed by JMAP clients.
@@ -139,6 +144,7 @@ async fn put_vacation(
             until: response.to_date,
             subject: response.subject.unwrap_or_default(),
             text: response.text_body.unwrap_or_default(),
+            contacts_only: response.contacts_only,
         })
     })
     .await;
@@ -781,13 +787,14 @@ mod tests {
         let (status, saved) = call(
             "PUT",
             "/api/vacation",
-            r#"{"enabled":true,"from":null,"until":4102444800,"subject":"Away\nuntil Monday","text":"Back on Monday."}"#.into(),
+            r#"{"enabled":true,"from":null,"until":4102444800,"subject":"Away\nuntil Monday","text":"Back on Monday.","contacts_only":true}"#.into(),
         )
         .await;
         assert_eq!(status, 200, "{saved}");
         assert_eq!(saved["subject"], "Away until Monday");
         let stored = db::get_vacation_response(&state.db_path, "user@example.test").unwrap();
         assert!(stored.enabled && stored.text_body.as_deref() == Some("Back on Monday."));
+        assert!(stored.contacts_only && saved["contacts_only"] == true);
 
         let (_, filters) = call("GET", "/api/filters", String::new()).await;
         assert_eq!(filters["mode"], "none");

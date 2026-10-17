@@ -6,7 +6,7 @@ import React, { useEffect, useState } from 'react';
 import { ArrowDown, ArrowUp, Filter, Plane, Plus, Trash2, X } from 'lucide-react';
 import { Api, ApiError, Folder, Label } from './types';
 
-export type Vacation = { enabled: boolean; from: number | null; until: number | null; subject: string; text: string };
+export type Vacation = { enabled: boolean; from: number | null; until: number | null; subject: string; text: string; contacts_only?: boolean };
 
 type Field = 'from' | 'to' | 'subject' | 'header' | 'size';
 type Op = 'contains' | 'not_contains' | 'is' | 'is_not' | 'over' | 'under';
@@ -86,6 +86,7 @@ export function VacationDialog({ api, initial, onClose, onSaved }: { api: Api; i
           </div>
           <label className="field"><span>Subject</span><input value={draft.subject} maxLength={200} placeholder="Out of office" onChange={(e) => setDraft({ ...draft, subject: e.target.value })} /></label>
           <label className="field"><span>Reply</span><textarea rows={7} value={draft.text} maxLength={20000} placeholder="I'm away until Monday and will answer when I'm back." onChange={(e) => setDraft({ ...draft, text: e.target.value })} /></label>
+          <label className="check-row"><input type="checkbox" checked={Boolean(draft.contacts_only)} onChange={(e) => setDraft({ ...draft, contacts_only: e.target.checked })} /><span>Only reply to people in my contacts</span></label>
         </fieldset>
         {error && <p className="error">{error}</p>}
         <footer><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button></footer>

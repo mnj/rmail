@@ -333,6 +333,12 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<()> {
     )?;
     ensure_outbound_columns(path)?;
     add_column_if_missing(path, "mailboxes", "quota_bytes", "INTEGER")?;
+    add_column_if_missing(
+        path,
+        "vacation_responses",
+        "contacts_only",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute_batch(crate::two_factor::SCHEMA)?;
     Ok(())
 }
@@ -712,6 +718,9 @@ pub struct VacationResponse {
     pub subject: Option<String>,
     pub text_body: Option<String>,
     pub html_body: Option<String>,
+    /// Reply only to senders in the account's address books (webmail's
+    /// setting; JMAP has no such property and leaves it as it is).
+    pub contacts_only: bool,
 }
 
 impl VacationResponse {
@@ -729,7 +738,7 @@ pub fn get_vacation_response<P: AsRef<Path>>(path: P, account: &str) -> Result<V
     let conn = Connection::open(path)?;
     let row = conn
         .query_row(
-            "SELECT enabled, from_date, to_date, subject, text_body, html_body
+            "SELECT enabled, from_date, to_date, subject, text_body, html_body, contacts_only
              FROM vacation_responses WHERE account = ?1",
             params![account.to_ascii_lowercase()],
             |row| {
@@ -740,6 +749,7 @@ pub fn get_vacation_response<P: AsRef<Path>>(path: P, account: &str) -> Result<V
                     subject: row.get(3)?,
                     text_body: row.get(4)?,
                     html_body: row.get(5)?,
+                    contacts_only: row.get::<_, i64>(6)? != 0,
                 })
             },
         )
@@ -754,12 +764,12 @@ pub fn set_vacation_response<P: AsRef<Path>>(
 ) -> Result<()> {
     let conn = Connection::open(path)?;
     conn.execute(
-        "INSERT INTO vacation_responses (account, enabled, from_date, to_date, subject, text_body, html_body)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO vacation_responses (account, enabled, from_date, to_date, subject, text_body, html_body, contacts_only)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(account) DO UPDATE SET enabled = excluded.enabled,
              from_date = excluded.from_date, to_date = excluded.to_date,
              subject = excluded.subject, text_body = excluded.text_body,
-             html_body = excluded.html_body",
+             html_body = excluded.html_body, contacts_only = excluded.contacts_only",
         params![
             account.to_ascii_lowercase(),
             i64::from(response.enabled),
@@ -768,6 +778,7 @@ pub fn set_vacation_response<P: AsRef<Path>>(
             response.subject,
             response.text_body,
             response.html_body,
+            i64::from(response.contacts_only),
         ],
     )?;
     Ok(())
